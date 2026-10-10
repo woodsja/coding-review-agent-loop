@@ -813,3 +813,62 @@ def test_ordinary_pr_ignores_unfinished_planning_on_its_linked_issue(
     with pytest.raises(_Reached):
         run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True)
     assert len(runner.comments) == comments_before
+
+
+@pytest.mark.parametrize("board", ["signed-reduction", "binding-swap"])
+def test_direct_staged_child_entry_floor_uses_the_parent_plan(tmp_path, monkeypatch, board):
+    """item-13: a direct-implementation staged child implements its parent's plan, so
+    run_issue_loop checks the floor against the parent board before any write."""
+    from dataclasses import replace as dc_replace
+
+    import coding_review_agent_loop.issue_loop as issue_loop
+    from coding_review_agent_loop.cli import run_issue_loop
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.protocol import EXECUTION_DISPOSITION_DIRECT
+    from test_issue_pr_handoff import (
+        _named_config, _named_plan_comments, _seat as _handoff_seat, _three_provider_plan,
+    )
+    from test_orchestrator_issue import _fresh_child_route_fixture
+
+    seats, approved = _three_provider_plan(tmp_path)
+    parent_comments = tuple(
+        IssueComment(author="bot", created_at=comment["createdAt"], body=comment["body"])
+        for comment in _named_plan_comments(
+            approved, _named_config(tmp_path, seats), removed=("c",), issue=55,
+        )
+    )
+    fresh, child, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_DIRECT)
+    child = dc_replace(child, body="Child phase issue for parent #55.\n\nImplement child.")
+    parent = dc_replace(parent, comments=parent_comments)
+    monkeypatch.setattr(
+        issue_loop, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    monkeypatch.setattr(issue_loop, "_resolve_fresh_child_provenance", lambda **_: fresh)
+
+    def reached(*_a, **_k):
+        raise _Reached
+
+    monkeypatch.setattr(issue_loop, "resolve_base_branch", reached)
+    for name in ("ensure_agent_workdirs", "_dispatch_decomposition_child", "prepare_agent_memory"):
+        monkeypatch.setattr(
+            issue_loop, name, lambda *_a, _n=name, **_k: pytest.fail(f"{_n} ran before the floor"),
+        )
+    runner = FakeRunner()
+    if board == "signed-reduction":
+        # The parent's signed 3 -> 2 reduction excuses the reviewer count.
+        with pytest.raises(_Reached):
+            run_issue_loop(
+                runner, issue_number=56,
+                config=_named_config(tmp_path, seats[:2], min_reviewers=3),
+            )
+    else:
+        # b moved to Codex: the inherited parent board a, b has one provider.
+        swapped = (seats[0], _handoff_seat(tmp_path, "b", "codex", "gpt-6.1-flash", "medium"), seats[2])
+        with pytest.raises(AgentLoopError, match="1 distinct provider\\(s\\) is below the floor of 2"):
+            run_issue_loop(
+                runner, issue_number=56,
+                config=_named_config(tmp_path, swapped, min_distinct_providers=2),
+            )
+    assert runner.comments == []
+    assert _agent_commands(runner) == []

@@ -1941,7 +1941,9 @@ the board with the floor, so amendment rebinding cannot trip it.
 `reviewer_floor.check_reviewer_floor` checks the effective board after
 read-only history and lineage resolution. It runs before any workdir setup,
 managed-CI activation, PR-side write, or agent invocation. That covers
-issue-run start (before base resolution and workdir setup), `managed-pr` (before
+issue-run start (before base resolution and workdir setup, using the parent's plan
+board when a direct-implementation staged child implements the parent's plan),
+`managed-pr` (before
 the branch and draft PR are created), and PR start or handoff. Providers are
 counted by seat backend. Only a validated, non-empty signed amendment chain
 supplies a floor exception. At handoff that requires an inherited seat set. On

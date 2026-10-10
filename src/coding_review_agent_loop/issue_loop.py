@@ -209,7 +209,24 @@ def run_issue_loop(
         from .reviewer_floor import board_floor_enabled
         if board_floor_enabled(config):
             floor_issue = get_issue_context(runner, config=config, issue_number=issue_number)
-            enforce_issue_board_floor(config, floor_issue.comments, issue_number=issue_number)
+            plan_owner = floor_issue
+            # The plan bound to this run is the one the routing below selects:
+            # a direct-implementation staged child implements its parent's
+            # approved plan, so the parent's board and signed lineage apply
+            # (#1378 review item-13).  Resolved read-only, like the routing.
+            floor_parent_number = _infer_staged_parent_issue(floor_issue)
+            if floor_parent_number is not None and floor_parent_number != issue_number:
+                floor_parent = get_issue_context(
+                    runner, config=config, issue_number=floor_parent_number,
+                )
+                floor_child = _resolve_fresh_child_provenance(
+                    issue_context=floor_issue, parent_issue_context=floor_parent,
+                )
+                if floor_child is not None and floor_child.route.is_direct:
+                    plan_owner = floor_parent
+            enforce_issue_board_floor(
+                config, plan_owner.comments, issue_number=plan_owner.number,
+            )
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(runner, config)
