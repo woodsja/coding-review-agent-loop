@@ -551,30 +551,25 @@ def _entry_plan_handoff_board(
     plan, the same selection the handoff seam applies.  ``None`` means no
     plan is bound, so no plan authorization applies.
     """
+    fresh_scope_number = managed_ci_issue_number or config.managed_ci_issue_number
+    branch_match = re.fullmatch(
+        r"agent-loop/managed-([1-9]\d*)", pr_context.metadata.head_branch or "",
+    )
+    branch_number = int(branch_match.group(1)) if branch_match is not None else None
+    ordinary_managed_recovery = config.managed_ci_pr_mode or fresh_scope_number is not None
     owning_number = issue_context.number if issue_context is not None else None
-    # Only the managed-CI recovery paths bind an issue's canonical plan when
-    # no handoff record names this PR (#1378 review item-10).
-    canonical_recovery_scope = False
     if owning_number is None:
-        owning_number = managed_ci_issue_number or config.managed_ci_issue_number
-        canonical_recovery_scope = (
-            owning_number is not None and config.managed_ci_fresh_authorization
-        )
+        owning_number = fresh_scope_number
     if owning_number is None:
         recorded = find_latest_pr_contract(
             pr_context.comments, repository=config.repo, pr_number=pr_number,
         )
         if recorded is not None:
             owning_number = recorded.primary_issue_number
-    if owning_number is None and config.managed_ci_pr_mode:
+    if owning_number is None and ordinary_managed_recovery:
         # Ordinary managed-CI recovery binds the issue named by the managed
         # branch, exactly as recover_issue_created_handoff does.
-        branch = re.fullmatch(
-            r"agent-loop/managed-([1-9]\d*)", pr_context.metadata.head_branch or "",
-        )
-        if branch is not None:
-            owning_number = int(branch.group(1))
-            canonical_recovery_scope = True
+        owning_number = branch_number
     if owning_number is None:
         # The same single-linked-issue fallback the provenance block applies;
         # its handoff record must still name this PR to bind a plan.
@@ -583,6 +578,13 @@ def _entry_plan_handoff_board(
             owning_number = linked[0]
     if owning_number is None:
         return None
+    # Only the managed-CI recovery paths bind an issue's canonical plan when
+    # no handoff record names this PR (#1378 review items 10-12).  Whether
+    # they run depends on the invocation's managed-CI scope and the managed
+    # branch, never on which lookup above supplied the owning issue.
+    canonical_recovery_scope = (
+        config.managed_ci_fresh_authorization and fresh_scope_number == owning_number
+    ) or (ordinary_managed_recovery and branch_number == owning_number)
     owning = get_issue_context(runner, config=config, issue_number=owning_number)
     if approved_plan_context is not None:
         plan_hash: str | None = approved_plan_context.plan_hash

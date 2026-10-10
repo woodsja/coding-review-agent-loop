@@ -1962,7 +1962,10 @@ the issue-side handoff that names this PR. The board then comes from the issue
 holding exactly that plan, either the child or its staged parent. With no
 handoff record, only the managed-CI recovery scopes (fresh authorization with
 an explicit issue, or ordinary resume from the managed branch) bind the owning
-issue's completely approved canonical plan. It is verified by the same helper
+issue's completely approved canonical plan. That scope is decided from the
+invocation's managed-CI settings and the managed branch, not from which lookup
+found the owning issue, so a caller-supplied issue or a PR-side contract does
+not hide it. It is verified by the same helper
 those recovery paths use, and that issue's board is used. An ordinary PR whose
 linked issue has no handoff record naming it binds no plan, so unfinished
 planning on that issue is never consulted. The read-only PR preflight also validates persisted PR seat bindings

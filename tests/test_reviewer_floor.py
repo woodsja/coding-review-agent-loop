@@ -597,43 +597,72 @@ def _no_handoff_plan_pr(tmp_path, *, plan_state, scope):
     )
     kwargs = {}
     overrides = {}
-    if scope == "explicit-scope":
-        # Managed-CI fresh authorization with an explicit issue scope.
+    if scope in {"explicit-scope", "caller-issue-fresh"}:
+        # Managed-CI fresh authorization with an explicit issue scope; the
+        # issue-mode resume also passes the issue context in-process.
         kwargs["managed_ci_issue_number"] = 56
+        if scope == "caller-issue-fresh":
+            kwargs["issue_context"] = IssueContext(56, "OWNER/REPO", "Issue", "Body", None, ())
         overrides.update(
             managed_ci=True, managed_ci_pr_mode=True, managed_ci_fresh_authorization=True,
             managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
         )
     else:
-        # Ordinary managed-CI recovery binds the issue named by the managed branch.
+        # Ordinary managed-CI recovery binds the issue named by the managed branch,
+        # even when a PR-side contract already names that issue as primary.
         runner.pr_payload["headRefName"] = "agent-loop/managed-56"
         overrides["managed_ci_pr_mode"] = True
+        if scope == "pr-contract-managed-branch":
+            from coding_review_agent_loop.pr_contract import (
+                format_pr_contract_comment, make_pr_contract,
+            )
+
+            runner.pr_payload.setdefault("comments", []).append({
+                "author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z",
+                "body": format_pr_contract_comment(make_pr_contract(
+                    repository="OWNER/REPO", pr_number=77,
+                    origin_flow="approved-plan-implementation",
+                    expected_closing_issue_ids=(56,), primary_issue_number=56,
+                )),
+            })
     return seats, runner, kwargs, overrides
 
 
-@pytest.mark.parametrize("scope", ["explicit-scope", "managed-branch"])
-@pytest.mark.parametrize("plan_state", ["signed", "unsigned", "incomplete"])
+@pytest.mark.parametrize(
+    "scope",
+    ["explicit-scope", "managed-branch", "caller-issue-fresh", "pr-contract-managed-branch"],
+)
+@pytest.mark.parametrize("plan_state", ["signed", "unsigned", "incomplete", "binding-swap"])
 def test_no_handoff_pr_entry_floor_verifies_the_canonical_plan(
     tmp_path, monkeypatch, scope, plan_state
 ):
-    """item-7: without a handoff record the entry floor uses the verified canonical plan."""
+    """items 7, 11, 12: without a handoff record, every managed-CI recovery scope uses
+    the verified canonical plan at entry, however the owning issue was found."""
     from coding_review_agent_loop.cli import run_pr_loop
-    from test_issue_pr_handoff import _named_config
+    from test_issue_pr_handoff import _named_config, _seat as _handoff_seat
 
     seats, runner, kwargs, overrides = _no_handoff_plan_pr(
-        tmp_path, plan_state=plan_state, scope=scope,
+        tmp_path, plan_state="signed" if plan_state == "binding-swap" else plan_state,
+        scope=scope,
     )
     releases = _watch_retained_label(monkeypatch)
-    config = _named_config(tmp_path, seats[:2], min_reviewers=3, **overrides)
+    if plan_state == "binding-swap":
+        # The inherited seat set with b moved from Claude to Codex: the signed
+        # plan board becomes a, b on one provider.
+        swapped = (seats[0], _handoff_seat(tmp_path, "b", "codex", "gpt-6.1-flash", "medium"), seats[2])
+        config = _named_config(tmp_path, swapped, min_distinct_providers=2, **overrides)
+    else:
+        config = _named_config(tmp_path, seats[:2], min_reviewers=3, **overrides)
     if plan_state == "signed":
         with pytest.raises(_Reached):
             run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True, **kwargs)
         assert releases == [True]
     else:
-        refusal = (
-            "2 reviewer\\(s\\) is below the floor of 3" if plan_state == "unsigned"
-            else "without a complete canonical reviewer approval"
-        )
+        refusal = {
+            "unsigned": "2 reviewer\\(s\\) is below the floor of 3",
+            "incomplete": "without a complete canonical reviewer approval",
+            "binding-swap": "1 distinct provider\\(s\\) is below the floor of 2",
+        }[plan_state]
         with pytest.raises(AgentLoopError, match=refusal):
             run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True, **kwargs)
         assert releases == []
