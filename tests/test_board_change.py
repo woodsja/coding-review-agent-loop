@@ -3467,7 +3467,7 @@ def test_approved_staged_plan_resumed_under_default_flags_is_not_reopened(tmp_pa
     """Row plan-approved-board-change: approved primary-then-panel plan, default planning flags."""
     staged = _plan_cfg(
         tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
-        primary_plan_reviewer="codex",
+        primary_plan_reviewer="codex", quiet=False,
     )
     runner = _plan_runner(
         claude_outputs=[structured_v1_plan_state()],
@@ -3551,3 +3551,281 @@ def test_signed_amendment_then_link_resolves_one_chain_through_resume(tmp_path):
     comments = len(runner.issue_comments)
     assert run_issue_loop(runner, issue_number=56, config=widened, plan_first=True) == 0
     assert len(runner.issue_comments) == comments
+
+
+# --- Round 2 review: keyless fallback, coder dispositions, cleared history
+
+
+def _issue_context(runner, *, requirements=()):
+    from coding_review_agent_loop.github import IssueComment, IssueContext
+
+    return IssueContext(
+        number=56, repo="OWNER/REPO", title="t", body="b", url=None,
+        comments=tuple(
+            IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
+                         author_id=c.get("_rest_author_id"))
+            for c in runner.issue_comments
+        ),
+        human_requirements=tuple(requirements),
+    )
+
+
+def _rewrite_plan_records(runner, predicate, *, body_suffix="", **changes):
+    """Rewrite every plan round record whose metadata matches ``predicate``."""
+    import re
+
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+
+    rewritten = 0
+    for comment in runner.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow != "plan" or not predicate(metadata):
+            continue
+        body = comment["body"][: match.start()].rstrip("\n") + body_suffix
+        comment["body"] = _attach_round_metadata(body, dataclasses.replace(metadata, **changes))
+        rewritten += 1
+    assert rewritten
+
+
+def _strip_requirement_keys(runner, *, acknowledged=False):
+    """Rewrite the reviewer records as keyless legacy approvals.
+
+    A legacy approval body carried its acknowledgement as the rendered marker.
+    """
+    _rewrite_plan_records(
+        runner, lambda metadata: metadata.role == "reviewer",
+        body_suffix="\n\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->" if acknowledged else "",
+        plan_candidate_key=None, surfaced_reviewer_requirement_ids=(),
+    )
+
+
+def _classify(runner, config, requirements=()):
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    return classify_plan_approval(
+        _plan_comments(runner), config=config, issue_number=56,
+        human_requirements=tuple(requirements), trusted_actor=_PLAN_ACTOR,
+    )
+
+
+def _recover(runner, config, requirements=()):
+    """Managed-CI no-handoff recovery and strict qualification's shared gate."""
+    from coding_review_agent_loop.plan_verification import require_recoverable_plan_approval
+
+    issue = _issue_context(runner, requirements=requirements)
+    require_recoverable_plan_approval(
+        None, config=config, issue_context=issue, comments=issue.comments,
+        trusted_actor=_PLAN_ACTOR, error_message="not recoverable",
+    )
+
+
+def test_keyless_acknowledged_approval_is_not_reused_after_withdrawal(tmp_path, monkeypatch):
+    """Item-2: a keyless legacy approval acknowledging a withdrawn requirement is stale."""
+    requirement = _signed_requirement()
+    _patch_requirements(monkeypatch, [requirement])
+    runner, config = _approved_plain_plan(tmp_path, requirement=requirement)
+    _strip_requirement_keys(runner, acknowledged=True)
+    # While the requirement stands, the legacy fallback binds the acknowledged approvals.
+    assert _classify(runner, config, [requirement]).state == "approved"
+    _recover(runner, config, [requirement])
+    _patch_requirements(monkeypatch, [])
+    withdrawn = _classify(runner, config)
+    assert withdrawn.state == "unfinished"
+    assert "stale requirement set" in withdrawn.reason
+    with pytest.raises(AgentLoopError, match="not recoverable"):
+        _recover(runner, config)
+    # A public rerun never reuses them: both reviewers review again.
+    runner.codex_outputs.append(structured_plan_review(state="approved"))
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer="Google Gemini"))
+    start = len(runner.commands)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        pass
+    assert {"codex", "gemini"} <= set(_plan_agents(runner, start))
+
+
+def test_missing_coder_dispositions_refuse_keyed_approvals_and_recovery(tmp_path, monkeypatch):
+    """Item-11: keyed approvals never stand in for the coder's requirement dispositions."""
+    requirement = _signed_requirement()
+    _patch_requirements(monkeypatch, [requirement])
+    runner, config = _approved_plain_plan(tmp_path, requirement=requirement)
+    assert _classify(runner, config, [requirement]).state == "approved"
+    _recover(runner, config, [requirement])
+    # An interrupted run left a plan record without the requirement disposition;
+    # the reviewers' keyed approvals are unchanged.
+    _rewrite_plan_records(
+        runner, lambda metadata: metadata.role == "coder",
+        raw_structured_coder_response=structured_v1_plan_state(),
+    )
+    interrupted = _classify(runner, config, [requirement])
+    assert interrupted.state == "unfinished"
+    assert "lacks complete requirement dispositions" in interrupted.reason
+    with pytest.raises(AgentLoopError, match="not recoverable"):
+        _recover(runner, config, [requirement])
+    # A restart is never shortcut as approved, so no approved outcome follows.
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _plan_agents(runner, start)
+
+
+def _semantic_patch(runner, *, round_number, summary, item_id):
+    """A plan revision patch against the round's authenticated plan state."""
+    from coding_review_agent_loop.plan_assembly import (
+        AuthenticatedPlanState,
+        decode_assembled_plan_sidecar,
+        hydrate_authenticated_plan_state,
+    )
+    from coding_review_agent_loop.response_validation import validate_structured_plan_state
+
+    if round_number == 1:
+        base = AuthenticatedPlanState.from_plan(
+            validate_structured_plan_state(structured_v1_plan_state()), round_number=1,
+        )
+    else:
+        coder = [r for r in _plan_records(runner) if r.metadata.role == "coder"][-1].metadata
+        assert coder.round_number == round_number
+        base = hydrate_authenticated_plan_state(
+            decode_assembled_plan_sidecar(coder.assembled_plan_sidecar)
+        )
+    patch = {
+        "schema_version": 1, "kind": "plan_revision_patch", "semantic_patch_contract_version": 1,
+        "state": "blocking", "summary": summary,
+        "prior_plan_item_dispositions": [
+            {"item_id": item_id, "disposition": "resolved", "rationale": "Addressed."},
+        ],
+        "base_round_number": round_number, "base_state_identity": base.state_identity,
+        "operations": [{"op": "replace", "field": "summary", "value": summary}],
+    }
+    return json.dumps(patch) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def test_completed_staged_plan_with_cleared_history_is_approved(tmp_path):
+    """Item-13: an earlier finding resolved and absent from the final ledger is cleared
+    history, not a lost obligation, live, at restart and in recovery.  The semantic
+    patches inherit their (empty) requirement dispositions from the assembled state."""
+    staged = _plan_cfg(
+        tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="x",
+            blocking_plan_issues=["Name the owner."],
+        )],
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged, plan_first=True)
+    # Round 3 resolves item-1; Gemini raises same-plan item-2.
+    runner.claude_outputs.append(
+        _semantic_patch(runner, round_number=1, summary="Name the owner.", item_id="item-1")
+    )
+    runner.codex_outputs.append(_review("codex"))
+    runner.gemini_outputs.append(_review(
+        "gemini", state="blocking", same_plan_followups=["Mention the owner in the summary."],
+    ))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged, plan_first=True)
+    # Round 4 carries only item-2: item-1 was cleared by recorded history.
+    resolved_2 = [{"item_id": "item-2", "disposition": "resolved"}]
+    runner.claude_outputs.append(
+        _semantic_patch(runner, round_number=3, summary="Mention the owner.", item_id="item-2")
+    )
+    runner.codex_outputs.append(_review("codex", dispositions=resolved_2))
+    runner.gemini_outputs.append(_review("gemini", dispositions=resolved_2))
+    assert run_issue_loop(runner, issue_number=56, config=staged, plan_first=True) == 0
+    final_coder = [r for r in _plan_records(runner) if r.metadata.role == "coder"][-1].metadata
+    assert final_coder.response_form == "semantic-patch-v1"
+    assert [item.item_id for item in final_coder.prior_items] == ["item-2"]
+    assert _classify(runner, staged).state == "approved"
+    _recover(runner, staged)
+    # An unchanged restart does not reopen the plan.
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    assert run_issue_loop(runner, issue_number=56, config=staged, plan_first=True) == 0
+    assert _plan_agents(runner, start) == []
+
+
+def test_staged_child_public_entry_merges_parent_requirements(tmp_path, monkeypatch):
+    """Item-3: the authoritative parent's signed requirements join the planning set at
+    the public entry, bind every approval, and gate restart and recovery."""
+    import coding_review_agent_loop.execution_policy as execution_policy
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+    from coding_review_agent_loop.github import HumanReviewRequirement, IssueContext
+    from coding_review_agent_loop.plan_verification import (
+        build_plan_approval_inputs,
+        classify_plan_approval,
+        require_recoverable_plan_approval,
+    )
+
+    parent_requirement = HumanReviewRequirement(
+        source_type="Issue body", author="maintainer", created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/55", body="Preserve the parent audit trail.",
+    )
+    parent_requirements = [parent_requirement]
+    for module in (execution_policy, plan_first_loop):
+        monkeypatch.setattr(
+            module, "_infer_staged_parent_issue",
+            lambda context: 55 if context.number == 56 else None,
+        )
+    monkeypatch.setattr(execution_policy, "_resolve_fresh_child_provenance", lambda **_kw: None)
+    real = orchestrator.get_issue_context
+
+    def with_parent(runner_arg, *, config, issue_number):
+        if issue_number == 55:
+            return IssueContext(
+                number=55, repo="OWNER/REPO", title="Parent", body="Parent body", url=None,
+                comments=(), human_requirements=tuple(parent_requirements),
+            )
+        return real(runner_arg, config=config, issue_number=issue_number)
+
+    import coding_review_agent_loop.github as github
+
+    monkeypatch.setattr(orchestrator, "get_issue_context", with_parent)
+    monkeypatch.setattr(github, "get_issue_context", with_parent)
+    runner, config = _approved_plain_plan(tmp_path, requirement=parent_requirement)
+    parent_id = parent_requirement.requirement_id
+    assert any(parent_requirement.body in prompt for prompt in (
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[0] == "claude"
+    ))
+    reviews = [r.metadata for r in _plan_records(runner) if r.metadata.role == "reviewer"]
+    assert reviews and all(m.parent_requirement_ids == (parent_id,) for m in reviews)
+    assert all(m.surfaced_reviewer_requirement_ids == (parent_id,) for m in reviews)
+
+    def classify():
+        issue = _issue_context(runner)
+        inputs = build_plan_approval_inputs(runner, config=config, issue_context=issue)
+        assert inputs.parent_requirement_ids == tuple(r.requirement_id for r in parent_requirements)
+        return classify_plan_approval(
+            issue.comments, config=config, issue_number=56, trusted_actor=_PLAN_ACTOR,
+            inputs=inputs,
+        )
+
+    assert classify().state == "approved"
+    def recover():
+        issue = _issue_context(runner)
+        require_recoverable_plan_approval(
+            runner, config=config, issue_context=issue, comments=issue.comments,
+            trusted_actor=_PLAN_ACTOR, error_message="not recoverable",
+        )
+
+    recover()
+    # An unchanged restart is not reopened.
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert _plan_agents(runner, start) == []
+    # The parent requirement changes: every approval is stale, recovery refuses,
+    # and a restart reviews again instead of reusing them.
+    parent_requirements[:] = [dataclasses.replace(parent_requirement, body="Changed parent rule.")]
+    assert classify().state in {"unfinished", "undetermined"}
+    with pytest.raises(AgentLoopError, match="not recoverable"):
+        recover()
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _plan_agents(runner, start)

@@ -4606,7 +4606,11 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
         quiet=False,
     )
 
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    # item-1 was published and never resolved, yet the resumed coder record
+    # carries nothing: the ledger is unreconstructible, so the approval
+    # boundary fails closed after the full-context review (#1377).
+    with pytest.raises(AgentLoopError, match="obligation\\(s\\) item-1 published earlier"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     review_prompt = [
         cmd[-1]
@@ -4616,6 +4620,7 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
     assert COMPACT_PLANNING_VOLATILE_TAIL_MARKER not in review_prompt
     captured = capsys.readouterr()
     assert "Planning round 2: Codex reviewing issue #56 (context mode: full (ledger incomplete))" in captured.err
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomplete_ledger(
     tmp_path, monkeypatch
@@ -12816,23 +12821,63 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         if record.role == "reviewer" and record.agent == "Codex"
     ]
     _ack_nonstaged_run.repair_results = repair_results
+    _ack_nonstaged_run.state = (runner, config, requirement)
     return outcome, codex_records, repair_calls
 
 
-def test_nonstaged_acknowledgement_repair_posts_one_comment_with_the_record(
+def test_nonstaged_acknowledgement_repair_persists_the_bound_record(
     tmp_path, monkeypatch
 ):
     outcome, codex_records, repair_calls = _ack_nonstaged_run(tmp_path, monkeypatch)
     assert outcome == 0, outcome
     assert repair_calls, "the acknowledgement repair must run through the flow"
-    # The comment posted before the gate, from the accepted carrier, is the
-    # only reviewer publication; a successful repair posts nothing new.
-    assert len(codex_records) == 1
-    (record,) = codex_records
-    assert record.architecture_impact is None
-    assert [r.outcome for r in record.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
+    # The comment posted before the gate comes from the accepted carrier.  The
+    # repaired approval is then persisted with its requirement binding
+    # (#1377), so a restart or qualification can bind it; both records keep
+    # the carrier's degraded assessment.
+    assert len(codex_records) == 2
+    carrier, repaired = codex_records
+    assert carrier.surfaced_reviewer_requirement_ids == ()
+    assert len(repaired.surfaced_reviewer_requirement_ids) == 1
+    assert repaired.plan_candidate_key is not None
+    for record in codex_records:
+        assert record.state == "approved"
+        assert record.architecture_impact is None
+        assert [r.outcome for r in record.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+    # The persisted binding is what a restart and strict qualification read.
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.plan_verification import (
+        classify_plan_approval,
+        require_recoverable_plan_approval,
+    )
+
+    runner, config, requirement = _ack_nonstaged_run.state
+    issue = IssueContext(
+        number=56, repo="OWNER/REPO", title="Issue", body="Issue body", url=None,
+        comments=tuple(
+            IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"])
+            for c in runner.issue_comments
+        ),
+        human_requirements=(requirement,),
+    )
+    assert classify_plan_approval(
+        issue.comments, config=config, issue_number=56, human_requirements=(requirement,),
+    ).state == "approved"
+    require_recoverable_plan_approval(
+        None, config=config, issue_context=issue, comments=issue.comments,
+        trusted_actor=None, error_message="not recoverable",
+    )
+    # An unchanged restart reuses the bound approvals: no reviewer runs again.
+    start = len(runner.commands)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        pass
+    assert not any(
+        cmd[0] in {"codex", "gemini"} for cmd, _cwd in runner.commands[start:]
+    )
 
 
 @pytest.mark.parametrize("status", ["unchanged", "none"])
@@ -12960,7 +13005,11 @@ def test_resumed_publication_plan_review_accepts_acknowledgement_only_repair(
         codex_impact=_DEG_UNCORROBORATED, repaired_impact=None,
     )
     assert run.resumed_without_reinvocation
-    assert [record.phase for record in run.records] == ["publication"]
+    # The repaired approval is persisted with its requirement binding (#1377).
+    assert [record.phase for record in run.records] == ["publication", "authoritative"]
+    assert run.records[0].surfaced_reviewer_requirement_ids == ()
+    assert len(run.records[-1].surfaced_reviewer_requirement_ids) == 1
+    _assert_degraded_carrier(run.records[-1])
     (carrier,) = run.carriers
     _assert_degraded_carrier(carrier)
     assert len(run.repair_calls) == 1

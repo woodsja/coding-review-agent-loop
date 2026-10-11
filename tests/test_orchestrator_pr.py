@@ -96,6 +96,7 @@ from coding_review_agent_loop.protocol import (
 )
 from agent_loop_helpers import (
     FakeRunner,
+    structured_plan_state,
     blocking_issues,
     command_index,
     make_config,
@@ -221,7 +222,8 @@ def _approved_issue_plan_comments(plan: str) -> list[dict[str, object]]:
                 PostedRoundMetadata(
                     flow="plan", role="coder", agent="Claude", round_number=1,
                     subject=subject, canonical_plan=plan,
-                    raw_structured_coder_response=plan,
+                    # Versioned (empty) dispositions back the keyless approval (#1377).
+                    raw_structured_coder_response=structured_plan_state(),
                 ),
             ),
         },

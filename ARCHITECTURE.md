@@ -2204,14 +2204,22 @@ startup.
   signed supersession state. Plan startup supplies the same fields from its
   own state. The ledger must also be reconstructible. A blocking or same-plan
   item that history published but that is neither in the resumed ledger nor
-  provably cleared means not approved.
+  provably cleared means not approved. Recorded reconciliation evidence, not
+  the resume reader's conservative incompleteness flag, tells cleared history
+  from a lost obligation. The live approval boundary applies the same rule to
+  its freshly re-read history and fails closed. With requirements surfaced, the
+  plan's own coder dispositions must name exactly that set (a semantic patch
+  inherits them from its authenticated assembled state), or the plan is
+  `unfinished`. Approving reviewers never stand in for the coder's
+  dispositions.
 - **Requirement-binding evidence.** Reviewer records of generation-1 plans now
   persist `plan_candidate_key` (and, when acknowledged,
   `surfaced_reviewer_requirement_ids`) under every planning policy. Under
   `all-reviewers` these fields are evidence only. Full-board scheduling and
   approval never read them. A recorded key binds only when it equals the key
   recomputed against the current requirement set. A legacy keyless approval
-  binds only when the plan's own dispositions cover exactly the current set,
+  binds only when the plan's own versioned dispositions cover exactly the
+  current set, even an empty one (an unversioned plan never proves its set),
   and every approval text carries the acknowledgement when that set is
   non-empty. With no requirement surfaced now, an approval text that carries
   the acknowledgement was given under a since-withdrawn requirement, so it is
@@ -2219,9 +2227,17 @@ startup.
   Reviewer records of a staged child also persist the authoritative parent's
   signed requirement IDs (`parent_requirement_ids`). A counted approval binds
   only to the current parent set, and a record without that evidence binds
-  only while the parent set is empty. The live loop never reuses a resumed
-  approval whose recorded key or parent set is stale, so its reviewer reviews
-  again. Staged carried approvals bind the parent set the same way.
+  only while the parent set is empty. The planning requirement set is the
+  issue's own signed requirements merged with the authoritative parent's, for
+  prompts, candidate keys, acknowledgements, the approval gate and the
+  classification alike. The pre-implementation refresh still compares the
+  issue's own set and the parent's set separately. The live loop never reuses
+  a resumed approval whose recorded key, keyless legacy fallback or parent set
+  is stale, so its reviewer reviews again. Staged carried approvals bind the
+  parent set the same way. An acknowledgement recovered by repair is
+  persisted as a new reviewer record wherever approvals carry this evidence,
+  including generation-1 `all-reviewers` plans, so a restart or qualification
+  binds it instead of reading the earlier unacknowledged record.
 - **Legacy plain history.** Unanchored plain `all-reviewers` history proves
   membership by its reviewer posters, never completion. Without an issue-side
   implementation handoff bound to the current plan hash it is `undetermined`
@@ -2236,7 +2252,10 @@ startup.
   implement-after-approval run restores the invocation's board, and the stage
   1 handoff rule alone governs the PR board and its floor. A board change
   recorded after approval is not activated. If the live boundary would
-  invoke a reviewer or start a revision, the run fails closed instead.
+  invoke a reviewer or start a revision, the run fails closed instead. A
+  staged restart of a completed round applies the recorded dispositions of
+  reviewers paused on their carried exact-plan approvals, so items they
+  resolved in that round are not reopened.
 - **Plan root anchor and legacy root.** Every plan round record carries
   `plan_board_root` and `plan_board_identity`, stamped at the single
   round-metadata encoder (`set_plan_board_stamp`). Board identity fields are

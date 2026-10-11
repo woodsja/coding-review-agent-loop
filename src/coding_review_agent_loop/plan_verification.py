@@ -800,33 +800,77 @@ def approval_record_binding(
     return "bound"
 
 
-def _legacy_requirement_fallback(plan_round: object, surfaced_ids: Sequence[str]) -> Callable[[object], str]:
-    """The authenticated fallback for a keyless legacy approval (step 12c2).
+def plan_coder_dispositions_complete(
+    coder_output: str | None,
+    surfaced_ids: Sequence[str],
+    *,
+    sidecar_payload: object = None,
+    response_form: str | None = None,
+) -> bool:
+    """Whether the current coder plan dispositions name exactly ``surfaced_ids``.
 
-    With signed requirements surfaced now, the plan's own dispositions must
-    name exactly that set and the approval text must carry the
-    acknowledgement.  With none surfaced now, an approval text carrying the
-    acknowledgement was given under requirements since withdrawn (the marker
-    is prohibited when none are surfaced), so it is stale; one without it
-    was given with none surfaced and still binds.
+    The live approval gate's coder attestation, shared with the
+    classification.  A semantic patch inherits its dispositions from the
+    authenticated assembled state.  An unparsable (unversioned) plan never
+    proves its disposition set, even an empty one.
     """
-    from .protocol import human_requirements_resolved
+    from .plan_assembly import decode_assembled_plan_sidecar, hydrate_authenticated_plan_state
     from .response_validation import _current_plan_has_complete_human_requirement_dispositions
 
-    dispositions_ok = bool(surfaced_ids) and _current_plan_has_complete_human_requirement_dispositions(
-        getattr(plan_round, "coder_output", None), surfaced_requirement_ids=tuple(surfaced_ids),
+    inherited = None
+    if response_form == "semantic-patch-v1" and sidecar_payload is not None:
+        try:
+            inherited = hydrate_authenticated_plan_state(
+                decode_assembled_plan_sidecar(sidecar_payload)
+            ).plan.human_requirement_dispositions
+        except (AgentLoopError, ValueError, KeyError, TypeError):
+            return False
+    return _current_plan_has_complete_human_requirement_dispositions(
+        coder_output, surfaced_requirement_ids=tuple(surfaced_ids),
+        inherited_dispositions=inherited,
     )
+
+
+def legacy_requirement_fallback(
+    dispositions_ok: bool, surfaced_ids: Sequence[str]
+) -> Callable[[object], str]:
+    """The authenticated fallback for a keyless legacy approval (step 12c2).
+
+    The plan's own dispositions must name exactly the current surfaced set,
+    empty or not (``dispositions_ok``); an unversioned plan cannot prove it.
+    With requirements surfaced, the approval text must carry the
+    acknowledgement.  With none surfaced, an approval text carrying it was
+    given under a since-withdrawn requirement (the marker is prohibited when
+    none are surfaced), so it is stale.
+    """
+    from .protocol import human_requirements_resolved
 
     def fallback(record: object) -> str:
         acknowledged = human_requirements_resolved(getattr(record, "body", "") or "")
-        if not surfaced_ids:
-            return "stale" if acknowledged else "bound"
-        return "bound" if dispositions_ok and acknowledged else "unproven"
+        if not surfaced_ids and acknowledged:
+            return "stale"
+        if not dispositions_ok:
+            return "unproven"
+        if surfaced_ids and not acknowledged:
+            return "unproven"
+        return "bound"
 
     return fallback
 
 
-def plan_ledger_unreconstructible_items(records: Sequence[object], plan_round: object) -> tuple[str, ...]:
+def _round_dispositions_ok(plan_round: object, surfaced_ids: Sequence[str]) -> bool:
+    metadata = getattr(plan_round, "coder_metadata", None)
+    return plan_coder_dispositions_complete(
+        getattr(plan_round, "coder_output", None),
+        surfaced_ids,
+        sidecar_payload=getattr(metadata, "assembled_plan_sidecar", None),
+        response_form=getattr(metadata, "response_form", None),
+    )
+
+
+def plan_ledger_unreconstructible_items(
+    records: Sequence[object], plan_round: object, *, ignored_ids: Sequence[str] = (),
+) -> tuple[str, ...]:
     """Blocking or same-plan items published in history that the resumed ledger lost.
 
     Every such item must still be in the resumed round's ledger or provably
@@ -846,7 +890,7 @@ def plan_ledger_unreconstructible_items(records: Sequence[object], plan_round: o
         item.item_id: item
         for record in records
         for item in record.metadata.new_items  # type: ignore[attr-defined]
-        if item.status in {"blocking", "same-plan"}
+        if item.status in {"blocking", "same-plan"} and item.item_id not in set(ignored_ids)
     }
     resolved = _canonically_resolved_history_item_ids(
         records, reconciliation_mode="aggregate", same_status="same-plan",
@@ -917,6 +961,13 @@ def build_plan_approval_inputs(
     parent_ids = tuple(sorted(
         requirement.requirement_id for requirement in getattr(parent, "human_requirements", ())
     ))
+    if getattr(parent, "human_requirements", ()):
+        from .github import deduplicate_human_requirements
+
+        # The planning requirement set includes the authoritative parent's.
+        requirements = deduplicate_human_requirements(
+            (*parent.human_requirements, *requirements)  # type: ignore[union-attr]
+        )
     try:
         fresh_child = _resolve_fresh_child_provenance(
             issue_context=issue_context, parent_issue_context=parent,  # type: ignore[arg-type]
@@ -1095,9 +1146,9 @@ def classify_plan_approval(
         return result("undetermined", f"the approval state cannot be reconstructed: {exc}")
     board = context.effective_reviewers
     # A reconstructible ledger: nothing published in history may be lost.
+    # Recorded reconciliation evidence, not the resume reader's conservative
+    # incompleteness flag, distinguishes cleared history from lost items.
     verification_records = _extract_round_metadata_records(plan_comments, flow="plan")
-    if getattr(plan_round, "ledger_may_be_incomplete", False):
-        return result("undetermined", "the plan ledger may be incomplete")
     lost = plan_ledger_unreconstructible_items(verification_records, plan_round)
     if lost:
         return result("undetermined", "unreconstructible plan obligation(s) " + ", ".join(lost))
@@ -1121,7 +1172,12 @@ def classify_plan_approval(
             record for record in plan_round.completed_reviews
             if record.metadata.agent in board and record.metadata.state == "approved"
         ]
-    fallback = _legacy_requirement_fallback(plan_round, surfaced_ids)
+    dispositions_ok = _round_dispositions_ok(plan_round, surfaced_ids)
+    if surfaced_ids and not dispositions_ok:
+        # The live approval gate's coder attestation (step 12): every
+        # surfaced requirement needs a coder disposition before approval.
+        return result("unfinished", "the plan lacks complete requirement dispositions")
+    fallback = legacy_requirement_fallback(dispositions_ok, surfaced_ids)
     bindings = {
         approval_record_binding(
             record,

@@ -25,7 +25,7 @@ from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
 )
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import FakeRunner, make_config, structured_plan_state
 
 
 def _staged_plan_checkpoint(binding, names, primary, round_number=1):
@@ -324,6 +324,8 @@ def _named_plan_comments(approved, plan_config, *, removed=(), restored=False, i
         _attach_round_metadata(approved.canonical_text, PostedRoundMetadata(
             flow="plan", role="coder", agent="Claude", round_number=1,
             subject="plan", canonical_plan=approved.canonical_text, seat_binding=binding,
+            # Versioned dispositions (empty): a keyless approval needs them (#1377).
+            raw_structured_coder_response=structured_plan_state(),
         )),
         checkpoint(1, board),
     ]
@@ -610,7 +612,8 @@ def test_unamended_plan_board_gets_no_floor_exception(tmp_path, floor, message):
     assert _agent_commands(runner) == []
 
 
-def _plain_plan_comments(plan, approvals):
+def _plain_plan_comments(plan, approvals, *, versioned=True):
+    """A legacy keyless plan history; ``versioned`` keeps the structured coder response."""
     from coding_review_agent_loop.round_state import (
         PostedRoundMetadata, _attach_round_metadata, _plan_subject,
     )
@@ -618,7 +621,8 @@ def _plain_plan_comments(plan, approvals):
     subject = _plan_subject(plan)
     bodies = [_attach_round_metadata(plan, PostedRoundMetadata(
         flow="plan", role="coder", agent="Claude", round_number=1, subject=subject,
-        canonical_plan=plan, raw_structured_coder_response=plan,
+        canonical_plan=plan,
+        raw_structured_coder_response=structured_plan_state() if versioned else plan,
     ))]
     for agent, state in approvals:
         bodies.append(_attach_round_metadata(f"{state}.", PostedRoundMetadata(
@@ -672,6 +676,57 @@ def test_strict_qualification_verifies_the_plan_against_its_own_board(tmp_path):
         _strict_verify(
             tmp_path, approved_by_a, pr_reviewers=("claude",), expected_hash="0" * 16,
         )
+
+
+def test_unversioned_keyless_plan_is_never_recovered_even_without_requirements(tmp_path):
+    """Item-10: an empty requirement set still needs a versioned disposition set."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import IssueContext as Issue
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    plan = "Approved plan.\n\n### Plan steps\n1. Keep plan identity bound."
+    approvals = (("Codex", "approved"), ("Gemini", "approved"))
+
+    def classify(comments):
+        issue = Issue(959, "OWNER/REPO", "t", "b", None, tuple(
+            IssueComment(author="agent-loop", created_at=c["createdAt"], body=c["body"])
+            for c in comments
+        ))
+        return classify_plan_approval(
+            issue.comments, config=make_config(tmp_path, reviewer=("claude",)),
+            issue_number=959, human_requirements=(), poster_completion_proven=True,
+            execution_mode_guard=False,
+        )
+
+    versioned = _plain_plan_comments(plan, approvals)
+    assert classify(versioned).state == "approved"
+    _strict_verify(tmp_path, versioned, pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan))
+    unversioned = _plain_plan_comments(plan, approvals, versioned=False)
+    result = classify(unversioned)
+    assert result.state == "undetermined"
+    assert "requirement binding is unproven" in result.reason
+    with pytest.raises(AgentLoopError, match="requirement binding is unproven"):
+        _strict_verify(
+            tmp_path, unversioned, pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan),
+        )
+    # Managed-CI fresh authorization without a handoff refuses before any agent.
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    runner = FakeRunner(
+        issue_comments=_plain_plan_comments(plan, (("Codex", "approved"),), versioned=False),
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    with pytest.raises(AgentLoopError, match="requirement binding is unproven"):
+        run_pr_loop(runner, pr_number=77, config=make_config(
+            tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+            managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+            reviewer=("claude", "gemini"), managed_ci_fresh_authorization=True,
+            managed_ci_issue_number=56,
+        ))
+    assert _agent_commands(runner) == []
 
 
 def test_plan_verification_context_keeps_a_primary_then_panel_plan_policy(tmp_path):
@@ -2156,7 +2211,7 @@ def _bound_plan_history(tmp_path, *, mutate):
     plan = "Approved bound plan.\n\n### Plan steps\n1. Keep bindings honest."
     subject = _plan_subject(plan)
     records = [
-        dict(role="coder", agent="Claude", canonical_plan=plan, raw_structured_coder_response=plan),
+        dict(role="coder", agent="Claude", canonical_plan=plan, raw_structured_coder_response=structured_plan_state()),
         dict(role="summary", agent="Orchestrator", scheduler_contract=make_plan_contract(
             ("a", "b"), "all-reviewers", None).as_dict()),
         dict(role="reviewer", agent="a", state="approved"),
@@ -2567,6 +2622,10 @@ def test_board_changed_plan_verifies_against_b_and_qualifies_a_pr_board_c(
     agents = [command[0] for command, _cwd in runner.commands if command[0] in _AGENT_COMMANDS]
     assert sorted(agents) == ["agy", "claude"]
     assert [merge["proof"].head_sha for merge in merges] == ["abc123"]
+    # The PR handoff audit record compares board C against the approving board B.
+    (audit,) = _audits(runner)
+    assert "- Added reviewer(s): Claude" in audit
+    assert "- Removed reviewer(s): Codex" in audit
 
 
 @pytest.mark.parametrize("entry", ["ordinary", "fresh"])
@@ -2588,30 +2647,74 @@ def test_malformed_plan_lineage_never_qualifies(tmp_path, monkeypatch, entry):
     assert _agent_commands(runner) == []
 
 
-def test_managed_ci_recovery_refuses_an_open_obligation_and_a_stale_requirement_key(tmp_path):
-    """Row plan-approval-gate-live-inputs at managed-CI recovery (unit): never bind."""
-    from types import SimpleNamespace
+def _forge_lost_plan_obligation(comments):
+    """Publish item-9 on the first Gemini review; no ledger ever carries or clears it."""
+    import dataclasses
+    import re
 
-    from coding_review_agent_loop.github import HumanReviewRequirement, IssueContext as Issue
-    from coding_review_agent_loop.plan_verification import classify_plan_approval
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.round_state import (
+        _attach_round_metadata, _decode_round_metadata,
+    )
+
+    lost = UnresolvedReviewItem(
+        item_id="item-9", reviewer="Gemini", source_round=1, text="Lost finding.",
+        status="blocking",
+    )
+    for comment in comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow == "plan" and metadata.role == "reviewer" and metadata.agent == "Gemini":
+            body = comment["body"][: match.start()].rstrip("\n")
+            comment["body"] = _attach_round_metadata(
+                body, dataclasses.replace(metadata, new_items=(*metadata.new_items, lost)),
+            )
+            return
+    raise AssertionError("no Gemini plan review")
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+@pytest.mark.parametrize("defect", ["added-requirement", "lost-obligation"])
+def test_managed_ci_recovery_refuses_an_unbound_requirement_and_a_lost_obligation(
+    tmp_path, monkeypatch, entry, defect
+):
+    """Row plan-approval-gate-live-inputs through managed-CI recovery and strict
+    qualification: the shared predicate refuses before any reviewer or merge."""
+    import dataclasses
+
+    import coding_review_agent_loop.pr_loop as pr_loop
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from coding_review_agent_loop.github import HumanReviewRequirement
 
     comments = _lineage_plan_comments(tmp_path)
-    issue_comments = tuple(
-        IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
-                     author_id=c.get("_rest_author_id"))
-        for c in comments
+    if defect == "added-requirement":
+        added = HumanReviewRequirement(
+            source_type="issue_comment", author="operator", created_at="2026-05-23T01:00:00Z",
+            url=None, body="Keep the rollout reversible.",
+        )
+        for module in (pr_loop, pr_loop_support):
+            real = module.get_issue_context
+
+            def with_requirement(*args, _real=real, **kwargs):
+                context = _real(*args, **kwargs)
+                if context.number != 56:
+                    return context
+                return dataclasses.replace(context, human_requirements=(added,))
+
+            monkeypatch.setattr(module, "get_issue_context", with_requirement)
+    else:
+        _forge_lost_plan_obligation(comments)
+    runner, config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, comments, entry=entry,
     )
-    config = make_config(tmp_path, reviewer=("claude", "antigravity"))
-    assert classify_plan_approval(
-        issue_comments, config=config, issue_number=56, human_requirements=(),
-        trusted_actor=_PLAN_ACTOR,
-    ).approved
-    added = HumanReviewRequirement(
-        source_type="issue_comment", author="operator", created_at="2026-05-23T01:00:00Z",
-        url=None, body="Keep the rollout reversible.",
-    )
-    assert not classify_plan_approval(
-        issue_comments, config=config, issue_number=56, human_requirements=(added,),
-        trusted_actor=_PLAN_ACTOR,
-    ).approved
-    del SimpleNamespace, Issue
+    reason = {
+        # The plan never dispositioned the new requirement (the coder gate).
+        "added-requirement": "lacks complete requirement dispositions",
+        "lost-obligation": "unreconstructible plan obligation\\(s\\) item-9",
+    }[defect]
+    with pytest.raises(AgentLoopError, match=reason):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+    assert _agent_commands(runner) == []

@@ -7,6 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace as dataclasses_replace
@@ -47,7 +48,13 @@ from .plan_board_state import (
     resolve_plan_board_state,
     resolve_plan_lineage,
 )
-from .plan_verification import approval_record_binding, classify_plan_approval
+from .plan_verification import (
+    approval_record_binding,
+    classify_plan_approval,
+    legacy_requirement_fallback,
+    plan_coder_dispositions_complete,
+    plan_ledger_unreconstructible_items,
+)
 from .pr_board_state import check_lineage_floor
 from .reviewer_floor import board_floor_enabled
 from .decomposition import (
@@ -793,6 +800,22 @@ _PLAN_BOARD_CONFIG_FIELDS = (
 )
 
 
+def _with_planning_requirements(
+    issue_context: IssueContext, parent_issue_context: IssueContext | None
+) -> IssueContext:
+    """``issue_context`` carrying its own and its authoritative parent's signed requirements."""
+    if parent_issue_context is None or not parent_issue_context.human_requirements:
+        return issue_context
+    from .github import deduplicate_human_requirements
+
+    return dataclasses_replace(
+        issue_context,
+        human_requirements=deduplicate_human_requirements(
+            (*parent_issue_context.human_requirements, *issue_context.human_requirements)
+        ),
+    )
+
+
 def _approving_plan_board_config(config: AgentLoopConfig, approving: object) -> AgentLoopConfig:
     """``config`` with only its planning board fields taken from the approving plan."""
     approving_config = approving.config_for(config)  # type: ignore[attr-defined]
@@ -845,6 +868,13 @@ def _run_plan_first_loop_body(
         if staged_parent_number is not None
         else None
     )
+    # The planning requirement set is the issue's own signed requirements plus
+    # its authoritative staged parent's (#1377): prompts, candidate keys,
+    # acknowledgements, the approval gate and the classification all use it.
+    plan_own_requirement_ids = {
+        requirement.requirement_id for requirement in issue_context.human_requirements
+    }
+    issue_context = _with_planning_requirements(issue_context, parent_issue_context)
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
     from .reviewer_seats import reviewer_seat_binding
@@ -1137,7 +1167,8 @@ def _run_plan_first_loop_body(
         raise AssertionError("unreachable inherited replan state")
 
     def plan_history_records(
-        *, refresh: bool = False, round_number: int | None = None
+        *, refresh: bool = False, round_number: int | None = None,
+        comments: Sequence[object] | None = None,
     ) -> tuple[PostedRoundRecord, ...]:
         """Planning round-metadata records, or the class-D stop.
 
@@ -1145,10 +1176,12 @@ def _run_plan_first_loop_body(
         cannot be extracted at all makes panel state, finding ownership, and
         exact-plan approvals unknowable, and the operator override cannot
         authorize a board over it.  Round boundaries re-read the durable
-        history so records this run posted are part of it.
+        history so records this run posted are part of it; a caller that
+        already re-read the issue passes those ``comments``.
         """
-        comments = issue_context.comments
-        if refresh:
+        if comments is None:
+            comments = issue_context.comments
+        if refresh and comments is issue_context.comments:
             comments = get_issue_context(
                 runner, config=config, issue_number=issue_number
             ).comments
@@ -2655,6 +2688,17 @@ def _run_plan_first_loop_body(
         # A resumed approval bound to a stale requirement set (issue or
         # authoritative parent) is never reused: its reviewer reviews the plan
         # again under the current requirements (#1377).
+        resumed_legacy_fallback = legacy_requirement_fallback(
+            plan_coder_dispositions_complete(
+                current_coder_output,
+                plan_hr_ids,
+                sidecar_payload=(
+                    current_plan_sidecar.to_payload() if current_plan_sidecar is not None else None
+                ),
+                response_form=current_response_form,
+            ),
+            plan_hr_ids,
+        )
         for stale_name in [
             name
             for name, record in resumed_by_name.items()
@@ -2664,6 +2708,7 @@ def _run_plan_first_loop_body(
                 current_key=current_plan_key,
                 surfaced_ids=plan_hr_ids,
                 parent_ids=plan_parent_requirement_ids,
+                legacy_fallback=resumed_legacy_fallback,
                 check_acknowledgement=False,
             ) == "stale"
         ]:
@@ -3370,6 +3415,33 @@ def _run_plan_first_loop_body(
                     raise error
             raise plan_fatal_errors[0][1]
 
+        if staged_planning and current_resume is not None:
+            # A reviewer paused on its carried exact-plan approval is not
+            # re-run, but its completed review of this very round still
+            # dispositioned the carried items: a restart of a completed round
+            # applies them instead of reopening the plan (#1377).
+            reviewed_this_round = {
+                name for name, _output in (*approved_review_outputs, *blocking_reviews)
+            }
+            for record in current_resume.completed_reviews:
+                metadata = record.metadata
+                if (
+                    metadata.agent in reviewed_this_round
+                    or metadata.agent not in plan_qualifying_approvals
+                    or metadata.state != "approved"
+                    or metadata.subject != current_plan_subject
+                ):
+                    continue
+                for disposition in metadata.dispositions:
+                    _record_prior_item_disposition(
+                        prior_dispositions,
+                        disposition,
+                        flow="plan",
+                        round_number=round_number,
+                        subject=current_plan_subject,
+                        reviewer_name=metadata.agent,
+                    )
+
         unresolved_items, _ = _apply_unresolved_item_dispositions(
             plan_ledger_view(prior_unresolved_items),
             prior_dispositions,
@@ -3517,7 +3589,10 @@ def _run_plan_first_loop_body(
                                 f"HUMAN_REQUIREMENTS_RESOLVED for {reviewer_name}",
                             )
                             repaired_plan_approvals[reviewer_name] = repaired_text
-                            if staged_planning:
+                            # Persisted wherever approvals carry requirement-
+                            # binding evidence (#1377): staged carries, and the
+                            # all-reviewers evidence of generation-1 plans.
+                            if staged_planning or current_plan_key.complete:
                                 # The record posted before the repair stores no
                                 # surfaced requirement IDs, because the original
                                 # text carried no acknowledgement.  Without an
@@ -3818,9 +3893,28 @@ def _run_plan_first_loop_body(
             refreshed_issue_context = get_issue_context(
                 runner, config=config, issue_number=issue_number
             )
-            previous_requirement_ids = {
-                requirement.requirement_id for requirement in issue_context.human_requirements
-            }
+            # The shared completion predicate's ledger rule (#1377): an
+            # obligation history published but neither carried nor provably
+            # cleared fails closed instead of being approved over.
+            lost_obligations = plan_ledger_unreconstructible_items(
+                plan_history_records(
+                    round_number=round_number, comments=refreshed_issue_context.comments,
+                ),
+                SimpleNamespace(
+                    prior_items=(*prior_unresolved_items, *unresolved_items),
+                    current_round_new_items=tuple(round_new_unresolved_items),
+                ),
+                ignored_ids=tuple(superseded_prepanel_item_ids),
+            )
+            if lost_obligations:
+                raise AgentLoopError(
+                    f"Planning round {round_number}: every reviewer approved, but plan "
+                    f"obligation(s) {', '.join(lost_obligations)} published earlier are neither "
+                    "carried in the current ledger nor cleared by recorded history, so the "
+                    "plan ledger cannot be reconstructed. Refusing to approve; inspect the "
+                    "plan round metadata and rerun."
+                )
+            previous_requirement_ids = set(plan_own_requirement_ids)
             refreshed_requirement_ids = {
                 requirement.requirement_id
                 for requirement in refreshed_issue_context.human_requirements
@@ -3861,6 +3955,7 @@ def _run_plan_first_loop_body(
                         "explicit acknowledgement."
                     )
                 parent_issue_context = refreshed_parent_context
+            issue_context = _with_planning_requirements(issue_context, parent_issue_context)
             approved_future_followup_sources = [
                 _plan_followup_source_from_unresolved_item(item)
                 for item in unresolved_items
@@ -4647,6 +4742,14 @@ def _run_plan_first_loop_body(
                     f"{anchor_state.episode.candidate_round} "
                     f"({len(step_back_anchor.dissolved_ids)} dissolved item(s))",
                 )
+        if plan_approved_shortcut:
+            # The classification and the live boundary disagree; an approved
+            # plan is never revised (#1377).
+            raise AgentLoopError(
+                f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} was classified "
+                f"completely approved, but round {round_number} would start a planner "
+                "revision; refusing to reopen an approved plan. No planner turn was started."
+            )
         log(
             config,
             f"Planning round {round_number}: {coder_name} revising the plan "
