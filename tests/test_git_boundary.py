@@ -1113,3 +1113,92 @@ def test_https_auth_failure_still_retries_with_gh_token(repositories, monkeypatc
                    repo="OWNER/REPO", runner=Runner(), gh_cmd="gh")
     assert fetches == [False, True]
     assert "--git-ssh-identity" not in str(raised.value)
+
+
+@pytest.mark.parametrize("defect", [
+    None, "writable-intermediate-dir", "foreign-intermediate-link", "selection-in-forbidden-root",
+])
+@pytest.mark.parametrize("selection", [
+    "identity-override", "config-identity", "ssh-config", "known-hosts-missing",
+])
+def test_every_symlink_hop_and_selection_path_is_trust_checked(
+        ssh_home, tmp_path, monkeypatch, capsys, selection, defect):
+    """An intermediate link, the directory it lives in, and every selection path
+    (not only the final referent) must be operator-controlled and outside agent roots."""
+    from coding_review_agent_loop import git_transport
+
+    checkout = tmp_path / "agent-checkout"
+    checkout.mkdir()
+    checkout.chmod(0o700)
+    real = ssh_home / "real"
+    real.mkdir()
+    real.chmod(0o700)
+    hopdir = ssh_home / ("shared" if defect == "writable-intermediate-dir" else "hops")
+    hopdir.mkdir()
+    hopdir.chmod(0o770 if defect == "writable-intermediate-dir" else 0o700)
+    plain_key = _key(ssh_home / ".ssh", "plain")
+    if selection == "known-hosts-missing":
+        target = real
+    elif selection == "ssh-config":
+        target = _write_ssh_config(ssh_home, "Host github.com\n  IdentityFile ~/.ssh/plain\n")
+        target = target.rename(real / "config")
+    else:
+        target = _key(real, "key")
+    hop = hopdir / "hop"
+    hop.symlink_to(target)
+    if defect == "foreign-intermediate-link":
+        _foreign_lstat(monkeypatch, hop)
+    base = checkout if defect == "selection-in-forbidden-root" else ssh_home
+    roots = (checkout,)
+    trusted = defect is None
+
+    if selection == "ssh-config":
+        home = ssh_home
+        if defect == "selection-in-forbidden-root":
+            # HOME inside an agent checkout whose .ssh points outward to trusted files.
+            home = checkout / "home"
+            home.mkdir(mode=0o700)
+            (home / ".ssh").symlink_to(real)
+            monkeypatch.setenv("HOME", str(home))
+        else:
+            (ssh_home / ".ssh" / "config").symlink_to(hop)
+        argv = _ssh_argv(forbidden_roots=roots)
+        if trusted:
+            assert argv[len(_SSH_PREFIX):] == ["-i", str(plain_key)]
+        else:
+            assert argv[len(_SSH_PREFIX):] == []
+            assert git_transport._SSH_CONFIG_IGNORED in capsys.readouterr().err
+        return
+
+    entry = base / "entry"
+    entry.symlink_to(hop)
+    if selection == "identity-override":
+        if trusted:
+            assert _option_values(_ssh_argv(ssh_identity=entry, forbidden_roots=roots), "-i") == [str(target)]
+        else:
+            with pytest.raises(AgentLoopError) as raised:
+                _ssh_argv(ssh_identity=entry, forbidden_roots=roots)
+            assert str(raised.value) == git_transport._SSH_IDENTITY_REFUSED
+        return
+    if selection == "config-identity":
+        _write_ssh_config(ssh_home, f"Host github.com\n  IdentityFile {entry}\n")
+        argv = _ssh_argv(forbidden_roots=roots)
+        assert argv[len(_SSH_PREFIX):] == (["-i", str(target)] if trusted else [])
+    else:
+        _write_ssh_config(ssh_home, f"Host github.com\n  UserKnownHostsFile {entry}/known_hosts\n")
+        argv = _ssh_argv(forbidden_roots=roots)
+        assert argv[len(_SSH_PREFIX):] == (
+            ["-o", f"UserKnownHostsFile={target / 'known_hosts'}"] if trusted else []
+        )
+    if not trusted:
+        assert "for trusted Git transport" in capsys.readouterr().err
+
+
+def test_symlink_loop_is_refused_without_hanging(ssh_home):
+    from coding_review_agent_loop.git_transport import _UntrustedPath, _trusted_operator_file
+
+    loop_a, loop_b = ssh_home / "a", ssh_home / "b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    with pytest.raises(_UntrustedPath):
+        _trusted_operator_file(loop_a, forbidden_roots=())

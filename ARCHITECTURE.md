@@ -1514,12 +1514,17 @@ explicit `-o`/`-i` options only when their final form (after `~/` expansion and
 realpath) matches `[A-Za-z0-9._/+,:@-]+` without a leading `-`; anything else is
 refused rather than escaped, so neither the shell nor ssh's option grammar or
 `%`/`${}`/`~` expansion can reinterpret it. The config file, identity files and
-the known-hosts file pass one trust walk (`_trusted_operator_file`): every
-component of the path and of its realpath is owned by the current uid or root
-and, unless it is a symlink, not group- or world-writable (root-owned sticky
-directories are exempt, never the final file); the target is a regular file
-outside `transport_forbidden_roots`, which covers every agent checkout,
-named-seat workdir, store, run-worktree root and import destination. The config
+the known-hosts file pass one trust walk (`_trusted_operator_file`). It
+resolves the path component by component, expanding each symlink in place
+(bounded hops), so every component traversed, including intermediate links
+and the directories their targets pass through, is owned by the current uid
+or root and, unless it is a symlink, not group- or world-writable. Root-owned
+sticky directories are exempt, but never the final file or the parent of an
+accepted missing file. The supplied path and every traversed component must
+lie outside `transport_forbidden_roots`, which covers every agent checkout,
+named-seat workdir, store, run-worktree root and import destination, so an
+agent-controlled link cannot select an otherwise trusted file. The target must
+be a regular file. The config
 is opened `O_NOFOLLOW|O_NONBLOCK`, inode-checked against the walk and read with
 a 256 KiB bound. An explicit `--git-ssh-identity` / `AGENT_LOOP_GIT_SSH_IDENTITY`
 replaces config identities with exactly one `-i` and `IdentitiesOnly=yes`, and

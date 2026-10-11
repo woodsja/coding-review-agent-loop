@@ -696,10 +696,14 @@ origin host, without running anything, and passes it as explicit options:
   not start with `-`. Values with `%` tokens, `${VAR}`, spaces, quotes or
   several known-hosts files are skipped with a warning, never escaped.
 - `~/.ssh/config`, every identity file and the known-hosts file must pass one
-  trust check. Every path component must be owned by you or root and must not
-  be group- or world-writable, the file must be a regular file, and it must lie
-  outside every agent checkout, store and run directory. An untrusted config is
-  ignored entirely; an untrusted entry is skipped with a warning.
+  trust check. agent-loop resolves the path one component at a time. Every
+  component it passes through, including each intermediate symlink and the
+  directories its target passes through, must be owned by you or root and must
+  not be group- or world-writable (a symlink's own mode is ignored). Neither
+  the path you gave nor any component on the way may lie inside an agent
+  checkout, store or run directory, and the final file must be a regular file.
+  An untrusted config is ignored entirely; an untrusted entry is skipped with a
+  warning.
 
 To select a key explicitly, pass `--git-ssh-identity /absolute/path/to/key` or
 set `AGENT_LOOP_GIT_SSH_IDENTITY`. The option wins over the variable, both win

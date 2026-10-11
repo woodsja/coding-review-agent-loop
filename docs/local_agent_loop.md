@@ -6141,9 +6141,11 @@ its role (implemented in `agent_permissions.py`):
   value is used only if, after `~/` expansion and symlink resolution, it is a
   plain path or name (`A-Z a-z 0-9 . _ / + , : @ -`, no leading `-`); other
   values are skipped with a warning. The config, identity and known-hosts files
-  must be regular files whose whole path is owned by the operator or root and
-  is not group- or world-writable, outside every agent checkout, store and run
-  directory; an untrusted config is ignored entirely.
+  must be regular files. Every component traversed while resolving them,
+  including each intermediate symlink and its target's directories, must be
+  owned by the operator or root and not group- or world-writable, and no
+  selection path or traversed component may lie inside an agent checkout,
+  store or run directory. An untrusted config is ignored entirely.
   `--git-ssh-identity PATH` (or `AGENT_LOOP_GIT_SSH_IDENTITY`; the option wins)
   takes precedence over config identities and offers only that key; an
   untrusted key is an error. `StrictHostKeyChecking=yes` is pinned, so the host

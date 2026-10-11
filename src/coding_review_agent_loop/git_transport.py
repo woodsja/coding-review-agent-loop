@@ -135,76 +135,113 @@ def _ssh_value_warning(key: str) -> str:
             "the value is unsupported or is not an operator-owned, agent-inaccessible plain path.")
 
 
-def _walk_chain(path: Path, *, uid: int, final: Path) -> None:
-    """lstat every component from ``path`` up to ``/``.
-
-    Each component must be owned by ``uid`` or root.  Write bits are checked on
-    every non-symlink component; a symlink's own mode is irrelevant because its
-    target is walked separately.  Root-owned sticky directories (``/tmp``) are
-    exempt from the write check, except ``final`` itself.
-    """
-    current = path
-    while True:
-        info = current.lstat()
-        if info.st_uid not in (uid, 0):
-            raise _UntrustedPath()
-        if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
-            sticky_root_dir = (info.st_uid == 0 and stat.S_ISDIR(info.st_mode)
-                               and info.st_mode & stat.S_ISVTX)
-            if current == final or not sticky_root_dir:
-                raise _UntrustedPath()
-        if current.parent == current:
-            return
-        current = current.parent
+_MAX_SYMLINK_HOPS = 40
 
 
-def _reject_forbidden(resolved: Path, forbidden_roots: tuple[Path, ...]) -> None:
+def _forbidden_root_forms(forbidden_roots: tuple[Path, ...]) -> tuple[str, ...]:
+    forms: dict[str, None] = {}
     for root in forbidden_roots:
-        real_root = os.path.realpath(root)
+        forms[os.path.abspath(root)] = None
+        forms[os.path.realpath(root)] = None
+    return tuple(forms)
+
+
+def _reject_forbidden(candidate: Path, roots: tuple[str, ...]) -> None:
+    for root in roots:
         try:
-            if os.path.commonpath((real_root, str(resolved))) == real_root:
+            if os.path.commonpath((root, str(candidate))) == root:
                 raise _UntrustedPath()
         except ValueError:
             continue
+
+
+def _check_component(path: Path, info: os.stat_result, *, uid: int, final: bool) -> None:
+    """Owner must be ``uid`` or root; a non-symlink must not be group/world-writable.
+
+    Root-owned sticky directories (``/tmp``) are exempt from the write check
+    unless they are the final component or the parent of an accepted missing file.
+    """
+    if info.st_uid not in (uid, 0):
+        raise _UntrustedPath()
+    if not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022:
+        sticky_root_dir = (info.st_uid == 0 and stat.S_ISDIR(info.st_mode)
+                           and info.st_mode & stat.S_ISVTX)
+        if final or not sticky_root_dir:
+            raise _UntrustedPath()
+
+
+def _trusted_resolve(path: Path, *, uid: int, roots: tuple[str, ...],
+                     allow_missing: bool) -> tuple[Path, os.stat_result | None]:
+    """Resolve ``path`` one component at a time, checking every component traversed.
+
+    Each symlink is expanded in place, so every intermediate link, every
+    directory it passes through and every selection path the walk visits must
+    be operator- or root-owned, writable by nobody else and outside every
+    forbidden root.  Returns the resolved path and its lstat (None if missing).
+    """
+    _check_component(Path("/"), Path("/").lstat(), uid=uid, final=False)
+    current = Path("/")
+    pending = list(path.parts[1:])
+    hops = 0
+    while pending:
+        name = pending.pop(0)
+        if name in ("", "."):
+            continue
+        if name == "..":
+            current = current.parent
+            continue
+        candidate = current / name
+        _reject_forbidden(candidate, roots)
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            if not allow_missing or pending:
+                raise _UntrustedPath() from None
+            parent_info = current.lstat()
+            if not stat.S_ISDIR(parent_info.st_mode):
+                raise _UntrustedPath() from None
+            _check_component(current, parent_info, uid=uid, final=True)
+            return candidate, None
+        _check_component(candidate, info, uid=uid, final=not pending)
+        if stat.S_ISLNK(info.st_mode):
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                raise _UntrustedPath()
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                current = Path("/")
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
+            continue
+        current = candidate
+    return current, info
 
 
 def _trusted_operator_file(path: Path, *, forbidden_roots: tuple[Path, ...],
                            allow_missing: bool = False) -> TrustedFile:
     """Validate an operator file that a same-user agent must not control (POSIX).
 
-    The full chain of both the given absolute path and its realpath must be
-    owned by the current uid or root and not group/world-writable; the target
-    must be a regular file outside every forbidden root.  With
-    ``allow_missing`` a missing final file is accepted when its parent chain
-    passes.
+    Every component traversed while resolving the path, including each
+    intermediate symlink and the directories its target passes through, must
+    be owned by the current uid or root, must not be group/world-writable
+    (symlinks excepted) and must lie outside every forbidden root.  The target
+    must be a regular file.  With ``allow_missing`` a missing final file is
+    accepted when its resolved parent passes.
     """
     if sys.platform == "win32" or not path.is_absolute() or ".." in path.parts:
         raise _UntrustedPath()
-    uid = os.getuid()
+    roots = _forbidden_root_forms(forbidden_roots)
+    _reject_forbidden(path, roots)
     try:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            if not allow_missing or path.name in ("", ".", ".."):
-                raise _UntrustedPath() from None
-            parent = path.parent
-            resolved_parent = Path(os.path.realpath(parent))
-            _walk_chain(parent, uid=uid, final=parent)
-            _walk_chain(resolved_parent, uid=uid, final=resolved_parent)
-            if not stat.S_ISDIR(resolved_parent.lstat().st_mode):
-                raise _UntrustedPath() from None
-            resolved = resolved_parent / path.name
-            _reject_forbidden(resolved, forbidden_roots)
-            return TrustedFile(path=resolved, identity=None)
-        resolved = Path(os.path.realpath(path))
-        _walk_chain(path, uid=uid, final=path)
-        _walk_chain(resolved, uid=uid, final=resolved)
-        info = resolved.lstat()
+        resolved, info = _trusted_resolve(path, uid=os.getuid(), roots=roots,
+                                          allow_missing=allow_missing)
     except OSError as exc:
         raise _UntrustedPath() from exc
+    if info is None:
+        return TrustedFile(path=resolved, identity=None)
     if not stat.S_ISREG(info.st_mode):
         raise _UntrustedPath()
-    _reject_forbidden(resolved, forbidden_roots)
     return TrustedFile(path=resolved, identity=(info.st_dev, info.st_ino))
 
 
