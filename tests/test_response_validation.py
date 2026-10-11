@@ -1208,3 +1208,144 @@ def test_remote_head_race_continuation_receives_the_head_change_expectation(monk
     assert flags == [("head-same", True), ("head-raced", True)]
     assert result.evidence.rows[0].status != "verified"
     assert any(d.code == "head-changed-during-correction" for d in result.diagnostics)
+
+
+# --- #1388: coder_followup repair with resolved and optional item IDs --------
+
+from unittest.mock import MagicMock as _MagicMock1388, patch as _patch1388  # noqa: E402
+
+import coding_review_agent_loop.repair as _repair_module_1388  # noqa: E402
+from coding_review_agent_loop.protocol import UnresolvedReviewItem as _Item1388  # noqa: E402
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    _validate_coder_followup_response as _validate_followup_1388,
+)
+
+
+def _malformed_1388(payload_text):
+    # Prose between the JSON object and the footer fails validation, so the
+    # first response needs a repair for a reason unrelated to item IDs.
+    json_part, _footer = payload_text.split("\n<!-- AGENT_STATE:", 1)
+    return json_part + "\n## Changes made\nProse before the footer.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"
+
+
+def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), resolved_ids=()):
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    real_attempt_repair = _repair_module_1388.attempt_repair
+    prompts = []
+    calls = []
+
+    def through_real_attempt(raw, gemini_cmd, **kwargs):
+        calls.append(kwargs)
+        result = _MagicMock1388(returncode=0, stdout=repaired)
+        with _patch1388.object(
+            _repair_module_1388.subprocess, "run", return_value=result
+        ) as run:
+            output = real_attempt_repair(raw, gemini_cmd, **kwargs)
+        cmd = run.call_args.args[0]
+        prompts.append(cmd[cmd.index("--prompt") + 1])
+        return output
+
+    runner = FakeRunner(claude_outputs=[malformed])
+    config = make_config(tmp_path, coder="claude", agent_max_retries=0)
+    with _patch1388.object(orchestrator, "attempt_repair", through_real_attempt):
+        response = orchestrator._run_validated_agent(
+            runner,
+            agent="claude",
+            config=config,
+            prompt="Address review feedback.",
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_followup_1388(
+                text,
+                unresolved_items=items,
+                optional_item_ids=optional_ids,
+                resolved_item_ids=resolved_ids,
+                human_requirements=(),
+                architecture_status_mode="legacy",
+            ),
+            use_repair=True,
+            repair_expected_kind="coder_followup",
+            repair_unresolved_item_ids=tuple(item.item_id for item in items),
+            repair_optional_item_ids=optional_ids,
+        )
+    return response, prompts, calls
+
+
+def test_1388_repaired_response_keeping_a_resolved_id_is_normalized(tmp_path):
+    items = (_Item1388(item_id="item-2", reviewer="Codex", source_round=2, text="Fix it.", status="blocking"),)
+    claim = dict(
+        state="approved",
+        addressed_items=["item-2", "item-1"],
+        addressed_item_notes={"item-2": "Fixed the parser.", "item-1": "Resolved earlier."},
+    )
+    repaired = structured_coder_followup(**claim)
+
+    response, prompts, _calls = _run_repair_1388(
+        tmp_path,
+        malformed=_malformed_1388(repaired),
+        repaired=repaired,
+        items=items,
+        resolved_ids=("item-1",),
+    )
+
+    assert len(prompts) == 1
+    assert response.marker_value.addressed_items == ("item-2",)
+    assert response.marker_value.addressed_item_notes == {"item-2": "Fixed the parser."}
+    assert response.marker_value.dropped_resolved_addressed_items == ("item-1",)
+
+
+def test_1388_repair_keeps_a_valid_optional_future_claim(tmp_path):
+    items = (_Item1388(item_id="item-1", reviewer="Codex", source_round=1, text="Fix it.", status="blocking"),)
+    claim = dict(
+        state="approved",
+        addressed_items=["item-1", "item-2"],
+        addressed_item_notes={
+            "item-1": "Fixed the parser.",
+            "item-2": "Also added the cache lock.",
+        },
+    )
+    repaired = structured_coder_followup(**claim)
+
+    response, prompts, calls = _run_repair_1388(
+        tmp_path,
+        malformed=_malformed_1388(repaired),
+        repaired=repaired,
+        items=items,
+        optional_ids=("item-2",),
+    )
+
+    assert calls[0]["unresolved_item_ids"] == ("item-1",)
+    assert calls[0]["optional_item_ids"] == ("item-2",)
+    [prompt] = prompts
+    required, optional = prompt.split("## Optional coder follow-up item IDs:", 1)
+    assert "- `item-1`" in required
+    assert "valid but not mandatory" in optional and "- `item-2`" in optional
+    assert response.marker_value.addressed_items == ("item-1", "item-2")
+    assert response.marker_value.addressed_item_notes["item-2"] == "Also added the cache lock."
+    assert response.marker_value.dropped_resolved_addressed_items == ()
+
+
+def test_1388_repair_that_strips_a_valid_optional_note_is_refused(tmp_path):
+    items = (_Item1388(item_id="item-1", reviewer="Codex", source_round=1, text="Fix it.", status="blocking"),)
+    source = structured_coder_followup(
+        state="approved",
+        addressed_items=["item-1", "item-2"],
+        addressed_item_notes={
+            "item-1": "Fixed the parser.",
+            "item-2": "Also added the cache lock.",
+        },
+    )
+    stripped = structured_coder_followup(
+        state="approved",
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Fixed the parser."},
+    )
+
+    with pytest.raises(AgentLoopError):
+        _run_repair_1388(
+            tmp_path,
+            malformed=_malformed_1388(source),
+            repaired=stripped,
+            items=items,
+            optional_ids=("item-2",),
+        )
