@@ -4083,9 +4083,12 @@ def test_pre_epoch_finding_lost_after_a_primary_change_refuses_managed_recovery(
     assert _agent_commands(pr_runner) == []
 
 
-def _unanimous_with_open_same_plan_item(tmp_path):
+def _unanimous_with_open_same_plan_item(tmp_path, kind="same-plan"):
     """Round 2's reviewers both approve, but neither dispositions Gemini's carried
-    same-plan item-1 (their resolutions are dropped from the records)."""
+    same-plan item-1 (their resolutions are dropped from the records).
+
+    ``kind="machine"`` records item-1 as a machine obligation instead, which no
+    planning participant can clear."""
     runner = _plan_runner(
         claude_outputs=[structured_v1_plan_state()],
         codex_outputs=[structured_plan_review(state="approved")],
@@ -4109,39 +4112,74 @@ def _unanimous_with_open_same_plan_item(tmp_path):
         lambda metadata: metadata.role == "reviewer" and metadata.round_number == 2,
         dispositions=(),
     )
+    if kind == "machine":
+        def machine(items):
+            return tuple(
+                dataclasses.replace(
+                    item, authority="machine", obligation_kind="github-pr-checks",
+                    lifecycle="qualification_ready", failed_head_sha="old-head",
+                    candidate_head_sha="abc123", obligation_identity="github-pr-checks:item-1",
+                )
+                if item.item_id == "item-1" else item
+                for item in items
+            )
+
+        for metadata in [r.metadata for r in _plan_records(runner)]:
+            if any(i.item_id == "item-1" for i in (*metadata.prior_items, *metadata.new_items)):
+                _rewrite_plan_records(
+                    runner,
+                    lambda m, target=(metadata.role, metadata.agent, metadata.round_number, metadata.phase): (
+                        (m.role, m.agent, m.round_number, m.phase) == target
+                    ),
+                    prior_items=machine(metadata.prior_items),
+                    new_items=machine(metadata.new_items),
+                )
     reviews = [
         r.metadata for r in _plan_records(runner)
         if r.metadata.role == "reviewer" and r.metadata.round_number == 2
     ]
     assert {m.state for m in reviews} == {"approved"} and len(reviews) == 2
     assert all([item.status for item in m.prior_items] == ["same-plan"] for m in reviews)
+    assert all(
+        item.is_machine_obligation == (kind == "machine")
+        for m in reviews for item in m.prior_items
+    )
     return runner, config
 
 
-def test_unanimous_approvals_with_an_open_same_plan_item_resume_planning(tmp_path):
-    """Item-9.s4: the open same-plan obligation keeps the plan unfinished at
-    classification and recovery, and a restart resumes into the revision."""
-    runner, config = _unanimous_with_open_same_plan_item(tmp_path)
+@pytest.mark.parametrize("kind", ["same-plan", "machine"])
+def test_unanimous_approvals_with_an_open_same_plan_item_resume_planning(tmp_path, kind):
+    """Item-9.s4: the open same-plan or machine obligation keeps the plan
+    unfinished at classification and recovery.  A restart resumes into the
+    revision for a same-plan item, and stops with the machine-obligation
+    diagnostic (no planning participant can clear it) for a machine one."""
+    runner, config = _unanimous_with_open_same_plan_item(tmp_path, kind)
     # The shared complete-approval check finds the undispositioned carried item.
     assert _classify(runner, config).state == "unfinished"
     with pytest.raises(AgentLoopError, match="not recoverable"):
         _recover(runner, config)
     start, comments = len(runner.commands), len(runner.issue_comments)
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+    refusal = (
+        "scripted agent output exhausted" if kind == "same-plan"
+        else "item-1 .*are machine obligations that no planning participant can clear"
+    )
+    with pytest.raises(AgentLoopError, match=refusal):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    # No reviewer is re-run and nothing is approved: the planner revises.
-    assert _plan_agents(runner, start) == ["claude"]
+    # No reviewer is re-run and nothing is approved: the planner revises a
+    # same-plan item; a machine obligation stops before any agent turn.
+    assert _plan_agents(runner, start) == (["claude"] if kind == "same-plan" else [])
     assert _plan_links(runner) == []
 
 
+@pytest.mark.parametrize("kind", ["same-plan", "machine"])
 @pytest.mark.parametrize("entry", ["ordinary", "fresh"])
 def test_unanimous_approvals_with_an_open_same_plan_item_refuse_managed_recovery(
-    tmp_path, monkeypatch, entry
+    tmp_path, monkeypatch, entry, kind
 ):
     """Item-9.s4: managed-CI recovery never binds the plan with an open obligation."""
     from test_issue_pr_handoff import _agent_commands, _lineage_strict_run
 
-    runner, _config = _unanimous_with_open_same_plan_item(tmp_path)
+    runner, _config = _unanimous_with_open_same_plan_item(tmp_path, kind)
     pr_runner, pr_config, merges, run_pr_loop = _lineage_strict_run(
         tmp_path, monkeypatch, list(runner.issue_comments), entry=entry,
     )
@@ -4184,3 +4222,234 @@ def test_signed_amendment_after_the_primary_approval_stops_before_the_phase_adva
     assert _plan_agents(runner) == ["claude", "codex"]
     assert not any(r.metadata.phase == "plan-phase-advance" for r in _plan_records(runner))
     assert max(r.metadata.round_number for r in _plan_records(runner)) == 1
+
+
+def _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement):
+    """Unstamped legacy plain history: keyless, acknowledged approvals of a plan whose
+    dispositions name ``requirement``, plus an issue-side handoff bound to the plan hash."""
+    from coding_review_agent_loop.decomposition import format_one_shot_impl_handoff_comment
+    from coding_review_agent_loop.round_state import _plan_subject
+
+    _patch_requirements(monkeypatch, [requirement])
+    runner, config = _approved_plain_plan(tmp_path, requirement=requirement)
+    _strip_plan_stamps(runner)
+    _strip_requirement_keys(runner, acknowledged=True)
+    assert all(r.metadata.plan_board_root is None for r in _plan_records(runner))
+    unanchored = _classify(runner, config, [requirement])
+    # Posters prove membership only: without the handoff it is undetermined.
+    assert unanchored.state == "undetermined"
+    plan = next(r.metadata.canonical_plan for r in _plan_records(runner) if r.metadata.role == "coder")
+    _append_issue_comment(runner, format_one_shot_impl_handoff_comment(
+        parent_issue=56, mode="implement-one-shot", plan_hash=unanchored.plan_hash,
+        plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="abc123",
+    ), login="agent-loop", author_id=_PLAN_ACTOR[1])
+    assert _classify(runner, config, [requirement]).state == "approved"
+    return runner, config
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+@pytest.mark.parametrize("requirements", ["matching", "withdrawn"])
+def test_legacy_keyless_fallback_through_managed_recovery(
+    tmp_path, monkeypatch, entry, requirements
+):
+    """Item-9.s3: legacy keyless history with matching dispositions and acknowledged
+    approvals binds and qualifies through managed-CI recovery; after the requirement
+    is withdrawn, the same recovery refuses before any PR reviewer or merge."""
+    import coding_review_agent_loop.pr_loop as pr_loop
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from test_issue_pr_handoff import _agent_commands, _lineage_strict_run
+
+    requirement = _signed_requirement()
+    runner, _config = _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement)
+    current = [requirement] if requirements == "matching" else []
+    for module in (pr_loop, pr_loop_support):
+        real = module.get_issue_context
+
+        def with_current(*args, _real=real, **kwargs):
+            context = _real(*args, **kwargs)
+            if context.number != 56:
+                return context
+            return dataclasses.replace(context, human_requirements=tuple(current))
+
+        monkeypatch.setattr(module, "get_issue_context", with_current)
+    pr_runner, pr_config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, list(runner.issue_comments), entry=entry,
+    )
+    if requirements == "matching":
+        # Recovery binds the plan and PR review starts on board C.  (The signed
+        # requirement also applies to PR review, whose acknowledgement turns
+        # are not scripted here, so the run stops there.)
+        with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+            run_pr_loop(pr_runner, pr_number=77, config=pr_config)
+        assert {cmd[0] for cmd in _agent_commands(pr_runner)} >= {"claude"}
+        assert merges == []
+        return
+    with pytest.raises(
+        AgentLoopError,
+        match="incomplete canonical plan approval|without a complete canonical reviewer approval"
+        "|not completely approved",
+    ):
+        run_pr_loop(pr_runner, pr_number=77, config=pr_config)
+    assert merges == []
+    assert _agent_commands(pr_runner) == []
+
+
+
+def test_primary_change_after_an_old_primary_streak_reopens_the_panel_for_the_owner(tmp_path):
+    """Item-9.s5 / row plan-primary-change-midrun: the old primary blocks two rounds,
+    approves, and the panel opens with a secondary finding; the primary then moves to
+    Antigravity under --plan-primary-stall-rounds 3.  The new primary's first block
+    never trips the stall stop (2 + 1 would), the carried finding keeps its owner and
+    blocks approval, and the panel reopens after the new primary's approval."""
+    def staged(primary):
+        return _plan_cfg(
+            tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+            primary_plan_reviewer=primary, plan_primary_stall_rounds=3, review_parallel=False,
+            max_rounds=10,
+        )
+
+    def last_coder_round():
+        return [r for r in _plan_records(runner) if r.metadata.role == "coder"][-1].metadata.round_number
+
+    def resolved(*item_ids):
+        return [{"item_id": item_id, "disposition": "resolved"} for item_id in item_ids]
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(
+            state="blocking", summary="x", blocking_plan_issues=["Name the owner."],
+        )],
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    runner.claude_outputs.append(_semantic_patch(
+        runner, round_number=last_coder_round(), summary="Owner.", item_id="item-1",
+    ))
+    runner.codex_outputs.append(_review(
+        "codex", state="blocking", blocking_plan_issues=["Name the deadline."],
+    ))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    runner.claude_outputs.append(_semantic_patch(
+        runner, round_number=last_coder_round(), summary="Deadline.", item_id="item-2",
+    ))
+    runner.codex_outputs.append(_review("codex", dispositions=resolved("item-2")))
+    runner.gemini_outputs.append(_review(
+        "gemini", dispositions=[], state="blocking", blocking_plan_issues=["Name the rollback."],
+    ))
+    runner.antigravity_outputs.append(_review("antigravity", dispositions=[]))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    records = [r.metadata for r in _plan_records(runner)]
+    # The old primary's blocking streak, its approval, and the panel opening
+    # with Gemini's post-opening finding.
+    assert [(m.round_number, m.state) for m in records if m.agent == "Codex"] == [
+        (1, "blocking"), (2, "blocking"), (3, "approved"),
+    ]
+    assert any(m.phase == "plan-phase-advance" and m.round_number == 4 for m in records)
+    assert [i.item_id for m in records if m.agent == "Gemini" for i in m.new_items] == ["item-3"]
+
+    # Primary change: the new primary blocks once.  Counting the old primary's
+    # streak would reach the stall threshold of 3; the run revises instead.
+    start = len(runner.commands)
+    runner.antigravity_outputs.append(_review(
+        "antigravity", state="blocking", blocking_plan_issues=["Name the metric."],
+        dispositions=[{"item_id": "item-3", "disposition": "blocking", "note": "Gemini owns it."}],
+    ))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("antigravity"), plan_first=True)
+    assert _plan_agents(runner, start) == ["agy", "claude"]
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["old_board"]["primary"] == "Codex"
+    assert payload["new_board"]["primary"] == "Antigravity"
+    epoch = payload["effective_from_round"]
+    prelaunch = [
+        r.metadata for r in _plan_records(runner)
+        if r.metadata.phase == "scheduler-prelaunch" and r.metadata.round_number == epoch
+    ]
+    assert prelaunch[0].scheduler_selected_reviewers == ("Antigravity",)
+    # The carried secondary finding keeps its owner into the primary-only round.
+    assert [(i.item_id, i.reviewer) for i in prelaunch[0].prior_items] == [("item-3", "Gemini")]
+
+    # The new primary approves; approval still waits for the reopened panel.
+    start = len(runner.commands)
+    runner.claude_outputs.append(_semantic_patch(
+        runner, round_number=last_coder_round(), summary="Metric.", item_id="item-4",
+    ))
+    runner.antigravity_outputs.append(_review("antigravity", dispositions=resolved("item-4", "item-3")))
+    runner.gemini_outputs.append(_review("gemini", dispositions=[]))
+    runner.codex_outputs.append(_review("codex", dispositions=[]))
+    assert run_issue_loop(runner, issue_number=56, config=staged("antigravity"), plan_first=True) == 0
+    assert _plan_agents(runner, start) == ["claude", "agy", "codex", "gemini"]
+    revision = [r.metadata for r in _plan_records(runner) if r.metadata.role == "coder"][-1]
+    assert {(i.item_id, i.reviewer) for i in revision.prior_items} >= {("item-3", "Gemini")}
+    final = [r.metadata for r in _plan_records(runner)]
+    reopened = max(m.round_number for m in final)
+    assert any(m.phase == "plan-phase-advance" and m.round_number == reopened for m in final)
+    assert {m.agent for m in final if m.round_number == reopened and m.role == "reviewer"} == {
+        "Codex", "Gemini",
+    }
+    assert len(_plan_links(runner)) == 1
+
+
+@pytest.mark.parametrize("next_primary", ["codex", "antigravity"])
+def test_primary_change_mid_streak_restarts_the_stall_count(tmp_path, next_primary):
+    """Item-9.s5: Codex blocks two consecutive primary rounds under
+    --plan-primary-stall-rounds 2.  Resuming with Codex trips the stall stop before
+    round 3; after a primary change, the new primary starts a fresh streak, reviews
+    and the run revises instead."""
+    def staged(primary):
+        return _plan_cfg(
+            tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+            primary_plan_reviewer=primary, plan_primary_stall_rounds=2, review_parallel=False,
+            max_rounds=10,
+        )
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(
+            state="blocking", summary="x", blocking_plan_issues=["Name the owner."],
+        )],
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    coder_round = [r for r in _plan_records(runner) if r.metadata.role == "coder"][-1].metadata.round_number
+    runner.claude_outputs.append(_semantic_patch(
+        runner, round_number=coder_round, summary="Owner.", item_id="item-1",
+    ))
+    runner.codex_outputs.append(_review(
+        "codex", state="blocking", blocking_plan_issues=["Name the deadline."],
+    ))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    assert [
+        (r.metadata.round_number, r.metadata.state)
+        for r in _plan_records(runner) if r.metadata.agent == "Codex"
+    ] == [(1, "blocking"), (2, "blocking")]
+    still_open = [{"item_id": "item-2", "disposition": "blocking", "note": "Still open."}]
+    third_block = dict(
+        state="blocking", blocking_plan_issues=["Name the metric."], dispositions=still_open,
+    )
+    start = len(runner.commands)
+    if next_primary == "codex":
+        # The pending round-2 revision runs; round 3 then stops on the streak
+        # before Codex is invoked again.
+        coder_round = [
+            r for r in _plan_records(runner) if r.metadata.role == "coder"
+        ][-1].metadata.round_number
+        runner.claude_outputs.append(_semantic_patch(
+            runner, round_number=coder_round, summary="Deadline.", item_id="item-2",
+        ))
+        runner.codex_outputs.append(_review("codex", **third_block))
+        with pytest.raises(AgentLoopError, match="stall"):
+            run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+        assert _plan_agents(runner, start) == ["claude"]
+        return
+    runner.antigravity_outputs.append(_review("antigravity", **third_block))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("antigravity"), plan_first=True)
+    # One link, a primary-only round on the new primary, and a planner revision:
+    # the old primary's two blocks did not count towards the new streak.
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["new_board"]["primary"] == "Antigravity"
+    assert _plan_agents(runner, start) == ["agy", "claude"]
