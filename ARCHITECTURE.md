@@ -2197,7 +2197,14 @@ startup.
   against each counted approval's requirement binding. Other inputs are the
   inherited-matrix admissibility of a planning child, any pending signed
   supersession, the execution-mode guard and the plan-growth gate. Any input
-  it cannot derive means not approved.
+  it cannot derive means not approved. `build_plan_approval_inputs` derives
+  the live inputs read-only for the issue preflight, managed-CI recovery and
+  strict qualification. These are the issue and authoritative-parent
+  requirement sets, and for a planning child its inherited admissibility and
+  signed supersession state. Plan startup supplies the same fields from its
+  own state. The ledger must also be reconstructible. A blocking or same-plan
+  item that history published but that is neither in the resumed ledger nor
+  provably cleared means not approved.
 - **Requirement-binding evidence.** Reviewer records of generation-1 plans now
   persist `plan_candidate_key` (and, when acknowledged,
   `surfaced_reviewer_requirement_ids`) under every planning policy. Under
@@ -2206,7 +2213,15 @@ startup.
   recomputed against the current requirement set. A legacy keyless approval
   binds only when the plan's own dispositions cover exactly the current set,
   and every approval text carries the acknowledgement when that set is
-  non-empty. Otherwise the binding is unproven and the plan is `undetermined`.
+  non-empty. With no requirement surfaced now, an approval text that carries
+  the acknowledgement was given under a since-withdrawn requirement, so it is
+  stale. Otherwise the binding is unproven and the plan is `undetermined`.
+  Reviewer records of a staged child also persist the authoritative parent's
+  signed requirement IDs (`parent_requirement_ids`). A counted approval binds
+  only to the current parent set, and a record without that evidence binds
+  only while the parent set is empty. The live loop never reuses a resumed
+  approval whose recorded key or parent set is stale, so its reviewer reviews
+  again. Staged carried approvals bind the parent set the same way.
 - **Legacy plain history.** Unanchored plain `all-reviewers` history proves
   membership by its reviewer posters, never completion. Without an issue-side
   implementation handoff bound to the current plan hash it is `undetermined`
@@ -2267,8 +2282,9 @@ startup.
   (`PlanSchedulerSnapshot.carried_obligations`). They are exempt only from the
   pre-panel safety stop and keep blocking approval.
 - **Plan floor.** The issue-entry preflight branches on the classification.
-  An approved plan, or no plan, keeps the stage 1 behavior: the handoff board
-  rule against the approving plan context. Any other plan is resolved through
+  An approved plan resumed plan-only selects no board, so no floor applies.
+  An approved plan resumed for implementation, or no plan, keeps the stage 1
+  behavior: the handoff board rule against the approving plan context. Any other plan is resolved through
   `resolve_plan_board_state`, so a below-floor plan board change is refused
   before any agent invocation or comment post, with the filled-in signed plan
   amendment template. Plan startup repeats the resolution, and the floor is
@@ -2285,5 +2301,9 @@ startup.
   actor are threaded through managed-CI fresh authorization, ordinary resume
   without an issue-side handoff, the handoff seam, strict managed-CI
   qualification and the issue floor preflight. Plans without links or root
-  anchors verify exactly as before. Managed-CI recovery also refuses a
-  canonical plan whose latest round leaves an open obligation.
+  anchors verify exactly as before. Managed-CI no-handoff recovery and strict
+  qualification also run the shared classification
+  (`require_recoverable_plan_approval`) and refuse to bind a plan it does not
+  approve. That covers a stale or unproven requirement binding, an open or
+  unreconstructible obligation, inherited inadmissibility and a pending
+  signed supersession.

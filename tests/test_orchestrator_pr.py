@@ -16183,6 +16183,11 @@ def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
             raise AgentLoopError(error_message)
 
     monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    # The fixture stubs the completion predicate, including the shared
+    # classification recovery now applies to real plan history (#1377).
+    import coding_review_agent_loop.plan_verification as plan_verification
+
+    monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
 
     def reached(*_args, **_kwargs):
         raise _PlanCheckReached
@@ -16407,6 +16412,11 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
             raise AgentLoopError(error_message)
 
     monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    # The fixture stubs the completion predicate, including the shared
+    # classification recovery now applies to real plan history (#1377).
+    import coding_review_agent_loop.plan_verification as plan_verification
+
+    monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
     recovered_plan = orchestrator.make_approved_plan_context(
         "approved plan",
         source_locator="issue #56 canonical approved plan",
@@ -16748,6 +16758,11 @@ def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monke
     monkeypatch.setattr(
         orchestrator, "_require_complete_canonical_plan_approval", lambda *a, **k: None
     )
+    # The fixture stubs the completion predicate, including the shared
+    # classification recovery now applies to real plan history (#1377).
+    import coding_review_agent_loop.plan_verification as plan_verification
+
+    monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
     handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
