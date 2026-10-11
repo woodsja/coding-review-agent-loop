@@ -19082,3 +19082,96 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
         assert audit.startswith("Reviewer board amendment applied.")
         assert "Required board now: Codex" in audit
         assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+
+
+# --- Future follow-ups on blocking plan reviews (#1389) ----------------------
+
+
+def _blocking_plan_future_runner_1389(future_text, **runner_kwargs):
+    return FakeRunner(
+        claude_outputs=[
+            "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            structured_plan_revision(
+                summary="Added the missing regression test.",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved", "note": "Added the test."}
+                ],
+                plan_steps=["Make the change.", "Add the missing regression test."],
+            ),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking",
+                blocking_plan_issues=["Add a regression test for the parser change."],
+                future_followups=[future_text],
+            ),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "future", "note": "Still off-scope."},
+                ],
+            ),
+            structured_pr_review(state="approved", summary="LGTM."),
+        ],
+        **runner_kwargs,
+    )
+
+
+def _plan_revision_prompts_1389(runner):
+    return [
+        cmd[-1]
+        for cmd, _cwd in runner.commands
+        if cmd[:1] == ["claude"] and '"kind": "plan_revision"' in cmd[-1]
+    ]
+
+
+def test_blocking_plan_review_future_followup_is_filed_at_plan_approval(tmp_path):
+    future_text = "Add cross-process locking for the plan cache."
+    runner = _blocking_plan_future_runner_1389(
+        future_text, issue_urls=["https://github.com/OWNER/REPO/issues/99"]
+    )
+    config = make_config(tmp_path, approved_followups="issue", max_rounds=2)
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True,
+        )
+        == 0
+    )
+
+    assert "### Future follow-ups\n- " + future_text in runner.comments[1]
+    assert [issue["title"] for issue in runner.issues] == [
+        f"Follow up future plan-review note: {future_text}"
+    ]
+    assert "Original plan item ID(s): item-2" in runner.issues[0]["body"]
+    revision_prompts = _plan_revision_prompts_1389(runner)
+    assert len(revision_prompts) == 1
+    # Only the blocking item is revision-required work; the future item is not
+    # in the carried plan-item ledger the planner must disposition.
+    assert "item-1" in revision_prompts[0]
+    assert "item-2" not in revision_prompts[0]
+
+
+def test_blocking_plan_review_future_followup_is_summarized_under_ignore(tmp_path):
+    future_text = "Add cross-process locking for the plan cache."
+    runner = _blocking_plan_future_runner_1389(future_text)
+    config = make_config(tmp_path, approved_followups="ignore", max_rounds=2)
+
+    assert (
+        run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True,
+        )
+        == 0
+    )
+
+    assert runner.issues == []
+    summary = next(
+        comment for comment in runner.comments if "Approved plan future follow-ups:" in comment
+    )
+    assert future_text in summary
+    revision_prompts = _plan_revision_prompts_1389(runner)
+    assert len(revision_prompts) == 1
+    assert "item-2" not in revision_prompts[0]

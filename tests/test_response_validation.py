@@ -155,7 +155,9 @@ def test_validate_coder_followup_response_accepts_structured_item_partition():
     assert parsed.remaining_items == ("item-2",)
 
 
-def test_validate_coder_followup_response_requires_visible_future_item():
+def test_validate_coder_followup_response_does_not_require_future_item():
+    # Issue #1389: retained future follow-ups are publication-only, so a coder
+    # response that omits them is valid.
     unresolved_items = (
         UnresolvedReviewItem(
             item_id="item-1",
@@ -177,15 +179,12 @@ def test_validate_coder_followup_response_requires_visible_future_item():
         summary="The current-PR behavior is fixed.",
     )
 
-    with pytest.raises(
-        AgentLoopError,
-        match="did not classify all unresolved reviewer items.*item-2",
-    ):
-        _validate_coder_followup_response(
-            response,
-            unresolved_items=unresolved_items,
-            human_requirements=(), architecture_status_mode="legacy",
-        )
+    parsed = _validate_coder_followup_response(
+        response,
+        unresolved_items=unresolved_items,
+        human_requirements=(), architecture_status_mode="legacy",
+    )
+    assert parsed.addressed_items == ("item-1",)
 
 
 def test_coder_namespace_keeps_machine_items_and_separates_ack_record():

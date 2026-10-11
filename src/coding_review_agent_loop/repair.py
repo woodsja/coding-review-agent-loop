@@ -335,6 +335,10 @@ def attempt_semantic_patch_disposition_normalization(raw: str) -> str | None:
     tail = stripped[json_end:]
     return json.dumps(normalized_payload, ensure_ascii=False) + tail
 
+# v14 prompt — issue #1389: blocking reviews may keep off-scope future_followups and
+# may disposition carried items as "future":
+#   - STATE RULES (BLOCKING) no longer demand future_followups=[] or forbid "future"
+#   - Worked Examples 1, 2 and 8 keep independent future items instead of discarding them
 # v13 prompt — adds repair guidance for human-requirements marker, active approved dispositions,
 # blocking+future dispositions, approved+current-plan future_followups, and same-round confusion:
 #   - _reviewer_human_requirements_instruction for pr_review/plan_review missing HUMAN_REQUIREMENTS_RESOLVED
@@ -774,10 +778,10 @@ The active planning human-requirements context above is authoritative. Do not us
   - If any entry is actually required for the current plan/PR to be correct (not independent future work):
     move it to blocking_plan_issues/blocking_items and change state to "blocking"
   - Only genuinely independent later work may remain in future_followups on an approved review
-### BLOCKING: future_followups=[], ALL prior items in the allowed list must appear in prior_item_dispositions
+### BLOCKING: ALL prior items in the allowed list must appear in prior_item_dispositions
   - No item may be omitted, including items that were "future" in a prior round
-  - "future" disposition is forbidden in blocking reviews
-  - Only "blocking"/"same-pr"/"same-plan"/"resolved" are valid prior dispositions in blocking reviews
+  - Blocking reviews may keep genuinely independent, off-scope work in future_followups; never discard it
+  - "resolved", "blocking", "same-pr"/"same-plan", and "future" are all valid prior dispositions in blocking reviews
 ### Invalid enum values: "still blocking" → "blocking", "still same-pr" → "same-pr",
   "still same-plan" → "same-plan" — normalize without dropping any other items
 
@@ -819,30 +823,31 @@ The active planning human-requirements context above is authoritative. Do not us
 - Use Format B if the original contains AGENT_PLAN_STATE / blocking_plan_issues / same_plan_followups / prior_plan_item_dispositions.
 - Otherwise use Format A.
 
-## WORKED EXAMPLE 1 — approved + same-PR items (change to blocking, DISCARD futures):
+## WORKED EXAMPLE 1 — approved + same-PR items (change to blocking, KEEP independent futures):
 
 Original (malformed): approved state, has same-PR items AND future items.
 
-CORRECT repair: change state to blocking, keep same-PR items, DISCARD future items entirely.
+CORRECT repair: change state to blocking, keep same-PR items, and keep the independent future item.
 {
   "schema_version": 1, "kind": "pr_review", "state": "blocking",
   "summary": "...",
   "blocking_items": [],
   "same_pr_followups": ["Fix the CSS class name"],
-  "future_followups": [],
+  "future_followups": ["Consider improving contrast ratio"],
   "prior_item_dispositions": []
 }
 <!-- AGENT_STATE: blocking -->
 -- Reviewer
 
-The future item ("Consider improving contrast ratio") is DISCARDED. It can be raised again in a later round.
+The future item ("Consider improving contrast ratio") stays in future_followups. Blocking reviews may carry
+off-scope future follow-ups; they never block and are published at approval.
 
 ## WORKED EXAMPLE 2 — prior item already filed as "future", now in a blocking review:
 
 Original (malformed): blocking review, prior item-1 was already "future" in a previous round,
 but item-1 is in the allowed carried prior item IDs list.
 
-CORRECT repair: include item-1 explicitly with a valid non-future disposition. Never omit it.
+CORRECT repair: include item-1 explicitly with a valid disposition. Never omit it.
 {
   "schema_version": 1, "kind": "pr_review", "state": "blocking",
   "summary": "...",
@@ -850,7 +855,7 @@ CORRECT repair: include item-1 explicitly with a valid non-future disposition. N
   "same_pr_followups": ["Fix the CLI flag in error message"],
   "future_followups": [],
   "prior_item_dispositions": [
-    {"item_id": "item-1", "disposition": "resolved", "note": "No longer relevant given current changes"},
+    {"item_id": "item-1", "disposition": "future", "note": "Still independent later work outside this issue's scope"},
     {"item_id": "item-2", "disposition": "same-pr", "note": "CLI flag still wrong"}
   ]
 }
@@ -858,8 +863,9 @@ CORRECT repair: include item-1 explicitly with a valid non-future disposition. N
 -- Reviewer
 
 item-1 must appear because all allowed prior items must be explicitly dispositioned in blocking reviews.
-"future" is forbidden in blocking reviews. Use "resolved" if no longer relevant, "blocking" if it must
-be fixed now, or "same-pr"/"same-plan" if it still needs attention.
+"future" is a valid disposition in blocking reviews when the item is still independent later work. Use
+"resolved" if no longer relevant, "blocking" if it must be fixed now, or "same-pr"/"same-plan" if it
+still needs attention.
 
 ## WORKED EXAMPLE 3 — coder follow-up with JSON wrapped in fences and human requirements:
 
@@ -1028,15 +1034,15 @@ CORRECT repair: change state to "blocking", keep the same-plan disposition.
 Original (malformed): blocking pr_review, has future_followups, prior item-1 was previously "future"
 and is in the allowed prior item IDs.
 
-CORRECT repair: remove future_followups, include item-1 with explicit non-future disposition.
+CORRECT repair: keep the off-scope future_followups entry and include item-1 with an explicit disposition.
 {
   "schema_version": 1, "kind": "pr_review", "state": "blocking",
   "summary": "...",
   "blocking_items": ["Fix the memory leak"],
   "same_pr_followups": [],
-  "future_followups": [],
+  "future_followups": ["Add cross-process locking for the cache directory"],
   "prior_item_dispositions": [
-    {"item_id": "item-1", "disposition": "resolved", "note": "No longer applicable"},
+    {"item_id": "item-1", "disposition": "future", "note": "Still independent later work"},
     {"item_id": "item-2", "disposition": "blocking", "note": "Memory leak is still present"}
   ]
 }
@@ -1044,7 +1050,7 @@ CORRECT repair: remove future_followups, include item-1 with explicit non-future
 -- Reviewer
 
 item-1 must appear explicitly; omitting it would fail validation.
-The future_followup entry is discarded; it can be raised again in a later round.
+The off-scope future_followups entry is kept; it never blocks and is published at approval.
 
 ## WORKED EXAMPLE 9 — "still blocking" invalid enum, all other items preserved:
 

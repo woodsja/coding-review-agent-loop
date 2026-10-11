@@ -2895,7 +2895,7 @@ def _run_plan_first_loop_body(
                     subject=current_plan_subject,
                     action=(
                         "Review the current plan for correctness, architecture fit, "
-                        "missing edge cases, test strategy, and ambiguity."
+                        "missing edge cases within the issue's scope, test strategy, and ambiguity."
                     ),
                 ),
                 # Each reviewer sees only its own superseded pre-panel review.

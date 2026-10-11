@@ -47,9 +47,11 @@ or bullet list for prior items outside the JSON object. Valid `disposition` valu
 - `"resolved"` — item is fixed in this PR.
 - `"blocking"` — the displayed Original claim is still a merge-blocking problem.
 - `"same-pr"` — the displayed Original claim needs to be fixed before merge.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
+- `"future"` — deferred; must include a `"note"` field; valid in approved and blocking reviews.
 
-Only use `"future"` when returning `approved`. If an item should still be fixed before
+Use `"future"` (in an approved or a blocking review) for an item that is independent
+later work, including a carried item outside the blocking scope criteria (i)-(iii) or
+in an operator-declared out-of-scope area. If an item should still be fixed before
 merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
 `"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
 `"blocking"`/`"same-pr"`.
@@ -87,6 +89,9 @@ when cleanup should be fixed before merge.
 Trivial style nits in touched code should be omitted unless worth requiring
 before merge; if required, they are current-PR work and the review is blocking,
 not approved with Future follow-ups.
+Do not use structured Future follow-ups in any review state in this run. Omit
+off-scope hardening that falls outside the blocking scope criteria rather than
+blocking on it.
 """
 
 
@@ -450,9 +455,9 @@ Same-PR follow-ups may appear only in blocking reviews. If any Same-PR
 follow-up remains, including a carried-forward prior item that stays
 `still blocking` or `same-pr`, the review is not approved yet.
 
-If the PR is otherwise fully complete for this round but you notice substantial
-work that is better handled separately in a future issue or PR, list at most
-three highest-value items under this exact heading:
+If you notice substantial work that is better handled separately in a future
+issue or PR, list at most three highest-value items under this exact heading,
+in an approved or a blocking review:
 
 ### Future follow-ups
 
@@ -466,18 +471,24 @@ carried-forward prior unresolved items left active for this round.
 Same-PR follow-ups will be sent back to Claude and require another review
 round before final approval. Before returning approved, self-check that no
 Future follow-up is trivial or local to the current PR; reclassify it as
-Same-PR or omit it. One-line correctness fixes (e.g. initialising a needed variable)
-belong in `blocking_items`; one-line cleanup (e.g. renaming for clarity, adding an
-annotation) belongs in `same_pr_followups`. Neither belongs in `future_followups`.
+Same-PR or omit it. Apply the blocking scope criteria first: only in-scope
+one-line fixes are current-PR work. An in-scope one-line correctness fix (e.g.
+initialising a needed variable) belongs in `blocking_items`; in-scope one-line
+cleanup (e.g. renaming for clarity, adding an annotation) belongs in
+`same_pr_followups`. Neither belongs in `future_followups`. A trivially small
+suggestion that is out of scope, or concerns an operator-declared out-of-scope
+area, stays optional: put it in `future_followups` or omit it, never in
+`blocking_items` or `same_pr_followups`.
 Do not put trivial style nits in either follow-up section.
-If you return `<!-- AGENT_STATE: blocking -->`, do not use structured Future
-follow-ups; keep all required current-round work in the blocking review so it
-is not missed during revision.
+If you return `<!-- AGENT_STATE: blocking -->`, you may still list off-scope
+independent later work in `future_followups`; those items never block and are
+carried to approval-time publication. Keep all required current-round work in
+`blocking_items` or `same_pr_followups` so it is not missed during revision.
 """
 
-_EXPECTED_FOLLOWUP_ELSE = """If you approve but notice substantial work that is better handled separately in
-a future issue or PR, list at most three highest-value items under this exact
-heading:
+_EXPECTED_FOLLOWUP_ELSE = """If you notice substantial work that is better handled separately in a future
+issue or PR, list at most three highest-value items under this exact heading, in
+an approved or a blocking review:
 
 ### Future follow-ups
 
@@ -492,9 +503,14 @@ Do not use the Same-PR follow-ups section in this mode; mark the review blocking
 instead when small or local cleanup should be fixed before merge.
 Before returning approved, self-check that no Future follow-up is trivial or
 local to the current PR; reclassify it as blocking current-PR work or omit it.
-One-line or trivially small mechanical fixes — whether a correctness issue (initialising a
-needed variable) or cleanup (renaming for clarity, adding an annotation) — belong in the
-current round as blocking work, not in a future issue.
+Apply the blocking scope criteria first. In-scope one-line or trivially small mechanical
+fixes — whether a correctness issue (initialising a needed variable) or cleanup (renaming
+for clarity, adding an annotation) — belong in the current round as blocking work, not in a
+future issue. A trivially small suggestion that is out of scope, or concerns an
+operator-declared out-of-scope area, stays optional: put it in Future follow-ups or omit it.
+If you return `<!-- AGENT_STATE: blocking -->`, you may still list off-scope independent
+later work under Future follow-ups; those items never block and are carried to
+approval-time publication. Keep all required current-round work in `blocking_items`.
 The legacy heading `### Non-blocking follow-ups` is still accepted as future
 follow-ups for compatibility, but prefer `### Future follow-ups`.
 """
@@ -1095,7 +1111,8 @@ def test_plan_review_prompt_includes_structured_sections_and_prior_items(tmp_pat
     assert "Future\nfollow-ups are independent later work" in prompt
     assert "A concern or\nparaphrase belongs in exactly one current-round list" in prompt
     assert "Do not duplicate or reclassify\nthe same concern across Same-plan and Future follow-up lists" in prompt
-    assert "do not use structured Future\nfollow-ups" in prompt
+    assert "do not use structured Future\nfollow-ups" not in prompt
+    assert "they are allowed in both approved and blocking plan reviews" in prompt
     assert "no blocking plan issues, no Same-plan\nfollow-ups, and no carried-forward plan items left active" in prompt
     assert '"kind": "plan_review"' in prompt
     assert '"prior_plan_item_dispositions"' in prompt
@@ -3094,7 +3111,8 @@ def test_review_prompt_allows_same_pr_followups_for_fix_modes(tmp_path):
     assert "will be sent back to Claude and require another review" in prompt
     assert "Approved means there are no blocking issues, no Same-PR follow-ups, and no\ncarried-forward prior unresolved items left active" in prompt
     assert "Before returning approved, self-check that no\nFuture follow-up is trivial or local to the current PR" in prompt
-    assert "If you return `<!-- AGENT_STATE: blocking -->`, do not use structured Future\nfollow-ups" in prompt
+    assert "do not use structured Future" not in prompt
+    assert "If you return `<!-- AGENT_STATE: blocking -->`, you may still list off-scope" in prompt
     assert (
         "`blocking_items`, `same_pr_followups`, and `future_followups` have distinct\n"
         "roles."
@@ -3113,30 +3131,34 @@ def test_plan_review_prompt_directs_one_liner_to_same_plan(tmp_path):
         prompt = build_plan_review_prompt(
             56, 1, "Plan.", config, reviewer="codex", compact_context=compact
         )
-        # Proves the guidance names future_followups as the excluded destination
-        assert "Before adding a\n`future_followups` entry" in prompt
-        # Proves the destination is same_plan_followups (not future)
-        assert "same_plan_followups` instead" in prompt
-        # Proves the classification-threshold text is present
-        assert "trivially small\nmechanical change" in prompt
+        flat = " ".join(prompt.split())
+        # An eligible one-liner goes to same_plan_followups, never future (#1389
+        # keeps this rule but scopes it to findings eligible under (i)-(iii)).
+        assert (
+            "An eligible one-line or trivially small mechanical change — initialising a "
+            "variable, renaming for clarity, adding a missing annotation — also belongs in "
+            "`same_plan_followups`, never in `future_followups`"
+        ) in flat
 
 def test_review_prompt_one_liner_preserves_blocking_vs_same_pr_in_fix_and_mode(tmp_path):
     config = make_config(tmp_path, approved_followups="fix-and-summarize")
     for compact in (False, True):
         prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
-        # Proves defect one-liners stay in blocking_items, cleanup goes to same_pr_followups
-        assert "blocking_items`; one-line cleanup" in prompt
+        flat = " ".join(prompt.split())
+        # Proves in-scope defect one-liners stay in blocking_items, cleanup goes to same_pr_followups
+        assert "belongs in `blocking_items`; in-scope one-line cleanup" in flat
         # Proves explicit exclusion from future_followups
-        assert "Neither belongs in `future_followups`" in prompt
+        assert "Neither belongs in `future_followups`" in flat
 
 def test_review_prompt_one_liner_excluded_from_future_in_standard_mode(tmp_path):
     config = make_config(tmp_path, approved_followups="summarize")
     for compact in (False, True):
         prompt = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+        flat = " ".join(prompt.split())
         # Proves exclusion from future follow-up issues
-        assert "not in a future issue" in prompt
+        assert "not in a future issue" in flat
         # Proves the classification-threshold text is present
-        assert "trivially small mechanical fixes" in prompt
+        assert "trivially small mechanical fixes" in flat
 
 def test_same_pr_followup_prompt_no_longer_claims_pr_was_approved(tmp_path):
     config = make_config(tmp_path)
@@ -4780,7 +4802,10 @@ def test_m931_over_cap_delta_block_fails_closed_instead_of_truncating(monkeypatc
 
 # --- Reviewer exhaustiveness rule (#894) -----------------------------------
 
-_EXHAUSTIVENESS_MARKER = "Review exhaustively: report every defect you can independently substantiate"
+_EXHAUSTIVENESS_MARKER = (
+    "Review exhaustively: report every in-scope defect (per the blocking scope criteria) "
+    "you can independently substantiate"
+)
 
 
 def _exhaustiveness_clauses(flow):
@@ -4789,11 +4814,12 @@ def _exhaustiveness_clauses(flow):
         "plan": ("blocking_plan_issues", "same_plan_followups", "reviewed plan", "full plan", "plan content"),
     }[flow]
     return (
-        f"report every defect you can independently substantiate on the {subject}, not only the first.",
+        "report every in-scope defect (per the blocking scope criteria) you can independently "
+        f"substantiate on the {subject}, not only the first.",
         "Substantiating one blocking defect does not end the review; "
         f"finish the pass over the {full_pass} before responding.",
         "re-read that whole function or path and enumerate every other independently evidenced "
-        f"defect there as separate `{blocking}` or `{followups}` entries in the same response.",
+        f"in-scope defect there as separate `{blocking}` or `{followups}` entries in the same response.",
         "Each entry still needs its own evidence; speculation, or padding the review with items "
         "you cannot evidence, is forbidden.",
         f"If a defect genuinely prevents you from evaluating {behind} behind it, say so in that "
@@ -5956,3 +5982,213 @@ def test_interpreter_check_errors_degrade_to_todays_text(tmp_path, monkeypatch):
     )
     assert text == today
     assert "Configured test interpreter" not in text and "For long or full suites" not in text
+
+
+# --- Reviewer scope discipline (#1389) ---------------------------------------
+
+from coding_review_agent_loop.github import HumanReviewRequirement as _HR1389, IssueContext as _IC1389  # noqa: E402
+
+_SCOPE_HEADING_1389 = "Operator-declared out of scope (binding):"
+
+
+def _issue_context_1389(*, scoped=True):
+    body = "Limit reviewer blocks.\n"
+    if scoped:
+        body += "\n## Non-goals\n- Step-back trigger changes\n\n## Acceptance\n- Prompts updated\n"
+    requirements = ()
+    if scoped:
+        requirements = (
+            _HR1389(
+                source_type="issue_comment",
+                author="operator",
+                created_at="2026-10-11T00:00:00Z",
+                url="https://github.com/owner/repo/issues/1389#issuecomment-1",
+                body="### Out of scope:\n- Cross-process locking\n",
+            ),
+        )
+    return _IC1389(
+        number=1389, repo="owner/repo", title="Scope discipline", body=body,
+        url="https://github.com/owner/repo/issues/1389", comments=(),
+        human_requirements=requirements,
+    )
+
+
+def _scope_routes_1389(config, context):
+    review_kwargs = {"issue_context": context}
+    return {
+        "plan": build_issue_plan_prompt(1389, config, issue_context=context),
+        "revision-full": build_plan_revision_prompt(
+            1389, 2, "Prior plan.", "Blocking review.", config, issue_context=context,
+        ),
+        "revision-compact": build_plan_revision_prompt(
+            1389, 2, "Prior plan.", "Blocking review.", config, issue_context=context,
+            compact_context=True,
+        ),
+        "revision-semantic": build_plan_revision_prompt(
+            1389, 2, "Prior plan.", "Blocking review.", config, issue_context=context,
+            response_form="semantic-patch-v1", base_round_number=1, base_state_identity="a" * 64,
+        ),
+        "plan-review-full": build_plan_review_prompt(
+            1389, 2, "Plan.", config, reviewer="codex", issue_context=context,
+        ),
+        "plan-review-compact": build_plan_review_prompt(
+            1389, 2, "Plan.", config, reviewer="codex", issue_context=context, compact_context=True,
+        ),
+        "pr-review-full": build_review_prompt(77, 2, config, reviewer="codex", **review_kwargs),
+        "pr-review-compact": build_review_prompt(
+            77, 2, config, reviewer="codex", compact_context=True, **review_kwargs,
+        ),
+    }
+
+
+def test_declared_out_of_scope_block_reaches_every_planner_and_reviewer_route(tmp_path):
+    config = make_config(tmp_path)
+    for name, prompt in _scope_routes_1389(config, _issue_context_1389()).items():
+        assert prompt.count(_SCOPE_HEADING_1389) == 1, name
+        assert "From issue body:\n- Step-back trigger changes" in prompt, name
+        assert (
+            "From signed human comment by operator "
+            "(https://github.com/owner/repo/issues/1389#issuecomment-1):\n- Cross-process locking"
+        ) in prompt, name
+        assert "- Prompts updated\nFrom" not in prompt, name
+
+
+def test_pr_review_scope_block_merges_parent_issue_sections(tmp_path):
+    parent = _IC1389(
+        number=1, repo="owner/repo", title="Parent", body="## Out of scope\n- Parent-only area\n",
+        url=None, comments=(),
+    )
+    for compact in (False, True):
+        prompt = build_review_prompt(
+            77, 2, make_config(tmp_path), reviewer="codex", compact_context=compact,
+            issue_context=_issue_context_1389(), parent_issue_context=parent,
+        )
+        assert prompt.count(_SCOPE_HEADING_1389) == 1
+        assert "- Parent-only area" in prompt and "- Step-back trigger changes" in prompt
+
+
+def test_no_out_of_scope_section_leaves_prompts_without_a_scope_block(tmp_path):
+    config = make_config(tmp_path)
+    fenced = _IC1389(
+        number=1389, repo="owner/repo", title="t",
+        body="```\n## Out of scope\n- not real\n```\n", url=None, comments=(),
+    )
+    for context in (_issue_context_1389(scoped=False), fenced):
+        for name, prompt in _scope_routes_1389(config, context).items():
+            assert "Operator-declared out of scope" not in prompt, name
+
+
+def test_scope_block_sits_in_byte_identical_compact_stable_prefixes(tmp_path):
+    config = make_config(tmp_path)
+    context = _issue_context_1389()
+    pr_prefixes, plan_prefixes, revision_prefixes = [], [], []
+    for round_number, head in ((2, "abc123"), (3, "def456")):
+        pr_prompt = build_review_prompt(
+            77, round_number, config, reviewer="codex", compact_context=True, issue_context=context,
+            compact_tail=CompactPrReviewTailContext(
+                head_sha=head, round_number=round_number, action=f"Review {head}."
+            ),
+        )
+        prefix, _tail = pr_prompt.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
+        assert _SCOPE_HEADING_1389 in prefix
+        pr_prefixes.append(prefix)
+        plan_prompt = build_plan_review_prompt(
+            1389, round_number, f"Plan {head}.", config, reviewer="codex", compact_context=True,
+            issue_context=context,
+            compact_tail=CompactPlanTailContext(subject=f"subject-{head}", action=f"Review {head}."),
+        )
+        prefix, _tail = plan_prompt.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+        assert _SCOPE_HEADING_1389 in prefix
+        plan_prefixes.append(prefix)
+        revision_prompt = build_plan_revision_prompt(
+            1389, round_number, f"Plan {head}.", "Blocking review.", config,
+            issue_context=context, compact_context=True,
+            compact_tail=CompactPlanTailContext(subject=f"subject-{head}", action=f"Revise {head}."),
+        )
+        prefix, _tail = revision_prompt.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+        assert _SCOPE_HEADING_1389 in prefix
+        revision_prefixes.append(prefix)
+    assert pr_prefixes[0].encode() == pr_prefixes[1].encode()
+    assert plan_prefixes[0].encode() == plan_prefixes[1].encode()
+    assert revision_prefixes[0].encode() == revision_prefixes[1].encode()
+
+
+_CRITERIA_CLAUSES_1389 = (
+    "(i) a stated requirement or acceptance criterion of the issue, or a signed human requirement;",
+    "(ii) a regression or correctness bug in behaviour this",
+    "(iii) a security or data-loss risk introduced by this",
+    "Decide this scope eligibility first, before deciding whether a finding is small or fits the current design.",
+    "cross-process concurrency, signal or cancellation paths, crash recovery",
+    "unless the finding text explicitly names which of (i)-(iii) it falls under and why.",
+)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize(
+    "approved_followups", ["ignore", "summarize", "issue", "fix-and-summarize", "fix-and-issue"]
+)
+def test_pr_review_prompt_states_blocking_criteria_and_future_on_blocking(
+    tmp_path, approved_followups, compact
+):
+    config = make_config(tmp_path, approved_followups=approved_followups)
+    flat = " ".join(build_review_prompt(77, 2, config, reviewer="codex", compact_context=compact).split())
+    for clause in _CRITERIA_CLAUSES_1389:
+        assert clause in flat
+    assert prompts_module._reviewer_blocking_scope_guidance("pr") in build_review_prompt(
+        77, 2, config, reviewer="codex", compact_context=compact
+    )
+    assert "do not use structured Future follow-ups; keep all required" not in flat
+    if approved_followups == "ignore":
+        assert "Do not use structured Future follow-ups in any review state in this run." in flat
+        assert "Omit off-scope hardening that falls outside the blocking scope criteria" in flat
+    else:
+        assert "If you return `<!-- AGENT_STATE: blocking -->`, you may still list off-scope" in flat
+        assert "carried to approval-time publication" in flat
+        assert "in an approved or a blocking review" in flat
+        # Scope eligibility qualifies the one-line rule (#1389, item-7).
+        assert "A trivially small suggestion that is out of scope, or concerns an" in flat
+        first = flat.index("Apply the blocking scope criteria first")
+        assert first < flat.index("one-line", first)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_plan_review_prompt_states_criteria_same_design_and_eligibility_order(tmp_path, compact):
+    config = make_config(tmp_path)
+    prompt = build_plan_review_prompt(1389, 2, "Plan.", config, reviewer="codex", compact_context=compact)
+    flat = " ".join(prompt.split())
+    for clause in _CRITERIA_CLAUSES_1389:
+        assert clause in flat
+    assert prompts_module._reviewer_blocking_scope_guidance("plan") in prompt
+    assert "missing edge cases within the issue's scope" in flat or compact
+    assert "they are allowed in both approved and blocking plan reviews" in flat
+    assert "do not use structured Future follow-ups" not in flat
+    assert "If so, put it in `same_plan_followups` instead" not in flat
+    eligibility = flat.index("First decide scope eligibility under the blocking scope criteria")
+    same_design = flat.index(
+        "if it is satisfiable within the current plan's design (a small addition with no new "
+        "mechanism, state machine, persistence, or process boundary), put it in "
+        "`same_plan_followups`, not `blocking_plan_issues`"
+    )
+    small_change = flat.index("An eligible one-line or trivially small mechanical change")
+    assert eligibility < same_design < small_change
+    assert (
+        "a finding that is not eligible goes in `future_followups` or is omitted, however small it "
+        "is, and never becomes `same_plan_followups` or `blocking_plan_issues` work; that includes "
+        "a trivially small suggestion touching an operator-declared out-of-scope area"
+    ) in flat
+
+
+def test_compact_plan_review_action_scopes_edge_cases(tmp_path):
+    prompt = build_plan_review_prompt(
+        1389, 2, "Plan.", make_config(tmp_path), reviewer="codex", compact_context=True
+    )
+    assert "missing edge cases within the issue's scope" in prompt
+
+
+def test_disposition_guidance_allows_future_on_blocking_reviews(tmp_path):
+    pr_guidance = prompts_module._build_unresolved_items_guidance()
+    plan_guidance = prompts_module._build_unresolved_plan_items_guidance()
+    for guidance in (pr_guidance, plan_guidance):
+        assert "only valid when approving" not in guidance
+        assert "valid in approved and blocking reviews" in guidance
+        assert "operator-declared out-of-scope area" in guidance

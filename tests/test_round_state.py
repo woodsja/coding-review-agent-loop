@@ -1371,3 +1371,92 @@ def test_plan_board_stamp_applies_only_to_plan_flow_records():
     (pr,) = _extract_round_metadata_records([SimpleNamespace(body=bodies[1])], flow="pr")
     assert plan.metadata.plan_board_root == _PLAN_ROOT
     assert pr.metadata.plan_board_root is None and pr.metadata.pr_board_root is None
+
+
+# --- Deferred publication replay (#1389) ------------------------------------
+
+from coding_review_agent_loop.protocol import ReviewItemDisposition  # noqa: E402
+from coding_review_agent_loop.round_state import (  # noqa: E402
+    UnresolvedReviewItem,
+    canonical_deferred_history_items,
+    canonical_history_item_outcomes,
+)
+
+
+def _deferred_item(item_id, status):
+    return UnresolvedReviewItem(
+        item_id=item_id, reviewer="Codex", source_round=1,
+        text=f"finding {item_id}", status=status,
+    )
+
+
+def _deferred_record(index, role, round_number, subject, **kw):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="pr", role=role, agent=kw.pop("agent", "Codex"),
+            round_number=round_number, subject=subject, **kw,
+        ),
+        body="",
+    )
+
+
+def test_canonical_deferred_history_items_tracks_eligibility_separately():
+    x = _deferred_item("item-1", "future")      # new future follow-up on a blocking review
+    y = _deferred_item("item-2", "blocking")    # blocker later dispositioned future
+    z = _deferred_item("item-3", "future")      # deferred, then re-promoted by the final review
+    w = _deferred_item("item-4", "future")      # full-context ledger future, later resolved
+    round_1 = _deferred_record(0, "reviewer", 1, "h0", state="blocking", new_items=(x, y, z, w))
+    ledger = (x, y, z, w)
+    coder_2 = _deferred_record(1, "coder", 2, "h1", agent="Claude", prior_items=ledger)
+    final_review = _deferred_record(
+        2, "reviewer", 2, "h1", state="blocking", prior_items=ledger,
+        dispositions=(
+            ReviewItemDisposition("item-2", "Codex", "future", "off-scope hardening"),
+            ReviewItemDisposition("item-3", "Codex", "blocking", "must be fixed now"),
+            ReviewItemDisposition("item-4", "Codex", "resolved"),
+        ),
+    )
+    records = [round_1, coder_2, final_review]
+    before = canonical_history_item_outcomes(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    )
+
+    deferred = canonical_deferred_history_items(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    )
+
+    assert [item.item_id for item in deferred] == ["item-1", "item-2"]
+    assert all(item.status == "future" for item in deferred)
+    # The legacy outcomes map is unchanged by the new replay (it does not reset
+    # a kept re-promotion, which is why eligibility is tracked separately).
+    assert before == {
+        "item-1": "deferred", "item-2": "deferred", "item-3": "deferred", "item-4": "resolved",
+    }
+    assert canonical_history_item_outcomes(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    ) == before
+
+
+def test_canonical_deferred_history_items_drops_reappearing_mandatory_item_and_machine_items():
+    y = _deferred_item("item-2", "blocking")
+    ci = UnresolvedReviewItem(
+        item_id="ci-item", reviewer="Orchestrator", source_round=1, text="checks",
+        status="future", authority="machine", obligation_kind="github-pr-checks",
+        lifecycle="repair_required", failed_head_sha="c" * 40, obligation_identity="ci-1",
+    )
+    round_1 = _deferred_record(0, "reviewer", 1, "h0", state="blocking", new_items=(y, ci))
+    downgrade = _deferred_record(
+        1, "reviewer", 2, "h1", state="blocking", prior_items=(y,),
+        dispositions=(ReviewItemDisposition("item-2", "Codex", "future", "later"),),
+    )
+    assert [
+        item.item_id
+        for item in canonical_deferred_history_items(
+            [round_1, downgrade], reconciliation_mode="aggregate", same_status="same-pr"
+        )
+    ] == ["item-2"]
+    reintroduced = _deferred_record(2, "coder", 3, "h2", agent="Claude", prior_items=(y,))
+    assert canonical_deferred_history_items(
+        [round_1, downgrade, reintroduced], reconciliation_mode="aggregate", same_status="same-pr"
+    ) == ()

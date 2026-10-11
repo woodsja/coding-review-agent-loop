@@ -2448,7 +2448,25 @@ def test_repair_prompt_blocking_state_rules_require_explicit_prior_dispositions(
     """STATE RULES for BLOCKING must prohibit omitting allowed prior items."""
     assert "ALL prior items in the allowed list must appear in prior_item_dispositions" in _REPAIR_PROMPT
     assert "No item may be omitted" in _REPAIR_PROMPT or "no item may be omitted" in _REPAIR_PROMPT.lower()
-    assert '"future" is forbidden in blocking reviews' in _REPAIR_PROMPT or "future\" is forbidden in blocking" in _REPAIR_PROMPT
+    # Issue #1389: blocking reviews may keep `future` dispositions and
+    # off-scope future_followups; the repair prompt must not forbid or drop them.
+    assert '"future" is forbidden in blocking reviews' not in _REPAIR_PROMPT
+    assert "BLOCKING: future_followups=[]" not in _REPAIR_PROMPT
+    assert '"future" are all valid prior dispositions in blocking reviews' in _REPAIR_PROMPT
+    assert "Blocking reviews may keep genuinely independent, off-scope work in future_followups" in _REPAIR_PROMPT
+
+
+def test_repair_prompt_worked_examples_keep_future_items_on_blocking_reviews():
+    example_1 = _REPAIR_PROMPT.split("## WORKED EXAMPLE 1", 1)[1].split("## WORKED EXAMPLE 2", 1)[0]
+    assert "DISCARD" not in example_1
+    assert '"future_followups": ["Consider improving contrast ratio"]' in example_1
+    example_2 = _REPAIR_PROMPT.split("## WORKED EXAMPLE 2", 1)[1].split("## WORKED EXAMPLE 3", 1)[0]
+    assert '{"item_id": "item-1", "disposition": "future"' in example_2
+    assert "forbidden" not in example_2
+    example_8 = _REPAIR_PROMPT.split("## WORKED EXAMPLE 8", 1)[1].split("## WORKED EXAMPLE 9", 1)[0]
+    assert "discarded" not in example_8
+    assert '"future_followups": ["Add cross-process locking for the cache directory"]' in example_8
+    assert '{"item_id": "item-1", "disposition": "future"' in example_8
 
 def test_repair_example_2_no_longer_says_omit():
     """Worked Example 2 must not instruct omission of formerly-future prior items."""
@@ -2891,18 +2909,18 @@ def test_parse_pr_review_rejects_approved_with_same_pr_active_disposition():
     with pytest.raises(AgentLoopError, match="Approved reviews must be fully complete"):
         parse_pr_review(malformed, reviewer="OpenAI Codex")
 
-def test_parse_plan_review_rejects_blocking_with_future_disposition_on_prior_item():
-    """Blocking plan review with future prior disposition must fail validation."""
-    malformed = structured_plan_review(
+def test_parse_plan_review_accepts_blocking_with_future_disposition_on_prior_item():
+    """Issue #1389: a blocking plan review may downgrade a carried item to future."""
+    review = structured_plan_review(
         state="blocking",
         blocking_plan_issues=["Something is wrong."],
-        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "future"}],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "future", "note": "Off-scope."}],
     )
-    with pytest.raises(AgentLoopError, match="[Ff]uture"):
-        parse_plan_review(malformed, reviewer="OpenAI Codex")
+    parsed = parse_plan_review(review, reviewer="OpenAI Codex")
+    assert [item.disposition for item in parsed.dispositions] == ["future"]
 
 def test_repair_blocking_formerly_future_prior_item_explicit_disposition():
-    """Repair of blocking review with formerly-future prior item produces explicit non-future disposition."""
+    """Repair of a blocking review keeps a formerly-future prior item's `future` disposition (#1389)."""
     malformed = (
         json.dumps({
             "schema_version": 1,
@@ -2922,7 +2940,7 @@ def test_repair_blocking_formerly_future_prior_item_explicit_disposition():
         state="blocking",
         summary="Fix the memory leak.",
         blocking_items=["Fix the memory leak"],
-        prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking"}],
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "future"}],
         reviewer="Reviewer",
     )
     mock_result = MagicMock()

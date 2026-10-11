@@ -1157,9 +1157,27 @@ def test_authorized_disposition_normalizations_are_accepted():
             {"item_id": "item-1", "disposition": "blocking", "note": "The retry loop is open."},
             {"item_id": "item-2", "disposition": "resolved",
              "note": "The revised plan already covers this."},
-            {"item_id": "item-3", "disposition": "blocking", "note": "Deferred work."},
+            {"item_id": "item-3", "disposition": "future", "note": "Deferred work."},
         ],
     ))
+
+
+def test_blocking_repair_may_not_promote_a_source_future_disposition():
+    # Issue #1389: blocking reviews accept `future`, so no schema rule forces a
+    # carried future item to change; promoting it is unsupported by the source.
+    source = _plan_review(
+        state="blocking",
+        prior_plan_item_dispositions=[
+            {"item_id": "item-3", "disposition": "future", "note": "Deferred work."},
+        ],
+    )
+    with pytest.raises(AgentLoopError, match="from `future` to `blocking`"):
+        check(source, _plan_review(
+            state="blocking",
+            prior_plan_item_dispositions=[
+                {"item_id": "item-3", "disposition": "blocking", "note": "Deferred work."},
+            ],
+        ))
 
 
 def test_deterministic_unknown_id_removal_stays_allowed():
@@ -1264,9 +1282,8 @@ def test_context_completed_active_id_cannot_ground_a_blocking_verdict():
 
 
 def test_future_to_active_promotion_cannot_ground_a_blocking_verdict():
-    # The source `future` disposition is not open current-scope work, and the
-    # schema-mandated re-statement is authorized only because the target is
-    # blocking, so it can never be that blocking state's own support.
+    # The source `future` disposition is not open current-scope work, and since
+    # #1389 blocking reviews accept `future`, so promoting it is unsupported.
     source = _plan_review(
         state="approved",
         summary="Plan is sound.",
@@ -1275,7 +1292,7 @@ def test_future_to_active_promotion_cannot_ground_a_blocking_verdict():
             {"item_id": "item-1", "disposition": "future", "note": "Deferred work."},
         ],
     )
-    with pytest.raises(AgentLoopError, match="state: blocking"):
+    with pytest.raises(AgentLoopError, match="from `future` to `blocking`|state: blocking"):
         check(source, _plan_review(
             state="blocking",
             summary="Plan is sound.",

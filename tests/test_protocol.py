@@ -936,7 +936,7 @@ def test_parse_plan_item_dispositions_ignores_parenthesized_empty_placeholders()
     assert parse_plan_item_dispositions(review, reviewer="OpenAI Codex") == ()
 
 
-def test_parse_plan_review_drops_future_followups_in_blocking_reviews():
+def test_parse_plan_review_keeps_future_followups_in_blocking_reviews():
     review = structured_plan_review(
         state="blocking",
         summary="Still blocked.",
@@ -945,21 +945,104 @@ def test_parse_plan_review_drops_future_followups_in_blocking_reviews():
     )
 
     result = parse_plan_review(review, reviewer="OpenAI Codex")
-    assert result.items.future == ()
+    assert [item.text for item in result.items.future] == ["Do this later."]
     assert result.items.blocking  # blocking item survives
 
 
-def test_parse_plan_review_rejects_future_disposition_in_blocking_reviews():
+def test_parse_plan_review_accepts_future_disposition_in_blocking_reviews():
+    # Issue #1389: a carried off-scope blocker may be downgraded to `future`
+    # while the review still blocks on another issue.
     review = structured_plan_review(
         state="blocking",
         summary="Still blocked.",
+        blocking_plan_issues=["Need clearer rollback coverage."],
         prior_plan_item_dispositions=[
-            {"item_id": "item-1", "disposition": "future", "note": "maybe later"}
+            {"item_id": "item-1", "disposition": "future", "note": "Outside this issue's scope."}
         ],
     )
 
-    with pytest.raises(AgentLoopError, match="Blocking plan reviews may not downgrade"):
-        parse_plan_review(review, reviewer="OpenAI Codex")
+    result = parse_plan_review(review, reviewer="OpenAI Codex")
+    assert result.state == "blocking"
+    assert [(item.item_id, item.disposition) for item in result.dispositions] == [("item-1", "future")]
+    assert result.items.blocking
+
+
+def test_parse_structured_pr_review_accepts_future_disposition_in_blocking_reviews():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": "blocking",
+                "summary": "Still blocked.",
+                "blocking_items": ["Needs one more test."],
+                "same_pr_followups": [],
+                "future_followups": [],
+                "prior_item_dispositions": [
+                    {"item_id": "item-1", "disposition": "future", "note": "Off-scope hardening."}
+                ],
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    result = parse_structured_pr_review(payload, reviewer="OpenAI Codex")
+    assert result is not None
+    assert result.state == "blocking"
+    assert [(item.item_id, item.disposition) for item in result.dispositions] == [("item-1", "future")]
+    assert result.blocking_items
+
+
+def test_approved_reviews_still_reject_active_items_after_1389():
+    pr_payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": "approved",
+                "summary": "Looks fine.",
+                "blocking_items": [],
+                "same_pr_followups": [],
+                "future_followups": ["Later work."],
+                "prior_item_dispositions": [
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Still broken here."}
+                ],
+            }
+        )
+        + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    )
+    with pytest.raises(AgentLoopError, match="Approved reviews must be fully complete"):
+        parse_structured_pr_review(pr_payload, reviewer="OpenAI Codex")
+    plan_review = structured_plan_review(
+        state="approved",
+        summary="Looks fine.",
+        same_plan_followups=["Tighten step 2."],
+    )
+    with pytest.raises(AgentLoopError, match="Approved plan reviews must be fully complete"):
+        parse_plan_review(plan_review, reviewer="OpenAI Codex")
+
+
+def test_blocking_review_future_duplicate_of_blocking_item_is_still_deduped():
+    payload = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": "blocking",
+                "summary": "Still blocked.",
+                "blocking_items": ["Needs one more test."],
+                "same_pr_followups": [],
+                "future_followups": ["Needs one more test.", "Add cross-process locking later."],
+                "prior_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+    result = parse_structured_pr_review(payload, reviewer="OpenAI Codex")
+    assert result is not None
+    assert [item.text for item in result.blocking_items] == ["Needs one more test."]
+    assert [item.text for item in result.followups.future] == ["Add cross-process locking later."]
 
 
 def test_parse_plan_review_rejects_contradictory_prior_plan_item_disposition():
@@ -1400,7 +1483,7 @@ def test_validate_review_response_rejects_ambiguous_blanket_prose():
         )
 
 
-def test_parse_review_drops_future_followups_in_blocking_reviews():
+def test_parse_review_keeps_future_followups_in_blocking_reviews():
     review = """
     Still blocked.
 
@@ -1418,7 +1501,8 @@ def test_parse_review_drops_future_followups_in_blocking_reviews():
 
     assert parsed.state == "blocking"
     assert [item.text for item in parsed.followups.same_pr] == ["Tighten the helper in this file."]
-    assert parsed.followups.future == ()
+    # Issue #1389: off-scope future follow-ups survive a blocking review.
+    assert [item.text for item in parsed.followups.future] == ["Do this later."]
 
 
 def test_parse_review_rejects_contradictory_prior_item_disposition():
@@ -1892,7 +1976,7 @@ def test_parse_pr_review_rejects_invalid_structured_candidate_instead_of_falling
         parse_pr_review(payload, reviewer="OpenAI Codex")
 
 
-def test_parse_structured_pr_review_strips_future_followups_in_blocking_reviews():
+def test_parse_structured_pr_review_keeps_future_followups_in_blocking_reviews():
     payload = (
         json.dumps(
             {
@@ -1911,7 +1995,7 @@ def test_parse_structured_pr_review_strips_future_followups_in_blocking_reviews(
 
     result = parse_structured_pr_review(payload, reviewer="OpenAI Codex")
     assert result is not None
-    assert result.followups.future == ()
+    assert [item.text for item in result.followups.future] == ["Clean this up later."]
     assert result.blocking_items  # blocking item survives
 
 
@@ -2362,7 +2446,7 @@ def test_parse_structured_plan_review_dedupes_same_plan_against_blocking_items()
     ]
 
 
-def test_parse_structured_plan_review_strips_blocking_future_followups():
+def test_parse_structured_plan_review_keeps_blocking_future_followups():
     payload = (
         json.dumps(
             {
@@ -2381,7 +2465,7 @@ def test_parse_structured_plan_review_strips_blocking_future_followups():
 
     result = parse_structured_plan_review(payload, reviewer="OpenAI Codex")
     assert result is not None
-    assert result.items.future == ()
+    assert [item.text for item in result.items.future] == ["Refactor the prompt later."]
     assert result.items.blocking  # blocking item survives
 
 

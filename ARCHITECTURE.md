@@ -120,6 +120,7 @@ Source paths below are relative to
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
 | Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `risk_coverage_map.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. `risk_coverage_map.py` is the pure, deterministic coverage-map completeness check (every enforceable row claimed or declared a gap, cited test paths are regular files in one pinned commit, declared `test_level` meets the required level), run once by the approved-plan implementation seam with a single pre-review coverage re-ask (#1290). Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. A repaired reviewer `architecture_impact.status` must likewise be the status the reviewer's own source declared; repair never supplies the decision (#1185). |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
+| Declared scope | `scope_declarations.py` | Pure extraction and rendering of operator-declared `Out of scope` / `Non-goals` heading sections from the issue body and signed human comments into a binding-scope prompt block (#1389). |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier, which tolerates exactly one known host comment footer (#1043). |
 | Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
@@ -815,6 +816,31 @@ items; it does not silently redefine a finding or resolve another participant's
 obligation. Human requirements and approved plans are separate from that ledger.
 Original requirements, valid later human instructions, and safety constraints
 outrank the plan; plan conflicts must be surfaced explicitly.
+
+Reviewer scope discipline (#1389). Plan and PR reviewer prompts limit blocking
+findings to the issue's stated requirements or signed human requirements,
+regressions in touched behaviour, and introduced security or data-loss risk;
+other hardening is routed to future follow-ups. Future follow-ups and `future`
+prior-item dispositions are accepted on blocking as well as approved plan and
+PR reviews (`protocol._finalize_parsed_review` and
+`_finalize_parsed_plan_review` keep only the approved-state invariants). They
+are recorded under the same follow-up-mode gate as approved-review items and
+are never coder or planner work: the general coder handoff and its validator
+exclude ledger `future` items, and compact PR review validation does not
+require dispositions for the future items the compact prompt hides. In compact
+PR context a carried item downgraded to `future` leaves the ledger, so
+`pr_loop` keeps a publication-only pending set. It is seeded at loop start or
+resume from `round_state.canonical_deferred_history_items`, a replay of the
+posted round records that tracks deferral eligibility separately from the
+legacy `canonical_history_item_outcomes` map. After each reconciliation it
+drops IDs the carried ledger owned and adds the round's newly deferred items.
+The set feeds only approval-time publication, adds no persisted fields, and the
+publish-once audit record keeps filing to exactly once. Operator-declared
+`## Out of scope` / `## Non-goals` sections in the issue body and signed human
+comments are extracted by the pure `scope_declarations.py` helper and rendered
+as a deterministic, bounded binding-scope block next to the issue context in
+planner and reviewer prompts, so compact stable prefixes stay byte-identical;
+compliance is enforced by the prompt, not by a deterministic classifier.
 
 Human-only exact-head evidence (#1068) is a separate channel from findings.
 Reviewers list it in `exact_head_evidence_requests`, and the ledger records it
