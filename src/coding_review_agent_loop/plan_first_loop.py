@@ -3639,6 +3639,18 @@ def _run_plan_first_loop_body(
                             review_output
                         ),
                     )
+                    # The repair was an agent turn after the round-outcome read:
+                    # re-read and re-validate the board history before its result
+                    # is published, and keep that read for the approval
+                    # boundary's requirement refresh (#1377).
+                    round_outcome_issue_context = get_issue_context(
+                        runner, config=config, issue_number=issue_number
+                    )
+                    revalidate_plan_lineage(
+                        round_outcome_issue_context.comments,
+                        round_number=round_number,
+                        boundary="after an acknowledgement repair",
+                    )
                     repaired_validated = _pin_acknowledgement_repair(
                         accepted_review_carriers.get(reviewer_name),
                         repaired_validated,
@@ -3961,9 +3973,10 @@ def _run_plan_first_loop_body(
             # a human instruction posted during planning cannot be hidden by
             # the original snapshot. New signed IDs require a fresh planning
             # acknowledgement rather than being silently folded into the plan.
-            # The re-read taken once this round's reviews were in is that
-            # boundary read: no agent turn has run since, and its board history
-            # was re-validated then (#1377).
+            # The latest round-outcome read is that boundary read: it was taken
+            # after this round's reviews and after any acknowledgement repair,
+            # so no agent turn has run since, and its board history was
+            # re-validated then (#1377).
             refreshed_issue_context = round_outcome_issue_context
             # The shared completion predicate's ledger rule (#1377): an
             # obligation history published but neither carried nor provably

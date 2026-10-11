@@ -18973,3 +18973,112 @@ def test_workflow_correction_repairs_a_deficient_reask_without_a_second_reask(tm
     # The deficiency that survived the re-ask disappears once correction supplies the level.
     assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
     assert "missing-level" not in comment.split("### Risk-matrix coverage map")[1]
+
+
+@pytest.mark.parametrize(
+    "event", ["forged-link", "signed-amendment", "requirement-added", "requirement-withdrawn"],
+)
+def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
+    tmp_path, monkeypatch, event
+):
+    """#1377 items 16/17: the acknowledgement repair is an agent turn, so the
+    run re-reads the issue after it.  Board history changed during the repair
+    refuses before the repaired record is published, and a requirement change
+    during it refuses at the approval boundary; neither approves nor hands off."""
+    import datetime
+
+    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
+    from coding_review_agent_loop.board_change import (
+        PLAN_BOARD_CHANGE_LINK_HEADING,
+        PLAN_BOARD_CHANGE_LINK_MARKER,
+    )
+
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output], codex_outputs=[unacknowledged], gemini_outputs=[panel],
+        serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
+    )
+    requirements = [requirement]
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=tuple(requirements))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+
+    def operator_comment(body):
+        runner.issue_comments.append({
+            "body": body, "author": {"login": "operator"}, "_rest_author_id": 81,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        })
+
+    def fake_repair(raw, cmd, **kwargs):
+        if event == "forged-link":
+            operator_comment(
+                f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->"
+            )
+        elif event == "signed-amendment":
+            operator_comment(format_reviewer_board_amendment_comment(
+                flow="plan", issue=56, pr_number=None,
+                original_required_reviewers=("Codex", "Gemini"),
+                policy="all-reviewers", primary_reviewer=None,
+                removed_reviewers=("Gemini",), effective_from_round=1,
+                rationale="Gemini quota exhausted.",
+            ))
+        elif event == "requirement-added":
+            requirements.append(HumanReviewRequirement(
+                source_type="Issue comment", author="maintainer",
+                created_at="2026-05-17T09:00:00Z",
+                url="https://github.com/OWNER/REPO/issues/56#issuecomment-9",
+                body="Also keep the audit trail.",
+            ))
+        else:
+            requirements.clear()
+        return repaired
+
+    refusal = {
+        "forged-link": "history is inconsistent after an acknowledgement repair",
+        "signed-amendment": "recorded while this run was active .*after an acknowledgement repair",
+        "requirement-added": "requirement\\(s\\) changed after plan approval: added",
+        "requirement-withdrawn": "requirement\\(s\\) changed after plan approval: withdrawn",
+    }[event]
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        with pytest.raises(AgentLoopError, match=refusal):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    codex_records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    if event in {"forged-link", "signed-amendment"}:
+        # The repaired result is never published under the old board history.
+        assert len(codex_records) == 1
+        assert codex_records[0].surfaced_reviewer_requirement_ids == ()
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    # Only the initial planner turn ran: no revision and no implementation coder.
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]) == 1
+    if event == "signed-amendment":
+        # A clean rerun resolves and activates the amendment: the board becomes
+        # Codex alone and Gemini is never invoked again.  (The resumed Codex
+        # record is rendered prose, which the existing substance gate never
+        # repairs, so this one-round rerun then stops at its round budget.)
+        event = "none"
+        start_commands, start_comments = len(runner.commands), len(runner.issue_comments)
+        with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        assert not any(
+            cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands[start_commands:]
+        )
+        (audit,) = [c["body"] for c in runner.issue_comments[start_comments:]]
+        assert audit.startswith("Reviewer board amendment applied.")
+        assert "Required board now: Codex" in audit
+        assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)

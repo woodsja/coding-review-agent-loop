@@ -2313,12 +2313,15 @@ startup.
   checked again at every planning round. Floor authorizations come only from
   signed plan segments. Once a round's reviews are in, before its outcome
   creates the next round (a planner revision or a reviewer-only phase-advance
-  record) or reaches approval, and again at each later round and at the
-  approval boundary, the run re-reads the issue, re-admits link records
+  record) or reaches approval, again after each acknowledgement repair (an
+  agent turn) before its result is published, and at each later round, the
+  run re-reads the issue, re-admits link records
   through the authenticated actor and re-resolves the plan lineage.
   Inconsistent history, or any board change recorded while the run was
   active, refuses before another agent turn, next-round record or approval; a
-  rerun resolves and applies it.
+  rerun resolves and applies it. The approval boundary's signed-requirement
+  refresh uses the latest of these reads, so no agent turn separates it from
+  approval.
 - **Plan verification.** `derive_plan_verification_context` resolves plan
   history that carries a root anchor or a link through the plan lineage,
   never from the invocation's planning configuration. The approving identity
