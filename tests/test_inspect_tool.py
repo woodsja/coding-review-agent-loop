@@ -579,3 +579,40 @@ def test_module_entry_point_loads_only_inspect_tool(repo, tmp_path):
     }
     ours = {name for name in imported if name.startswith("coding_review_agent_loop")}
     assert ours <= {"coding_review_agent_loop", "coding_review_agent_loop.inspect_tool"}
+
+
+@pytest.mark.parametrize("name", ["git", "git.exe", "GIT.EXE", "git-2.45"])
+def test_hardened_probes_delegate_pinned_git_regardless_of_basename(tmp_path, monkeypatch, name):
+    """Gate and probe both go through the confined helper, including git.exe."""
+    git = str(tmp_path / "Program Files" / "Git" / "bin" / name)
+    launched: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        launched.append(list(command))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(inspect_tool.subprocess, "run", fake_run)
+    inspect_tool.run_hardened_git(git, "status", ("--porcelain",), cwd=str(tmp_path), environ={})
+
+    assert len(launched) == 2
+    for command in launched:
+        assert command[:4] == [sys.executable, "-I", "-S", "-c"]
+        assert command[6] == git, "the pinned Git must reach the confined helper, not launch directly"
+        assert git not in command[:6]
+
+
+def test_failed_boundary_preflight_stops_before_consequential_probe(tmp_path, monkeypatch):
+    """A helper that refuses (unsupported backend) blocks the probe after the gate."""
+    git = str(tmp_path / "Git" / "bin" / "git.exe")
+    launched: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        launched.append(list(command))
+        return subprocess.CompletedProcess(command, 1, b"", b"Unsupported Git confinement")
+
+    monkeypatch.setattr(inspect_tool.subprocess, "run", fake_run)
+    with pytest.raises(InspectRejected, match="config gate"):
+        inspect_tool.run_hardened_git(git, "status", (), cwd=str(tmp_path), environ={})
+    assert len(launched) == 1
+    assert launched[0][:4] == [sys.executable, "-I", "-S", "-c"]
+    assert git not in launched[0][:6]

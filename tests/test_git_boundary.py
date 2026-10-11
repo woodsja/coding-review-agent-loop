@@ -495,3 +495,25 @@ def test_unsupported_backend_refuses_first_checkout_probe(repositories, monkeypa
     monkeypatch.setattr(secure_git.sys, "platform", "unsupported-test")
     with pytest.raises(AgentLoopError, match="Unsupported Git confinement"):
         Runner().run(("git", "status", "--porcelain"), cwd=checkout)
+
+
+@pytest.mark.parametrize("program", ["git", "/usr/bin/git", r"C:\Program Files\Git\bin\git.exe", "GIT.EXE"])
+@pytest.mark.parametrize("path", ["text", "binary"])
+def test_runner_routes_every_git_spelling_through_local_boundary(tmp_path, monkeypatch, program, path):
+    """A Git launch by absolute path or git.exe must not bypass the boundary."""
+    from coding_review_agent_loop import runner as runner_module
+    from coding_review_agent_loop.runner import Runner, run_binary_capture
+
+    routed: list[tuple[str, ...]] = []
+
+    def fake_local_command(args, *, environ=None, checkout=None):
+        routed.append(tuple(args))
+        return ["true"], dict(environ or {}), ()
+
+    monkeypatch.setattr(secure_git, "local_command", fake_local_command)
+    if path == "text":
+        Runner().run([program, "status", "--porcelain"], cwd=tmp_path)
+    else:
+        run_binary_capture([program, "status", "--porcelain"], cwd=tmp_path)
+    assert routed == [("status", "--porcelain")]
+    assert runner_module._is_git_launch(["gitk"]) is False

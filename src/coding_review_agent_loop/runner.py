@@ -116,6 +116,11 @@ class BinaryCommandResult:
     returncode: int | None = None
 
 
+def _is_git_launch(cmd: Sequence[str]) -> bool:
+    """Route any Git launch, bare or by path (including ``git.exe``), to the boundary."""
+    return bool(cmd) and os.path.basename(cmd[0].replace("\\", "/")).lower() in {"git", "git.exe"}
+
+
 def run_binary_capture(
     args: Sequence[str],
     *,
@@ -136,7 +141,7 @@ def run_binary_capture(
         raise AgentLoopError("Binary command timeout must be positive.")
     cmd = [str(value) for value in args]
     pass_fds: tuple[int, ...] = ()
-    protected_git = bool(cmd and cmd[0] == "git")
+    protected_git = _is_git_launch(cmd)
     if protected_git:
         from .secure_git import local_command
 
@@ -2040,7 +2045,7 @@ class Runner:
             )
 
         pass_fds: tuple[int, ...] = ()
-        protected_git = bool(cmd and cmd[0] == "git")
+        protected_git = _is_git_launch(cmd)
         if protected_git:
             from .secure_git import local_command
 
