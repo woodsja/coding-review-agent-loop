@@ -15132,7 +15132,37 @@ def _m1376_rebind_review(runner, comment_id, binding):
             mirrored["body"] = body
 
 
-@pytest.mark.parametrize("history", ["governing-board", "tampered"])
+_PLAN_1376 = "5e1f6a0c2b9d4e77"
+
+
+def _m1376_plan_bound(monkeypatch):
+    """Bind every run to an approved plan on issue 643, so fresh qualification
+    walks the PR-side authorization chain itself (#966 binding path)."""
+    from coding_review_agent_loop.github import IssueContext
+    from coding_review_agent_loop.round_state import ApprovedPlanContext
+
+    issue = IssueContext(
+        number=643, repo="OWNER/REPO", title="t", body="b", url=None, comments=(),
+    )
+    plan = ApprovedPlanContext(
+        canonical_text="plan", plan_hash=_PLAN_1376, plan_subject="subject",
+        availability="available",
+    )
+    monkeypatch.setattr(orchestrator, "get_issue_context", lambda *a, **k: issue)
+    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", lambda *a, **k: plan)
+    walks = []
+    real_verify = orchestrator.verify_managed_pr_plan_binding
+
+    def verify(*args, **kwargs):
+        walks.append(kwargs["live_head"])
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "verify_managed_pr_plan_binding", verify)
+    return {"issue_context": issue, "approved_plan_context": plan}, walks
+
+
+@pytest.mark.parametrize("history", ["governing-board", "tampered-before-rerun",
+                                     "tampered-before-qualification"])
 def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_transition(
     tmp_path, monkeypatch, history,
 ):
@@ -15145,9 +15175,12 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     continuity H2 -> H3 re-authenticates the whole authorization chain, whose
     ancestors and rejected-recovery review were recorded under A.  The new
     seat approves H3, and managed CI qualifies it under B.
-    When that historical review is rewritten to carry B's binding (the
-    current board, not the one that governed it), the rerun fails closed
-    before any agent, post, qualification or merge.
+    The plan-bound fresh qualification snapshot itself walks that chain.
+    When the historical review is rewritten to carry B's binding (the current
+    board, not the one that governed it) before the rerun, it fails closed
+    before any agent or post; rewritten after the final approval, the fresh
+    qualification snapshot refuses before any dispatch, qualification or
+    merge.
     """
     config_a = _m1376_seat_config(tmp_path, "gpt-a")
     runner = _RecoveryRoundCommentRunner1367(
@@ -15159,12 +15192,16 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     })
     root = publish_issue_created_authorization(
         runner, config=config_a,
-        handoff=replace(_authorization_handoff(), opening_override_nonce="nonce-643"),
-        metadata=metadata(),
+        handoff=replace(
+            _authorization_handoff(), opening_override_nonce="nonce-643",
+            approved_plan_hash=_PLAN_1376,
+        ),
+        metadata=metadata(), approved_plan_hash=_PLAN_1376,
     )
     events = []
     handoff_box = [root, False]
     _pr_loop_stubs_1367(monkeypatch, handoff_box, events)
+    plan_bound, walks = _m1376_plan_bound(monkeypatch)
     runner.codex_outputs = [_m1376_review(
         "gpt-a", state="blocking", summary="Needs a test.", blocking_items=["Add a regression test."],
     )]
@@ -15172,7 +15209,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     with pytest.raises(AgentLoopError, match="live remote target"):
         orchestrator.run_pr_loop(
             runner, pr_number=7, config=config_a, managed_ci_handoff=root,
-            managed_ci_issue_number=643,
+            managed_ci_issue_number=643, **plan_bound,
         )
     stranded = runner.pr_payload["headRefOid"]
     runner.rest_pr["head"]["sha"] = stranded
@@ -15186,6 +15223,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
             metadata(), head_branch="agent-loop/managed-643", head_sha=stranded,
             body=runner.rest_pr["body"],
         ),
+        approved_plan_hash=_PLAN_1376,
     )
     handoff_box[:] = [fresh, True]
     runner.codex_outputs = [_m1376_review(
@@ -15196,7 +15234,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     with pytest.raises(_ReviewReached):
         orchestrator.run_pr_loop(
             runner, pr_number=7, config=config_a, managed_ci_handoff=fresh,
-            managed_ci_issue_number=643,
+            managed_ci_issue_number=643, **plan_bound,
         )
     recovered = runner.pr_payload["headRefOid"]
     (first_grant,) = [r for _cid, r in _authorization_records(runner) if r.kind == "continuity"]
@@ -15228,15 +15266,15 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
             events.append(("manual-qualify", expected_head_sha)) or expected_head_sha
         ),
     )
-    if history == "tampered":
-        (review_id,) = [
-            comment["id"] for comment in runner.intent_comments
-            if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
-            and decoded["role"] == "reviewer"
-            and comment["id"] < fresh.authorization_comment_id
-        ]
-        from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
 
+    (review_id,) = [
+        comment["id"] for comment in runner.intent_comments
+        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        and decoded["role"] == "reviewer"
+        and comment["id"] < fresh.authorization_comment_id
+    ]
+    if history == "tampered-before-rerun":
         _m1376_rebind_review(runner, review_id, reviewer_seat_binding(config_b))
         commands, posted = len(runner.commands), len(runner.pr_payload["comments"])
         # Every reader of that history -- the PR lineage at startup and the
@@ -15244,7 +15282,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
         with pytest.raises(AgentLoopError, match="differs from the board that governs it"):
             orchestrator.run_pr_loop(
                 runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
-                managed_ci_issue_number=643,
+                managed_ci_issue_number=643, **plan_bound,
             )
         assert not any(
             command[:1] in (["codex"], ["claude"]) for command, _cwd in runner.commands[commands:]
@@ -15253,9 +15291,31 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
         assert events == []
         assert [r.kind for _cid, r in _authorization_records(runner)].count("continuity") == 1
         return
+    if history == "tampered-before-qualification":
+        # The history is rewritten after the new seat approves the final head,
+        # so only the fresh qualification snapshot can see it.
+        current_post = orchestrator.post_pr_comment
+
+        def post_then_tamper(*args, **kwargs):
+            result = current_post(*args, **kwargs)
+            body = str(kwargs.get("body") or "")
+            if body.startswith("**Review verdict:** Approved") and "Covered." in body:
+                _m1376_rebind_review(runner, review_id, reviewer_seat_binding(config_b))
+            return result
+
+        monkeypatch.setattr(orchestrator, "post_pr_comment", post_then_tamper)
+        with pytest.raises(AgentLoopError, match="No qualification or merge is permitted"):
+            orchestrator.run_pr_loop(
+                runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
+                managed_ci_issue_number=643, **plan_bound,
+            )
+        # The approval exists, but nothing was dispatched, qualified or merged.
+        assert events == []
+        assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+        return
     assert orchestrator.run_pr_loop(
         runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
-        managed_ci_issue_number=643,
+        managed_ci_issue_number=643, **plan_bound,
     ) == 0
     links = [c["body"] for c in runner.pr_payload["comments"]
              if c["body"].startswith("Reviewer board change recorded.")]
@@ -15271,15 +15331,11 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     # Managed CI qualified exactly the final head; this unprotected PR then
     # needs a manual merge, so no merge command runs.
     assert events == [("qualify", final), ("manual-qualify", final)]
-    # Strict qualification's chain check walks the terminal back to the root
-    # with B as the current board: the recovery link's review and every
-    # ancestor recorded under A validate against A, the board that governed
-    # them.  (This fixture carries no approved plan, so the loop itself never
-    # reaches this plan-binding walk; it is invoked here directly.)
-    managed_ci.verify_managed_pr_plan_binding(
-        runner, config=config_b, pr_number=7, issue_number=643, live_head=final,
-        approved_plan_hash=fresh.approved_plan_hash,
-    )
+    # The loop's own fresh qualification snapshot walked the plan-bound chain
+    # from the final head back to the root with B as the current board: the
+    # recovery link's review and every ancestor recorded under A validated
+    # against A, the board that governed them.
+    assert walks[-1] == final
     # An ordinary resume at the final head re-reads the lineage and the whole
     # chain, reuses the exact-head approval under B, posts no second link and
     # qualifies the same head again.
@@ -15287,7 +15343,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     events.clear()
     assert orchestrator.run_pr_loop(
         runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
-        managed_ci_issue_number=643,
+        managed_ci_issue_number=643, **plan_bound,
     ) == 0
     assert not any(command[:1] in (["codex"], ["claude"]) for command, _cwd in runner.commands[commands:])
     assert len([c for c in runner.pr_payload["comments"]

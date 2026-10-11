@@ -1726,6 +1726,118 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
     _qualify(runner, swapped)
 
 
+@pytest.mark.parametrize("activation", ["immediate", "after-crash"])
+@pytest.mark.parametrize("head", ["same-head", "new-head"])
+def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
+    tmp_path, monkeypatch, activation, head
+):
+    """Item-9.s1 (row pr-remove-with-blocker), driven by the live loop.
+
+    Round 1 freezes on Codex's (retained) and Gemini's (outgoing) evidence
+    requests.  A human signs the evidence; in the evidence pass each requester
+    resolves its own request and Gemini re-emits its request at the same head.
+    The anchor round's reconciliation clears both and the release (with its
+    clearances) is recorded, then the run stops.  After the board change --
+    immediate or recovered after a crash -- carry-over keeps that
+    post-reconciliation ledger as it is (D4b step 2), so the re-emission at
+    abc123 reopens nothing: no obligation, no second freeze, and the PR
+    qualifies.  (Rebuilding an unreconciled anchor round's requests against
+    the accumulated clearances is pinned by
+    test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearances.)  At a different head the retained requester's same request is a
+    new obligation and freezes that head.
+    """
+    from test_orchestrator_pr import _evidence_review, _signed
+
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_LIVE_LOG])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=[_LIVE_SUITE])],
+    )
+    original = make_config(tmp_path, reviewer=("codex", "gemini"))
+    with pytest.raises(orchestrator.HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=original)
+    runner.pr_payload["comments"].append(
+        _signed("Live suite and deploy log at abc123: 11 passed, deploy healthy.", 1)
+    )
+    resolved = [
+        {"item_id": item_id, "disposition": "resolved",
+         "note": "The signed output covers this exact head."}
+        for item_id in ("item-1", "item-2")
+    ]
+    runner.codex_outputs.append(_evidence_review(dispositions=resolved, hr=True))
+    runner.gemini_outputs.append(_evidence_review(
+        reviewer="Google Gemini", dispositions=resolved, evidence=[_LIVE_SUITE], hr=True,
+    ))
+    real_post = orchestrator.post_pr_comment
+
+    def stop_after_release(*args, **kwargs):
+        real_post(*args, **kwargs)
+        (record,) = _extract_round_metadata_records(
+            [SimpleNamespace(body=str(kwargs["body"]))], flow="pr"
+        ) or (None,)
+        if record is not None and record.metadata.phase == "evidence-release":
+            raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", stop_after_release)
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=original)
+    (release,) = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-release"]
+    assert release.evidence_release.reason == "evidence-cleared"
+    cleared = {identity for identity, at in release.evidence_clearances if at == "abc123"}
+    assert len(cleared) == 2
+    anchor = board_anchor(_records(runner))
+    assert release.round_number == anchor.round_number
+    assert any(
+        r.metadata.agent == "Gemini" and r.metadata.round_number == anchor.round_number
+        and r.metadata.dispositions and r.metadata.evidence_requests == (_LIVE_SUITE,)
+        for r in _records(runner)
+    )
+    swapped = make_config(tmp_path, reviewer=("codex", "antigravity"))
+    if head == "new-head":
+        runner.pr_payload["headRefOid"] = "def456"
+    if activation == "after-crash":
+        with monkeypatch.context() as patch:
+            _crash_after_link(patch)
+            with pytest.raises(KeyboardInterrupt):
+                run_pr_loop(runner, pr_number=77, config=swapped)
+    if head == "same-head":
+        runner.codex_outputs.append(_evidence_review(hr=True))
+        runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True))
+        start = len(runner.commands)
+        assert run_pr_loop(runner, pr_number=77, config=swapped) == 0
+        assert "gemini" not in _agents(runner, start)
+    else:
+        # At def456 Codex, the retained requester, asks for its evidence again.
+        runner.codex_outputs.append(_evidence_review(evidence=[_LIVE_LOG], hr=True))
+        runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True))
+        with pytest.raises(orchestrator.HumanDecisionRequiredError, match="frozen at head def456"):
+            run_pr_loop(runner, pr_number=77, config=swapped)
+    (payload,) = _link_payloads(runner)
+    assert payload["anchor_round"] == anchor.round_number and payload["advance"] is True
+    after = [r.metadata for r in _records(runner)
+             if r.metadata.round_number >= payload["effective_from_round"]]
+    assert after and all(
+        m.reviewer_board_change_digest == board_change_link_digest(payload) for m in after
+    )
+    # Nothing the anchor round cleared is carried as an obligation.
+    carried = [item for m in after if m.role == "reviewer" for item in m.prior_items
+               if item.obligation_kind and item.obligation_identity in cleared]
+    assert carried == []
+    freezes = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-freeze"]
+    if head == "same-head":
+        assert [m.subject for m in freezes] == ["abc123"]
+        assert not any(m.phase == "evidence-response" for m in after)
+        _qualify(runner, swapped)
+    else:
+        assert [m.subject for m in freezes] == ["abc123", "def456"]
+        owed = [item for item in freezes[-1].prior_items if item.obligation_kind]
+        # The same obligation identity, cleared only at abc123, is owed at def456.
+        assert [(item.text, item.reviewer, item.candidate_head_sha) for item in owed] == [
+            (_LIVE_LOG, "Codex", "def456")
+        ]
+        assert owed[0].obligation_identity in cleared
+
+
 def _staged_panel_history(tmp_path, monkeypatch):
     """Codex (primary) approves, the panel opens, Gemini raises item-1; then stop."""
     from test_orchestrator_pr import _staged_config, _staged_review
