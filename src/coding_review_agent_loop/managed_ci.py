@@ -10,7 +10,7 @@ import secrets
 import shlex
 import threading
 import time
-from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from dataclasses import dataclass, replace
@@ -2270,6 +2270,13 @@ def _ordinary_continuity_round_metadata_is_valid(
         selected.append((comment_id, metadata))
     if len(selected) != len(wanted):
         return False
+    # Every referenced ancestor record carries its governing board's binding
+    # once the PR has recorded board changes (#1376).
+    if _historical_bindings_match(
+        comments, [comment_id for comment_id, _metadata in selected], by_index,
+        actor_id=authorization.actor_id,
+    ) is False:
+        return False
     coders = [
         item for item in selected
         if item[1]["role"] == "coder" and item[1]["subject"] == authorization.head_sha
@@ -2740,6 +2747,37 @@ def _seat_binding_key(binding: Mapping[str, object] | None) -> str:
     return json.dumps(binding, sort_keys=True, separators=(",", ":"))
 
 
+def _historical_bindings_match(
+    comments: list[dict[str, object]],
+    comment_ids: Sequence[int],
+    by_index: Mapping[int, Mapping[str, object]],
+    *,
+    actor_id: int | None,
+) -> bool | None:
+    """Whether every listed round record carries its governing board's binding.
+
+    ``None`` when the PR carries no board-change record (#1376), so callers
+    keep their current-board rule.  Otherwise each record must carry a
+    binding its governing lineage element allows; any lineage defect fails.
+    """
+    from .board_change import lineage_binding_resolver
+
+    resolver = lineage_binding_resolver(comments, actor_id=actor_id)
+    if resolver is None:
+        return None
+    wanted = set(comment_ids)
+    for index, comment in enumerate(comments):
+        if comment.get("id") not in wanted:
+            continue
+        metadata = by_index.get(index)
+        if metadata is None or not metadata.get("seat_binding_valid", False):
+            return False
+        allowed = {_seat_binding_key(binding) for binding in resolver(index, metadata["round_number"])}
+        if _seat_binding_key(metadata.get("seat_binding")) not in allowed:
+            return False
+    return True
+
+
 def _rejected_recovery_round_ids(
     comments: list[dict[str, object]],
     by_index: Mapping[int, Mapping[str, object]],
@@ -2869,15 +2907,17 @@ def _rejected_recovery_round_ids(
     if any(not metadata.get("seat_binding_valid", False) for _id, metadata in reviewers):
         return None
     bindings = {_seat_binding_key(metadata.get("seat_binding")) for _id, metadata in reviewers}
-    # Historical reviews are judged by the board that governed their round,
-    # never the current one: a recorded board change (#1376) may have rebound
-    # the board since.  Without any change record this is the current binding.
-    from .board_change import governing_seat_binding_from_comments
-
-    expected_seat_binding = governing_seat_binding_from_comments(
-        comments, round_number=round_number, actor_id=actor_id, current=expected_seat_binding,
+    # Historical reviews are judged by the board that governed their round and
+    # comment position in the validated lineage, never the current one: a
+    # recorded board change (#1376) may have rebound the board since.
+    historical = _historical_bindings_match(
+        comments, [comment_id for comment_id, _metadata in reviewers],
+        by_index, actor_id=actor_id,
     )
-    if expected_seat_binding is not None:
+    if historical is not None:
+        if not historical:
+            return None
+    elif expected_seat_binding is not None:
         if bindings != {_seat_binding_key(expected_seat_binding)}:
             return None
     elif len(bindings) != 1:

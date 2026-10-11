@@ -14634,28 +14634,32 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
         _plan_binding_1367(published, config)
 
 
+_NO_OVERRIDE_1376 = object()
+
+
 def _board_link_comment_1376(comment_id, old_binding, new_binding, *, effective_round=2,
-                             login="agent-loop", user_id=1):
+                             login="agent-loop", user_id=1, recorded_old=_NO_OVERRIDE_1376):
     """An orchestrator board-change link rebinding seat ``sol`` (#1376)."""
     from coding_review_agent_loop.board_change import (
         BoardIdentity,
         board_change_link_payload,
         render_board_change_link,
     )
+    from coding_review_agent_loop.review_scheduling import normalize_broad_rules
     from coding_review_agent_loop.reviewer_floor import BoardSeat
 
     def identity(binding):
         (entry,) = binding["seats"]
         return BoardIdentity(
-            policy="all-reviewers", primary=None, broad_rules=(),
+            policy="all-reviewers", primary=None, broad_rules=normalize_broad_rules(None),
             seats=(BoardSeat("sol", entry["backend"], tuple(entry["model_chain"]), None),),
         )
 
     old, new = identity(old_binding), identity(new_binding)
     payload = board_change_link_payload(
         pr_number=7, root=old, predecessor=old.digest, old_board=old, new_board=new,
-        old_seat_binding=old_binding, binding_init={},
-        anchor_round=effective_round - 1, advance=True,
+        old_seat_binding=old_binding if recorded_old is _NO_OVERRIDE_1376 else recorded_old,
+        binding_init={}, anchor_round=effective_round - 1, advance=True,
     )
     assert payload["new_seat_binding"] == new_binding
     return {
@@ -14665,15 +14669,20 @@ def _board_link_comment_1376(comment_id, old_binding, new_binding, *, effective_
     }
 
 
-@pytest.mark.parametrize("history", ["governing-board", "tampered", "foreign-link"])
+@pytest.mark.parametrize("history", [
+    "governing-board", "tampered", "foreign-link", "tampered-old-binding", "null-old-binding",
+    "ordinary-ancestor", "ordinary-ancestor-tampered",
+])
 def test_m1376_historical_recovery_review_uses_the_board_that_governed_it(tmp_path, history):
     """Row pr-managed-ci-historical-binding: board A history, a link to board B.
 
-    The blocking review of the rejected-coder recovery was bound to board A;
+    The blocking review of the rejected-coder recovery (and, with an ordinary
+    continuity ancestor, that ancestor's round records) were bound to board A;
     a later board-change link rebound the seat to board B.  Historical records
     are validated against the binding of the lineage element that governed
-    their round, never the current board; current-board checks use B.  A
-    tampered historical binding, or a link no orchestrator wrote, fails closed.
+    them, never the current board; current-board checks use B.  A tampered
+    historical binding, a link that misstates or nulls its previous binding,
+    or a link no orchestrator wrote fails closed.
     """
     board_a = {"version": 1, "seats": [
         {"id": "sol", "backend": "codex", "model_chain": ["gpt-a"], "effort": None},
@@ -14684,19 +14693,43 @@ def test_m1376_historical_recovery_review_uses_the_board_that_governed_it(tmp_pa
     tampered = {"version": 1, "seats": [
         {"id": "sol", "backend": "codex", "model_chain": ["gpt-z"], "effort": None},
     ]}
-    chain, _round = _recovery_chain_1367(
-        seat_binding=tampered if history == "tampered" else board_a
+    ancestor = history.startswith("ordinary-ancestor")
+    chain, round_number = _recovery_chain_1367(
+        continuity_root=ancestor,
+        seat_binding=tampered if history == "tampered" else board_a,
     )
+    # Every round record of the named board carries its seat binding.
+    rebinds = [
+        ("first-dispatch", 51, _dispatch_meta_1367(round_number, attempt=1, head=_H0_1367)),
+        ("rejected", 52, _rejected_meta_1367(round_number)),
+        ("dispatch", 61, _dispatch_meta_1367(round_number)),
+        ("coder", 62, _coder_meta_1367(round_number + 1)),
+    ]
+    if ancestor:
+        rebinds += [
+            ("origin-review", 31, _review_meta_1367(subject=_ORIGIN_1367)),
+            ("origin-coder", 32, _coder_meta_1367(2, _H0_1367)),
+        ]
+    for key, comment_id, metadata in rebinds:
+        binding = tampered if (history, key) == ("ordinary-ancestor-tampered", "origin-review") else board_a
+        chain[key] = _meta_comment_1367(comment_id, replace(metadata, seat_binding=binding))
+    # The board change came after the recovery: those rounds stay under A.
+    link_kwargs = {}
+    if history == "foreign-link":
+        link_kwargs = {"login": "mallory", "user_id": 9}
+    elif history == "tampered-old-binding":
+        link_kwargs = {"recorded_old": tampered}
+    elif history == "null-old-binding":
+        link_kwargs = {"recorded_old": None}
     chain["link"] = _board_link_comment_1376(
-        45, board_a, board_b,
-        **({"login": "mallory", "user_id": 9} if history == "foreign-link" else {}),
+        66, board_a, board_b, effective_round=round_number + 2, **link_kwargs,
     )
     config = _config_1367(tmp_path, pr_seat_binding_override=board_b)
     handoff = _fresh_handoff_1367()
     runner = _runner_1367(chain)
     published = _runner_1367(_published_chain_1367(chain))
-    if history == "governing-board":
-        assert _correlate_1367(runner, config, handoff) == _RECOVERY_IDS_1367
+    if history in {"governing-board", "ordinary-ancestor"}:
+        assert _correlate_1367(runner, config, handoff, round_number=round_number) == _RECOVERY_IDS_1367
         publish_issue_created_continuity_authorization(
             runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
             new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
@@ -14706,8 +14739,9 @@ def test_m1376_historical_recovery_review_uses_the_board_that_governed_it(tmp_pa
         assert audit is not None and audit[0] == 70
         _plan_binding_1367(published, config)
         return
-    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
-        _correlate_1367(runner, config, handoff)
+    if not history.startswith("ordinary-ancestor"):
+        with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+            _correlate_1367(runner, config, handoff, round_number=round_number)
     assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
     with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
         _plan_binding_1367(published, config)

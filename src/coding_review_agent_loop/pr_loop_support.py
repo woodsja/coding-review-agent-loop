@@ -2858,7 +2858,8 @@ def _pr_amendment_start_round(
     from .board_change import board_reentry_round
 
     return board_reentry_round(
-        pr_context.comments, resumed.round_number if resumed is not None else None
+        pr_context.comments, resumed.round_number if resumed is not None else None,
+        signed_amendment=True,
     )
 
 

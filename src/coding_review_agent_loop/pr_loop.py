@@ -46,6 +46,7 @@ from .plan_verification import (
 )
 from .reviewer_floor import board_floor_enabled
 from .board_change import (
+    pre_epoch_panel_items,
     board_reentry_round,
     name_agents,
     identity_agents,
@@ -529,7 +530,8 @@ def _enforce_pr_board_floor(
             ),
         )
         return board_reentry_round(
-            pr_context.comments, resumed.round_number if resumed is not None else None
+            pr_context.comments, resumed.round_number if resumed is not None else None,
+            signed_amendment=True,
         )
 
     resolve_pr_board_state(
@@ -2419,6 +2421,7 @@ def run_pr_loop(
         )
         pr_fresh_from_rounds = pr_contract_lineage.fresh_from_rounds
         pr_primary_epoch_round = pr_contract_lineage.primary_epoch_round
+        pr_pre_epoch_panel_items = pre_epoch_panel_items(startup_records, pr_contract_lineage)
         if plan_handoff_board is not None and plan_handoff_board.changed:
             # One orchestrator-written audit record per derived board change,
             # before round 1; its digest makes every rerun a no-op.
@@ -2500,14 +2503,16 @@ def run_pr_loop(
                 reconciliation_mode=pr_reconciliation_mode,
             )
             if (
-                resumed_round is None
+                (resumed_round is None or pr_contract_lineage.pending_amendments)
                 and startup_records
                 and comments_bear_board_change_links(initial_pr_context.comments)
             ):
-                # The highest recorded round holds no record by a current seat
-                # (a recorded board change removed them): re-enter after it with
-                # its records collected under every seat the lineage has known,
-                # instead of restarting at round 1.
+                # With link history, re-enter after the highest recorded round
+                # when it holds no record by a current seat (a recorded board
+                # change removed them), or when a pending signed amendment takes
+                # effect (every element takes effect after the one before it).
+                # Its records are collected under every seat the lineage has
+                # known, instead of restarting at round 1.
                 anchor = board_anchor(startup_records)
                 pr_board_anchor_round = _resume_pr_round_admitted(
                     runner,
@@ -2546,7 +2551,6 @@ def run_pr_loop(
                 reconciliation_mode=pr_reconciliation_mode,
                 evidence_clearances=pr_board_anchor_round.evidence_clearances,
                 next_item_number=pr_board_anchor_round.next_unresolved_item_number,
-                board_seats=tuple(pr_contract_lineage.last_seen),
             )
             resumed_round = dataclasses_replace(
                 pr_board_anchor_round,
@@ -4058,6 +4062,7 @@ def run_pr_loop(
                         pr_ledger_view(prior_unresolved_items),
                         epoch_round=pr_primary_epoch_round,
                         primary=scheduler_contract.primary_reviewer,
+                        eligible=pr_pre_epoch_panel_items,
                     ),
                 )
                 try:
@@ -5534,6 +5539,7 @@ def run_pr_loop(
                     pr_ledger_view(unresolved_items),
                     epoch_round=pr_primary_epoch_round,
                     primary=scheduler_contract.primary_reviewer,
+                    eligible=pr_pre_epoch_panel_items,
                 ))
                 if scheduler_capabilities.requires_primary else set()
             )

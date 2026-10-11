@@ -21,6 +21,7 @@ from agent_loop_helpers import (
 from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
 from coding_review_agent_loop.board_change import (
     BOARD_CHANGE_LINK_HEADING,
+    BOARD_CHANGE_LINK_MARKER,
     BOARD_CHANGE_LINK_RE,
     BoardIdentity,
     board_anchor,
@@ -391,7 +392,10 @@ def test_reviewer_text_naming_the_link_marker_is_neutralized(tmp_path):
     assert _links(runner) == []
 
 
-@pytest.mark.parametrize("corruption", ["foreign-author", "malformed", "broken-predecessor", "wrong-old-board"])
+@pytest.mark.parametrize("corruption", [
+    "foreign-author", "malformed", "broken-predecessor", "wrong-old-board",
+    "empty-payload", "illegal-characters", "foreign-illegal-characters", "wrong-old-seat-binding",
+])
 def test_inconsistent_link_records_fail_closed_at_startup_and_qualification(tmp_path, corruption):
     """Rows pr-qualification-forged-record and pr-link-marker-agent-forgery."""
     runner, config = _approved_two_reviewer_run(tmp_path)
@@ -405,9 +409,22 @@ def test_inconsistent_link_records_fail_closed_at_startup_and_qualification(tmp_
         _append(runner, body.replace(match.group("payload"), bad), author_id=_ACTOR_ID)
     elif corruption == "broken-predecessor":
         _append(runner, _forged_link_body(runner, smaller, predecessor="0" * 64), author_id=_ACTOR_ID)
-    else:
+    elif corruption == "wrong-old-board":
         wrong = identity_from_config(make_config(tmp_path, reviewer=("gemini",))).payload()
         _append(runner, _forged_link_body(runner, smaller, old_board=wrong), author_id=_ACTOR_ID)
+    elif corruption == "wrong-old-seat-binding":
+        forged_binding = {"version": 1, "seats": [
+            {"id": "x", "backend": "codex", "model_chain": ["m"], "effort": None},
+        ]}
+        _append(runner, _forged_link_body(runner, smaller, old_seat_binding=forged_binding),
+                author_id=_ACTOR_ID)
+    else:
+        # Record-shaped spans the strict grammar cannot match are still records.
+        payload = {"empty-payload": "", "illegal-characters": "!!not*base64!!",
+                   "foreign-illegal-characters": "!!not*base64!!"}[corruption]
+        author = 9 if corruption.startswith("foreign") else _ACTOR_ID
+        _append(runner, f"Board change.\n\n<!-- {BOARD_CHANGE_LINK_MARKER}: {payload} -->",
+                login="mallory" if author == 9 else "operator", author_id=author)
     comments = len(runner.pr_payload["comments"])
     start = len(runner.commands)
     with pytest.raises(AgentLoopError, match="lineage is inconsistent|not authored"):
@@ -802,10 +819,11 @@ def _record_body(round_number, root, identity, *, change=None, amendment=None,
     )
 
 
-def _link_body(root, predecessor, old, new, *, anchor, advance, inits=None):
+def _link_body(root, predecessor, old, new, *, anchor, advance, inits=None, old_base=None):
+    """``old_base`` is the predecessor segment's base board (its seat binding)."""
     payload = board_change_link_payload(
         pr_number=77, root=root, predecessor=predecessor, old_board=old, new_board=new,
-        old_seat_binding=old.seat_binding(), binding_init=inits or {},
+        old_seat_binding=(old_base or old).seat_binding(), binding_init=inits or {},
         anchor_round=anchor, advance=advance,
     )
     return str(render_board_change_link(payload)), board_change_link_digest(payload)
@@ -1043,37 +1061,31 @@ def test_pending_link_activation_follows_durable_history(tmp_path, state):
 # --- pr-primary-change -------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("change", ["new-primary", "primary-model", "primary-effort"])
 def test_primary_change_restarts_the_primary_phase_and_carries_secondary_obligations(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, change
 ):
-    """Row pr-primary-change: the panel's open item survives the restarted primary phase."""
+    """Row pr-primary-change: a new primary, or a model or effort change on the
+    same primary seat, restarts the primary phase; the panel's open item
+    survives it and is dispositioned by its owner when the panel reopens."""
     from test_orchestrator_pr import _audit_phases, _staged_config, _staged_review
-    from coding_review_agent_loop.review_scheduling import TransitionClassification
 
-    monkeypatch.setattr(
-        orchestrator, "_observe_pr_transition",
-        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
-    )
-    runner = FakeRunner(
-        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
-        gemini_outputs=[_staged_review(
-            reviewer="Google Gemini", state="blocking",
-            blocking_items=[{"text": "panel gap", "fix_scope": ["src/worker.py"]}],
-        )],
-        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
-        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
-    )
-    # Codex (primary) approves, the panel opens, Gemini raises item-1, the
-    # coder answers, and the next round runs out of scripted output.
-    with pytest.raises(AgentLoopError):
-        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, pre_review_tests=False))
+    runner = _staged_panel_history(tmp_path, monkeypatch)
     assert _agents(runner)[:3] == ["codex", "gemini", "agy"]
-    changed = _staged_config(tmp_path, primary_reviewer="antigravity", pre_review_tests=False)
+    overrides = {
+        "new-primary": {"primary_reviewer": "antigravity"},
+        "primary-model": {"reviewer_codex_model": "gpt-primary-next"},
+        "primary-effort": {"reviewer_codex_reasoning_effort": "high"},
+    }[change]
+    changed = _staged_config(tmp_path, pre_review_tests=False, **overrides)
+    primary, primary_agent = (
+        ("Antigravity", "agy") if change == "new-primary" else ("Codex", "codex")
+    )
     # A non-owner's disposition is a note under owner-scoped reconciliation:
     # item-1 stays pending on its owner, Gemini.
     carried = [{"item_id": "item-1", "disposition": "resolved",
                 "note": "Looks addressed to me; Gemini owns the finding."}]
-    # Round 4: the new primary alone; round 5: the reopened panel at the same
+    # The restarted primary alone first, then the reopened panel at the same
     # head, where Gemini dispositions its own carried finding.
     runner.antigravity_outputs.append(_staged_review(reviewer="Antigravity", dispositions=carried))
     runner.gemini_outputs.append(_staged_review(
@@ -1084,19 +1096,23 @@ def test_primary_change_restarts_the_primary_phase_and_carries_secondary_obligat
     start = len(runner.commands)
     assert run_pr_loop(runner, pr_number=77, config=changed) == 0
     (payload,) = _link_payloads(runner)
-    assert (payload["old_board"]["primary"], payload["new_board"]["primary"]) == ("Codex", "Antigravity")
-    # The new primary runs alone first -- no pre-panel stop for the carried
-    # secondary obligation -- then the panel reopens and Gemini dispositions it.
+    assert payload["new_board"]["primary"] == primary
+    if change == "new-primary":
+        assert payload["old_board"]["primary"] == "Codex"
+    else:
+        assert payload["rebound"] == ["Codex"]
+    # The restarted primary runs alone first -- no pre-panel stop for the
+    # carried secondary obligation -- then the panel reopens.
     agents = _agents(runner, start)
-    assert agents[0] == "agy" and "gemini" in agents[1:] and "claude" not in agents
+    assert agents[0] == primary_agent and "gemini" in agents[1:] and "claude" not in agents
     phases = [phase for phase, _head in _audit_phases(runner)][phases_before:]
     assert phases[0] == "primary" and "secondary-audit" in phases
     restarted = [
         r.metadata for r in _records(runner)
-        if r.metadata.role == "reviewer" and r.metadata.agent == "Antigravity"
+        if r.metadata.role == "reviewer" and r.metadata.agent == primary
         and r.metadata.reviewer_board_change_digest == board_change_link_digest(payload)
     ]
-    # item-1 was still pending on Gemini when the new primary reviewed.
+    # item-1 was still pending on Gemini when the restarted primary reviewed.
     assert restarted and [item.item_id for item in restarted[0].prior_items] == ["item-1"]
     assert not any("pre-panel safety" in c for c in runner.comments)
     _qualify(runner, changed)
@@ -1193,7 +1209,7 @@ def test_signed_restoration_after_a_link_only_restores_seats_signed_off_since_it
     # the link cannot bring it back.
     removal = _signed_body(("a", "b", "c"), removed=("c",), round_number=2)
     link, _ = _link_body(root, _amendment_digest(removal), root.with_seats(root.seats[:2]), abd,
-                         anchor=2, advance=True)
+                         anchor=2, advance=True, old_base=root)
     restore_c = _signed_body(("a", "b", "d"), restored=("c",), round_number=4)
     history = [
         _record_body(1, root, root),
@@ -1431,3 +1447,533 @@ def test_signed_amendment_posted_during_the_run_blocks_qualification(tmp_path):
     ).replace('"seat-unavailable"', '"backend-unavailable"'))
     with pytest.raises(AgentLoopError, match="No qualification or merge is permitted"):
         _qualify(runner, config)
+
+
+# --- carried-finding provenance (D4b) ---------------------------------------------------
+
+
+def _review_record(index, agent, new_items, *, round_number=2):
+    return SimpleNamespace(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="pr", role="reviewer", agent=agent, round_number=round_number,
+            subject="abc123", state="blocking", new_items=tuple(new_items),
+        ),
+    )
+
+
+@pytest.mark.parametrize("case", [
+    "unknown-owner", "other-seat-owner", "record-collision", "ledger-collision",
+])
+def test_carry_over_refuses_unverifiable_or_conflicting_findings(case):
+    """Row pr-remove-with-blocker: the publisher must own its findings, and a
+    repeated item ID must carry identical content wherever it repeats."""
+    from coding_review_agent_loop.board_change import carry_over_anchor_round
+
+    prior = ()
+    if case == "unknown-owner":
+        reviews = [_review_record(1, "Gemini", [_item(2, "Somebody Else")])]
+    elif case == "other-seat-owner":
+        reviews = [_review_record(1, "Gemini", [_item(2, "Codex")])]
+    elif case == "record-collision":
+        first = _item(2, "Gemini")
+        reviews = [
+            _review_record(1, "Gemini", [first]),
+            _review_record(2, "Gemini", [dataclasses.replace(first, text="another claim")]),
+        ]
+    else:
+        prior = (_item(2, "Gemini"),)
+        reviews = [_review_record(1, "Gemini", [dataclasses.replace(prior[0], text="changed")])]
+    with pytest.raises(AgentLoopError, match="cannot verify the owner|conflicting content"):
+        carry_over_anchor_round(
+            prior_items=prior, completed_reviews=reviews, settled_new_items=(),
+            records=reviews, round_number=2, reconciliation_mode="aggregate",
+            evidence_clearances=(), next_item_number=3,
+        )
+
+
+# --- signed original board as the legacy root (D1a) ---------------------------------------
+
+
+@pytest.mark.parametrize("shape", ["coder-only", "never-published", "non-tail"])
+@pytest.mark.parametrize("floor", ["reviewers", "providers"])
+@pytest.mark.parametrize("flags", ["reduced", "original"])
+def test_signed_original_board_is_the_legacy_plain_root(tmp_path, shape, floor, flags):
+    """Rows pr-floor-unsigned-vs-signed and pr-legacy-root-anchor.
+
+    Plain legacy history with signed amendments takes the earliest signed
+    original board as its root, so a reduction of a never-published seat or a
+    non-tail seat resolves in both flag forms and for both floor measures.
+    """
+    if shape == "non-tail":
+        board = ("Codex", "Gemini", "Antigravity")
+        history = [_legacy("reviewer", name, 1, subject="abc000", state="approved") for name in board]
+        removed, kept = ("Gemini",), ("codex", "antigravity")
+    else:
+        board = ("Codex", "Gemini")
+        history = (
+            [] if shape == "coder-only"
+            else [_legacy("reviewer", "Codex", 1, subject="abc000", state="approved")]
+        )
+        removed, kept = ("Gemini",), ("codex",)
+    history.append(_legacy("coder", "Claude", 2 if history else 1))
+    reentry = 2 if len(history) > 1 else 1
+    runner = _legacy_runner(history)
+    minimum = len(board)
+    floor_kwargs = (
+        {"min_reviewers": minimum} if floor == "reviewers" else {"min_distinct_providers": minimum}
+    )
+    plain = {"Codex": "codex", "Gemini": "gemini", "Antigravity": "antigravity"}
+    original = make_config(tmp_path, reviewer=tuple(plain[name] for name in board), **floor_kwargs)
+    reduced = make_config(tmp_path, reviewer=kept, **floor_kwargs)
+    comments = len(runner.pr_payload["comments"])
+    with pytest.raises(AgentLoopError, match="below the floor"):
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert len(runner.pr_payload["comments"]) == comments and _agents(runner) == []
+    _append(runner, _signed_body(board, removed=removed, round_number=reentry))
+    runner.codex_outputs.append(structured_pr_review())
+    runner.antigravity_outputs.append(structured_pr_review(reviewer="Antigravity"))
+    config = reduced if flags == "reduced" else original
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert "gemini" not in _agents(runner) and _links(runner) == []
+    upgraded = [r.metadata for r in _records(runner) if r.metadata.pr_board_root is not None]
+    assert upgraded and all(
+        BoardIdentity.from_payload(m.pr_board_root).names == board for m in upgraded
+    )
+    _qualify(runner, reduced)
+
+
+# --- evidence requests across a board change (item-1, row pr-remove-with-blocker) ----------
+
+
+_DEPLOY_LOG = "Attach the production deploy log for this head."
+_CANARY = "Attach the canary dashboard for this head."
+
+
+def _evidence_history(release_head):
+    """Gemini's deploy-log request was cleared at ``release_head`` by a durable
+    release; in round 2 Gemini (outgoing) re-emits it and Codex (retained)
+    emits a new request, at head abc123."""
+    from coding_review_agent_loop.round_state import EvidenceReleaseRecord
+    from coding_review_agent_loop.unresolved_items import evidence_obligation_identity
+
+    release = _attach_round_metadata(
+        "## Exact-head evidence accepted\n\n-- coding-review-agent-loop",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1,
+            subject="abc123", state="blocking", phase="evidence-release",
+            evidence_release=EvidenceReleaseRecord(
+                released_head="abc123", reason="evidence-cleared",
+                signed_requirement_ids_surfaced=(), allowed_rounds=5,
+                watch_failure_extension_used=False, watch_head_extension_used=False,
+            ),
+            evidence_clearances=((evidence_obligation_identity(_DEPLOY_LOG, "Gemini"), release_head),),
+        ),
+    )
+    return [
+        _legacy("reviewer", "Codex", 1, state="approved"),
+        _legacy("reviewer", "Gemini", 1, state="approved", evidence_requests=(_DEPLOY_LOG,)),
+        release,
+        _legacy("reviewer", "Codex", 2, state="approved", evidence_requests=(_CANARY,)),
+        _legacy("reviewer", "Gemini", 2, state="approved", evidence_requests=(_DEPLOY_LOG,)),
+    ]
+
+
+@pytest.mark.parametrize("activation", ["immediate", "after-crash"])
+@pytest.mark.parametrize("cleared_at", ["same-head", "other-head"])
+def test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearances(
+    tmp_path, monkeypatch, activation, cleared_at
+):
+    """Item-1: durable clearances accumulated before the anchor round are kept.
+
+    The outgoing reviewer's request cleared at this head stays cleared; at
+    another head it is a new obligation.  The retained reviewer's request is
+    rebuilt.  Open evidence obligations block qualification.
+    """
+    runner = _legacy_runner(_evidence_history("abc123" if cleared_at == "same-head" else "f" * 40))
+    swapped = make_config(tmp_path, reviewer=("codex", "antigravity"))
+    if activation == "after-crash":
+        with monkeypatch.context() as patch:
+            _crash_after_link(patch)
+            with pytest.raises(KeyboardInterrupt):
+                run_pr_loop(runner, pr_number=77, config=swapped)
+    # Every reviewer dispositions the carried evidence obligations (item-1,
+    # and item-2 at another head); on a human-only evidence obligation that is
+    # only a note, so the obligation stays owed.
+    owed = [
+        {"item_id": item_id, "disposition": "resolved",
+         "note": "The code looks right; the human evidence is still owed."}
+        for item_id in (("item-1", "item-2") if cleared_at == "other-head" else ("item-1",))
+    ]
+    runner.codex_outputs.append(structured_pr_review(prior_item_dispositions=owed))
+    runner.antigravity_outputs.append(
+        structured_pr_review(reviewer="Antigravity", prior_item_dispositions=owed)
+    )
+    try:
+        outcome = run_pr_loop(runner, pr_number=77, config=swapped)
+    except AgentLoopError:
+        outcome = None
+    (payload,) = _link_payloads(runner)
+    assert payload["effective_from_round"] == 3
+    round_three = [
+        r.metadata for r in _records(runner)
+        if r.metadata.round_number == 3 and r.metadata.role == "reviewer"
+    ]
+    assert round_three
+    texts = {item.text for item in round_three[0].prior_items if item.obligation_kind}
+    assert _CANARY in texts
+    assert (_DEPLOY_LOG in texts) is (cleared_at == "other-head")
+    # Human-only evidence is still owed: the run neither approves nor merges.
+    assert outcome != 0
+    assert not any(c.startswith("PR #77 approved") for c in runner.comments)
+
+
+def _staged_panel_history(tmp_path, monkeypatch):
+    """Codex (primary) approves, the panel opens, Gemini raises item-1; then stop."""
+    from test_orchestrator_pr import _staged_config, _staged_review
+    from coding_review_agent_loop.review_scheduling import TransitionClassification
+
+    monkeypatch.setattr(
+        orchestrator, "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    runner = FakeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(
+            reviewer="Google Gemini", state="blocking",
+            blocking_items=[{"text": "panel gap", "fix_scope": ["src/worker.py"]}],
+        )],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, pre_review_tests=False))
+    return runner
+
+
+@pytest.mark.parametrize("opening", ["qualified", "never-opened"])
+def test_carried_obligations_require_a_qualified_pre_epoch_opening(tmp_path, monkeypatch, opening):
+    """Item-4 (row pr-primary-change): only items created under a qualified
+    panel opening before the epoch are exempt from the pre-panel stop."""
+    from test_orchestrator_pr import _staged_config
+    from coding_review_agent_loop.board_change import (
+        carried_secondary_obligations,
+        pre_epoch_panel_items,
+    )
+
+    runner = _staged_panel_history(tmp_path, monkeypatch)
+    changed = _staged_config(tmp_path, primary_reviewer="antigravity", pre_review_tests=False)
+    lineage = _board_state(runner, changed).lineage
+    assert lineage.primary_epoch_round == 4
+    records = _records(runner)
+    if opening == "never-opened":
+        # The same secondary-owned item without the qualified opening record.
+        records = [
+            r for r in records
+            if not (r.metadata.scheduler_phase == "secondary-audit" and r.metadata.role == "summary")
+        ]
+    eligible = pre_epoch_panel_items(records, lineage)
+    ledger = [item for r in records for item in r.metadata.prior_items][-1:]
+    carried = carried_secondary_obligations(
+        ledger, epoch_round=4, primary="Antigravity", eligible=eligible,
+    )
+    assert carried == (("item-1",) if opening == "qualified" else ())
+
+
+def test_unqualified_secondary_item_still_stops_after_a_primary_change(tmp_path, monkeypatch):
+    """Item-4: a secondary-owned item that never had a qualified opening keeps
+    the pre-panel safety stop, before any reviewer runs."""
+    from test_orchestrator_pr import _rewrite_pr_metadata, _staged_config
+
+    runner = _staged_panel_history(tmp_path, monkeypatch)
+
+    def drop_opening(payload):
+        # Demote the secondary-audit decision so history holds no qualified opening.
+        if payload.get("scheduler_phase") == "secondary-audit":
+            return {**payload, "scheduler_phase": "primary"}
+        return None
+
+    _rewrite_pr_metadata(runner, drop_opening)
+    changed = _staged_config(tmp_path, primary_reviewer="antigravity", pre_review_tests=False)
+    start = len(runner.commands)
+    with pytest.raises(orchestrator.PrePanelSafetyError, match="item-1"):
+        run_pr_loop(runner, pr_number=77, config=changed)
+    assert _agents(runner, start) == []
+
+
+def test_co_owned_pre_epoch_item_is_carried_while_an_owner_is_pending():
+    """Row pr-primary-change: co-owned items follow the carry rule per owner."""
+    from coding_review_agent_loop.board_change import carried_secondary_obligations
+
+    def co_owned(gemini_state):
+        return _item(
+            1, "Gemini", owners=("Gemini", "Antigravity"),
+            states=(("Gemini", gemini_state), ("Antigravity", "cleared")),
+        )
+
+    assert carried_secondary_obligations(
+        [co_owned("pending")], epoch_round=4, primary="Codex", eligible=frozenset({"item-1"}),
+    ) == ("item-1",)
+    assert carried_secondary_obligations(
+        [co_owned("cleared")], epoch_round=4, primary="Codex", eligible=frozenset({"item-1"}),
+    ) == ()
+
+
+# --- prelaunch-only anchors and successive changes (row pr-link-crash-recovery) -------------
+
+
+def _selective_prelaunch_history():
+    """Round 1 reviewed at abc123 (Gemini raised item-1); round 2 holds only its
+    scheduler-prelaunch record (the run stopped right after posting it)."""
+    from coding_review_agent_loop.review_scheduling import make_contract
+
+    contract = make_contract(("Codex", "Gemini"), "selective-intermediate", None)
+    item = _item(1, "Gemini")
+
+    def prelaunch(round_number, prior):
+        return _legacy(
+            "summary", "Orchestrator", round_number, phase="scheduler-prelaunch",
+            prior_items=prior, scheduler_contract=contract.as_dict(),
+            scheduler_previous_sha=None, scheduler_current_sha="abc123",
+            scheduler_obligation_digest="0" * 16, scheduler_selected_reviewers=("Codex", "Gemini"),
+            scheduler_reasons=("full board",), scheduler_final_sweep=False,
+            scheduler_force_full=False, scheduler_calls_avoided=0,
+        )
+
+    return [
+        prelaunch(1, ()),
+        _legacy("reviewer", "Codex", 1, state="approved"),
+        _legacy("reviewer", "Gemini", 1, state="blocking", new_items=(item,)),
+        prelaunch(2, (item,)),
+    ]
+
+
+@pytest.mark.parametrize("path", ["recover", "supersede"])
+def test_prelaunch_only_anchor_survives_a_crash_and_a_superseding_change(
+    tmp_path, monkeypatch, path
+):
+    """Row pr-link-crash-recovery: a genuinely prelaunch-only round R > 1."""
+    runner = _legacy_runner(_selective_prelaunch_history())
+    anchor = board_anchor(_records(runner))
+    in_round = [r.metadata for r in _records(runner) if r.metadata.round_number == 2]
+    assert anchor.round_number == 2 and [m.phase for m in in_round] == ["scheduler-prelaunch"]
+    assert not any(m.role in {"coder", "reviewer"} for m in in_round)
+    first = make_config(tmp_path, reviewer=("codex", "antigravity"),
+                        pr_review_policy="selective-intermediate")
+    final = first
+    with monkeypatch.context() as patch:
+        _crash_after_link(patch)
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=first)
+        if path == "supersede":
+            final = make_config(tmp_path, reviewer=("codex", "claude"), coder="codex",
+                                pr_review_policy="selective-intermediate")
+            with pytest.raises(KeyboardInterrupt):
+                run_pr_loop(runner, pr_number=77, config=final)
+    payloads = _link_payloads(runner)
+    assert all((p["anchor_round"], p["advance"], p["effective_from_round"]) == (2, True, 3)
+               for p in payloads)
+    assert len(payloads) == (2 if path == "supersede" else 1)
+    reviews = {
+        "antigravity": "antigravity_outputs", "claude": "claude_outputs", "codex": "codex_outputs",
+    }
+    for backend in ("codex", "antigravity" if path == "recover" else "claude"):
+        getattr(runner, reviews[backend]).append(structured_pr_review(
+            reviewer={"codex": "OpenAI Codex", "antigravity": "Antigravity",
+                      "claude": "Anthropic Claude"}[backend],
+            prior_item_dispositions=_RESOLVED_1,
+        ))
+    assert run_pr_loop(runner, pr_number=77, config=final) == 0
+    assert len(_link_payloads(runner)) == len(payloads)
+    new = [r.metadata for r in _records(runner) if r.metadata.pr_board_root is not None]
+    # Re-entered round 3 exactly once, with round 2's ledger carried.
+    assert {m.round_number for m in new} == {3}
+    reviewer = next(m for m in new if m.role == "reviewer")
+    assert [item.item_id for item in reviewer.prior_items] == ["item-1"]
+    assert {m.reviewer_board_change_digest for m in new} == {
+        board_change_link_digest(payloads[-1])
+    }
+    _qualify(runner, final)
+
+
+def test_further_change_after_coder_only_activation_takes_effect_next_round(tmp_path):
+    """Row pr-link-crash-recovery: a link activated by a coder-only round, then another change."""
+    runner = _legacy_runner(_gemini_blocker_history())
+    swapped = make_config(tmp_path, reviewer=("codex", "antigravity"))
+    keep_open = [{"item_id": "item-2", "disposition": "blocking",
+                  "note": "The retry is still unbounded in src/worker.py; bound it and test it."}]
+    runner.codex_outputs.append(structured_pr_review(state="blocking", prior_item_dispositions=keep_open))
+    runner.antigravity_outputs.append(structured_pr_review(
+        reviewer="Antigravity", state="blocking", prior_item_dispositions=keep_open,
+    ))
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-2"]))
+    # Round 3 reviews, the coder answers in round 4, and round 4's reviews run out.
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=swapped)
+    (first,) = _link_payloads(runner)
+    round_four = [r.metadata for r in _records(runner) if r.metadata.round_number == 4]
+    assert round_four and {m.role for m in round_four} <= {"coder", "summary"}
+    assert all(m.reviewer_board_change_digest == board_change_link_digest(first) for m in round_four)
+    again = make_config(tmp_path, reviewer=("codex", "gemini"))
+    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
+    runner.codex_outputs.append(structured_pr_review(prior_item_dispositions=resolved))
+    runner.gemini_outputs.append(
+        structured_pr_review(reviewer="Google Gemini", prior_item_dispositions=resolved)
+    )
+    assert run_pr_loop(runner, pr_number=77, config=again) == 0
+    _, second = _link_payloads(runner)
+    assert second["predecessor"] == board_change_link_digest(first)
+    assert (second["anchor_round"], second["advance"], second["effective_from_round"]) == (4, True, 5)
+    _qualify(runner, again)
+
+
+# --- pending signed removal after a rebinding or seat-adding link (row pr-floor-candidate-link)
+
+
+_LABELS = {"codex": "OpenAI Codex", "gemini": "Google Gemini", "antigravity": "Google Antigravity"}
+_OUTPUTS = {"codex": "codex_outputs", "gemini": "gemini_outputs", "antigravity": "antigravity_outputs"}
+
+
+def _queue_reviews(runner, seats):
+    for seat in seats:
+        review = structured_pr_review(
+            reviewer=f"{seat} ({_LABELS[seat.backend]}: {seat.model_chain[0]})"
+        )
+        getattr(runner, _OUTPUTS[seat.backend]).append(
+            (review, 0) if seat.backend == "antigravity" else review
+        )
+
+
+@pytest.mark.parametrize("link", ["backend-rebinding", "seat-adding"])
+def test_pending_signed_removal_after_a_link_is_authorized_from_the_link_board(tmp_path, link):
+    """Row pr-floor-candidate-link, end to end: preflight refusal, signed
+    activation, resume and qualification all use the frozen authorization
+    taken from the predecessor link's board."""
+    a = _seat(tmp_path, "a", "codex", "gpt-a")
+    b = _seat(tmp_path, "b", "gemini", "gem-b")
+    c = _seat(tmp_path, "c", "antigravity", "Model C")
+    selective = {"pr_review_policy": "selective-intermediate"}
+    runner = FakeRunner()
+    _queue_reviews(runner, (a, b, c))
+    assert run_pr_loop(runner, pr_number=77, config=_named(tmp_path, a, b, c, **selective)) == 0
+    if link == "backend-rebinding":
+        changed = (a, _seat(tmp_path, "b", "codex", "gpt-b"), c)
+        floor = {"min_distinct_providers": 2}
+        refusal = "1 distinct provider\\(s\\) is below the floor of 2"
+    else:
+        changed = (a, b, c, _seat(tmp_path, "d", "codex", "gpt-d"))
+        floor = {"min_reviewers": 4}
+        refusal = "3 reviewer\\(s\\) is below the floor of 4"
+    runner.pr_payload["headRefOid"] = "def456"
+    _queue_reviews(runner, changed)
+    assert run_pr_loop(runner, pr_number=77, config=_named(tmp_path, *changed, **selective, **floor)) == 0
+    (first,) = _link_payloads(runner)
+    reduced_seats = tuple(seat for seat in changed if str(seat) != "c")
+    reduced = _named(tmp_path, *reduced_seats, **selective, **floor)
+    comments = len(runner.pr_payload["comments"])
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match=refusal) as refused:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    # Refused at preflight: no record, link or agent.
+    assert len(runner.pr_payload["comments"]) == comments and _agents(runner, start) == []
+    template = refused.value.args[0][refused.value.args[0].index("Reviewer board amendment:"):]
+    assert '"c"' in template.split('"removed_reviewers"')[1].split("]")[0]
+    _append(runner, template.replace("<why the removed reviewer cannot be reached>", "c is out of quota."))
+    runner.pr_payload["headRefOid"] = "fed789"
+    _queue_reviews(runner, reduced_seats)
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+    assert len(_link_payloads(runner)) == 1
+    assert any("Reviewer board amendment applied." in c for c in runner.comments)
+    assert "agy" not in _agents(runner, start)
+    lineage = _board_state(runner, reduced).lineage
+    assert [element.kind for element in lineage.elements] == ["link", "amendment"]
+    (authorization,) = lineage.authorizations
+    assert [seat.seat_id for seat in authorization.seats] == [str(seat) for seat in reduced_seats]
+    _qualify(runner, reduced)
+    # A resume with the same board derives the same lineage and posts nothing.
+    # (A named Gemini seat is re-asked on every rerun, as on main.)
+    _queue_reviews(runner, [seat for seat in reduced_seats if seat.backend == "gemini"])
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+    assert len(_link_payloads(runner)) == 1
+    assert first == _link_payloads(runner)[0]
+
+
+_LABELS["claude"] = "Anthropic Claude"
+_OUTPUTS["claude"] = "claude_outputs"
+
+
+@pytest.mark.parametrize("floor", ["reviewers", "providers"])
+@pytest.mark.parametrize("flags", ["reduced", "original"])
+def test_named_legacy_all_reviewers_signed_reduction(tmp_path, floor, flags):
+    """Rows pr-floor-unsigned-vs-signed and pr-legacy-root-anchor: a legacy
+    named all-reviewers PR (recorded seat binding, no scheduler contract)."""
+    sol = _seat(tmp_path, "sol", "codex", "gpt-sol")
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    opus = _seat(tmp_path, "opus", "claude", "claude-opus")
+    board = (sol, flash, opus)
+    runner = FakeRunner()
+    _queue_reviews(runner, board)
+    assert run_pr_loop(runner, pr_number=77, config=_named(tmp_path, *board)) == 0
+    _strip_board_identity(runner)
+    assert all(r.metadata.pr_board_root is None and r.metadata.seat_binding for r in _records(runner))
+    floor_kwargs = {"min_reviewers": 3} if floor == "reviewers" else {"min_distinct_providers": 3}
+    kept = (sol, opus)
+    reduced = _named(tmp_path, *kept, **floor_kwargs)
+    original = _named(tmp_path, *board, **floor_kwargs)
+    runner.pr_payload["headRefOid"] = "def456"
+    comments = len(runner.pr_payload["comments"])
+    before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="below the floor of 3") as refused:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert len(runner.pr_payload["comments"]) == comments and _agents(runner, before) == []
+    _append(runner, _amendment_from(str(refused.value)))
+    start = len(runner.commands)
+    _queue_reviews(runner, kept)
+    assert run_pr_loop(runner, pr_number=77, config=reduced if flags == "reduced" else original) == 0
+    assert "agy" not in _agents(runner, start) and _links(runner) == []
+    upgraded = [r.metadata for r in _records(runner) if r.metadata.pr_board_root is not None]
+    assert upgraded and {
+        BoardIdentity.from_payload(m.pr_board_root).names for m in upgraded
+    } == {("sol", "flash", "opus")}
+    _qualify(runner, reduced)
+
+
+def test_signed_first_upgrade_initializes_bindings_through_a_crash_then_links_a_model_change(
+    tmp_path, monkeypatch
+):
+    """Row pr-legacy-root-anchor: a plain signed reduction under reduced flags is
+    the first upgrade; the crash after its first record keeps the initialization,
+    and a later model change is exactly one link needing fresh approval."""
+    runner = _legacy_runner([
+        _legacy("reviewer", "Codex", 1, subject="abc000", state="approved"),
+        _legacy("reviewer", "Gemini", 1, subject="abc000", state="approved"),
+        _legacy("coder", "Claude", 2),
+    ])
+    _append(runner, _signed_body(("Codex", "Gemini"), removed=("Gemini",), round_number=2))
+    reduced = make_config(tmp_path, reviewer=("codex",), min_reviewers=2)
+    real_post = orchestrator.post_pr_comment
+
+    def crash_after_first_record(*args, **kwargs):
+        real_post(*args, **kwargs)
+        if "AGENT_LOOP_META" in str(kwargs["body"]):
+            raise KeyboardInterrupt
+
+    runner.codex_outputs.append(structured_pr_review())
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", crash_after_first_record)
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=reduced)
+    (first,) = [r.metadata for r in _records(runner) if r.metadata.pr_board_root is not None]
+    assert first.reviewer_board_amendment_digest is not None
+    # Gemini (signed off) stays unknown; Codex is initialized by this record.
+    assert set(first.pr_board_binding_init) == {"Codex"}
+    assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+    assert _links(runner) == []
+    moved = dataclasses.replace(reduced, reviewer_codex_model="gpt-later")
+    runner.codex_outputs.append(structured_pr_review())
+    start = len(runner.commands)
+    assert run_pr_loop(runner, pr_number=77, config=moved) == 0
+    (payload,) = _link_payloads(runner)
+    assert payload["rebound"] == ["Codex"] and payload["binding_init"] == {}
+    assert _agents(runner, start) == ["codex"]
+    _qualify(runner, moved)

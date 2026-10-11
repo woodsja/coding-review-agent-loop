@@ -2025,14 +2025,18 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   actor (the REST identity path used for PR recovery records) is admitted. A
   marker-bearing comment by anyone else, a malformed payload, a digest, root or
   predecessor mismatch, or an old board that differs from the derived one fails
-  closed at startup and at qualification. Agent text naming the marker is
+  closed at startup and at qualification. Any record-shaped span naming the
+  record counts, even one the strict grammar cannot parse. Agent text naming
+  the marker is
   neutralized by the reserved-marker registry. Policy and broad-rule changes
   stay contract drift.
 - **One ordered chain.** Links and signed amendments are ordered by comment
   position with strictly increasing effective rounds. The only exception is a
   link that supersedes a never-activated pending link: it copies that link's
-  anchor round, advance flag and effective round. A signed amendment after a
-  link amends the link's new board. A signed restoration can only re-add a seat
+  anchor round, advance flag and effective round. With link history, a
+  pending signed amendment takes effect in the round after the highest
+  recorded round, with the same carry-over as a link, and its printed template
+  names that round. A signed amendment after a link amends the link's new board. A signed restoration can only re-add a seat
   a signed amendment removed since the latest link. Each round record is
   governed by the latest element whose comment precedes it and whose effective
   round is at or before its round. It must carry that element's digest in the
@@ -2049,9 +2053,11 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   of any role or phase (a scheduler-prelaunch-only round included), and
   `advance` is set when it holds any record. The anchor round's records are
   collected under the predecessor board, so an outgoing reviewer's findings are
-  kept. Its persisted dispositions are reconciled with the existing rules,
-  its new findings merged, and its evidence requests rebuilt with the
-  accumulated head-scoped clearances. The run then re-enters the effective
+  kept, and a finding whose author is not its publisher, or a repeated item ID
+  with different content, fails closed. Its persisted dispositions are
+  reconciled with the existing rules, its new findings merged, and its evidence
+  requests rebuilt with the head-scoped clearances accumulated by durable
+  records up to the anchor round plus those its reconciliation produces. The run then re-enters the effective
   round once, with the anchor round's coder output as the artifact. A link
   posted before a crash is recovered from durable history alone. A resume whose
   anchor no longer matches fails closed before any agent invocation or post.
@@ -2066,7 +2072,13 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   epoch are carried obligations. They are exempt only from the pre-panel safety
   stop, keep their owners, and block qualification. When the restarted primary
   approves, the panel reopens at the same head so their owners disposition them.
-- **Managed CI.** Historical rejected-recovery reviews are checked against the
-  seat binding of the board that governed their round, which the link records
-  carry. Current-head checks use the current board.
+  Only items first published after a qualified panel opening before the epoch
+  (judged with the replaced primary and board), or published by the replaced
+  primary itself, are carried; any other secondary-owned item still stops.
+- **Managed CI.** Once a PR carries board-change records, historical
+  rejected-recovery reviews and every round record an ordinary continuity
+  ancestor references are checked against the seat binding of the lineage
+  element that governed them (by comment position and round), resolved through
+  the same validated lineage, including each link's recorded previous binding.
+  Any lineage defect fails the chain. Current-head checks use the current board.
 

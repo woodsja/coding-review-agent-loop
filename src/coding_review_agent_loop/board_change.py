@@ -54,6 +54,8 @@ BOARD_CHANGE_LINK_HEADING = "Reviewer board change recorded."
 BOARD_CHANGE_LINK_RE = re.compile(
     rf"<!--\s*{BOARD_CHANGE_LINK_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
 )
+# Any record-shaped span naming the link record, well-formed or not.
+BOARD_CHANGE_LINK_PRESENCE_RE = re.compile(rf"<!--\s*{BOARD_CHANGE_LINK_MARKER}\b", re.I)
 _LINK_KEYS = frozenset(
     {
         "kind",
@@ -285,15 +287,24 @@ def name_agents(names: Sequence[str]) -> tuple[object, ...]:
     )
 
 
-def board_reentry_round(comments: Sequence[object], resumed_round: int | None) -> int:
+def board_reentry_round(
+    comments: Sequence[object], resumed_round: int | None, *, signed_amendment: bool = False,
+) -> int:
     """The round a PR resume re-enters (#1376).
 
     The resume reader matches the latest round's records by the configured
     board.  When a recorded board change has left that round with no record by
     a current seat, the reader finds nothing; with link history the run then
     re-enters after the highest recorded round instead of restarting at round 1.
+
+    With link history a pending signed amendment always takes effect after
+    the highest recorded round (``signed_amendment``): every lineage element
+    takes effect strictly after the one before it, and the anchor round's
+    records are carried over exactly as for a link.
     """
-    if resumed_round is not None:
+    if resumed_round is not None and not (
+        signed_amendment and comments_bear_board_change_links(comments)
+    ):
         return resumed_round
     if comments_bear_board_change_links(comments):
         from .round_state import _extract_round_metadata_records
@@ -591,8 +602,9 @@ def parse_board_change_link(
 
 
 def comments_bear_board_change_links(comments: Sequence[object]) -> bool:
+    """Whether any comment carries a record-shaped link span, well-formed or not."""
     return any(
-        isinstance(body := _body(comment), str) and BOARD_CHANGE_LINK_RE.search(body)
+        isinstance(body := _body(comment), str) and BOARD_CHANGE_LINK_PRESENCE_RE.search(body)
         for comment in comments
     )
 
@@ -620,12 +632,15 @@ def collect_board_change_links(
         body = _body(comment)
         if not isinstance(body, str):
             continue
-        matches = list(BOARD_CHANGE_LINK_RE.finditer(body))
-        if not matches:
+        shaped = list(BOARD_CHANGE_LINK_PRESENCE_RE.finditer(body))
+        if not shaped:
             continue
+        matches = list(BOARD_CHANGE_LINK_RE.finditer(body))
         locator = f"PR #{pr_number} comment {index + 1}"
-        if len(matches) > 1:
+        if len(shaped) > 1:
             raise _fail(f"{locator} carries more than one board-change record")
+        if len(matches) != 1:
+            raise _fail(f"the board-change record at {locator} is malformed")
         author_id = (
             comment.get("author_id") if isinstance(comment, dict)
             else getattr(comment, "author_id", None)
@@ -934,9 +949,16 @@ def derive_legacy_root(
             broad_rules=configured.broad_rules,
             seats=tuple(seat_for(name) for name in binding_entries),
         )
-    if not posters:
-        return configured
     if amendments:
+        # Signed evidence takes precedence whenever PR round history exists,
+        # including coder-only history and never-published seats (D1a).
+        if not records:
+            raise AgentLoopError(
+                "Human decision required: signed reviewer-board amendment(s) at "
+                + ", ".join(getattr(record, "comment_locator") for record in amendments)
+                + " are unmatched: this PR has no round history to amend yet. Change "
+                "the reviewer flags directly and delete the record."
+            )
         original = tuple(getattr(amendments[0], "original_required_reviewers"))
         outside = [name for name in posters if name not in original]
         if outside:
@@ -945,6 +967,8 @@ def derive_legacy_root(
                 f"original board {list(original)}"
             )
         names = original
+    elif not posters:
+        return configured
     else:
         names = tuple(dict.fromkeys((*configured.names, *posters)))
     primary = configured.primary if configured.primary in names else None
@@ -1159,6 +1183,7 @@ def resolve_board_lineage(
         key=lambda item: (item[0], item[1] != "element"),
     )
     previous_identity = root
+    previous_base = root
     for index, kind, value in events:
         if kind == "element":
             element: LineageElement = value
@@ -1171,7 +1196,13 @@ def resolve_board_lineage(
                         f"the board-change record at comment {index + 1} names an old board "
                         "that differs from the board derived at that point"
                     )
+                if link.payload["old_seat_binding"] != apply_inits(previous_base, inits).seat_binding():
+                    raise _fail(
+                        f"the board-change record at comment {index + 1} names a previous seat "
+                        "binding that differs from the board derived at that point"
+                    )
                 _merge_inits(inits, link.binding_init, locator=f"comment {index + 1}")
+            previous_base = element.segment_base
             previous_identity = element.identity
             continue
         record = value
@@ -1523,9 +1554,7 @@ def build_board_change_candidate(
         predecessor=latest.digest if latest is not None else lineage.root.digest,
         old_board=view,
         new_board=configured,
-        old_seat_binding=lineage.binding_for_round(
-            max(anchor_round, latest.effective_from_round if latest is not None else 1)
-        ),
+        old_seat_binding=apply_inits(lineage.segment_base, lineage.inits).seat_binding(),
         binding_init=inits,
         anchor_round=anchor_round,
         advance=advance,
@@ -1631,7 +1660,6 @@ def carry_over_anchor_round(
     reconciliation_mode: str,
     evidence_clearances: Sequence[tuple[str, str]],
     next_item_number: int,
-    board_seats: Sequence[str] = (),
 ) -> CarryOver:
     """Collect, reconcile, merge and rebuild evidence for the anchor round.
 
@@ -1649,16 +1677,25 @@ def carry_over_anchor_round(
     )
     from .unresolved_items import _apply_unresolved_item_dispositions, _upsert_evidence_obligation
 
-    # A review may only carry findings in its own name: one naming another
-    # board seat as its author is never adopted.
-    seats = set(board_seats)
+    # A review may only carry findings in its own name (D4b provenance).
     for review in completed_reviews:
         for item in review.metadata.new_items:
-            if item.reviewer != review.metadata.agent and item.reviewer in seats:
+            if item.reviewer != review.metadata.agent:
                 raise AgentLoopError(
-                    "PR board change cannot verify the owner of a carried finding."
+                    "PR board change cannot verify the owner of a carried finding: "
+                    f"{item.item_id} names {item.reviewer!r} but was published by "
+                    f"{review.metadata.agent!r}."
                 )
+    # Head-scoped clearances already accumulated by durable records up to the
+    # anchor round (evidence freeze/release ledgers), plus the resume reader's
+    # own, plus those this round's reconciliation produces (D4b step 3a).
     clearances = list(evidence_clearances)
+    for record in sorted(records, key=lambda item: item.index):
+        if record.metadata.round_number > round_number:
+            continue
+        for clearance in record.metadata.evidence_clearances:
+            if clearance not in clearances:
+                clearances.append(clearance)
     reconciled_clearances: list[tuple[str, str]] = []
     items, _future = _apply_unresolved_item_dispositions(
         prior_items,
@@ -1670,15 +1707,25 @@ def carry_over_anchor_round(
     )
     items = [item for item in items if item.status in {"blocking", "same-pr"}]
     by_id = {item.item_id: item for item in items}
+    prior_by_id = {item.item_id: item for item in prior_items}
     new_items = list(settled_new_items) or [
         item for review in completed_reviews for item in review.metadata.new_items
     ]
+    seen: dict[str, object] = {}
     for item in new_items:
-        existing = by_id.get(item.item_id)
-        if existing is not None and existing != item and existing.reviewer != item.reviewer:
-            raise AgentLoopError(
-                "PR board change found conflicting provenance for a carried finding."
-            )
+        # An item ID seen twice must carry identical content, whether it
+        # collides with the anchor ledger or with another collected record.
+        for source in (prior_by_id, seen):
+            existing = source.get(item.item_id)
+            if existing is not None and existing != item:
+                raise AgentLoopError(
+                    "PR board change found conflicting content for carried finding "
+                    f"{item.item_id}."
+                )
+        seen[item.item_id] = item
+        if item.item_id in prior_by_id:
+            # Already reconciled from the anchor ledger; never reopened here.
+            continue
         if item.status in {"blocking", "same-pr"} and item.item_id not in by_id:
             by_id[item.item_id] = item
             items.append(item)
@@ -1717,15 +1764,77 @@ def carry_over_anchor_round(
     )
 
 
+def pre_epoch_panel_items(records: Sequence[object], lineage: BoardLineage) -> frozenset[str]:
+    """Items legitimately created under the panel opening before the primary epoch.
+
+    The opening is derived from authenticated round history between the
+    previous epoch (or the start) and the latest one, judged with the primary
+    and board the restarting link replaced.  Eligible are the items first
+    published after that qualified opening, plus items the replaced primary
+    published itself (it keeps them as a carried owner).  A secondary-owned
+    item that never had a qualified opening is not eligible, so it still
+    raises the pre-panel stop (D5a).
+    """
+    from .panel_evidence import _derive_pr_panel_evidence
+
+    epochs = [
+        element for element in lineage.elements
+        if element.link is not None
+        and element.link.new_board.policy == "primary-then-panel"
+        and (
+            element.link.old_board.primary != element.link.new_board.primary
+            or element.link.new_board.primary in element.link.rebound
+        )
+    ]
+    if not epochs:
+        return frozenset()
+    latest = epochs[-1]
+    link = latest.link
+    assert link is not None
+    start = epochs[-2].effective_from_round if len(epochs) > 1 else 0
+    history = sorted(
+        (
+            record for record in records
+            if start <= record.metadata.round_number < latest.effective_from_round
+        ),
+        key=lambda record: record.index,
+    )
+    evidence = _derive_pr_panel_evidence(
+        history,
+        primary_reviewer=link.old_board.primary,
+        required_reviewers=link.old_board.names,
+    )
+    eligible: set[str] = set()
+    seen: set[str] = set()
+    for record in history:
+        for item in record.metadata.new_items:
+            if item.item_id in seen:
+                continue
+            seen.add(item.item_id)
+            if (
+                evidence.opening_index is not None and record.index > evidence.opening_index
+            ) or item.reviewer == link.old_board.primary:
+                eligible.add(item.item_id)
+    return frozenset(eligible)
+
+
 def carried_secondary_obligations(
-    items: Sequence[object], *, epoch_round: int | None, primary: str | None
+    items: Sequence[object],
+    *,
+    epoch_round: int | None,
+    primary: str | None,
+    eligible: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
-    """Active items pending on secondaries that predate the primary epoch (D5a)."""
+    """Active pre-epoch items pending on secondaries that a qualified opening created (D5a)."""
     if epoch_round is None:
         return ()
     carried: list[str] = []
     for item in items:
-        if item.status not in {"blocking", "same-pr"} or item.source_round >= epoch_round:
+        if (
+            item.status not in {"blocking", "same-pr"}
+            or item.source_round >= epoch_round
+            or item.item_id not in eligible
+        ):
             continue
         owners = tuple(item.resolution_owners or (item.reviewer,))
         states = dict(item.owner_states or ((owner, "pending") for owner in owners))
@@ -1733,49 +1842,72 @@ def carried_secondary_obligations(
             carried.append(item.item_id)
     return tuple(carried)
 
-
-def governing_seat_binding_from_comments(
-    comments: Sequence[object],
+def lineage_binding_resolver(
+    comments: Sequence[Mapping[str, object]],
     *,
-    round_number: int,
     actor_id: int | None,
-    current: Mapping[str, object] | None,
-) -> Mapping[str, object] | None:
-    """The seat binding that governed ``round_number``, from link records alone.
+) -> Callable[[int, int], tuple[Mapping[str, object] | None, ...]] | None:
+    """Historical seat bindings from the validated board lineage, for managed CI.
 
-    Used by managed-CI history checks that read raw REST comments.  Without
-    any admitted link the current binding governs every round, as before.
-    Links not authored by ``actor_id`` are ignored here: startup and
-    qualification fail closed on them.
+    ``comments`` are raw REST comments.  Returns ``None`` when no comment
+    carries a board-change record, so the caller keeps its current-board
+    check.  Otherwise the full lineage is resolved (authorship, digests,
+    predecessors, old boards and old seat bindings), and the returned function
+    maps a round record's comment position and round to the bindings its
+    governing element allows: the segment base's binding, or the governing
+    board's own.  Any lineage defect yields a function that allows nothing,
+    so every historical check fails closed.
     """
-    admitted: list[tuple[int, object, object]] = []
+    from types import SimpleNamespace
+
+    from .board_amendment import collect_reviewer_board_amendments
+    from .pr_loop_support import _scheduler_contract_from_metadata
+    from .round_state import _extract_round_metadata_records
+
+    def body(comment: Mapping[str, object]) -> str:
+        value = comment.get("body")
+        return value if isinstance(value, str) else ""
+
+    if not any(BOARD_CHANGE_LINK_PRESENCE_RE.search(body(comment)) for comment in comments):
+        return None
+
+    def refuse(_index: int, _round: int) -> tuple[Mapping[str, object] | None, ...]:
+        return ()
+
+    namespaced = []
     for comment in comments:
-        body = _body(comment)
-        match = BOARD_CHANGE_LINK_RE.search(body) if isinstance(body, str) else None
-        if match is None:
-            continue
-        user = comment.get("user") if isinstance(comment, dict) else None
-        author_id = (
-            user.get("id") if isinstance(user, dict) else getattr(comment, "author_id", None)
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        namespaced.append(SimpleNamespace(body=body(comment), author_id=user.get("id")))
+    try:
+        match = next(
+            found for item in namespaced if (found := BOARD_CHANGE_LINK_RE.search(item.body))
         )
-        if actor_id is None or author_id != actor_id:
-            continue
-        try:
-            payload = json.loads(base64.urlsafe_b64decode(match.group("payload").encode("ascii")))
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if not isinstance(payload, dict) or payload.get("kind") != BOARD_CHANGE_LINK_KIND:
-            continue
-        effective = payload.get("effective_from_round")
-        if isinstance(effective, int) and not isinstance(effective, bool):
-            admitted.append(
-                (effective, payload.get("old_seat_binding"), payload.get("new_seat_binding"))
-            )
-    if not admitted:
-        return current
-    governing: object = ...
-    for effective, _old, new in admitted:
-        if effective <= round_number:
-            governing = new
-    binding = admitted[0][1] if governing is ... else governing
-    return binding if isinstance(binding, dict) else None
+        first = json.loads(base64.urlsafe_b64decode(match.group("payload").encode("ascii")))
+        pr_number = first["pr_number"]
+        root = BoardIdentity.from_payload(first["root"])
+        records = _extract_round_metadata_records(namespaced, flow="pr")
+        lineage = resolve_board_lineage(
+            records,
+            namespaced,
+            amendments=collect_reviewer_board_amendments(
+                namespaced, flow="pr", pr_number=pr_number, ignored_sink=[]
+            ),
+            configured=root,
+            pr_number=pr_number,
+            trusted_actor=("orchestrator", actor_id) if actor_id is not None else None,
+            contract_from_metadata=_scheduler_contract_from_metadata,
+            drift_error=lambda _persisted, detail: AgentLoopError(detail),
+        )
+    except (AgentLoopError, StopIteration, ValueError, KeyError, TypeError):
+        return refuse
+
+    def allowed(index: int, round_number: int) -> tuple[Mapping[str, object] | None, ...]:
+        element = lineage.governing(record_index=index, round_number=round_number)
+        base = element.segment_base if element is not None else lineage.root
+        identity = element.identity if element is not None else lineage.root
+        return (
+            apply_inits(base, lineage.inits).seat_binding(),
+            apply_inits(identity, lineage.inits).seat_binding(),
+        )
+
+    return allowed
