@@ -809,14 +809,81 @@ def test_changed_provenance_blocks_next_read_only_claude_spawn(tmp_path, sandbox
         assert coder_runner.commands
 
 
-def test_checkout_local_shadow_package_does_not_change_isolated_resolution(tmp_path, sandbox):
+CHECKOUT_SRC = Path(__file__).resolve().parents[1] / "src"
+_FIND_PACKAGE = (
+    "import importlib.util;"
+    "print(list(importlib.util.find_spec('coding_review_agent_loop').submodule_search_locations)[0])"
+)
+
+
+def _checkout_isolated_python(root: Path) -> str:
+    """Build an interpreter whose isolated-mode import resolves to this checkout (#1387).
+
+    ``-I`` ignores the ``pythonpath`` pytest gives in-process imports, so
+    ``sys.executable -I`` resolves through whatever the running venv installed,
+    which may be an editable install of another checkout. A throwaway venv whose
+    site-packages holds a ``.pth`` naming this checkout's ``src`` has a known
+    isolated resolution, since site-packages ``.pth`` files still apply under ``-I``.
+    """
+    stage = "venv creation"
+    try:
+        venv = root / "venv"
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if created.returncode != 0:
+            pytest.skip(
+                "cannot build an isolated interpreter bound to the checkout under test: "
+                f"{created.stderr.strip() or f'venv exited {created.returncode}'}"
+            )
+        python = str(venv / "bin" / "python")
+        stage = "neutral cwd setup"
+        neutral = root / "neutral-cwd"
+        neutral.mkdir()
+        stage = "purelib discovery"
+        purelib = subprocess.run(
+            [python, "-I", "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
+            cwd=neutral, capture_output=True, text=True, timeout=60,
+        )
+        if purelib.returncode != 0 or not purelib.stdout.strip():
+            pytest.skip(
+                "cannot build an isolated interpreter bound to the checkout under test: "
+                f"no purelib reported: {purelib.stderr.strip() or 'no output'}"
+            )
+        stage = ".pth setup"
+        site_packages = Path(purelib.stdout.strip())
+        site_packages.mkdir(parents=True, exist_ok=True)
+        (site_packages / "agent_loop_checkout.pth").write_text(f"{CHECKOUT_SRC}\n", encoding="utf-8")
+        stage = "resolution verification"
+        resolved = subprocess.run(
+            [python, "-I", "-c", _FIND_PACKAGE], cwd=neutral, capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        pytest.skip(
+            f"cannot build an isolated interpreter bound to the checkout under test: {stage} failed: {exc!r}"
+        )
+    found = os.path.realpath(resolved.stdout.strip()) if resolved.returncode == 0 else None
+    if found != PACKAGE_DIR:
+        pytest.skip(
+            "isolated interpreter bound to the checkout under test does not resolve "
+            f"{PACKAGE_DIR}; it resolves {found or resolved.stderr.strip() or 'nothing'}"
+        )
+    return python
+
+
+@pytest.fixture(scope="module")
+def checkout_python(tmp_path_factory):
+    return _checkout_isolated_python(tmp_path_factory.mktemp("checkout-python"))
+
+
+def test_checkout_local_shadow_package_does_not_change_isolated_resolution(tmp_path, sandbox, checkout_python):
     config = sandboxed_config(tmp_path)
     shadow = config.claude_dir / "coding_review_agent_loop"
     shadow.mkdir()
     (shadow / "__init__.py").write_text("raise SystemExit('shadow')\n", encoding="utf-8")
     completed = subprocess.run(
-        [sys.executable, "-I", "-c",
-         "import importlib.util;print(list(importlib.util.find_spec('coding_review_agent_loop').submodule_search_locations)[0])"],
+        [checkout_python, "-I", "-c", _FIND_PACKAGE],
         cwd=config.claude_dir, capture_output=True, text=True, timeout=60,
     )
     assert completed.returncode == 0
@@ -825,8 +892,79 @@ def test_checkout_local_shadow_package_does_not_change_isolated_resolution(tmp_p
     ap.verify_inspect_provenance(config)
 
 
-def test_real_package_locator_uses_isolated_interpreter(tmp_path, sandbox):
-    assert ap._locate_package(sys.executable) == PACKAGE_DIR
+def test_real_package_locator_uses_isolated_interpreter(tmp_path, sandbox, checkout_python):
+    assert ap._locate_package(checkout_python) == PACKAGE_DIR
+
+
+def test_real_package_locator_ignores_cwd_shadow_package(tmp_path, monkeypatch, checkout_python):
+    # Without ``-I``, ``-c`` puts the locator's cwd first on sys.path and
+    # find_spec would return this shadow package (without executing it).
+    cwd = tmp_path / "locator-cwd"
+    shadow = cwd / "coding_review_agent_loop"
+    shadow.mkdir(parents=True)
+    (shadow / "__init__.py").write_text("raise SystemExit('shadow')\n", encoding="utf-8")
+    monkeypatch.setattr(ap.tempfile, "gettempdir", lambda: str(cwd))
+    located = ap._locate_package(checkout_python)
+    assert located != os.path.realpath(shadow)
+    assert located == PACKAGE_DIR
+
+
+@pytest.mark.parametrize("failure", [
+    "venv-raises", "venv-exit", "no-purelib", "purelib-raises", "purelib-timeout",
+    "neutral-mkdir-raises", "pth-write-raises", "resolution-raises", "resolution-timeout",
+    "foreign-resolution",
+])
+def test_checkout_isolated_python_skips_when_it_cannot_be_built_or_verified(tmp_path, monkeypatch, failure):
+    calls = []
+    foreign = "/elsewhere/src/coding_review_agent_loop"
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1:3] == ["-m", "venv"]:
+            if failure == "venv-raises":
+                raise OSError("venv module unavailable")
+            return subprocess.CompletedProcess(argv, 1 if failure == "venv-exit" else 0, "", "ensurepip broke")
+        if "sysconfig" in argv[-1]:
+            if failure == "no-purelib":
+                return subprocess.CompletedProcess(argv, 1, "", "no sysconfig")
+            if failure == "purelib-raises":
+                raise OSError("purelib probe exec failed")
+            if failure == "purelib-timeout":
+                raise subprocess.TimeoutExpired(argv, 60)
+            return subprocess.CompletedProcess(argv, 0, str(tmp_path / "site") + "\n", "")
+        if failure == "resolution-raises":
+            raise OSError("resolution probe exec failed")
+        if failure == "resolution-timeout":
+            raise subprocess.TimeoutExpired(argv, 60)
+        return subprocess.CompletedProcess(argv, 0, foreign + "\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    if failure == "neutral-mkdir-raises":
+        (tmp_path / "neutral-cwd").write_text("not a directory", encoding="utf-8")
+    if failure == "pth-write-raises":
+        (tmp_path / "site").mkdir()
+        (tmp_path / "site" / "agent_loop_checkout.pth").mkdir()
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        _checkout_isolated_python(tmp_path)
+    reason = str(skipped.value)
+    expected = {
+        "venv-raises": "venv module unavailable",
+        "venv-exit": "ensurepip broke",
+        "no-purelib": "no sysconfig",
+        "purelib-raises": "purelib discovery failed",
+        "purelib-timeout": "purelib discovery failed",
+        "neutral-mkdir-raises": "neutral cwd setup failed",
+        "pth-write-raises": ".pth setup failed",
+        "resolution-raises": "resolution verification failed",
+        "resolution-timeout": "resolution verification failed",
+        "foreign-resolution": foreign,
+    }[failure]
+    assert expected in reason
+    if failure == "foreign-resolution":
+        assert PACKAGE_DIR in reason
+    # The helper never falls back to probing the running interpreter.
+    assert all(argv[0] == sys.executable for argv in calls[:1])
+    assert all(argv[0] == str(tmp_path / "venv" / "bin" / "python") for argv in calls[1:])
 
 
 # ------------------------------------------------------ backend wiring
