@@ -6132,8 +6132,27 @@ its role (implemented in `agent_permissions.py`):
   A fresh default checkout uses HTTPS unless the operator selects
   `--trusted-origin-protocol ssh`; that setting chooses the pinned SSH origin
   before any fetch and requires the operator's SSH identity. The pinned SSH
-  client ignores the user's SSH config, including proxy commands; it can use
-  default identity files and `SSH_AUTH_SOCK`. SSH transport on Windows is
+  client runs with `-F /dev/null`; on POSIX, agent-loop itself reads only
+  `IdentityFile`, `HostName`, `IdentitiesOnly`, one `UserKnownHostsFile`, and
+  `Port` (when the URL has none) from `~/.ssh/config` `Host` blocks for the
+  origin host and passes them as explicit options. `User`, `Match`, `Include`,
+  `ProxyCommand`, `ProxyJump`, `LocalCommand` and `KnownHostsCommand` are
+  ignored, nothing in the config is executed, and `ssh -G` is never used. A
+  value is used only if, after `~/` expansion and symlink resolution, it is a
+  plain path or name (`A-Z a-z 0-9 . _ / + , : @ -`, no leading `-`); other
+  values are skipped with a warning. The config, identity and known-hosts files
+  must be regular files whose whole path is owned by the operator or root and
+  is not group- or world-writable, outside every agent checkout, store and run
+  directory; an untrusted config is ignored entirely.
+  `--git-ssh-identity PATH` (or `AGENT_LOOP_GIT_SSH_IDENTITY`; the option wins)
+  takes precedence over config identities and offers only that key; an
+  untrusted key is an error. `StrictHostKeyChecking=yes` is pinned, so the host
+  key must already be known; there is no prompt. Default identity files and
+  `SSH_AUTH_SOCK` remain available. Failures print a fixed class (`remote not
+  found`, `host-key failure`, `network or timeout`, `authentication failure`,
+  `unclassified`) and never Git's stderr; SSH authentication failures suggest
+  `--git-ssh-identity`. No HTTPS fallback is attempted. On Windows the config
+  is not read and the override is refused. SSH transport on Windows is
   untested (no Windows CI runner; only command construction is covered;
   tracked in #1371). Same-UID agents that race agent-loop while it runs are
   outside this boundary and need OS-level isolation (#1371).

@@ -496,6 +496,14 @@ def build_parser() -> argparse.ArgumentParser:
             help="Protocol for a newly created GitHub checkout origin (default: https). Choose ssh for an operator-configured SSH identity.",
         )
         subparser.add_argument(
+            "--git-ssh-identity", type=Path, default=None, metavar="PATH",
+            help=(
+                "Absolute path of the SSH private key for trusted Git transport, taking precedence over "
+                "~/.ssh/config IdentityFile (default: AGENT_LOOP_GIT_SSH_IDENTITY, then ~/.ssh/config). "
+                "The key must be an operator-owned, agent-inaccessible regular file."
+            ),
+        )
+        subparser.add_argument(
             "--reviewer-codex-model", default="",
             help="Codex reviewer model, overriding --codex-model for plan/PR reviews and discussion turns only.",
         )

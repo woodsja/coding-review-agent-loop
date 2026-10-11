@@ -748,3 +748,48 @@ def test_worktree_links_are_per_run_and_removal_keeps_store_target(tmp_path, mon
     finally:
         if proc_a.poll() is None:
             stop(proc_a)
+
+
+def test_transport_forbidden_roots_cover_every_agent_location_and_call_site(tmp_path, monkeypatch):
+    """#1380: SSH config, identities and known-hosts are refused in any agent-controlled root."""
+    from coding_review_agent_loop import git_transport
+
+    env = Env(tmp_path, monkeypatch)
+    explicit = tmp_path / "explicit-codex"
+    seat_dir = tmp_path / "seat-checkout"
+    config = env.config(extra=(
+        "--codex-dir", str(explicit),
+        "--reviewer-seat", "audit=gemini", "--seat-model", "audit=gemini-test",
+        "--seat-dir", f"audit={seat_dir}",
+    ))
+    roots = set(config.transport_forbidden_roots)
+    claude_store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    expected = {
+        config.claude_dir, explicit.resolve(), seat_dir.resolve(), claude_store,
+        default_run_worktree_root("OWNER/REPO", "claude").resolve(), env.bare.resolve(),
+    }
+    assert expected <= roots
+    assert len(roots) == len(config.transport_forbidden_roots)
+
+    calls = []
+    real_import = git_transport.import_ref
+
+    def recording_import(destination, source_ref, tracking_ref, **kwargs):
+        calls.append((destination, kwargs["forbidden_roots"], kwargs["ssh_identity"]))
+        return real_import(destination, source_ref, tracking_ref, **kwargs)
+
+    monkeypatch.setattr(git_transport, "import_ref", recording_import)
+    sha = env.commit("b.txt", "two")
+    env.set_pr_head(7, sha)
+    assert run_worktrees.prepare_store(claude_store, config=config, runner=Runner()) == sha
+    assert run_worktrees.pin_pr_head(claude_store, 7, config=config, runner=Runner()) == sha
+    assert calls and all(
+        forbidden == config.transport_forbidden_roots and identity is None
+        for _destination, forbidden, identity in calls
+    )
+
+    calls.clear()
+    doubles = SimpleNamespace(repo="OWNER/REPO", gh_cmd=str(env.gh), base="main",
+                              trusted_local_origin=env.bare)
+    run_worktrees._fetch_and_pin(claude_store, "main", config=doubles, runner=Runner(), free=False)
+    assert calls == [(claude_store, (), None)]

@@ -678,10 +678,51 @@ must match that resolved path exactly.
 New checkouts use HTTPS by default. Pass `--trusted-origin-protocol ssh` when
 the operator has configured SSH authentication; agent-loop creates the exact
 `git@host:owner/repo.git` origin before its private fetch (or an `ssh://` URL
-when the trusted host includes a port). The pinned SSH client ignores the
-user's SSH config; default identity files and `SSH_AUTH_SOCK` remain available.
-This option cannot
-be combined with `--trusted-local-origin`.
+when the trusted host includes a port). This option cannot be combined with
+`--trusted-local-origin`.
+
+The pinned SSH client runs with `-F /dev/null`, so `~/.ssh/config` is never
+evaluated by ssh itself, and `ssh -G` is never used. On Linux and macOS,
+agent-loop instead reads a small subset of `~/.ssh/config` for the literal
+origin host, without running anything, and passes it as explicit options:
+
+- `IdentityFile` (each entry, as `-i`), `HostName`, `IdentitiesOnly`, a single
+  `UserKnownHostsFile`, and `Port` only when the origin URL has no port.
+- `User` is ignored, because the origin pins the `git` user. `Match` blocks,
+  `Include`, `ProxyCommand`, `ProxyJump`, `LocalCommand`, `KnownHostsCommand`
+  and every other directive are ignored.
+- Only plain values are used: after `~/` expansion (to `$HOME`) and symlink
+  resolution, a value must contain only `A-Z a-z 0-9 . _ / + , : @ -` and must
+  not start with `-`. Values with `%` tokens, `${VAR}`, spaces, quotes or
+  several known-hosts files are skipped with a warning, never escaped.
+- `~/.ssh/config`, every identity file and the known-hosts file must pass one
+  trust check. Every path component must be owned by you or root and must not
+  be group- or world-writable, the file must be a regular file, and it must lie
+  outside every agent checkout, store and run directory. An untrusted config is
+  ignored entirely; an untrusted entry is skipped with a warning.
+
+To select a key explicitly, pass `--git-ssh-identity /absolute/path/to/key` or
+set `AGENT_LOOP_GIT_SSH_IDENTITY`. The option wins over the variable, both win
+over `~/.ssh/config` identities, and agent-loop then offers only that key
+(`IdentitiesOnly=yes`). An explicit key that fails the trust check stops the
+run with an error. The option cannot be combined with `--trusted-local-origin`,
+and managed recovery commands keep it.
+
+The SSH command pins `StrictHostKeyChecking=yes`: the server's host key must
+already be in `~/.ssh/known_hosts` (or the trusted `UserKnownHostsFile`), and
+unknown or changed keys fail without a prompt. `BatchMode` is not set, so an
+encrypted key can still ask for its passphrase on a terminal. Default identity
+files and `SSH_AUTH_SOCK` remain available unless `IdentitiesOnly` says
+otherwise.
+
+A failed fetch never shows Git's stderr, because it may contain credentials.
+Instead the error names a fixed class: `remote not found`, `host-key failure`,
+`network or timeout`, `authentication failure` or `unclassified`. An SSH
+authentication failure suggests `--git-ssh-identity`. No HTTPS fallback is
+attempted after an SSH failure.
+
+On Windows, `~/.ssh/config` is not read and `--git-ssh-identity` is refused
+until a Windows ACL trust policy exists (#1371).
 SSH transport on Windows is untested: no Windows CI runner exists, so only
 its command construction is covered (tracked in #1371). This boundary covers
 settings, hooks, environment, and transport options planted in a checkout; a

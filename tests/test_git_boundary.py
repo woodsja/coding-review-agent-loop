@@ -517,3 +517,599 @@ def test_runner_routes_every_git_spelling_through_local_boundary(tmp_path, monke
         run_binary_capture([program, "status", "--porcelain"], cwd=tmp_path)
     assert routed == [("status", "--porcelain")]
     assert runner_module._is_git_launch(["gitk"]) is False
+
+
+# --- SSH identity selection from ~/.ssh/config (#1380) -------------------------
+
+import re as _re
+import shlex as _shlex
+import threading as _threading
+
+_SSH_PREFIX = [
+    "/usr/bin/ssh", "-F", os.devnull, "-o", "ProxyCommand=none", "-o", "PermitLocalCommand=no",
+    "-o", "ClearAllForwardings=yes", "-o", "StrictHostKeyChecking=yes",
+]
+_SAFE = _re.compile(r"[A-Za-z0-9._/+,:@-]+")
+
+
+@pytest.fixture
+def ssh_home(tmp_path, monkeypatch):
+    """A trusted 0700 HOME with ~/.ssh; skip where tmp ancestry is not operator-trusted."""
+    from coding_review_agent_loop import git_transport
+
+    if os.name != "posix" or not Path("/usr/bin/ssh").exists():
+        pytest.skip("POSIX OpenSSH client is unavailable")
+    try:
+        git_transport._trusted_executable("/usr/bin/ssh")
+    except AgentLoopError:
+        pytest.skip("/usr/bin/ssh is not in a root-owned installation")
+    tmp_path.chmod(0o700)
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    home.chmod(0o700)
+    (home / ".ssh").chmod(0o700)
+    probe = home / ".ssh" / "probe"
+    probe.write_text("")
+    probe.chmod(0o600)
+    try:
+        git_transport._trusted_operator_file(probe, forbidden_roots=())
+    except git_transport._UntrustedPath:
+        pytest.skip("tmp_path ancestry is not operator-owned and private")
+    probe.unlink()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr(git_transport, "_EMITTED_WARNINGS", set())
+    return home
+
+
+def _write_ssh_config(home: Path, text: str) -> Path:
+    path = home / ".ssh" / "config"
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
+def _key(directory: Path, name: str = "k") -> Path:
+    if not directory.exists():
+        directory.mkdir(parents=True)
+        directory.chmod(0o700)
+    path = directory / name
+    path.write_text("placeholder key material is never read\n")
+    path.chmod(0o600)
+    return path
+
+
+def _ssh_argv(url: str = "git@github.com:OWNER/REPO.git", **kwargs) -> list[str]:
+    from coding_review_agent_loop import git_transport
+
+    return _shlex.split(git_transport._transport_env(url, None, **kwargs)["GIT_SSH_COMMAND"])
+
+
+def _option_values(argv: list[str], flag: str) -> list[str]:
+    return [argv[index + 1] for index, token in enumerate(argv[:-1]) if token == flag]
+
+
+def _no_process(monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("SSH option resolution must not run a process (no ssh -G)")
+
+    monkeypatch.setattr(git_transport.subprocess, "run", refuse)
+    monkeypatch.setattr(git_transport.subprocess, "Popen", refuse)
+
+
+def test_config_identity_file_is_carried_after_hardening_prefix(ssh_home, monkeypatch):
+    key = _key(ssh_home / ".ssh")
+    _write_ssh_config(ssh_home, "Host github.com\n  IdentityFile ~/.ssh/k\n")
+    _no_process(monkeypatch)
+    argv = _ssh_argv()
+    assert argv[:len(_SSH_PREFIX)] == _SSH_PREFIX
+    assert argv[len(_SSH_PREFIX):] == ["-i", str(key)]
+
+
+def test_dangerous_ssh_directives_are_ignored_and_include_is_not_opened(ssh_home, tmp_path, monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    key = _key(ssh_home / ".ssh")
+    _key(ssh_home / ".ssh", "evil")
+    marker = tmp_path / "marker"
+    included = ssh_home / ".ssh" / "other"
+    included.write_text("Host *\n  IdentityFile ~/.ssh/evil\n")
+    included.chmod(0o600)
+    _write_ssh_config(ssh_home, (
+        "Include other\n"
+        "Host github.com\n"
+        f"  ProxyCommand touch {marker}\n"
+        "  ProxyJump jump.example.com\n"
+        f"  LocalCommand touch {marker}\n"
+        f"  KnownHostsCommand touch {marker}\n"
+        "  User operator\n"
+        "  IdentityFile ~/.ssh/k\n"
+        f'Match exec "touch {marker}"\n'
+        "  IdentityFile ~/.ssh/evil\n"
+        "  HostName evil.example.com\n"
+    ))
+    opened: list[str] = []
+    real_open = os.open
+
+    def recording_open(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_transport.os, "open", recording_open)
+    _no_process(monkeypatch)
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == ["-i", str(key)]
+    assert opened == [str(ssh_home / ".ssh" / "config")]
+    assert not marker.exists()
+    assert "evil" not in " ".join(argv) and "ProxyJump" not in " ".join(argv)
+
+
+def test_ssh_host_pattern_semantics_first_value_and_negation():
+    from coding_review_agent_loop.git_transport import _ssh_host_options
+
+    text = (
+        "IdentityFile ~/.ssh/global\n"
+        "Host *.example.com !bad.example.com\n"
+        "  HostName wild.example.net\n"
+        "  IdentityFile ~/.ssh/wild\n"
+        "Host other.com\n"
+        "  IdentityFile ~/.ssh/other\n"
+        "  Port 1111\n"
+        "Host GITHUB.COM gitlab.com\n"
+        "  HostName=first.example.net\n"
+        '  IdentityFile "~/.ssh/k"  # trailing comment\n'
+        "Host *\n"
+        "  HostName second.example.net\n"
+        "  IdentityFile ~/.ssh/k2\n"
+        "  Port 2200\n"
+        "Host g?thub.com\n"
+        "  IdentitiesOnly yes\n"
+    )
+    github = _ssh_host_options(text, "github.com")
+    assert github["hostname"] == ("first.example.net",)
+    assert github["port"] == ("2200",)
+    assert github["identitiesonly"] == ("yes",)
+    assert github["identityfile"] == [("~/.ssh/global",), ("~/.ssh/k",), ("~/.ssh/k2",)]
+    good = _ssh_host_options(text, "good.example.com")
+    assert good["hostname"] == ("wild.example.net",)
+    bad = _ssh_host_options(text, "bad.example.com")
+    assert bad["hostname"] == ("second.example.net",)
+    assert ("~/.ssh/wild",) not in bad["identityfile"]
+    assert all(("~/.ssh/other",) != entry for entry in github["identityfile"])
+
+
+@pytest.mark.parametrize("line,filename", [
+    ('IdentityFile "~/.ssh/a b"', "a b"),
+    ("IdentityFile '~/.ssh/q'", "q"),
+    ("IdentityFile ~/.ssh/a\\b", "a\\b"),
+    ("IdentityFile ~/.ssh/$(touch x)", "$(touch x)"),
+    ("IdentityFile ~/.ssh/`x`", "`x`"),
+    ("IdentityFile ~/.ssh/a=b", "a=b"),
+    ("IdentityFile ~/.ssh/a#b", "a#b"),
+    ("IdentityFile ~/.ssh/%h_%r", "%h_%r"),
+    ("IdentityFile ${HOME}/.ssh/k", "k"),
+    ("IdentityFile -oProxyCommand=x", "k"),
+    ("IdentityFile ~operator/.ssh/k", "k"),
+    ("IdentityFile .ssh/k", "k"),
+])
+def test_unsafe_identity_values_are_refused_not_escaped(ssh_home, monkeypatch, capsys, line, filename):
+    _key(ssh_home / ".ssh", filename)
+    _key(ssh_home / ".ssh")
+    _write_ssh_config(ssh_home, f"Host github.com\n  {line}\n")
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == []
+    assert "IdentityFile for trusted Git transport" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("line,key", [
+    ("Port 99999", "Port"), ("Port 22x", "Port"), ("Port -1", "Port"),
+    ("HostName -oProxyCommand=x", "HostName"), ("HostName %h.example.com", "HostName"),
+    ("HostName a;b", "HostName"), ("IdentitiesOnly maybe", "IdentitiesOnly"),
+    ("UserKnownHostsFile ~/.ssh/a ~/.ssh/b", "UserKnownHostsFile"),
+    ("UserKnownHostsFile ~/.ssh/%k", "UserKnownHostsFile"),
+    ('HostName "unterminated', "HostName"),
+])
+def test_unsafe_scalar_values_are_skipped_with_fixed_warning(ssh_home, capsys, line, key):
+    _write_ssh_config(ssh_home, f"Host github.com\n  {line}\n")
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == []
+    err = capsys.readouterr().err
+    assert f"{key} for trusted Git transport" in err
+    assert line.split(None, 1)[1] not in err
+
+
+@pytest.mark.parametrize("home_name", ["h%h", "h${X}", "h space"])
+def test_unsafe_home_or_realpath_refuses_clean_raw_values(tmp_path, monkeypatch, capsys, ssh_home, home_name):
+    home = tmp_path / home_name
+    (home / ".ssh").mkdir(parents=True)
+    home.chmod(0o700)
+    (home / ".ssh").chmod(0o700)
+    _key(home / ".ssh")
+    _write_ssh_config(home, "Host github.com\n  IdentityFile ~/.ssh/k\n"
+                            "  UserKnownHostsFile ~/.ssh/known_hosts\n")
+    monkeypatch.setenv("HOME", str(home))
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == []
+    assert home_name not in " ".join(argv)
+    assert "IdentityFile for trusted Git transport" in capsys.readouterr().err
+
+
+def test_symlinked_identity_with_unsafe_realpath_is_refused(ssh_home, capsys):
+    real = _key(ssh_home / ".ssh", "real%k")
+    (ssh_home / ".ssh" / "k").symlink_to(real)
+    _write_ssh_config(ssh_home, "Host github.com\n  IdentityFile ~/.ssh/k\n")
+    assert _ssh_argv()[len(_SSH_PREFIX):] == []
+
+
+def test_emitted_config_values_are_allowlisted(ssh_home):
+    key = _key(ssh_home / ".ssh", "github_key")
+    _write_ssh_config(ssh_home, (
+        "Host github.com\n  HostName ssh.github.com\n  Port 443\n  IdentitiesOnly YES\n"
+        "  UserKnownHostsFile ~/.ssh/known_hosts_github\n  IdentityFile ~/.ssh/github_key\n"
+    ))
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == [
+        "-o", "HostName=ssh.github.com", "-o", "Port=443", "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={ssh_home / '.ssh' / 'known_hosts_github'}", "-i", str(key),
+    ]
+    for token in argv[len(_SSH_PREFIX):]:
+        if token not in ("-o", "-i"):
+            assert _SAFE.fullmatch(token.split("=", 1)[-1])
+
+
+def test_config_user_is_ignored_and_port_only_without_url_port(ssh_home):
+    _write_ssh_config(ssh_home, "Host github.com\n  User operator\n  Port 2200\n")
+    scp = _ssh_argv("git@github.com:OWNER/REPO.git")
+    assert scp[len(_SSH_PREFIX):] == ["-o", "Port=2200"]
+    explicit = _ssh_argv("ssh://git@github.com:2222/OWNER/REPO.git")
+    assert explicit[len(_SSH_PREFIX):] == []
+    for argv in (scp, explicit):
+        assert not any(token.lower().startswith("user=") for token in argv)
+        assert "-l" not in argv
+
+
+def test_explicit_identity_overrides_config_identity_and_identities_only(ssh_home):
+    config_key = _key(ssh_home / ".ssh", "a")
+    explicit = _key(ssh_home / "keys", "c")
+    (ssh_home / "keys").chmod(0o700)
+    _write_ssh_config(ssh_home, "Host github.com\n  IdentityFile ~/.ssh/a\n  IdentitiesOnly no\n"
+                                "  HostName ssh.github.com\n")
+    argv = _ssh_argv(ssh_identity=explicit)
+    assert _option_values(argv, "-i") == [str(explicit)]
+    assert str(config_key) not in argv
+    assert [value for value in _option_values(argv, "-o") if value.startswith("IdentitiesOnly")] == [
+        "IdentitiesOnly=yes"
+    ]
+    assert "HostName=ssh.github.com" in argv
+
+
+def test_git_ssh_identity_cli_beats_environment(tmp_path, monkeypatch):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import resolve_git_ssh_identity
+
+    monkeypatch.setenv("AGENT_LOOP_GIT_SSH_IDENTITY", "/env/key")
+    args = build_parser().parse_args(["issue", "1", "--git-ssh-identity", "/cli/key"])
+    assert args.git_ssh_identity == Path("/cli/key")
+    assert resolve_git_ssh_identity(args, local_origin=None) == Path("/cli/key")
+    assert resolve_git_ssh_identity(SimpleNamespace(git_ssh_identity=None), local_origin=None) == Path("/env/key")
+    monkeypatch.setenv("AGENT_LOOP_GIT_SSH_IDENTITY", "")
+    assert resolve_git_ssh_identity(SimpleNamespace(git_ssh_identity=None), local_origin=None) is None
+
+
+@pytest.mark.parametrize("value,local_origin,message", [
+    ("relative/key", None, "absolute path"),
+    ("/keys/%h", None, "plain path"),
+    ("/keys/${HOME}", None, "plain path"),
+    ("/keys/k", Path("/srv/origin"), "cannot be combined with --trusted-local-origin"),
+])
+def test_git_ssh_identity_option_validation(monkeypatch, value, local_origin, message):
+    from coding_review_agent_loop.config import resolve_git_ssh_identity
+
+    monkeypatch.delenv("AGENT_LOOP_GIT_SSH_IDENTITY", raising=False)
+    with pytest.raises(AgentLoopError, match=_re.escape(message)):
+        resolve_git_ssh_identity(SimpleNamespace(git_ssh_identity=Path(value)), local_origin=local_origin)
+    monkeypatch.setenv("AGENT_LOOP_GIT_SSH_IDENTITY", value)
+    with pytest.raises(AgentLoopError, match=_re.escape(message)):
+        resolve_git_ssh_identity(SimpleNamespace(git_ssh_identity=None), local_origin=local_origin)
+
+
+def _foreign_lstat(monkeypatch, target: Path):
+    """Report ``target`` (not its referent) as owned by another uid."""
+    real = Path.lstat
+
+    def fake(self):
+        info = real(self)
+        if str(self) == str(target):
+            values = list(info[:10])
+            values[4] = os.getuid() + 4242
+            return os.stat_result(values)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", fake)
+
+
+@pytest.mark.parametrize("case", [
+    "group-writable", "world-writable", "writable-ancestor", "foreign-owned", "directory",
+    "fifo", "sibling-checkout", "seat-workdir", "store", "prior-run-dir",
+    "symlink-to-group-writable", "symlink-under-writable-ancestor", "symlink-into-checkout",
+    "foreign-owned-symlink",
+])
+def test_untrusted_identity_is_refused(ssh_home, tmp_path, monkeypatch, capsys, case):
+    from coding_review_agent_loop import git_transport
+
+    roots = {name: tmp_path / name for name in ("sibling-checkout", "seat-workdir", "store", "prior-run-dir")}
+    for root in roots.values():
+        root.mkdir(mode=0o700)
+        root.chmod(0o700)
+    keys = ssh_home / "keys"
+    keys.mkdir()
+    keys.chmod(0o700)
+    if case in roots:
+        identity = _key(roots[case] / "nested")
+    elif case == "directory":
+        identity = keys / "dir"
+        identity.mkdir()
+    elif case == "fifo":
+        identity = keys / "fifo"
+        os.mkfifo(identity, 0o600)
+    elif case == "writable-ancestor":
+        identity = _key(keys / "shared")
+        (keys / "shared").chmod(0o770)
+    elif case.startswith("symlink") or case == "foreign-owned-symlink":
+        target_dir = {"symlink-under-writable-ancestor": keys / "shared",
+                      "symlink-into-checkout": roots["sibling-checkout"]}.get(case, keys)
+        target = _key(target_dir, "target")
+        if case == "symlink-to-group-writable":
+            target.chmod(0o620)
+        if case == "symlink-under-writable-ancestor":
+            target_dir.chmod(0o770)
+        identity = keys / "link"
+        identity.symlink_to(target)
+        if case == "foreign-owned-symlink":
+            _foreign_lstat(monkeypatch, identity)
+    else:
+        identity = _key(keys)
+        if case == "group-writable":
+            identity.chmod(0o620)
+        elif case == "world-writable":
+            identity.chmod(0o602)
+        elif case == "foreign-owned":
+            _foreign_lstat(monkeypatch, identity)
+    forbidden = tuple(roots.values())
+    with pytest.raises(AgentLoopError) as raised:
+        _ssh_argv(ssh_identity=identity, forbidden_roots=forbidden)
+    assert str(raised.value) == git_transport._SSH_IDENTITY_REFUSED
+    assert str(identity) not in str(raised.value)
+    _write_ssh_config(ssh_home, f"Host github.com\n  IdentityFile {identity}\n")
+    argv = _ssh_argv(forbidden_roots=forbidden)
+    assert "-i" not in argv
+    assert "IdentityFile for trusted Git transport" in capsys.readouterr().err
+
+
+def test_trusted_symlinks_are_accepted_and_realpaths_emitted(tmp_path, monkeypatch, ssh_home):
+    real_ssh = tmp_path / "real-ssh"
+    real_ssh.mkdir(mode=0o700)
+    key = _key(real_ssh, "github_key")
+    home = tmp_path / "linked-home"
+    home.mkdir(mode=0o700)
+    (home / ".ssh").symlink_to(real_ssh)
+    (home / "id_link").symlink_to(key)
+    assert (home / "id_link").lstat().st_mode & 0o777 == 0o777 or os.uname().sysname != "Linux"
+    _write_ssh_config(home, "Host github.com\n  IdentityFile ~/id_link\n")
+    monkeypatch.setenv("HOME", str(home))
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == ["-i", str(key)]
+
+
+def test_trusted_operator_file_return_shapes(ssh_home):
+    from coding_review_agent_loop.git_transport import _trusted_operator_file
+
+    key = _key(ssh_home / ".ssh")
+    info = key.stat()
+    existing = _trusted_operator_file(key, forbidden_roots=())
+    assert existing.path == key.resolve() and existing.identity == (info.st_dev, info.st_ino)
+    missing = _trusted_operator_file(ssh_home / ".ssh" / "known_hosts_new", forbidden_roots=(),
+                                     allow_missing=True)
+    assert missing.path == ssh_home.resolve() / ".ssh" / "known_hosts_new"
+    assert missing.identity is None
+
+
+def test_config_swapped_between_walk_and_open_is_ignored(ssh_home, monkeypatch, capsys):
+    from coding_review_agent_loop import git_transport
+
+    _key(ssh_home / ".ssh")
+    config = _write_ssh_config(ssh_home, "Host github.com\n  IdentityFile ~/.ssh/k\n")
+    monkeypatch.setattr(git_transport, "_trusted_operator_file",
+                        lambda *_a, **_k: git_transport.TrustedFile(config.resolve(), (0, 0)))
+    assert git_transport._read_ssh_config(ssh_home, ()) is None
+    assert git_transport._SSH_CONFIG_IGNORED in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("case", [
+    "config-group-writable", "ssh-dir-world-writable", "home-group-writable", "foreign-owned",
+    "home-inside-run-root", "fifo", "oversized",
+])
+def test_untrusted_ssh_config_is_ignored_entirely(ssh_home, tmp_path, monkeypatch, capsys, case):
+    from coding_review_agent_loop import git_transport
+
+    home = ssh_home
+    roots: tuple[Path, ...] = ()
+    if case == "home-inside-run-root":
+        roots = (home,)
+    _key(home / ".ssh")
+    config = home / ".ssh" / "config"
+    text = ("Host github.com\n  HostName evil.example.com\n  IdentityFile ~/.ssh/k\n"
+            "  UserKnownHostsFile ~/.ssh/kh\n")
+    if case == "fifo":
+        os.mkfifo(config, 0o600)
+    else:
+        _write_ssh_config(home, text + ("#" * (256 * 1024) if case == "oversized" else ""))
+    if case == "config-group-writable":
+        config.chmod(0o620)
+    elif case == "ssh-dir-world-writable":
+        (home / ".ssh").chmod(0o703)
+    elif case == "home-group-writable":
+        home.chmod(0o770)
+    elif case == "foreign-owned":
+        _foreign_lstat(monkeypatch, config)
+    result: dict[str, list[str]] = {}
+    worker = _threading.Thread(target=lambda: result.update(argv=_ssh_argv(forbidden_roots=roots)),
+                               daemon=True)
+    worker.start()
+    worker.join(10)
+    assert not worker.is_alive(), "reading a non-regular config must not block"
+    assert result["argv"][len(_SSH_PREFIX):] == []
+    assert capsys.readouterr().err.count(git_transport._SSH_CONFIG_IGNORED) == 1
+
+
+@pytest.mark.parametrize("case", ["checkout", "store", "writable-ancestor", "two-paths", "missing"])
+def test_known_hosts_file_passes_shared_trust_walk(ssh_home, tmp_path, capsys, case):
+    checkout, store = tmp_path / "checkout", tmp_path / "store"
+    for root in (checkout, store):
+        root.mkdir()
+        root.chmod(0o700)
+    shared = ssh_home / "shared"
+    shared.mkdir()
+    shared.chmod(0o770)
+    value = {
+        "checkout": str(checkout / "known_hosts"),
+        "store": str(store / "known_hosts"),
+        "writable-ancestor": str(shared / "known_hosts"),
+        "two-paths": "~/.ssh/a ~/.ssh/b",
+        "missing": "~/.ssh/known_hosts_missing",
+    }[case]
+    for path in (checkout / "known_hosts", store / "known_hosts", shared / "known_hosts"):
+        path.write_text("")
+        path.chmod(0o600)
+    _write_ssh_config(ssh_home, f"Host github.com\n  UserKnownHostsFile {value}\n")
+    argv = _ssh_argv(forbidden_roots=(checkout, store))
+    if case == "missing":
+        assert argv[len(_SSH_PREFIX):] == [
+            "-o", f"UserKnownHostsFile={ssh_home.resolve() / '.ssh' / 'known_hosts_missing'}"
+        ]
+        assert not (ssh_home / ".ssh" / "known_hosts_missing").exists()
+    else:
+        assert argv[len(_SSH_PREFIX):] == []
+        assert "UserKnownHostsFile for trusted Git transport" in capsys.readouterr().err
+
+
+def test_windows_ssh_command_is_unchanged_and_override_refused(tmp_path, monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "config").write_text("Host github.com\n  IdentityFile ~/.ssh/k\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(git_transport.sys, "platform", "win32")
+    monkeypatch.setattr(git_transport, "_git_path", lambda: r"C:\Program Files\Git\bin\git.exe")
+    monkeypatch.setattr(git_transport, "_trusted_executable", lambda path: path)
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(git_transport.os.path, "isfile",
+                        lambda path: path.endswith("ssh.exe") or real_isfile(path))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Windows must not read ~/.ssh/config or call os.getuid")
+
+    monkeypatch.setattr(git_transport, "_read_ssh_config", forbidden)
+    monkeypatch.setattr(git_transport.os, "getuid", forbidden, raising=False)
+    command = git_transport._transport_env("git@github.com:OWNER/REPO.git", None)["GIT_SSH_COMMAND"]
+    assert command == (
+        f'"C:\\Program Files\\Git\\usr\\bin\\ssh.exe" -F {os.devnull} -o ProxyCommand=none '
+        "-o PermitLocalCommand=no -o ClearAllForwardings=yes"
+    )
+    with pytest.raises(AgentLoopError, match="not supported on Windows"):
+        git_transport._transport_env("git@github.com:OWNER/REPO.git", None,
+                                     ssh_identity=Path("C:/keys/k"))
+
+
+def test_import_ref_passes_identity_and_destination_forbidden_root(repositories, monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    _, _, checkout = repositories
+    git(checkout, "config", "remote.origin.url", "git@github.com:OWNER/REPO.git")
+    seen = {}
+
+    def recording_env(url, gh_cmd, **kwargs):
+        seen.update(kwargs)
+        raise AgentLoopError("stop before transport")
+
+    monkeypatch.setattr(git_transport, "_transport_env", recording_env)
+    store = Path("/srv/agent-store")
+    with pytest.raises(AgentLoopError, match="stop before transport"):
+        import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main", repo="OWNER/REPO",
+                   runner=Runner(), ssh_identity=Path("/keys/k"), forbidden_roots=(store,))
+    assert seen == {"ssh_identity": Path("/keys/k"), "forbidden_roots": (store, checkout)}
+
+
+_FOOTER = ("fatal: Could not read from remote repository.\n\n"
+           "Please make sure you have the correct access rights\nand the repository exists.\n")
+_SECRET = "ghp_fixtureSecretValue123"
+
+
+@pytest.mark.parametrize("stderr,label", [
+    (f"ssh: connect to host h port 22: Connection refused {_SECRET}\n" + _FOOTER, "network or timeout"),
+    (f"ssh: connect to host h port 22: Connection timed out {_SECRET}\n" + _FOOTER, "network or timeout"),
+    (f"ssh: Could not resolve hostname h: {_SECRET}\n" + _FOOTER, "network or timeout"),
+    (f"ERROR: Repository not found. {_SECRET}\n" + _FOOTER, "remote not found"),
+    (f"Host key verification failed. {_SECRET}\n" + _FOOTER, "host-key failure"),
+    (f"git@github.com: Permission denied (publickey). {_SECRET}\n" + _FOOTER, "authentication failure"),
+    (_FOOTER + _SECRET, "authentication failure"),
+    (f"fatal: something new {_SECRET}\n", "unclassified"),
+])
+@pytest.mark.parametrize("ssh", [True, False])
+def test_transport_failure_class_is_fixed_and_nonsecret(monkeypatch, capsys, stderr, label, ssh):
+    from coding_review_agent_loop import git_transport
+
+    monkeypatch.setattr(git_transport, "_git_path", lambda: "/usr/bin/git")
+    monkeypatch.setattr(
+        git_transport.subprocess, "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(command, 128, b"", stderr.encode()),
+    )
+    with pytest.raises(AgentLoopError) as raised:
+        git_transport._private_git(("fetch", f"https://x-access-token:{_SECRET}@example/r"),
+                                   cwd=Path("/"), env={}, ssh=ssh)
+    message = str(raised.value)
+    assert message.startswith(f"Trusted Git transport failed with exit 128 ({label}).")
+    assert _SECRET not in message and "fetch" not in message and "Connection" not in message
+    assert ("--git-ssh-identity" in message) == (ssh and label == "authentication failure")
+    assert ("known_hosts" in message) == (ssh and label == "host-key failure")
+    captured = capsys.readouterr()
+    assert _SECRET not in captured.out + captured.err
+
+
+def test_transport_timeout_reports_network_class(monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    def timeout(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, 1, stderr=_SECRET.encode())
+
+    monkeypatch.setattr(git_transport, "_git_path", lambda: "/usr/bin/git")
+    monkeypatch.setattr(git_transport.subprocess, "run", timeout)
+    with pytest.raises(AgentLoopError, match=_re.escape("timed out (network or timeout)")) as raised:
+        git_transport._private_git(("fetch",), cwd=Path("/"), env={}, ssh=True)
+    assert _SECRET not in str(raised.value)
+
+
+def test_https_auth_failure_still_retries_with_gh_token(repositories, monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    _, _, checkout = repositories
+    git(checkout, "config", "remote.origin.url", "https://github.com/OWNER/REPO.git")
+    fetches = []
+    real_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] == git_transport._git_path() and "fetch" in command:
+            fetches.append("GIT_CONFIG_COUNT" in kwargs["env"])
+            return subprocess.CompletedProcess(command, 128, b"", b"returned error: 401\n")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(git_transport.subprocess, "run", fake_run)
+    monkeypatch.setattr(git_transport, "_token_from_gh", lambda *_args: "token")
+    with pytest.raises(AgentLoopError, match=_re.escape("(authentication failure).")) as raised:
+        import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main",
+                   repo="OWNER/REPO", runner=Runner(), gh_cmd="gh")
+    assert fetches == [False, True]
+    assert "--git-ssh-identity" not in str(raised.value)

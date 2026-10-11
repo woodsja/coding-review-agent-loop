@@ -499,6 +499,14 @@ def _fast_forward_base(store: Path, base: str, sha: str, *, config: Any, runner:
     _git(runner, store, "update-ref", ref, sha, old)
 
 
+def _transport_options(config: Any) -> dict[str, Any]:
+    """Operator SSH identity and agent-controlled roots for import_ref (#1380)."""
+    return {
+        "ssh_identity": getattr(config, "git_ssh_identity", None),
+        "forbidden_roots": tuple(getattr(config, "transport_forbidden_roots", ())),
+    }
+
+
 def _fetch_and_pin(store: Path, base: str, *, config: Any, runner: Any, free: bool) -> str:
     from .git_transport import import_ref
 
@@ -506,6 +514,7 @@ def _fetch_and_pin(store: Path, base: str, *, config: Any, runner: Any, free: bo
         store, f"refs/heads/{base}", f"refs/remotes/origin/{base}",
         repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
         local_origin=config.trusted_local_origin,
+        **_transport_options(config),
     )
     if free:
         _fast_forward_base(store, base, sha, config=config, runner=runner)
@@ -536,6 +545,7 @@ def pin_pr_head(store: Path, pr_number: int, *, config: Any, runner: Any) -> str
             store, f"refs/pull/{pr_number}/head", pr_ref,
             repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
             local_origin=config.trusted_local_origin,
+            **_transport_options(config),
         )
 
 

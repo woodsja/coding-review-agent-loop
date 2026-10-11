@@ -284,6 +284,10 @@ class AgentLoopConfig:
     worktree_links: tuple[str, ...] = ()
     trusted_local_origin: Path | None = None
     trusted_origin_protocol: str = "https"
+    # Explicit operator SSH identity for trusted transport (#1380), and every
+    # agent-controlled root whose files the transport must never trust.
+    git_ssh_identity: Path | None = None
+    transport_forbidden_roots: tuple[Path, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
     implementation_coder: AgentName | None = None
@@ -1464,6 +1468,8 @@ def _sync_base_branch(
             path, f"refs/heads/{config.base}", f"refs/remotes/origin/{config.base}",
             repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
             local_origin=config.trusted_local_origin,
+            ssh_identity=config.git_ssh_identity,
+            forbidden_roots=config.transport_forbidden_roots,
         )
         current = _run_git(runner, path, ("rev-parse", "--verify", f"refs/heads/{config.base}"), check=False)
         if current.returncode == 0:
@@ -1739,11 +1745,15 @@ def sync_checkout_to_pr(
                     path, f"refs/heads/{config.base}", f"refs/remotes/origin/{config.base}",
                     repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
                     local_origin=config.trusted_local_origin,
+                    ssh_identity=config.git_ssh_identity,
+                    forbidden_roots=config.transport_forbidden_roots,
                 )
             pinned = import_ref(
                 path, f"refs/pull/{pr_number}/head", pr_ref,
                 repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
                 local_origin=config.trusted_local_origin,
+                ssh_identity=config.git_ssh_identity,
+                forbidden_roots=config.transport_forbidden_roots,
             )
             require_advertised_head(pinned)
             if default_owned:
@@ -2009,6 +2019,28 @@ def validate_sandboxed_args(
         )
 
 
+def resolve_git_ssh_identity(args: argparse.Namespace, *, local_origin: Path | None) -> Path | None:
+    """--git-ssh-identity, then AGENT_LOOP_GIT_SSH_IDENTITY, then none (#1380)."""
+    identity = getattr(args, "git_ssh_identity", None)
+    if identity is None:
+        raw = os.environ.get("AGENT_LOOP_GIT_SSH_IDENTITY", "")
+        identity = Path(raw) if raw else None
+    if identity is None:
+        return None
+    if not identity.is_absolute():
+        raise AgentLoopError(
+            "--git-ssh-identity (or AGENT_LOOP_GIT_SSH_IDENTITY) must be an absolute path."
+        )
+    if "%" in str(identity) or "${" in str(identity):
+        raise AgentLoopError(
+            "--git-ssh-identity (or AGENT_LOOP_GIT_SSH_IDENTITY) must be a plain path "
+            "without % or ${ tokens."
+        )
+    if local_origin is not None:
+        raise AgentLoopError("--git-ssh-identity cannot be combined with --trusted-local-origin.")
+    return identity
+
+
 def config_from_args(
     args: argparse.Namespace,
     runner: Runner,
@@ -2022,6 +2054,7 @@ def config_from_args(
         raise AgentLoopError("--trusted-local-origin must be an absolute path.")
     if local_origin is not None and getattr(args, "trusted_origin_protocol", "https") != "https":
         raise AgentLoopError("--trusted-origin-protocol cannot be combined with --trusted-local-origin.")
+    git_ssh_identity = resolve_git_ssh_identity(args, local_origin=local_origin)
 
     named_seats = resolve_reviewer_seats(args)
     legacy_reviewers = tuple(args.reviewer or (["codex"] if not named_seats else ()))
@@ -2089,6 +2122,15 @@ def config_from_args(
         for agent, store in default_checkout_stores
         for root in (store, default_run_worktree_root(repo, agent).resolve())
     )
+    transport_forbidden_roots = tuple(dict.fromkeys(
+        Path(os.path.realpath(root))
+        for root in (
+            claude_dir, codex_dir, gemini_dir, antigravity_dir,
+            *(seat.workdir for seat in seat_agents),
+            *store_roots,
+            *((local_origin,) if local_origin is not None else ()),
+        )
+    ))
     primary_dir = {
         "claude": claude_dir,
         "codex": codex_dir,
@@ -2164,6 +2206,8 @@ def config_from_args(
         gh_cmd=args.gh_cmd,
         trusted_local_origin=getattr(args, "trusted_local_origin", None),
         trusted_origin_protocol=getattr(args, "trusted_origin_protocol", "https"),
+        git_ssh_identity=git_ssh_identity,
+        transport_forbidden_roots=transport_forbidden_roots,
         claude_args=static_args("claude", args.claude_arg),
         codex_args=static_args("codex", args.codex_arg),
         gemini_args=static_args("gemini", args.gemini_arg),
