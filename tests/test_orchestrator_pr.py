@@ -20725,3 +20725,134 @@ def test_every_coder_handoff_excludes_retained_future_items(dispatch):
     _validate_structured_coder_followup_items(
         parsed(["item-1", "item-2"]), unresolved_items=ledger, optional_item_ids=("item-2",)
     )
+
+
+def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
+    """Drive a PR loop to an acknowledgement-only coder round (#1388).
+
+    item-1 is resolved in round 2 and item-2 in round 3, so the round-3 coder
+    dispatch carries only the acknowledgement obligation.  The coder still
+    lists the already-resolved item-1 as addressed.  ``recorded_history``
+    controls whether the loop sees the posted round records.
+    """
+    import coding_review_agent_loop.github as github_module
+    import coding_review_agent_loop.validated_agent as validated_agent_module
+
+    ack_item_id = HUMAN_REQUIREMENTS_ACK_ITEM_ID
+    first = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T10:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep the audit trail.",
+    )
+    second = HumanReviewRequirement(
+        source_type="PR comment", author="maintainer", created_at="2026-05-18T11:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-2",
+        body="Also log every audit write.",
+    )
+    ack_markdown = (
+        "Implemented the fix.\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n"
+        "### Human requirements\n- Requirement 1: kept the audit trail.\n"
+        "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    note = (
+        "src/audit.py still lacks the acknowledged logging requirement; acknowledge "
+        "requirement 2 and add tests/test_audit.py coverage for the audit log."
+    )
+    resolved_claim = structured_coder_followup(
+        state="approved",
+        summary="Acknowledged the new signed requirement.",
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Resolved by the human decision."},
+        human_requirement_ids=[first.requirement_id, second.requirement_id],
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Fix.", blocking_items=["Fix the bug."],
+                human_requirements_resolved=True,
+            ),
+            structured_pr_review(
+                state="approved", summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+            structured_pr_review(
+                state="blocking", summary="The new requirement is unacknowledged.",
+                prior_item_dispositions=[
+                    {"item_id": "item-2", "disposition": "resolved"},
+                    {"item_id": ack_item_id, "disposition": "blocking", "note": note},
+                ],
+            ),
+            structured_pr_review(
+                state="approved", summary="Acknowledged.", human_requirements_resolved=True,
+            ),
+        ],
+        claude_outputs=[ack_markdown, ack_markdown, resolved_claim],
+    )
+    metadata = PullRequestMetadata(
+        number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
+        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+    )
+    fetches = []
+    real_context = github_module.get_pr_review_context
+
+    def review_context(*args, **kwargs):
+        fetches.append(True)
+        requirements = (first,) if len(fetches) <= 2 else (first, second)
+        comments = real_context(*args, **kwargs).comments if recorded_history else ()
+        return PullRequestReviewContext(
+            metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
+            comments=comments, human_requirements=requirements,
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_review_context", review_context)
+    repairs = []
+    real_repair = validated_agent_module._run_structured_repair
+
+    def spy_repair(raw, **kwargs):
+        repairs.append(raw)
+        return real_repair(raw, **kwargs)
+
+    monkeypatch.setattr(validated_agent_module, "_run_structured_repair", spy_repair)
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4, quiet=False)
+    return runner, config, repairs, resolved_claim
+
+
+def test_1388_coder_listing_a_resolved_item_as_addressed_is_normalized(
+    tmp_path, monkeypatch, capsys,
+):
+    runner, config, repairs, resolved_claim = _run_1388_acknowledgement_round(
+        tmp_path, monkeypatch, recorded_history=True
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert resolved_claim not in repairs
+    err = capsys.readouterr().err
+    assert (
+        "Round 3: Claude listed already-resolved item(s) item-1 in addressed_items; "
+        "dropped them from the follow-up"
+    ) in err
+    coder_comment = next(
+        comment for comment in runner.comments
+        if "Acknowledged the new signed requirement." in comment
+    )
+    addressed_section = coder_comment.split("### Addressed items", 1)[1].split("###", 1)[0]
+    assert "item-1" not in addressed_section
+    assert "- None." in addressed_section
+
+
+def test_1388_addressed_item_without_resolution_history_still_fails_closed(
+    tmp_path, monkeypatch, capsys,
+):
+    runner, config, repairs, resolved_claim = _run_1388_acknowledgement_round(
+        tmp_path, monkeypatch, recorded_history=False
+    )
+
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert resolved_claim in repairs
+    assert "listed already-resolved item(s)" not in capsys.readouterr().err
+    assert not any(
+        "Acknowledged the new signed requirement." in comment for comment in runner.comments
+    )

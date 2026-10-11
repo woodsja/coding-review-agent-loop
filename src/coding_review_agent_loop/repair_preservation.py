@@ -1005,6 +1005,7 @@ def validate_repair_preservation(
     repaired: str,
     *,
     unresolved_item_ids: Sequence[str] | None = None,
+    optional_item_ids: Sequence[str] = (),
     surfaced_requirement_ids: Sequence[str] | None = None,
     reviewer_requirement_ids: Sequence[str] | None = None,
     allowed_prior_item_ids: Sequence[str] | None = None,
@@ -1410,8 +1411,11 @@ def validate_repair_preservation(
             )
 
     if source["kind"] == "coder_followup":
+        # Required plus retained-future optional IDs are valid (#1388).
         allowed_item_ids = (
-            set(unresolved_item_ids) if unresolved_item_ids is not None else None
+            {*unresolved_item_ids, *optional_item_ids}
+            if unresolved_item_ids is not None
+            else None
         )
         for field in ("addressed_item_notes", "remaining_item_notes"):
             notes = source.get(field)

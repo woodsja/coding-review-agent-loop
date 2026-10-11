@@ -369,10 +369,12 @@ def _run_structured_repair(
                     "require_risk_test_matrix_contract",
                     "reject_unsolicited_risk_test_matrix_contract",
                     "evidence_row_id_universe",
+                    "optional_item_ids",
                 )
             ):
                 raise
             legacy_kwargs = dict(repair_kwargs)
+            legacy_kwargs.pop("optional_item_ids", None)
             legacy_kwargs.pop("reviewer_requirement_ids", None)
             legacy_kwargs.pop("require_execution_strategy_contract", None)
             legacy_kwargs.pop("require_risk_test_matrix_contract", None)
@@ -976,6 +978,7 @@ def _run_validated_agent(
     use_repair: bool = False,
     repair_expected_kind: str | None = None,
     repair_unresolved_item_ids: Sequence[str] | None = None,
+    repair_optional_item_ids: Sequence[str] = (),
     repair_surfaced_requirement_ids: Sequence[str] | None = None,
     repair_reviewer_requirement_ids: Sequence[str] | None = None,
     repair_requires_direct_discussion_ack: bool = False,
@@ -2420,6 +2423,8 @@ def _run_validated_agent(
                         repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
                         if repair_unresolved_item_ids is not None:
                             repair_kwargs["unresolved_item_ids"] = tuple(repair_unresolved_item_ids)
+                            if repair_optional_item_ids and repair_expected_kind == "coder_followup":
+                                repair_kwargs["optional_item_ids"] = tuple(repair_optional_item_ids)
                         if repair_expected_kind in {"issue_implementation", "plan_state", "plan_revision"}:
                             repair_kwargs["surfaced_requirement_ids"] = tuple(
                                 repair_surfaced_requirement_ids or ()

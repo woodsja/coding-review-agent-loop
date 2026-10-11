@@ -977,9 +977,14 @@ def _validate_structured_coder_followup_items(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem],
     optional_item_ids: Sequence[str] = (),
-) -> None:
+    resolved_item_ids: Sequence[str] = (),
+) -> StructuredCoderFollowup:
     # ``optional_item_ids`` are retained future follow-ups outside this
     # dispatch (#1389): a coder may still list them, but never has to.
+    # ``resolved_item_ids`` is the orchestrator's fail-closed proof of items
+    # already canonically resolved (#1388).  Listing one as addressed asserts
+    # nothing new, so it is dropped with a diagnostic instead of rejected;
+    # listing one as remaining or disputed is still an unknown ID.
     allowed_ids = [
         *(item.item_id for item in select_coder_followup_items(unresolved_items)),
         *optional_item_ids,
@@ -996,7 +1001,30 @@ def _validate_structured_coder_followup_items(
             "Coder follow-up listed unresolved reviewer item IDs more than once: "
             + ", ".join(duplicates)
         )
-    unknown = sorted(set(listed_ids) - set(allowed_ids))
+    allowed = set(allowed_ids)
+    droppable = set(resolved_item_ids) - allowed
+    dropped = tuple(item_id for item_id in parsed.addressed_items if item_id in droppable)
+    if dropped:
+        dropped_set = set(dropped)
+        parsed = replace(
+            parsed,
+            addressed_items=tuple(
+                item_id for item_id in parsed.addressed_items if item_id not in dropped_set
+            ),
+            addressed_item_notes={
+                item_id: note
+                for item_id, note in parsed.addressed_item_notes.items()
+                if item_id not in dropped_set
+            },
+            addressed_sub_items=tuple(
+                sub_item_id
+                for sub_item_id in parsed.addressed_sub_items
+                if sub_item_id.split(".", 1)[0] not in dropped_set
+            ),
+            dropped_resolved_addressed_items=dropped,
+        )
+        listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
+    unknown = sorted(set(listed_ids) - allowed)
     if unknown:
         raise AgentLoopError(
             "Coder follow-up referenced unknown unresolved reviewer item IDs: "
@@ -1009,6 +1037,7 @@ def _validate_structured_coder_followup_items(
             "addressed, remaining, or disputed: "
             + ", ".join(missing)
         )
+    return parsed
 
 
 def _validate_coder_followup_response(
@@ -1025,6 +1054,7 @@ def _validate_coder_followup_response(
     execution_catalog=None,
     architecture_status_mode: str,
     optional_item_ids: Sequence[str] = (),
+    resolved_item_ids: Sequence[str] = (),
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -1048,10 +1078,11 @@ def _validate_coder_followup_response(
         },
     )
     if structured_followup is not None:
-        _validate_structured_coder_followup_items(
+        structured_followup = _validate_structured_coder_followup_items(
             structured_followup,
             unresolved_items=unresolved_items,
             optional_item_ids=optional_item_ids,
+            resolved_item_ids=resolved_item_ids,
         )
         validate_human_requirement_dispositions(
             structured_followup.human_requirement_dispositions,

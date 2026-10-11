@@ -377,6 +377,7 @@ from .review_rounds import (
     _unavailable_reviewer_amendment_advisory,
     _round_ledger_may_be_incomplete,
     _round_resolved_history_item_ids,
+    _post_round_resolved_history_item_ids,
     _ReviewerTurnResult,
     _review_round_spool,
     _replay_spooled_review,
@@ -7982,6 +7983,7 @@ def run_pr_loop(
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
+                    classifiable_item_ids=tuple(item.item_id for item in coder_followup_items),
                 )
                 log(config, f"Round {round_number}: {coder_name} resolving merge conflict")
             elif same_pr_items and not blocking_items:
@@ -8007,6 +8009,7 @@ def run_pr_loop(
                     step_back_context=step_back_guidance,
                     generalization_guidance=True,
                     finding_history=finding_history_view,
+                    classifiable_item_ids=tuple(item.item_id for item in coder_followup_items),
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
@@ -8031,10 +8034,41 @@ def run_pr_loop(
                     step_back_context=step_back_guidance,
                     generalization_guidance=True,
                     finding_history=finding_history_view,
+                    classifiable_item_ids=tuple(item.item_id for item in coder_followup_items),
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(
                 item.item_id for item in coder_followup_items
+            )
+            # Retained future follow-ups outside this dispatch: valid, never
+            # required (#1389).  The validator and repair share this set.
+            coder_optional_item_ids = tuple(
+                item.item_id
+                for item in unresolved_items
+                if item.status == "future"
+                and item.item_id not in set(repair_unresolved_item_ids)
+            )
+            # Fail-closed proof of items already canonically cleared (#1388):
+            # recorded round history plus this round's live dispositions, the
+            # same rule the plan revision uses (#874).  Anything still in the
+            # ledger, and every machine obligation, stays out of the proof.
+            current_ledger_ids = {item.item_id for item in unresolved_items}
+            coder_resolved_item_ids = tuple(
+                item_id
+                for item_id in _post_round_resolved_history_item_ids(
+                    prior_unresolved_items=prior_unresolved_items,
+                    dispositions_by_item=prior_dispositions,
+                    carried_items=unresolved_items,
+                    comments=pr_comments,
+                    flow="pr",
+                    reconciliation_mode=(
+                        "owner-scoped"
+                        if scheduler_capabilities.owner_scoped_reconciliation
+                        else "aggregate"
+                    ),
+                    same_status="same-pr",
+                )
+                if item_id not in current_ledger_ids
             )
             if (
                 evidence_pass is not None
@@ -8153,15 +8187,11 @@ def run_pr_loop(
                     session_id=coder_session_id,
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
-                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=tuple(
-                        item.item_id
-                        for item in unresolved_items
-                        if item.status == "future"
-                        and item.item_id not in {selected.item_id for selected in coder_followup_items}
-                    ): _validate_coder_followup_response(
+                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
+                        resolved_item_ids=resolved_ids,
                         human_requirements=human_requirements,
                         # Every new coder-followup response is v1. A missing
                         # document must not silently downgrade the protocol.
@@ -8193,6 +8223,7 @@ def run_pr_loop(
                     use_repair=True,
                     repair_expected_kind="coder_followup",
                     repair_unresolved_item_ids=repair_unresolved_item_ids,
+                    repair_optional_item_ids=coder_optional_item_ids,
                     repair_surfaced_requirement_ids=coder_human_requirements_context.surfaced_requirement_ids,
                     repair_requires_direct_discussion_ack=coder_human_requirements_context.requires_direct_discussion_ack,
                     salvage_context=SalvageContext(
@@ -8221,6 +8252,15 @@ def run_pr_loop(
                         assigned_workdir=active_workdir(config),
                     )
                     raw_structured_coder_response = coder_output
+                    if coder_response.marker_value.dropped_resolved_addressed_items:
+                        dropped_names = ", ".join(
+                            coder_response.marker_value.dropped_resolved_addressed_items
+                        )
+                        log(
+                            config,
+                            f"Round {round_number}: {coder_name} listed already-resolved item(s) "
+                            f"{dropped_names} in addressed_items; dropped them from the follow-up",
+                        )
                     if coder_response.marker_value.disputed_items:
                         unresolved_items = _apply_dispute_evidence(
                             unresolved_items,

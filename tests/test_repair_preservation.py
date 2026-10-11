@@ -2684,3 +2684,57 @@ def test_plan_review_repair_keeps_or_drops_folded_extra_1328():
         _plan_review(blocking_plan_issues=[{"finding": "Gap."}]),
         match="blocking_plan_issues",
     )
+
+
+# --- #1388: valid optional (retained future) IDs keep their notes -------------
+
+
+def test_1388_note_for_a_valid_optional_id_must_be_preserved():
+    source = {
+        "kind": "coder_followup",
+        "addressed_items": ["item-1", "item-2"],
+        "addressed_item_notes": {
+            "item-1": "Fixed the parser.",
+            "item-2": "Also added the cache lock.",
+        },
+    }
+    stripped = {
+        "kind": "coder_followup",
+        "addressed_items": ["item-1"],
+        "addressed_item_notes": {"item-1": "Fixed the parser."},
+    }
+    with pytest.raises(AgentLoopError, match="addressed_item_notes"):
+        validate_repair_preservation(
+            json.dumps(source),
+            json.dumps(stripped),
+            unresolved_item_ids=("item-1",),
+            optional_item_ids=("item-2",),
+        )
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(source),
+        unresolved_item_ids=("item-1",),
+        optional_item_ids=("item-2",),
+    )
+
+
+def test_1388_note_outside_required_and_optional_ids_may_be_dropped():
+    source = {
+        "kind": "coder_followup",
+        "addressed_items": ["item-1", "item-9"],
+        "addressed_item_notes": {
+            "item-1": "Fixed the parser.",
+            "item-9": "Resolved earlier by a human decision.",
+        },
+    }
+    target = {
+        "kind": "coder_followup",
+        "addressed_items": ["item-1"],
+        "addressed_item_notes": {"item-1": "Fixed the parser."},
+    }
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(target),
+        unresolved_item_ids=("item-1",),
+        optional_item_ids=("item-2",),
+    )

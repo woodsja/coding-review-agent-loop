@@ -6192,3 +6192,59 @@ def test_disposition_guidance_allows_future_on_blocking_reviews(tmp_path):
         assert "only valid when approving" not in guidance
         assert "valid in approved and blocking reviews" in guidance
         assert "operator-declared out-of-scope area" in guidance
+
+
+# --- #1388: a zero-item coder dispatch must not invite item IDs ---------------
+
+
+def _coder_followup_prompts_1388(config, classifiable_item_ids):
+    kwargs = (
+        {} if classifiable_item_ids == "omitted"
+        else {"classifiable_item_ids": classifiable_item_ids}
+    )
+    return {
+        "followup": build_followup_prompt(77, 3, "Acknowledge the record.", config, **kwargs),
+        "same-pr": build_same_pr_followup_prompt(77, 3, "Acknowledge the record.", config, **kwargs),
+        "merge-conflict": build_merge_conflict_prompt(
+            77, 3, "", config,
+            base_branch="main", head_sha="deadbeef",
+            merge_state_detail="mergeable=CONFLICTING, mergeStateStatus=DIRTY",
+            **kwargs,
+        ),
+    }
+
+
+@pytest.mark.parametrize("builder", ["followup", "same-pr", "merge-conflict"])
+def test_1388_zero_item_dispatch_renders_an_empty_item_example(tmp_path, builder):
+    config = make_config(tmp_path)
+    prompt = _coder_followup_prompts_1388(config, ())[builder]
+
+    assert '"addressed_items": [],' in prompt
+    assert '"remaining_items": [],' in prompt
+    assert '"disputed_items": [],' in prompt
+    assert '"addressed_item_notes": {},' in prompt
+    assert '"remaining_item_notes": {},' in prompt
+    assert '"dispute_evidence": {},' in prompt
+    assert (
+        "No reviewer items are unresolved in this round, so `addressed_items`, "
+        "`remaining_items`, and `disputed_items` must all be empty arrays"
+    ) in prompt
+    assert "including items resolved by a human decision" in prompt
+    assert "addressed_sub_items" not in prompt
+    assert not re.search(r"\bitem-\d+(\.s\d+)?\b", prompt)
+    assert "classify every unresolved reviewer item ID shown in this prompt" not in prompt
+
+
+@pytest.mark.parametrize("builder", ["followup", "same-pr", "merge-conflict"])
+def test_1388_non_empty_or_omitted_item_ids_keep_the_existing_example(tmp_path, builder):
+    config = make_config(tmp_path)
+    omitted = _coder_followup_prompts_1388(config, "omitted")[builder]
+    explicit_none = _coder_followup_prompts_1388(config, None)[builder]
+    non_empty = _coder_followup_prompts_1388(config, ("item-4",))[builder]
+
+    assert omitted == explicit_none == non_empty
+    assert '"addressed_items": ["item-1"],' in omitted
+    assert '"disputed_items": ["item-3"],' in omitted
+    assert '[\\"item-2.s1\\"]' in omitted or '["item-2.s1"]' in omitted
+    assert "classify every unresolved reviewer item ID shown in this prompt" in omitted
+    assert "No reviewer items are unresolved in this round" not in omitted

@@ -1444,6 +1444,7 @@ def _build_repair_prompt(
     *,
     expected_kind: str | None = None,
     unresolved_item_ids: Sequence[str] | None = None,
+    optional_item_ids: Sequence[str] = (),
     surfaced_requirement_ids: Sequence[str] | None = None,
     requires_direct_discussion_ack: bool = False,
     reviewer_requirement_ids: Sequence[str] | None = None,
@@ -1470,7 +1471,7 @@ def _build_repair_prompt(
         requires_direct_discussion_ack,
     )
     coder_followup_required_items_instruction = _coder_followup_required_items_instruction(
-        expected_kind, unresolved_item_ids
+        expected_kind, unresolved_item_ids, optional_item_ids
     )
     coder_followup_human_requirements_instruction = (
         _coder_followup_human_requirements_instruction(
@@ -1938,6 +1939,7 @@ def execute_repair(
                         raw,
                         output,
                         unresolved_item_ids=prompt_kwargs.get("unresolved_item_ids"),
+                        optional_item_ids=prompt_kwargs.get("optional_item_ids") or (),
                         surfaced_requirement_ids=prompt_kwargs.get("surfaced_requirement_ids"),
                         reviewer_requirement_ids=prompt_kwargs.get("reviewer_requirement_ids"),
                         allowed_prior_item_ids=prompt_kwargs.get("allowed_prior_item_ids"),
@@ -2025,18 +2027,50 @@ def execute_repair(
 def _coder_followup_required_items_instruction(
     expected_kind: str | None,
     unresolved_item_ids: Sequence[str] | None,
+    optional_item_ids: Sequence[str] = (),
 ) -> str:
     if unresolved_item_ids is None:
+        if optional_item_ids:
+            raise ValueError("optional_item_ids requires unresolved_item_ids")
         return ""
     if expected_kind != "coder_followup":
         raise ValueError("unresolved_item_ids may only be used for coder_followup repair")
-    rendered_ids = "\n".join(f"- `{item_id}`" for item_id in unresolved_item_ids)
-    return (
+    required = tuple(unresolved_item_ids)
+    required_set = set(required)
+    # Retained future follow-ups (#1389) are valid but never mandatory, so the
+    # repair model must not strip them (#1388).
+    optional = tuple(item_id for item_id in optional_item_ids if item_id not in required_set)
+    rendered_ids = "\n".join(f"- `{item_id}`" for item_id in required)
+    if not required and not optional:
+        return (
+            "## Required coder follow-up item IDs:\n"
+            "- (none)\n"
+            "No reviewer item is unresolved in this round, so `addressed_items`, "
+            "`remaining_items`, and `disputed_items` must all be empty arrays. Remove every "
+            "item ID from these arrays and from `addressed_item_notes`, `remaining_item_notes`, "
+            "and `dispute_evidence`, including items already resolved earlier.\n"
+            "Do not put human requirement IDs such as `hr-...` in these arrays.\n"
+        )
+    instruction = (
         "## Required coder follow-up item IDs:\n"
         "The repaired coder_followup must classify every ID below in exactly one of "
         "`addressed_items`, `remaining_items`, or `disputed_items`, even if the malformed response does "
         "not mention the ID:\n"
         f"{rendered_ids or '- (none)'}\n"
+    )
+    if optional:
+        rendered_optional = "\n".join(f"- `{item_id}`" for item_id in optional)
+        instruction += (
+            "## Optional coder follow-up item IDs:\n"
+            "These retained future follow-up IDs are valid but not mandatory. Keep a source "
+            "classification of one of them, with its note, in at most one array; never add one "
+            "that the source did not list:\n"
+            f"{rendered_optional}\n"
+        )
+    return instruction + (
+        "The required and optional IDs above are the complete set of valid IDs. Remove any other "
+        "ID from all three arrays and from `addressed_item_notes`, `remaining_item_notes`, and "
+        "`dispute_evidence`.\n"
         "Preserve a source `disputed_items` classification and its complete `dispute_evidence` "
         "when its ID is listed above. Remove dispute entries for IDs not listed above.\n"
         "Do not put human requirement IDs such as `hr-...` in these arrays.\n"
@@ -2221,6 +2255,7 @@ def attempt_repair(
     *,
     expected_kind: str | None = None,
     unresolved_item_ids: Sequence[str] | None = None,
+    optional_item_ids: Sequence[str] = (),
     surfaced_requirement_ids: Sequence[str] | None = None,
     requires_direct_discussion_ack: bool = False,
     reviewer_requirement_ids: Sequence[str] | None = None,
@@ -2242,6 +2277,7 @@ def attempt_repair(
         raw,
         expected_kind=expected_kind,
         unresolved_item_ids=unresolved_item_ids,
+        optional_item_ids=optional_item_ids,
         surfaced_requirement_ids=surfaced_requirement_ids,
         requires_direct_discussion_ack=requires_direct_discussion_ack,
         reviewer_requirement_ids=reviewer_requirement_ids,
@@ -2282,6 +2318,7 @@ def attempt_repair(
                 raw,
                 text,
                 unresolved_item_ids=unresolved_item_ids,
+                optional_item_ids=optional_item_ids,
                 surfaced_requirement_ids=surfaced_requirement_ids,
                 reviewer_requirement_ids=reviewer_requirement_ids,
                 allowed_prior_item_ids=allowed_prior_item_ids,

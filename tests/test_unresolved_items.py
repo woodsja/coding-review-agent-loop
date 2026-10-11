@@ -309,3 +309,150 @@ def test_unresolved_disposition_keeps_the_tag_on_the_same_item():
         round_number=2,
     )
     assert [(entry.item_id, entry.evidence_row_ids) for entry in kept] == [("item-1", ("row-a",))]
+
+
+# --- #1388: an already-resolved addressed claim is normalized, not rejected ---
+
+import dataclasses  # noqa: E402
+
+from agent_loop_helpers import structured_coder_followup  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    UnresolvedReviewItem,
+    validate_structured_coder_followup,
+)
+from coding_review_agent_loop.review_rounds import (  # noqa: E402
+    _post_round_resolved_history_item_ids,
+)
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    _validate_structured_coder_followup_items,
+)
+
+
+def _followup_1388(**kwargs):
+    return validate_structured_coder_followup(
+        structured_coder_followup(**kwargs), architecture_status_mode="degradable"
+    )
+
+
+def _item_1388(item_id, status="blocking"):
+    return UnresolvedReviewItem(
+        item_id=item_id, reviewer="Codex", source_round=1, text="Fix it.", status=status,
+    )
+
+
+def test_1388_resolved_addressed_id_is_dropped_with_a_diagnostic():
+    parsed = _followup_1388(
+        addressed_items=["item-1"],
+        addressed_item_notes={"item-1": "Resolved by the human decision."},
+    )
+
+    normalized = _validate_structured_coder_followup_items(
+        parsed, unresolved_items=(), resolved_item_ids=("item-1",)
+    )
+
+    assert normalized.addressed_items == ()
+    assert normalized.addressed_item_notes == {}
+    assert normalized.dropped_resolved_addressed_items == ("item-1",)
+
+
+def test_1388_unknown_addressed_id_without_resolution_proof_is_still_rejected():
+    parsed = _followup_1388(addressed_items=["item-1"])
+
+    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-1"):
+        _validate_structured_coder_followup_items(parsed, unresolved_items=())
+    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-1"):
+        _validate_structured_coder_followup_items(
+            parsed, unresolved_items=(), resolved_item_ids=("item-9",)
+        )
+
+
+@pytest.mark.parametrize("field", ["remaining_items", "disputed_items"])
+def test_1388_resolved_id_in_remaining_or_disputed_is_still_rejected(field):
+    extra = {"dispute_evidence": {"item-1": "Docs confirm it."}} if field == "disputed_items" else {}
+    parsed = _followup_1388(**{field: ["item-1"]}, **extra)
+
+    with pytest.raises(AgentLoopError, match="unknown unresolved reviewer item IDs: item-1"):
+        _validate_structured_coder_followup_items(
+            parsed, unresolved_items=(), resolved_item_ids=("item-1",)
+        )
+
+
+def test_1388_duplicate_resolved_addressed_id_is_still_a_duplicate():
+    # The parser rejects duplicates too; the item validator keeps its own
+    # check, run on the raw lists before any normalization.
+    parsed = dataclasses.replace(
+        _followup_1388(addressed_items=["item-1"]), addressed_items=("item-1", "item-1")
+    )
+
+    with pytest.raises(AgentLoopError, match="more than once: item-1"):
+        _validate_structured_coder_followup_items(
+            parsed, unresolved_items=(), resolved_item_ids=("item-1",)
+        )
+
+
+def test_1388_required_item_is_kept_while_resolved_item_is_dropped():
+    parsed = _followup_1388(
+        addressed_items=["item-2", "item-1"],
+        addressed_item_notes={"item-2": "Fixed the parser.", "item-1": "Already resolved."},
+    )
+
+    normalized = _validate_structured_coder_followup_items(
+        parsed, unresolved_items=(_item_1388("item-2"),), resolved_item_ids=("item-1",)
+    )
+
+    assert normalized.addressed_items == ("item-2",)
+    assert normalized.addressed_item_notes == {"item-2": "Fixed the parser."}
+    assert normalized.dropped_resolved_addressed_items == ("item-1",)
+
+
+def test_1388_carried_or_future_item_is_never_dropped_by_the_resolved_rule():
+    # A required item that also appears in the proof stays a required
+    # classification: omitting it is still the missing-item error.
+    with pytest.raises(AgentLoopError, match="did not classify all"):
+        _validate_structured_coder_followup_items(
+            _followup_1388(),
+            unresolved_items=(_item_1388("item-1"),),
+            resolved_item_ids=("item-1",),
+        )
+    required = _validate_structured_coder_followup_items(
+        _followup_1388(addressed_items=["item-1"]),
+        unresolved_items=(_item_1388("item-1"),),
+        resolved_item_ids=("item-1",),
+    )
+    assert required.addressed_items == ("item-1",)
+    assert required.dropped_resolved_addressed_items == ()
+    optional = _validate_structured_coder_followup_items(
+        _followup_1388(addressed_items=["item-2"]),
+        unresolved_items=(),
+        optional_item_ids=("item-2",),
+        resolved_item_ids=("item-2",),
+    )
+    assert optional.addressed_items == ("item-2",)
+    assert optional.dropped_resolved_addressed_items == ()
+
+
+def test_1388_resolved_proof_excludes_re_carried_and_machine_items():
+    resolved_once = _item_1388("item-1")
+    re_carried = _item_1388("item-3", status="future")
+    [machine] = _upsert_machine_obligation(
+        [], item_number=4, kind="github-pr-checks",
+        source_round=1, text="CI failed.", failed_head_sha=H1,
+    )
+    dispositions = {
+        item_id: [
+            ReviewItemDisposition(item_id=item_id, reviewer="Codex", disposition="resolved")
+        ]
+        for item_id in ("item-1", "item-3", machine.item_id)
+    }
+
+    proof = _post_round_resolved_history_item_ids(
+        prior_unresolved_items=(resolved_once, re_carried, machine),
+        dispositions_by_item=dispositions,
+        carried_items=(re_carried,),
+        comments=(),
+        flow="pr",
+        reconciliation_mode="aggregate",
+        same_status="same-pr",
+    )
+
+    assert proof == ("item-1",)

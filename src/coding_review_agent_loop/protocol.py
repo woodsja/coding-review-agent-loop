@@ -1218,6 +1218,9 @@ class StructuredCoderFollowup:
     sub_item_claim_degradations: tuple[ParseDegradation, ...] = ()
     # Coder-declared untestable rows (#1290); never persisted as authority.
     risk_test_matrix_coverage_gaps: SemanticRiskCoverageGaps | None = None
+    # Orchestrator-derived, never parsed: addressed_items IDs that ledger
+    # history proves were already resolved, dropped by validation (#1388).
+    dropped_resolved_addressed_items: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

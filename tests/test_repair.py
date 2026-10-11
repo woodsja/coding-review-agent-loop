@@ -5103,3 +5103,82 @@ def test_repair_prompts_describe_test_level_and_gaps_as_preserve_only(kind):
     assert semantic_risk_claim_example_json() in prompt
     assert '"test_level"' not in prompt
     assert "strip `test_level`" not in prompt
+
+
+# --- #1388: the repair prompt states the mandatory and the valid ID sets ------
+
+
+def test_1388_repair_with_no_required_or_optional_ids_demands_empty_arrays():
+    prompt = _build_repair_prompt(
+        '{"addressed_items":["item-1"]}',
+        expected_kind="coder_followup",
+        unresolved_item_ids=(),
+    )
+
+    assert "## Required coder follow-up item IDs:\n- (none)\n" in prompt
+    assert (
+        "`addressed_items`, `remaining_items`, and `disputed_items` must all be empty arrays"
+    ) in prompt
+    assert "Optional coder follow-up item IDs" not in prompt
+
+
+def test_1388_repair_with_required_ids_states_the_complete_valid_set():
+    prompt = _build_repair_prompt(
+        '{"addressed_items":["item-1"]}',
+        expected_kind="coder_followup",
+        unresolved_item_ids=("item-2",),
+    )
+
+    assert "classify every ID below in exactly one of" in prompt
+    assert "- `item-2`" in prompt
+    assert "The required and optional IDs above are the complete set of valid IDs." in prompt
+    assert "Remove any other ID from all three arrays and from `addressed_item_notes`" in prompt
+    assert "Optional coder follow-up item IDs" not in prompt
+    assert "must all be empty arrays" not in prompt
+
+
+def test_1388_repair_lists_optional_ids_as_valid_but_not_mandatory():
+    prompt = _build_repair_prompt(
+        '{"addressed_items":["item-1","item-2"]}',
+        expected_kind="coder_followup",
+        unresolved_item_ids=("item-1",),
+        optional_item_ids=("item-2",),
+    )
+
+    required, optional = prompt.split("## Optional coder follow-up item IDs:", 1)
+    assert "- `item-1`" in required.split("## Required coder follow-up item IDs:", 1)[1]
+    assert "valid but not mandatory" in optional
+    assert "- `item-2`" in optional
+    assert "The required and optional IDs above are the complete set of valid IDs." in optional
+    assert "must all be empty arrays" not in prompt
+
+
+def test_1388_repair_with_only_optional_ids_does_not_demand_empty_arrays():
+    prompt = _build_repair_prompt(
+        '{"addressed_items":["item-2"]}',
+        expected_kind="coder_followup",
+        unresolved_item_ids=(),
+        optional_item_ids=("item-2",),
+    )
+
+    assert "must all be empty arrays" not in prompt
+    assert "valid but not mandatory" in prompt
+
+
+def test_1388_optional_ids_are_refused_for_non_coder_kinds():
+    with pytest.raises(ValueError, match="unresolved_item_ids"):
+        _build_repair_prompt(
+            "malformed plan review",
+            expected_kind="plan_review",
+            unresolved_item_ids=(),
+            optional_item_ids=("item-2",),
+        )
+    with pytest.raises(ValueError, match="optional_item_ids"):
+        _build_repair_prompt(
+            "malformed plan review",
+            expected_kind="plan_review",
+            optional_item_ids=("item-2",),
+        )
+    assert "## Required coder follow-up item IDs:" not in _build_repair_prompt(
+        "malformed plan review", expected_kind="plan_review"
+    )

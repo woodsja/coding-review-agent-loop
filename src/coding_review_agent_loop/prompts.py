@@ -1592,7 +1592,12 @@ def _structured_coder_followup_guidance(
     human_requirements_context: CoderHumanRequirementsPromptContext,
     coder_signature: str,
     include_coverage_map: bool = False,
+    classifiable_item_ids: Sequence[str] | None = None,
 ) -> str:
+    # ``classifiable_item_ids=()`` means this dispatch carries no reviewer item
+    # to classify, so the example and rules must not invite item IDs (#1388).
+    # ``None`` keeps the generic example for callers that do not know.
+    no_items = classifiable_item_ids is not None and not tuple(classifiable_item_ids)
     example_human_requirement_dispositions = (
         [{
             "requirement_id": human_requirements_context.surfaced_requirement_ids[0],
@@ -1610,14 +1615,35 @@ def _structured_coder_followup_guidance(
         '  "schema_version": 1,',
         '  "kind": "coder_followup",',
         '  "state": "blocking",',
-        '  "summary": "Implemented the requested fix and left one reviewer item for follow-up.",',
-        '  "addressed_items": ["item-1"],',
-        '  "remaining_items": ["item-2"],',
-        '  "disputed_items": ["item-3"],',
+        *(
+            [
+                '  "summary": "Checked the current head against the remaining handoff requirements.",',
+                '  "addressed_items": [],',
+                '  "remaining_items": [],',
+                '  "disputed_items": [],',
+            ]
+            if no_items
+            else [
+                '  "summary": "Implemented the requested fix and left one reviewer item for follow-up.",',
+                '  "addressed_items": ["item-1"],',
+                '  "remaining_items": ["item-2"],',
+                '  "disputed_items": ["item-3"],',
+            ]
+        ),
         '  "architecture_impact": {"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""},',
-        '  "addressed_item_notes": {"item-1": "Updated the parser and added regression coverage."},',
-        '  "remaining_item_notes": {"item-2": "Deferred because it requires a separate UI change."},',
-        '  "dispute_evidence": {"item-3": "Checked Google pricing page (https://...): $1.50/1M tokens is correct per the official docs."},',
+        *(
+            [
+                '  "addressed_item_notes": {},',
+                '  "remaining_item_notes": {},',
+                '  "dispute_evidence": {},',
+            ]
+            if no_items
+            else [
+                '  "addressed_item_notes": {"item-1": "Updated the parser and added regression coverage."},',
+                '  "remaining_item_notes": {"item-2": "Deferred because it requires a separate UI change."},',
+                '  "dispute_evidence": {"item-3": "Checked Google pricing page (https://...): $1.50/1M tokens is correct per the official docs."},',
+            ]
+        ),
         f'  "human_requirement_dispositions": {example_human_requirement_dispositions_json},',
         '  "human_requirements": {',
         '    "addressed_ids": [],',
@@ -1631,9 +1657,17 @@ def _structured_coder_followup_guidance(
         "Required structured fields: `schema_version`, `kind`, `state`, `summary`, `addressed_items`, `remaining_items`, `human_requirements`, `human_requirement_dispositions`, and `architecture_impact` for this fresh coder turn. `addressed_item_notes`, `remaining_item_notes`, `disputed_items`, `dispute_evidence`, `tests_run`, and `test_observations` are optional.",
         "Your response and public response file must start directly with `{`, contain exactly one top-level JSON object, and must not include stdout filtering markers, prose, headings, or code fences before or between the JSON and footer.",
         "After the JSON object, add exactly one footer `<!-- AGENT_STATE: approved|blocking -->`, then only your standalone signature. The JSON `state` must match the `AGENT_STATE` footer exactly.",
-        "Use `addressed_items`, `remaining_items`, and `disputed_items` to classify every unresolved reviewer item ID shown in this prompt. Do not omit any listed reviewer item ID and do not list any item ID more than once.",
-        "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
-        "When a listed item shows sub-items and you leave it in `remaining_items`, classify each open sub-item you addressed in the optional `addressed_sub_items` array (for example `[\"item-2.s1\"]`); the rest stay remaining. Listing an item in `addressed_items` implies every open sub-item is addressed. `addressed_sub_items` entries are advisory claims that the reviewer verifies; invalid entries are dropped, never rejected.",
+        *(
+            [
+                "No reviewer items are unresolved in this round, so `addressed_items`, `remaining_items`, and `disputed_items` must all be empty arrays, and `addressed_item_notes`, `remaining_item_notes`, and `dispute_evidence` must be empty objects. Do not list items resolved earlier, including items resolved by a human decision.",
+            ]
+            if no_items
+            else [
+                "Use `addressed_items`, `remaining_items`, and `disputed_items` to classify every unresolved reviewer item ID shown in this prompt. Do not omit any listed reviewer item ID and do not list any item ID more than once.",
+                "Use `addressed_item_notes` to summarize how each addressed item was resolved, and use `remaining_item_notes` to give a visible reason for each intentionally deferred remaining item.",
+                "When a listed item shows sub-items and you leave it in `remaining_items`, classify each open sub-item you addressed in the optional `addressed_sub_items` array (for example `[\"item-2.s1\"]`); the rest stay remaining. Listing an item in `addressed_items` implies every open sub-item is addressed. `addressed_sub_items` entries are advisory claims that the reviewer verifies; invalid entries are dropped, never rejected.",
+            ]
+        ),
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, report the exact command, outcome, caveats, test identifiers, and locations. The wrapper prints an invocation-local `execution_ref`; use that selector only in semantic coverage claims. Never copy a receipt ID into a risk claim, and never infer a selector from command text, test identifiers, list position, or outcome.",
         "A standalone Node test script is citable only when run as `node --test <file>`; it counts as one runner test that passes only on exit 0. A package.json script is citable via `npm run <name>` (or `pnpm run`/`yarn run`) only when it is a single recognized test command with no pre/post scripts.",
@@ -5354,6 +5388,7 @@ def build_followup_prompt(
     step_back_context: str = "",
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
+    classifiable_item_ids: Sequence[str] | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -5386,6 +5421,7 @@ Do not create a new PR.
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
     include_coverage_map=coverage_map_applies(approved_plan_context),
+    classifiable_item_ids=classifiable_item_ids,
 )}This is round {round_number}. Use blocking to hand the updated PR back to {reviewer_name}.
 If you cannot safely address the review, explain why and still use the blocking
 marker so a human can intervene. Do not place your signature before the
@@ -5420,6 +5456,7 @@ def build_same_pr_followup_prompt(
     step_back_context: str = "",
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
+    classifiable_item_ids: Sequence[str] | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -5453,6 +5490,7 @@ Same-PR follow-ups:
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
     include_coverage_map=coverage_map_applies(approved_plan_context),
+    classifiable_item_ids=classifiable_item_ids,
 )}This is round {round_number}. Use blocking to hand the updated PR back to {reviewer_name}.
 If you cannot safely address the follow-ups, explain why and still use the
 blocking marker so a human can intervene. Do not place your signature before
@@ -5480,6 +5518,7 @@ def build_merge_conflict_prompt(
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    classifiable_item_ids: Sequence[str] | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -5519,6 +5558,7 @@ push if practical, alongside the conflict resolution):
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
     include_coverage_map=coverage_map_applies(approved_plan_context),
+    classifiable_item_ids=classifiable_item_ids,
 )}This is round {round_number}. Use blocking to hand the resolved PR back for review.
 If you cannot safely resolve the conflict, explain why and still use the blocking
 marker so a human can intervene. Do not place your signature before the
