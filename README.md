@@ -650,6 +650,15 @@ one-process Job Object before resume. A host without a verified boundary
 fails before its first checkout Git probe. Checkout settings that require
 external filters or helpers may make the operation fail; the planted program
 does not run.
+Host prerequisites: on Linux, agent-loop needs a root-owned Git at
+`/usr/bin/git`, `/bin/git`, or `/usr/local/bin/git`; a root-owned C compiler at
+`/usr/bin/cc` or `/usr/bin/clang`; the Linux UAPI headers (`linux-libc-dev` on
+Debian/Ubuntu, `kernel-headers` on Fedora/RHEL); and an x86_64 or aarch64 CPU.
+On macOS, agent-loop tries `/opt/homebrew/bin/git`, `/usr/local/bin/git`, then
+`/usr/bin/git`, and pins the first one in a root-owned, preloadable install.
+Apple Silicon Homebrew is owned by the installing user, so it is skipped.
+Without these, checkout Git operations fail with
+`Unsupported Git confinement: ...` before any checkout Git runs.
 On POSIX hosts the pinned Git binary and every component of its installation
 path must be root-owned. Private HTTPS authentication uses the same rule for
 the GitHub CLI and SSH client. Guard source and the Windows launcher are

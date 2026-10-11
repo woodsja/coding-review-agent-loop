@@ -303,13 +303,60 @@ def test_same_user_private_installation_is_not_trusted(repositories, tmp_path, m
     else:
         monkeypatch.setattr(secure_git, "_PINNED_GIT", None)
         monkeypatch.setattr(secure_git.sys, "platform", "darwin")
-        real_isfile = secure_git.os.path.isfile
-        monkeypatch.setattr(secure_git.os.path, "isfile", lambda name: name == "/opt/homebrew/bin/git" or real_isfile(name))
+        monkeypatch.setattr(secure_git.os.path, "isfile", lambda name: name == "/opt/homebrew/bin/git")
         real_realpath = secure_git.os.path.realpath
         monkeypatch.setattr(secure_git.os.path, "realpath", lambda name: str(planted) if name == "/opt/homebrew/bin/git" else real_realpath(name))
         with pytest.raises(AgentLoopError, match="trusted installation"):
             secure_git._git_path()
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("target", ["git", "gh"])
+@pytest.mark.parametrize("later_trusted", [True, False])
+def test_untrusted_earlier_candidate_falls_through_to_trusted_later_one(
+    repositories, tmp_path, monkeypatch, target, later_trusted
+):
+    """A user-owned Homebrew prefix must not hide a root-owned later install."""
+    from coding_review_agent_loop import git_transport
+
+    _, _, checkout = repositories
+    # Each list's earlier entry is untrusted and a later one is root-owned.
+    untrusted, trusted = (("/opt/homebrew/bin/git", "/usr/local/bin/git") if target == "git"
+                          else ("/usr/bin/gh", "/usr/local/bin/gh"))
+    present = {untrusted, trusted}
+    trusted_target = str(tmp_path / ("trusted-" + target))
+    calls: list[str] = []
+
+    def fake_trusted(path):
+        calls.append(path)
+        if path == trusted and later_trusted:
+            return trusted_target
+        raise AgentLoopError("untrusted installation")
+
+    monkeypatch.setattr(secure_git.sys, "platform", "darwin")
+    monkeypatch.setattr(secure_git.os.path, "isfile", lambda name: name in present)
+    monkeypatch.setattr(secure_git, "_trusted_executable", fake_trusted)
+    if target == "git":
+        monkeypatch.setattr(secure_git, "_PINNED_GIT", None)
+        monkeypatch.setattr(secure_git, "_PINNED_GIT_HASH", None)
+        monkeypatch.setattr(secure_git.Path, "read_bytes", lambda self: b"git")
+        if later_trusted:
+            assert secure_git._git_path() == trusted_target
+        else:
+            with pytest.raises(AgentLoopError, match="trusted installation"):
+                secure_git._git_path()
+    else:
+        monkeypatch.setattr(git_transport.sys, "platform", "darwin")
+        if later_trusted:
+            def fake_run(argv, **kwargs):
+                assert argv[0] == trusted_target
+                return subprocess.CompletedProcess(argv, 0, b"token\n", b"")
+            monkeypatch.setattr(git_transport.subprocess, "run", fake_run)
+            assert git_transport._token_from_gh("gh", checkout, "github.com") == "token"
+        else:
+            with pytest.raises(AgentLoopError, match="agent-inaccessible installation"):
+                git_transport._token_from_gh("gh", checkout, "github.com")
+    assert calls[:2] == [untrusted, trusted]
 
 
 @pytest.mark.parametrize("helper", ["git_exec_guard.c", "git_exec_guard_macos.c", "git_windows_launcher.py"])

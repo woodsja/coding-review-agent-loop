@@ -6119,6 +6119,14 @@ its role (implemented in `agent_permissions.py`):
   mode. Inherited `GIT_TRACE*`, `GIT_CONFIG_COUNT`, `GIT_EXTERNAL_DIFF`,
   alternate repository variables, and executable lookup paths do not reach
   those commands. The caller's environment is unchanged.
+  Host prerequisites: on Linux, a root-owned Git (`/usr/bin/git`, `/bin/git`
+  or `/usr/local/bin/git`), a root-owned C compiler (`/usr/bin/cc` or
+  `/usr/bin/clang`), the Linux UAPI headers (`linux-libc-dev` or
+  `kernel-headers`), and an x86_64 or aarch64 host. On macOS, the first
+  root-owned, preloadable Git among `/opt/homebrew/bin/git`,
+  `/usr/local/bin/git` and `/usr/bin/git` is pinned; untrusted candidates
+  are skipped. A missing prerequisite fails with `Unsupported Git
+  confinement: ...` before the first checkout Git probe.
   Guard source files and the Windows launcher must match identities already
   loaded by the controller; changed helper bytes are refused before use.
   A fresh default checkout uses HTTPS unless the operator selects

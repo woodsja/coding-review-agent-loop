@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .errors import AgentLoopError
-from .secure_git import _git_path, _trusted_executable, local_command
+from .secure_git import _first_trusted_executable, _git_path, _trusted_executable, local_command
 
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -142,19 +142,17 @@ def _private_git(args: tuple[str, ...], *, cwd: Path, env: dict[str, str],
 
 def _token_from_gh(gh_cmd: str, destination: Path, host: str) -> str:
     if os.path.isabs(gh_cmd):
-        candidate = gh_cmd
+        candidates: tuple[str, ...] = (gh_cmd,)
     elif gh_cmd == "gh":
-        candidates = ([r"C:\Program Files\GitHub CLI\gh.exe"] if sys.platform == "win32"
-                      else ["/usr/bin/gh", "/usr/local/bin/gh", "/opt/homebrew/bin/gh"])
-        candidate = next((path for path in candidates if os.path.isfile(path)), "")
+        candidates = ((r"C:\Program Files\GitHub CLI\gh.exe",) if sys.platform == "win32"
+                      else ("/usr/bin/gh", "/usr/local/bin/gh", "/opt/homebrew/bin/gh"))
     else:
-        candidate = ""
-    if not candidate:
-        raise AgentLoopError("Trusted GitHub authentication is unavailable.")
-    try:
-        resolved = _trusted_executable(candidate)
-    except (OSError, AgentLoopError) as exc:
-        raise AgentLoopError("Trusted GitHub CLI must be in an agent-inaccessible installation.") from exc
+        candidates = ()
+    resolved = _first_trusted_executable(
+        candidates,
+        missing="Trusted GitHub authentication is unavailable.",
+        untrusted="Trusted GitHub CLI must be in an agent-inaccessible installation.",
+    )
     try:
         if os.path.commonpath((resolved, os.path.realpath(destination))) == os.path.realpath(destination):
             raise AgentLoopError("Trusted GitHub CLI must be outside the agent checkout.")

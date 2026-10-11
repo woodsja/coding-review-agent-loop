@@ -94,30 +94,49 @@ def _trusted_helper(name: str) -> bytes:
     return source
 
 
+def _first_trusted_executable(
+    candidates: tuple[str, ...], *, missing: str, untrusted: str
+) -> str:
+    """Pin the first candidate that exists and passes the trust walk.
+
+    An untrusted earlier candidate (for example a user-owned Homebrew prefix)
+    falls through to a later trusted one instead of failing the whole lookup.
+    """
+    present = False
+    last_error: Exception | None = None
+    for item in candidates:
+        if not os.path.isfile(item):
+            continue
+        present = True
+        try:
+            return _trusted_executable(item)
+        except (OSError, AgentLoopError) as exc:
+            last_error = exc
+    if not present:
+        raise AgentLoopError(missing)
+    raise AgentLoopError(untrusted) from last_error
+
+
 def _git_path() -> str:
     global _PINNED_GIT, _PINNED_GIT_HASH
     if _PINNED_GIT is None:
         # Resolve independently of checkout-controlled PATH.  The operator's
         # system installation is the supported Linux backend.
         if sys.platform == "win32":
-            candidate = next((item for item in (
+            candidates = (
                 r"C:\Program Files\Git\mingw64\bin\git.exe",
                 r"C:\Program Files\Git\bin\git.exe",
                 r"C:\Program Files (x86)\Git\mingw64\bin\git.exe",
-            ) if os.path.isfile(item)), None)
+            )
         elif sys.platform == "darwin":
-            candidate = next((item for item in (
-                "/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"
-            ) if os.path.isfile(item)), None)
+            candidates = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git")
         else:
-            candidate = next((item for item in ("/usr/bin/git", "/bin/git", "/usr/local/bin/git")
-                              if os.path.isfile(item)), None)
-        if not candidate:
-            raise AgentLoopError("Unsupported Git confinement: no pinned Git executable.")
-        try:
-            path = _trusted_executable(candidate)
-        except (OSError, AgentLoopError) as exc:
-            raise AgentLoopError("Unsupported Git confinement: pinned Git is not in a trusted installation.") from exc
+            candidates = ("/usr/bin/git", "/bin/git", "/usr/local/bin/git")
+        path = _first_trusted_executable(
+            candidates,
+            missing="Unsupported Git confinement: no pinned Git executable.",
+            untrusted="Unsupported Git confinement: pinned Git is not in a trusted installation.",
+        )
         _PINNED_GIT = path
         _PINNED_GIT_HASH = hashlib.sha256(Path(path).read_bytes()).digest()
     elif hashlib.sha256(Path(_PINNED_GIT).read_bytes()).digest() != _PINNED_GIT_HASH:
@@ -142,11 +161,14 @@ def _guard_fd() -> int:
             raise AgentLoopError("Unsupported Git confinement: guard source identity could not be verified.") from exc
         try:
             with tempfile.TemporaryDirectory(prefix="agent-loop-git-guard-") as directory:
-                compiler = next((item for item in ("/usr/bin/cc", "/usr/bin/clang")
-                                 if os.path.isfile(item)), None)
-                if not compiler:
-                    raise OSError("C compiler unavailable")
-                compiler = _trusted_executable(compiler)
+                try:
+                    compiler = _first_trusted_executable(
+                        ("/usr/bin/cc", "/usr/bin/clang"),
+                        missing="C compiler unavailable",
+                        untrusted="C compiler is not in a trusted installation",
+                    )
+                except AgentLoopError as exc:
+                    raise OSError(str(exc)) from exc
                 # Keep the linker output on a descriptor that has no directory
                 # entry. Another process under this UID can replace a named
                 # temporary file between compilation and sealing.
