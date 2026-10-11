@@ -2057,8 +2057,14 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   with different content, fails closed. Its persisted dispositions are
   reconciled with the existing rules, its new findings merged, and its evidence
   requests rebuilt with the head-scoped clearances accumulated by durable
-  records up to the anchor round plus those its reconciliation produces. The run then re-enters the effective
-  round once, with the anchor round's coder output as the artifact. A link
+  records up to the anchor round plus those its reconciliation produces.
+  Replay never clears human-only evidence from an unreconciled
+  evidence-response pass. An evidence freeze at the anchor round's head stays
+  in force across the change, so the new board answers new signed input at
+  that head in an evidence-response pass. A request whose requester left the
+  board then needs every configured reviewer. A release boundary is dropped,
+  so the new board reviews the head itself. The run then re-enters the
+  effective round once, with the anchor round's coder output as the artifact. A link
   posted before a crash is recovered from durable history alone. A resume whose
   anchor no longer matches fails closed before any agent invocation or post.
 - **Approval and ledger rules.** Required reviewers are the effective board
@@ -2075,6 +2081,10 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   Only items first published after a qualified panel opening before the epoch
   (judged with the replaced primary and board), or published by the replaced
   primary itself, are carried; any other secondary-owned item still stops.
+  Each epoch closes one window of history, judged by the board that governed
+  it, and eligibility is fixed at an item's first publication. An item
+  therefore stays carried through successive primary changes, and through a
+  change that supersedes a pending one at the same round.
 - **Managed CI.** Once a PR carries board-change records, historical
   rejected-recovery reviews and every round record an ordinary continuity
   ancestor references are checked against the seat binding of the lineage

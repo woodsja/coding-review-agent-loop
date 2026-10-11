@@ -2562,7 +2562,17 @@ def run_pr_loop(
                 reconciled=False,
                 ledger_may_be_incomplete=False,
                 qualification_checkpoint=None,
-                evidence_boundary=None,
+                # An evidence freeze stays in force across the change: the new
+                # board answers new signed input at the frozen head in an
+                # evidence-response pass (a removed requester's request then
+                # needs every configured reviewer).  A release boundary is
+                # dropped, so the new board reviews the head itself.
+                evidence_boundary=(
+                    pr_board_anchor_round.evidence_boundary
+                    if pr_board_anchor_round.evidence_boundary is not None
+                    and pr_board_anchor_round.evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
+                    else None
+                ),
                 broken_evidence_freeze_head=None,
                 evidence_clearances=tuple(carry.evidence_clearances),
                 recovery_round_budget=None,

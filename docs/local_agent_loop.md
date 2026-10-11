@@ -668,7 +668,12 @@ reviewers, the round the change takes effect from, and the reason
 - **Primary changes.** Under `primary-then-panel`, a new primary, or a model or
   backend change on the primary seat, restarts the primary phase on the current
   head. Open findings owned by secondaries stay open with their owners, and the
-  panel reopens at the same head after the new primary approves.
+  panel reopens at the same head after the new primary approves. This holds
+  through repeated primary changes too.
+- **Evidence freezes.** A board change while the PR is frozen awaiting
+  human-only evidence keeps the freeze. Signed evidence posted for that head is
+  answered by the new board. A request whose reviewer left the board then needs
+  every remaining reviewer to resolve it.
 - **The floor.** With `--min-reviewers` or `--min-distinct-providers`, the new
   board is checked before the record is posted, at every round, and at
   qualification. A board below the floor is refused before any agent runs or

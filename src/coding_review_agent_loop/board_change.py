@@ -1765,57 +1765,75 @@ def carry_over_anchor_round(
 
 
 def pre_epoch_panel_items(records: Sequence[object], lineage: BoardLineage) -> frozenset[str]:
-    """Items legitimately created under the panel opening before the primary epoch.
+    """Items legitimately created under a panel opening before the primary epoch.
 
-    The opening is derived from authenticated round history between the
-    previous epoch (or the start) and the latest one, judged with the primary
-    and board the restarting link replaced.  Eligible are the items first
-    published after that qualified opening, plus items the replaced primary
-    published itself (it keeps them as a carried owner).  A secondary-owned
-    item that never had a qualified opening is not eligible, so it still
-    raises the pre-panel stop (D5a).
+    Every primary epoch closes one window of authenticated round history,
+    from the previous epoch (or the start) up to its effective round.  The
+    window's opening is judged with the primary and board that governed it:
+    the old board of the first link taking effect at that epoch, which for a
+    supersession run is the activated predecessor.  Eligible are the items
+    first published after a window's qualified opening, plus items that
+    window's primary published itself (it keeps them as a carried owner).
+
+    Eligibility is decided once, from the item's first publication, and
+    carried across every later epoch, so a finding stays eligible through
+    successive primary changes even though later windows only hold it in
+    their ledgers, and links superseding a pending change at the same round
+    share one window.  A secondary-owned item that never had a qualified
+    opening is not eligible, so it still raises the pre-panel stop (D5a).
     """
     from .panel_evidence import _derive_pr_panel_evidence
 
-    epochs = [
-        element for element in lineage.elements
-        if element.link is not None
-        and element.link.new_board.policy == "primary-then-panel"
-        and (
-            element.link.old_board.primary != element.link.new_board.primary
-            or element.link.new_board.primary in element.link.rebound
-        )
-    ]
-    if not epochs:
-        return frozenset()
-    latest = epochs[-1]
-    link = latest.link
-    assert link is not None
-    start = epochs[-2].effective_from_round if len(epochs) > 1 else 0
-    history = sorted(
-        (
-            record for record in records
-            if start <= record.metadata.round_number < latest.effective_from_round
-        ),
-        key=lambda record: record.index,
-    )
-    evidence = _derive_pr_panel_evidence(
-        history,
-        primary_reviewer=link.old_board.primary,
-        required_reviewers=link.old_board.names,
-    )
+    epochs: dict[int, BoardChangeLink] = {}
+    for element in lineage.elements:
+        link = element.link
+        if (
+            link is not None
+            and link.new_board.policy == "primary-then-panel"
+            and (
+                link.old_board.primary != link.new_board.primary
+                or link.new_board.primary in link.rebound
+            )
+        ):
+            epochs.setdefault(element.effective_from_round, _first_link_at(
+                lineage, element.effective_from_round
+            ))
     eligible: set[str] = set()
     seen: set[str] = set()
-    for record in history:
-        for item in record.metadata.new_items:
-            if item.item_id in seen:
-                continue
-            seen.add(item.item_id)
-            if (
-                evidence.opening_index is not None and record.index > evidence.opening_index
-            ) or item.reviewer == link.old_board.primary:
-                eligible.add(item.item_id)
+    start = 0
+    for epoch_round in sorted(epochs):
+        judge = epochs[epoch_round]
+        history = sorted(
+            (
+                record for record in records
+                if start <= record.metadata.round_number < epoch_round
+            ),
+            key=lambda record: record.index,
+        )
+        start = epoch_round
+        evidence = _derive_pr_panel_evidence(
+            history,
+            primary_reviewer=judge.old_board.primary,
+            required_reviewers=judge.old_board.names,
+        )
+        for record in history:
+            for item in record.metadata.new_items:
+                if item.item_id in seen:
+                    continue
+                seen.add(item.item_id)
+                if (
+                    evidence.opening_index is not None and record.index > evidence.opening_index
+                ) or item.reviewer == judge.old_board.primary:
+                    eligible.add(item.item_id)
     return frozenset(eligible)
+
+
+def _first_link_at(lineage: BoardLineage, effective_round: int) -> BoardChangeLink:
+    """The first link taking effect at ``effective_round`` (a supersession run's head)."""
+    for element in lineage.elements:
+        if element.link is not None and element.effective_from_round == effective_round:
+            return element.link
+    raise AgentLoopError(f"No board-change link takes effect at round {effective_round}.")
 
 
 def carried_secondary_obligations(
