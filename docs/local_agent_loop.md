@@ -6125,7 +6125,10 @@ its role (implemented in `agent_permissions.py`):
   `--trusted-origin-protocol ssh`; that setting chooses the pinned SSH origin
   before any fetch and requires the operator's SSH identity. The pinned SSH
   client ignores the user's SSH config, including proxy commands; it can use
-  default identity files and `SSH_AUTH_SOCK`.
+  default identity files and `SSH_AUTH_SOCK`. SSH transport on Windows is
+  untested (no Windows CI runner; only command construction is covered;
+  tracked in #1371). Same-UID agents that race agent-loop while it runs are
+  outside this boundary and need OS-level isolation (#1371).
 - A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
   and `--output-last-message` points at the pre-created public response file,
   so failed-exit salvage reads it as usual. It has no network.

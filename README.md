@@ -673,6 +673,11 @@ when the trusted host includes a port). The pinned SSH client ignores the
 user's SSH config; default identity files and `SSH_AUTH_SOCK` remain available.
 This option cannot
 be combined with `--trusted-local-origin`.
+SSH transport on Windows is untested: no Windows CI runner exists, so only
+its command construction is covered (tracked in #1371). This boundary covers
+settings, hooks, environment, and transport options planted in a checkout; a
+live, unrestricted agent running as the same OS user that races agent-loop
+while it runs needs OS-level isolation and is out of scope (#1371).
 
 Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.
 
