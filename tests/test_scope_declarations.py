@@ -158,3 +158,19 @@ def test_render_uses_the_issue_context_prose_sanitizer():
     block = render_declared_out_of_scope_block(sections)
     assert token not in block
     assert RESERVED_MARKER_REGISTRY[0].safe_label in block
+
+
+@pytest.mark.parametrize(
+    ("opening", "suffixed"),
+    [("```markdown", "```python"), ("~~~markdown", "~~~python"), ("```", "``` x"), ("~~~", "~~~ x")],
+)
+def test_fence_delimiter_with_info_string_does_not_close_an_open_fence(opening, suffixed):
+    body = "\n".join(
+        [opening, suffixed, "## Non-goals", "- Parser validation", opening[:3], "## Real", "text"]
+    )
+    assert extract_declared_out_of_scope(_context(body)) == ()
+
+
+def test_bare_closing_fence_with_trailing_whitespace_still_closes():
+    body = "```python\n## Non-goals\n- example\n```   \n## Out of scope\n- Locks\n"
+    assert [section.text for section in extract_declared_out_of_scope(_context(body))] == ["- Locks"]

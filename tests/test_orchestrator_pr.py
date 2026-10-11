@@ -20633,3 +20633,95 @@ def test_resume_after_future_item_repromotion_never_publishes_it(tmp_path, monke
     coder_prompts = _coder_prompts_1389(runner)
     assert "Validate the config path before use." not in coder_prompts[0]
     assert "Validate the config path before use." in coder_prompts[-1]
+
+
+def test_merge_conflict_handoff_omits_retained_future_followup_and_still_files_it(
+    tmp_path, monkeypatch
+):
+    """Retained future work is never coder work on the merge-conflict handoff (#1389)."""
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="One in-scope defect plus later work.",
+                blocking_items=["Fix the off-by-one in src/a.py:10."],
+                future_followups=["Add cross-process locking for the cache directory."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Fixed and rebased.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        # Round 1 is an ordinary fix; round 2 starts with a merge conflict, so the
+        # conflict handoff carries item-1 and the retained future item-2.  The
+        # coder omits item-2 entirely and the response must validate.
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-1"]),
+        ],
+        mergeability_payloads=[
+            {"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+             "headRefOid": "abc123", "baseRefName": "main"},
+            {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY",
+             "headRefOid": "abc123", "baseRefName": "main"},
+        ],
+    )
+    _advance_head_after_coder_1389(monkeypatch, runner)
+    config = make_config(
+        tmp_path, approved_followups="fix-and-issue", pr_review_context_mode="compact", max_rounds=4
+    )
+    runner.pr_payload.update({"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"})
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    coder_prompts = _coder_prompts_1389(runner)
+    assert len(coder_prompts) == 2
+    conflict_prompt = coder_prompts[1]
+    assert "merge conflict with its base branch `main`" in conflict_prompt
+    assert "[item-1]" in conflict_prompt
+    assert "[item-2]" not in conflict_prompt
+    assert "- Add cross-process locking for the cache directory.\n" not in conflict_prompt
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up future review note: Add cross-process locking for the cache directory."
+    ]
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    ["general", "same-pr", "merge-conflict"],
+)
+def test_every_coder_handoff_excludes_retained_future_items(dispatch):
+    """One rule for every coder dispatch: future items are optional, never required."""
+    from coding_review_agent_loop.unresolved_items import (
+        MERGE_CONFLICT_ITEM_ID,
+        _validate_structured_coder_followup_items,
+        format_coder_followup_context,
+        select_coder_followup_items,
+    )
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    status = "same-pr" if dispatch == "same-pr" else "blocking"
+    work = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Codex", source_round=1, text="Required fix.", status=status,
+    )
+    future = UnresolvedReviewItem(
+        item_id="item-2", reviewer="Codex", source_round=1, text="Later work.", status="future",
+    )
+    ledger = [work, future]
+    if dispatch == "merge-conflict":
+        ledger = [item for item in ledger if item.item_id != MERGE_CONFLICT_ITEM_ID]
+    selected = select_coder_followup_items(ledger)
+    assert [item.item_id for item in selected] == ["item-1"]
+    assert "[item-2]" not in format_coder_followup_context(ledger)
+
+    def parsed(addressed):
+        return validate_structured_coder_followup(
+            structured_coder_followup(addressed_items=addressed),
+            architecture_status_mode="degradable",
+        )
+
+    _validate_structured_coder_followup_items(parsed(["item-1"]), unresolved_items=ledger)
+    _validate_structured_coder_followup_items(
+        parsed(["item-1", "item-2"]), unresolved_items=ledger, optional_item_ids=("item-2",)
+    )

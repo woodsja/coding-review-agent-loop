@@ -21,6 +21,8 @@ from .protocol_markers import sanitize_untrusted_prose
 
 _HEADING_RE = re.compile(r"^ {0,3}(?P<hashes>#{1,6})(?:[ \t]+(?P<text>.*?))?[ \t]*#*[ \t]*$")
 _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
+# A closing fence carries no info string: only whitespace may follow it.
+_CLOSING_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})[ \t]*$")
 _SCOPE_HEADING_TEXT_RE = re.compile(
     r"^(?:out[ -]of[ -]scope|non[- ]?goals)(?:\s+for\s+this\s+(?:issue|pr|change|plan))?\s*:?$",
     re.IGNORECASE,
@@ -60,8 +62,9 @@ def _extract_sections(text: str | None) -> list[str]:
     for line in text.splitlines():
         fence_match = _FENCE_RE.match(line)
         if fence is not None:
-            if fence_match and fence_match.group("fence")[0] == fence[0] and len(
-                fence_match.group("fence")
+            closing = _CLOSING_FENCE_RE.match(line)
+            if closing and closing.group("fence")[0] == fence[0] and len(
+                closing.group("fence")
             ) >= len(fence):
                 fence = None
             if capture_level is not None:

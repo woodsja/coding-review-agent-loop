@@ -71,7 +71,9 @@ def select_coder_followup_items(
 
     The acknowledgement and merge-conflict records have dedicated protocol
     paths. Every other record, including machine-owned repair obligations,
-    remains in the coder's addressed/remaining/disputed namespace.
+    remains in the coder's addressed/remaining/disputed namespace, except
+    retained future follow-ups: they are publication-only and never coder
+    work on any handoff (#1389).
     """
     return tuple(
         item
@@ -79,6 +81,7 @@ def select_coder_followup_items(
         if item.item_id not in CODER_NON_CLASSIFIABLE_ITEM_IDS
         # Human-only exact-head evidence is never coder work (#1068).
         and not _is_evidence_obligation(item)
+        and item.status != "future"
     )
 
 
@@ -983,8 +986,8 @@ def _validate_structured_coder_followup_items(
     ]
     # The caller supplies the dispatch-specific item set that was rendered in
     # the prompt. Every selected item is therefore required in the coder's
-    # addressed/remaining/disputed partition.  Retained future work is not part
-    # of the general handoff (#1389); it remains on merge-conflict handoffs.
+    # addressed/remaining/disputed partition.  Retained future work is never
+    # selected (#1389); it is only accepted through ``optional_item_ids``.
     required_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
     listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})

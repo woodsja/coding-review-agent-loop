@@ -8010,14 +8010,10 @@ def run_pr_loop(
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
-                # Retained future follow-ups are publication-only (#1389): they
-                # are never coder work, so the prompt and the validator both
-                # use the same non-future item set.
-                coder_visible_items = [
-                    item for item in unresolved_items if item.status != "future"
-                ]
-                coder_followup_items = select_coder_followup_items(coder_visible_items)
-                combined_review = stall_context + summary_context + format_coder_followup_context(coder_visible_items)
+                # select_coder_followup_items drops retained future follow-ups,
+                # so the prompt and the validator share one non-future set (#1389).
+                coder_followup_items = select_coder_followup_items(unresolved_items)
+                combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
