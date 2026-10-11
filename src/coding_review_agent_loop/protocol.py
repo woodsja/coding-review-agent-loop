@@ -6776,12 +6776,9 @@ def _finalize_parsed_review(
     architecture_impact_degradations: tuple[ParseDegradation, ...] = (),
     sub_item_degradations: tuple[ParseDegradation, ...] = (),
 ) -> ParsedReview:
-    if state == "blocking" and followups.future:
-        followups = ApprovedFollowups(same_pr=followups.same_pr, future=())
-    if state == "blocking" and any(item.disposition == "future" for item in dispositions):
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            "Blocking reviews may not downgrade prior unresolved items to Future follow-ups."
-        )
+    # Issue #1389: blocking reviews may carry off-scope Future follow-ups and
+    # downgrade carried items to `future`; those never block and are published
+    # at approval exactly like Future follow-ups from approved reviews.
     if state == "approved":
         active_dispositions = [
             item.disposition for item in dispositions if item.disposition in {"blocking", "same-pr"}
@@ -6816,12 +6813,8 @@ def _finalize_parsed_plan_review(
     architecture_impact: ArchitectureImpact | None = None,
     architecture_impact_degradations: tuple[ParseDegradation, ...] = (),
 ) -> ParsedPlanReview:
-    if state == "blocking" and items.future:
-        items = PlanReviewItems(blocking=items.blocking, same_plan=items.same_plan, future=())
-    if state == "blocking" and any(item.disposition == "future" for item in dispositions):
-        raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            "Blocking plan reviews may not downgrade prior unresolved plan items to Future follow-ups."
-        )
+    # Issue #1389: blocking plan reviews keep off-scope Future follow-ups and
+    # may downgrade carried items to `future`.
     if state == "approved":
         active_dispositions = [
             item.disposition for item in dispositions if item.disposition in {"blocking", "same-plan"}

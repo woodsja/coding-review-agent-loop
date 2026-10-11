@@ -4140,26 +4140,17 @@ def _canonically_resolved_history_item_ids(
     return frozenset(resolved - set(active) - set(current_carried_ids))
 
 
-def canonical_history_item_outcomes(
+def _replay_history_items(
     records: Sequence[PostedRoundRecord],
     *,
     reconciliation_mode: str,
     same_status: str,
-) -> dict[str, str]:
-    """Replay already-extracted records into per-item history outcomes (#1273).
+) -> tuple[dict[str, str], dict[str, UnresolvedReviewItem]]:
+    """Shared group-by-(subject, round) replay for the history helpers.
 
-    Read-only sibling of ``_canonically_resolved_history_item_ids``: the same
-    group-by-(subject, round) replay through the live reconciler, but called
-    with ``retain_future=False`` (the compact-PR call shape).  Every item whose
-    reconciled status is ``future`` therefore lands in the SECOND returned
-    collection, which is where a deferral is read; the FIRST collection holds
-    only still-mandatory items and carries their updated state forward.
-
-    Returns ``item_id -> "active" | "deferred" | "resolved"``.  ``resolved`` is
-    any candidate the reconciler dropped (literal or derived clearance), so a
-    retained future item cleared by sub-item completion is not left deferred.
-    A later carry or reintroduction as a mandatory item resets the outcome to
-    ``active``; machine obligations never get an outcome.
+    Returns the legacy per-item ``outcomes`` map and, tracked independently,
+    the items currently eligible for deferred publication (#1389).  The
+    outcomes map is never derived from, nor fed into, the deferred map.
     """
     groups: dict[tuple[str, int], list[PostedRoundRecord]] = {}
     for record in records:
@@ -4167,6 +4158,7 @@ def canonical_history_item_outcomes(
         groups.setdefault(key, []).append(record)
     active: dict[str, UnresolvedReviewItem] = {}
     outcomes: dict[str, str] = {}
+    deferred: dict[str, UnresolvedReviewItem] = {}
 
     def appear(item: UnresolvedReviewItem) -> None:
         if _is_machine_obligation(item):
@@ -4176,6 +4168,10 @@ def canonical_history_item_outcomes(
         # clears it; compact mode never stores it, so absence keeps it deferred.
         active[item.item_id] = item
         outcomes[item.item_id] = "deferred" if item.status == "future" else "active"
+        if item.status == "future":
+            deferred[item.item_id] = item
+        else:
+            deferred.pop(item.item_id, None)
 
     for group in groups.values():
         for record in group:
@@ -4198,8 +4194,14 @@ def canonical_history_item_outcomes(
             for item in future:
                 active.pop(item.item_id, None)
                 outcomes[item.item_id] = "deferred"
+                deferred[item.item_id] = item
             for item in kept:
                 active[item.item_id] = item
+                if item.status == "future":
+                    deferred[item.item_id] = item
+                else:
+                    # Re-promoted to mandatory work: no longer publishable.
+                    deferred.pop(item.item_id, None)
             returned = {item.item_id for item in (*kept, *future)}
             for item in candidates:
                 if item.item_id in returned:
@@ -4209,10 +4211,58 @@ def canonical_history_item_outcomes(
                 # sub-item completion, so the drop itself is authoritative.
                 del active[item.item_id]
                 outcomes[item.item_id] = "resolved"
+                deferred.pop(item.item_id, None)
         for record in group:
             for item in record.metadata.new_items:
                 appear(item)
+    return outcomes, deferred
+
+
+def canonical_history_item_outcomes(
+    records: Sequence[PostedRoundRecord],
+    *,
+    reconciliation_mode: str,
+    same_status: str,
+) -> dict[str, str]:
+    """Replay already-extracted records into per-item history outcomes (#1273).
+
+    Read-only sibling of ``_canonically_resolved_history_item_ids``: the same
+    group-by-(subject, round) replay through the live reconciler, but called
+    with ``retain_future=False`` (the compact-PR call shape).  Every item whose
+    reconciled status is ``future`` therefore lands in the SECOND returned
+    collection, which is where a deferral is read; the FIRST collection holds
+    only still-mandatory items and carries their updated state forward.
+
+    Returns ``item_id -> "active" | "deferred" | "resolved"``.  ``resolved`` is
+    any candidate the reconciler dropped (literal or derived clearance), so a
+    retained future item cleared by sub-item completion is not left deferred.
+    A later carry or reintroduction as a mandatory item resets the outcome to
+    ``active``; machine obligations never get an outcome.
+    """
+    outcomes, _deferred = _replay_history_items(
+        records, reconciliation_mode=reconciliation_mode, same_status=same_status
+    )
     return outcomes
+
+
+def canonical_deferred_history_items(
+    records: Sequence[PostedRoundRecord],
+    *,
+    reconciliation_mode: str,
+    same_status: str,
+) -> tuple[UnresolvedReviewItem, ...]:
+    """Return the items whose latest replayed state is a pending deferral (#1389).
+
+    An item is eligible when it last appeared (as a prior or new item) with
+    status ``future`` or the reconciler deferred it.  A later appearance or
+    reconciliation with a mandatory status (re-promotion), or a reconciler
+    drop (resolution), removes it.  Machine obligations are ignored.  This
+    feeds only approval-time follow-up publication; it is never required work.
+    """
+    _outcomes, deferred = _replay_history_items(
+        records, reconciliation_mode=reconciliation_mode, same_status=same_status
+    )
+    return tuple(deferred.values())
 
 
 def _live_round_resolved_item_ids(

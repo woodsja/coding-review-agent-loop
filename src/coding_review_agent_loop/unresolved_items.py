@@ -627,7 +627,14 @@ def _validate_review_response(
     current_round_items: Sequence[UnresolvedReviewItem] = (),
     architecture_status_mode: str,
     approved_matrix_row_ids: Sequence[str] | None = None,
+    optional_item_ids: Sequence[str] = (),
 ) -> ParsedReview:
+    """Validate a PR review against the carried ledger.
+
+    ``optional_item_ids`` are carried items the prompt did not render (retained
+    future follow-ups in compact context, #1389): a disposition for them is
+    accepted but not required.
+    """
     parsed = parse_pr_review(
         text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
     )
@@ -655,7 +662,7 @@ def _validate_review_response(
             current_round_items=current_round_items,
         )
     if unresolved_items:
-        missing = sorted(set(unresolved_by_id) - set(disposition_ids))
+        missing = sorted(set(unresolved_by_id) - set(disposition_ids) - set(optional_item_ids))
         if missing:
             raise MissingPriorItemDispositionError(tuple(missing))
     # Sub-item keys must name sub-items of that entry's carried item; anything
@@ -966,12 +973,18 @@ def _validate_structured_coder_followup_items(
     parsed: StructuredCoderFollowup,
     *,
     unresolved_items: Sequence[UnresolvedReviewItem],
+    optional_item_ids: Sequence[str] = (),
 ) -> None:
-    allowed_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
+    # ``optional_item_ids`` are retained future follow-ups outside this
+    # dispatch (#1389): a coder may still list them, but never has to.
+    allowed_ids = [
+        *(item.item_id for item in select_coder_followup_items(unresolved_items)),
+        *optional_item_ids,
+    ]
     # The caller supplies the dispatch-specific item set that was rendered in
     # the prompt. Every selected item is therefore required in the coder's
-    # addressed/remaining/disputed partition, including retained future work
-    # on general and merge-conflict handoffs.
+    # addressed/remaining/disputed partition.  Retained future work is not part
+    # of the general handoff (#1389); it remains on merge-conflict handoffs.
     required_ids = [item.item_id for item in select_coder_followup_items(unresolved_items)]
     listed_ids = [*parsed.addressed_items, *parsed.remaining_items, *parsed.disputed_items]
     duplicates = sorted({item_id for item_id in listed_ids if listed_ids.count(item_id) > 1})
@@ -1008,6 +1021,7 @@ def _validate_coder_followup_response(
     delivered_risk_test_matrix_row_ids=None,
     execution_catalog=None,
     architecture_status_mode: str,
+    optional_item_ids: Sequence[str] = (),
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -1034,6 +1048,7 @@ def _validate_coder_followup_response(
         _validate_structured_coder_followup_items(
             structured_followup,
             unresolved_items=unresolved_items,
+            optional_item_ids=optional_item_ids,
         )
         validate_human_requirement_dispositions(
             structured_followup.human_requirement_dispositions,

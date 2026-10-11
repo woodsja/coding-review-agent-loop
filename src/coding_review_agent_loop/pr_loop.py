@@ -64,7 +64,11 @@ from .pr_board_state import (
     qualification_board_check,
     resolve_pr_board_state,
 )
-from .round_state import reset_pr_board_stamp, set_pr_board_stamp
+from .round_state import (
+    canonical_deferred_history_items,
+    reset_pr_board_stamp,
+    set_pr_board_stamp,
+)
 from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
     _decode_json_payload,
@@ -2304,6 +2308,23 @@ def run_pr_loop(
             ),
             same_status="same-pr",
         )
+        # Publication-only pending future follow-ups (#1389): items deferred on
+        # a round that did not approve (a `future` disposition in compact
+        # context, or a ledger future item lost to recovery) are replayed from
+        # the posted round records and published at approval.  They are never
+        # coder work, reviewer carried items, or round state.
+        pending_future_items: dict[str, UnresolvedReviewItem] = {
+            item.item_id: item
+            for item in canonical_deferred_history_items(
+                startup_records,
+                reconciliation_mode=(
+                    "owner-scoped"
+                    if scheduler_capabilities.owner_scoped_reconciliation
+                    else "aggregate"
+                ),
+                same_status="same-pr",
+            )
+        }
         # Signed reviewer-board amendments (#943) live on the PR itself, in
         # the same comment list as the PR scheduler records, for issue-mode
         # and standalone runs alike.  A PR amendment on the owning issue is
@@ -2712,6 +2733,9 @@ def run_pr_loop(
 
         if resumed_round is not None:
             unresolved_items = list(resumed_round.prior_items)
+            # The resumed ledger owns every item it still carries.
+            for item in unresolved_items:
+                pending_future_items.pop(item.item_id, None)
             pr_compact_prior_summaries = list(
                 bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
             )
@@ -3426,6 +3450,14 @@ def run_pr_loop(
                 and round_number >= 2
                 and not round_ledger_incomplete
             )
+            # The compact review prompt omits retained future follow-ups (they
+            # are publication-only), so reviewers are not required to
+            # disposition them; an explicit disposition is still accepted (#1389).
+            compact_hidden_future_ids = (
+                tuple(item.item_id for item in prior_unresolved_items if item.status == "future")
+                if use_compact_pr_context
+                else ()
+            )
             coder_followup_context = _coder_followup_review_context(
                 latest_coder_output,
                 latest_coder_metadata,
@@ -3751,6 +3783,7 @@ def run_pr_loop(
                     text,
                     reviewer=reviewer_name,
                     unresolved_items=prior_unresolved_items,
+                    optional_item_ids=compact_hidden_future_ids,
                     # Never share the mutable round_new_unresolved_items
                     # list with concurrent workers (#594): it only
                     # enriches the UnknownPriorItemDispositionError
@@ -5001,6 +5034,7 @@ def run_pr_loop(
                         text,
                         reviewer=reviewer_name,
                         unresolved_items=items,
+                        optional_item_ids=compact_hidden_future_ids,
                         current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
                         approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
                     ))
@@ -5295,6 +5329,22 @@ def run_pr_loop(
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
                                 next_unresolved_item_number += 1
+                        if config.approved_followups != "ignore":
+                            # Off-scope future follow-ups on a blocking review
+                            # (#1389) are recorded exactly like those on an
+                            # approved review: never coder work, published at
+                            # approval.
+                            for followup in parsed_review.followups.future:
+                                tracked_item = _next_unresolved_item(
+                                    item_number=next_unresolved_item_number,
+                                    reviewer=followup.reviewer,
+                                    source_round=round_number,
+                                    text=followup.text,
+                                    status="future",
+                                )
+                                round_new_unresolved_items.append(tracked_item)
+                                reviewer_new_unresolved_items.append(tracked_item)
+                                next_unresolved_item_number += 1
                         if reviewer not in early_published_pr_reviewers:
                             _post_pr_reviewer_comment(
                                 reviewer_name, parsed_review, review_output=review_output,
@@ -5483,6 +5533,15 @@ def run_pr_loop(
             unresolved_items = list(
                 pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
             )
+            # The carried ledger was authoritative for its items this round, so
+            # a resolved or re-promoted item leaves the pending set; only an
+            # item that left the ledger as `future` is held for publication.
+            for item in prior_unresolved_items:
+                pending_future_items.pop(item.item_id, None)
+            for item in future_from_prior_items:
+                pending_future_items[item.item_id] = item
+            for item in unresolved_items:
+                pending_future_items.pop(item.item_id, None)
             pr_finding_history.observe_reconciled(unresolved_items, future_from_prior_items)
             # Confirmed sub-item outcome of this round (#958): published after
             # reconciliation and before any coder turn, approval, budget check
@@ -5544,10 +5603,17 @@ def run_pr_loop(
                 }
                 if required_reviewer_names <= acknowledged_reviewer_names:
                     unresolved_items = _clear_human_requirements_ack_item(unresolved_items)
+            future_followup_items: dict[str, UnresolvedReviewItem] = {}
+            for item in [
+                *unresolved_items,
+                *future_from_prior_items,
+                *pending_future_items.values(),
+            ]:
+                if item.status == "future":
+                    future_followup_items.setdefault(item.item_id, item)
             future_followups = [
                 _approved_followup_from_unresolved_item(item)
-                for item in [*unresolved_items, *future_from_prior_items]
-                if item.status == "future"
+                for item in future_followup_items.values()
             ]
             migration_validation = None
             if not unavailable_reviewer_failures and any(
@@ -5867,6 +5933,7 @@ def run_pr_loop(
                                     candidate,
                                     reviewer=reviewer_name,
                                     unresolved_items=prior_unresolved_items,
+                                    optional_item_ids=compact_hidden_future_ids,
                                     current_round_items=round_new_unresolved_items, architecture_status_mode="strict",
                                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
                                 ),
@@ -7943,8 +8010,14 @@ def run_pr_loop(
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
-                coder_followup_items = select_coder_followup_items(unresolved_items)
-                combined_review = stall_context + summary_context + format_coder_followup_context(unresolved_items)
+                # Retained future follow-ups are publication-only (#1389): they
+                # are never coder work, so the prompt and the validator both
+                # use the same non-future item set.
+                coder_visible_items = [
+                    item for item in unresolved_items if item.status != "future"
+                ]
+                coder_followup_items = select_coder_followup_items(coder_visible_items)
+                combined_review = stall_context + summary_context + format_coder_followup_context(coder_visible_items)
                 coder_human_requirements_context = render_coder_human_requirements_prompt_context(
                     human_requirements
                 )
@@ -8084,9 +8157,15 @@ def run_pr_loop(
                     session_id=coder_session_id,
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
-                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
+                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=tuple(
+                        item.item_id
+                        for item in unresolved_items
+                        if item.status == "future"
+                        and item.item_id not in {selected.item_id for selected in coder_followup_items}
+                    ): _validate_coder_followup_response(
                         text,
                         unresolved_items=items,
+                        optional_item_ids=optional_ids,
                         human_requirements=human_requirements,
                         # Every new coder-followup response is v1. A missing
                         # document must not silently downgrade the protocol.

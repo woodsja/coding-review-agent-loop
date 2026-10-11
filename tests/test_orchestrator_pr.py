@@ -7077,7 +7077,9 @@ def test_pr_loop_combines_issue_and_pr_signed_human_requirements(tmp_path):
         "Use the absolute URL in the PR path."
     )
 
-def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(tmp_path):
+def test_pr_loop_keeps_blocking_review_with_off_scope_future_followups(tmp_path):
+    # Issue #1389: a blocking review may carry an off-scope future follow-up.
+    # It is rendered, never sent to the coder, and filed at approval.
     runner = FakeRunner(
         gemini_outputs=[
             "Still blocked.\n\n"
@@ -7088,13 +7090,13 @@ def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(t
             "<!-- AGENT_STATE: blocking -->\n"
             "-- Google Gemini",
             "LGTM."
-            + prior_item_dispositions("[item-1] resolved")
+            + prior_item_dispositions("[item-1] resolved", "[item-2] future follow-up: still later work")
             + "\n<!-- AGENT_STATE: approved -->\n-- Google Gemini",
         ],
         codex_outputs=[
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
             "LGTM."
-            + prior_item_dispositions("[item-1] resolved")
+            + prior_item_dispositions("[item-1] resolved", "[item-2] future follow-up: still later work")
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Fixed review.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
@@ -7108,7 +7110,10 @@ def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(t
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert runner.comments[0].startswith("**Review verdict:** Blocking\n\nStill blocked.")
-    assert "Consider a broader cleanup later." not in runner.comments[0]
+    assert "### Future follow-ups\n- Consider a broader cleanup later." in runner.comments[0]
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up future review note: Consider a broader cleanup later."
+    ]
     # Only the same-PR item ("Tighten the reset helper.") is tracked -- the
     # blocking summary prose ("Still blocked.") is never itemized when a
     # same_pr_followups entry already represents the actionable concern, so
@@ -7121,6 +7126,7 @@ def test_pr_loop_keeps_blocking_review_when_future_followups_are_misclassified(t
     assert "Address the follow-up items below" in followup_prompt
     assert "Still blocked." in followup_prompt
     assert "Latest reviewer summaries (review-level context):" in followup_prompt
+    assert "Consider a broader cleanup later." not in followup_prompt
 
 def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     runner = FakeRunner(
@@ -8107,7 +8113,7 @@ def test_pr_loop_fix_and_issue_uses_final_round_future_followups_after_same_pr_c
             "Codex approves final pass.\n\n"
             "### Future follow-ups\n"
             "- Add a separate migration dry-run command.\n"
-            + prior_item_dispositions("[item-1] resolved")
+            + prior_item_dispositions("[item-1] resolved", "[item-2] resolved")
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Tightened message.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
@@ -8122,18 +8128,20 @@ def test_pr_loop_fix_and_issue_uses_final_round_future_followups_after_same_pr_c
     commands = [cmd[:3] for cmd, _cwd in runner.commands]
     assert commands.count(["gh", "issue", "create"]) == 1
 
-def test_pr_loop_fix_and_issue_drops_blocking_round_future_followups(tmp_path):
+def test_pr_loop_fix_and_issue_files_carried_blocking_round_future_followups(tmp_path):
+    # Issue #1389: a future follow-up raised on a blocking round is no longer
+    # dropped; it is filed at approval like an approved-review future item.
     runner = FakeRunner(
         codex_outputs=[
             "### Same-PR follow-ups\n"
             "- Tighten the validation message.\n\n"
             "### Future follow-ups\n"
-            "- Stale future item from the blocking round.\n"
+            "- Off-scope item from the blocking round.\n"
             "<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
             "Codex approves final pass.\n\n"
             "### Future follow-ups\n"
             "- Add a separate migration dry-run command.\n"
-            + prior_item_dispositions("[item-1] resolved")
+            + prior_item_dispositions("[item-1] resolved", "[item-2] future follow-up: still separate")
             + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         claude_outputs=["Tightened message.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
@@ -8142,8 +8150,12 @@ def test_pr_loop_fix_and_issue_drops_blocking_round_future_followups(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.issues) == 1
-    assert "Stale future item from the blocking round." not in runner.issues[0]["body"]
+    assert sorted(issue["title"] for issue in runner.issues) == [
+        "Follow up future review note: Add a separate migration dry-run command.",
+        "Follow up future review note: Off-scope item from the blocking round.",
+    ]
+    coder_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert coder_prompts and all("Off-scope item from the blocking round." not in p for p in coder_prompts)
 
 def test_pr_loop_fix_and_issue_uses_only_final_round_future_followups(tmp_path):
     runner = FakeRunner(
@@ -20348,3 +20360,276 @@ def test_unchanged_head_stop_names_unsuperseded_evidence_receipts(tmp_path):
         str(without.value),
     )
     assert found is not None, str(without.value)
+
+
+# --- Future follow-ups on blocking reviews (#1389) ---------------------------
+
+
+def _pr_meta_records_1389(runner):
+    records = []
+    for comment in runner.pr_payload["comments"]:
+        match = re.search(
+            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", comment["body"]
+        )
+        if match:
+            records.append(_decode_round_metadata(match.group("payload")))
+    return records
+
+
+def _coder_prompts_1389(runner):
+    return [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def _advance_head_after_coder_1389(monkeypatch, runner, *, interrupt=None):
+    """Advance the PR head after each coder turn; optionally interrupt a call."""
+    original = orchestrator._run_validated_agent
+    counter = iter(range(1, 20))
+    calls = {"coder": 0, "reviewer": 0}
+
+    class Interrupted(Exception):
+        pass
+
+    def run(*args, **kwargs):
+        role = kwargs.get("role")
+        if role in calls:
+            calls[role] += 1
+            if interrupt is not None and interrupt == (role, calls[role]):
+                raise Interrupted
+        response = original(*args, **kwargs)
+        if role == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    return Interrupted
+
+
+def test_blocking_pr_review_future_followup_is_recorded_and_filed_at_approval(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="One in-scope defect.",
+                blocking_items=["Fix the off-by-one in src/a.py:10."],
+                future_followups=["Add cross-process locking for the cache directory."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    _advance_head_after_coder_1389(monkeypatch, runner)
+    config = make_config(
+        tmp_path, approved_followups="fix-and-issue", pr_review_context_mode="compact", max_rounds=3
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    round_1 = [
+        record for record in _pr_meta_records_1389(runner)
+        if record.role == "reviewer" and record.round_number == 1
+    ]
+    assert [(item.item_id, item.status) for item in round_1[0].new_items] == [
+        ("item-1", "blocking"), ("item-2", "future"),
+    ]
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up future review note: Add cross-process locking for the cache directory."
+    ]
+    coder_prompts = _coder_prompts_1389(runner)
+    assert len(coder_prompts) == 1
+    assert "Fix the off-by-one in src/a.py:10." in coder_prompts[0]
+    assert "item [item-2]" not in coder_prompts[0]
+    assert "cross-process locking" not in coder_prompts[0]
+
+
+def test_blocking_pr_review_future_followup_is_not_recorded_under_ignore(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="One in-scope defect.",
+                blocking_items=["Fix the off-by-one in src/a.py:10."],
+                future_followups=["Add cross-process locking for the cache directory."],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    _advance_head_after_coder_1389(monkeypatch, runner)
+    config = make_config(tmp_path, approved_followups="ignore", max_rounds=3)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert all(
+        item.status != "future"
+        for record in _pr_meta_records_1389(runner)
+        for item in (*record.new_items, *record.prior_items)
+    )
+    assert runner.issues == []
+    assert not any("future follow-ups for PR #77" in comment for comment in runner.comments)
+    assert all("item [item-2]" not in prompt for prompt in _coder_prompts_1389(runner))
+
+
+def test_compact_carried_blocker_downgraded_on_blocking_round_is_filed_once(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Two defects.",
+                blocking_items=[
+                    "Harden signal handling for the worker pool.",
+                    "Fix the parser regression in src/b.py:20.",
+                ],
+            ),
+            structured_pr_review(
+                state="blocking",
+                summary="Parser still broken; signal handling is off-scope.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future",
+                     "note": "Outside criteria (i)-(iii) for this issue."},
+                    {"item_id": "item-2", "disposition": "blocking",
+                     "note": "src/b.py:20 still drops the last token; add a regression test."},
+                ],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Parser fixed.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1", "item-2"]),
+            structured_coder_followup(addressed_items=["item-2"]),
+        ],
+    )
+    _advance_head_after_coder_1389(monkeypatch, runner)
+    config = make_config(
+        tmp_path, approved_followups="fix-and-issue", pr_review_context_mode="compact", max_rounds=4
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert [issue["title"] for issue in runner.issues] == [
+        "Follow up future review note: Harden signal handling for the worker pool."
+    ]
+    coder_prompts = _coder_prompts_1389(runner)
+    assert len(coder_prompts) == 2
+    assert "unresolved blocking item [item-1]" in coder_prompts[0]
+    # Round 2: item-1 left the ledger as future; it is not coder work.
+    assert "item [item-1]" not in coder_prompts[1]
+    assert "- Harden signal handling for the worker pool.\n" not in coder_prompts[1]
+    assert "unresolved blocking item [item-2]" in coder_prompts[1]
+
+
+def test_resume_after_blocking_round_future_followup_publishes_it_once(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="Two defects plus later work.",
+                blocking_items=[
+                    "Harden signal handling for the worker pool.",
+                    "Fix the off-by-one in src/a.py:10.",
+                ],
+                future_followups=["Add crash recovery for interrupted uploads."],
+            ),
+            structured_pr_review(
+                state="blocking",
+                summary="Off-by-one remains; signal handling is off-scope.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "future",
+                     "note": "Outside criteria (i)-(iii) for this issue."},
+                    {"item_id": "item-2", "disposition": "blocking",
+                     "note": "src/a.py:10 still skips the last row; add a regression test."},
+                ],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="Fixed.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1", "item-2"]),
+            structured_coder_followup(addressed_items=["item-2"]),
+        ],
+    )
+    # Stop after the round-2 coder advanced the head, before the round-3
+    # review is recorded: item-1 has left the compact ledger as future and
+    # item-3 is a new future item from a blocking round.
+    interrupted = _advance_head_after_coder_1389(monkeypatch, runner, interrupt=("reviewer", 3))
+    config = make_config(
+        tmp_path, approved_followups="fix-and-issue", pr_review_context_mode="compact", max_rounds=4
+    )
+
+    with pytest.raises(interrupted):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert runner.issues == []
+    assert runner.pr_payload["headRefOid"] == "repaired-2"
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert sorted(issue["title"] for issue in runner.issues) == [
+        "Follow up future review note: Add crash recovery for interrupted uploads.",
+        "Follow up future review note: Harden signal handling for the worker pool.",
+    ]
+    commands = [cmd[:3] for cmd, _cwd in runner.commands]
+    assert commands.count(["gh", "issue", "create"]) == 2
+    coder_prompts = _coder_prompts_1389(runner)
+    assert all("item [item-3]" not in prompt for prompt in coder_prompts)
+    assert all("- Add crash recovery for interrupted uploads.\n" not in prompt for prompt in coder_prompts)
+    assert "item [item-1]" not in coder_prompts[-1]
+
+
+def test_resume_after_future_item_repromotion_never_publishes_it(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking",
+                summary="One defect plus later work.",
+                blocking_items=["Fix the off-by-one in src/a.py:10."],
+                future_followups=["Validate the config path before use."],
+            ),
+            structured_pr_review(
+                state="blocking",
+                summary="The config path is in scope after all.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "blocking",
+                     "note": "Criterion (ii): src/c.py:5 now reads an unvalidated path; validate it."},
+                ],
+            ),
+            structured_pr_review(
+                state="approved",
+                summary="All fixed.",
+                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-2"]),
+        ],
+    )
+    # Stop right after the re-promoting round-2 review, before its coder turn.
+    interrupted = _advance_head_after_coder_1389(monkeypatch, runner, interrupt=("coder", 2))
+    config = make_config(
+        tmp_path, approved_followups="fix-and-issue", pr_review_context_mode="compact", max_rounds=4
+    )
+
+    with pytest.raises(interrupted):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.issues == []
+    assert not any("future follow-ups for PR #77" in comment for comment in runner.comments)
+    coder_prompts = _coder_prompts_1389(runner)
+    assert "Validate the config path before use." not in coder_prompts[0]
+    assert "Validate the config path before use." in coder_prompts[-1]

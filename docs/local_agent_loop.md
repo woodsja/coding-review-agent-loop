@@ -1855,9 +1855,15 @@ item dispositions in the JSON `prior_plan_item_dispositions` array using
 `"resolved"`, `"blocking"`, `"same-plan"`, or `"future"` (with a `"note"`).
 The orchestrator renders a `### Prior unresolved plan item dispositions` section
 in the public GitHub comment; reviewers do not add that section themselves. Use
-`"same-plan"` for required current-plan refinements; `"future"` is accepted only
-in approved plan reviews and the approved future follow-ups are reconciled with
-the final approved plan instead of reopening planning. In `--approved-followups=issue` and `fix-and-issue` modes,
+`"same-plan"` for required current-plan refinements. `"future"` dispositions and
+new `future_followups` are accepted in both approved and blocking plan reviews
+(#1389): a blocking review may park off-scope hardening there instead of
+blocking on it. Future items never become planner work; they stay in the plan
+ledger and are reconciled with the final approved plan instead of reopening
+planning. Plan reviewers also put a finding that is in scope but satisfiable
+within the current plan's design (a small addition with no new mechanism) in
+`same_plan_followups` rather than `blocking_plan_issues`; step-back and stall
+counting is unchanged. In `--approved-followups=issue` and `fix-and-issue` modes,
 when implementation will continue after approval, plan-stage future follow-ups
 are filed as separate issues before implementation starts. If implementation
 continues but issue filing is disabled, they are summarized inline with a note
@@ -6417,9 +6423,47 @@ Reviewer responses should use structured JSON first. A PR review starts with:
 A plan review uses `kind: "plan_review"`, `blocking_plan_issues`,
 `same_plan_followups`, `future_followups`, and
 `prior_plan_item_dispositions`. The JSON state must match the final
-`AGENT_STATE` or `AGENT_PLAN_STATE` footer. Blocking reviews must not hide
-current-round work in `future_followups`; approved reviews must not contain
-active blocking, Same-PR, Same-plan, or carried-forward active items.
+`AGENT_STATE` or `AGENT_PLAN_STATE` footer. Blocking reviews may list
+off-scope independent work in `future_followups` and may disposition a carried
+item as `future`, but must not hide current-round work there; approved reviews
+must not contain active blocking, Same-PR, Same-plan, or carried-forward active
+items.
+
+### Reviewer blocking scope
+
+Plan and PR reviewer prompts state the blocking criteria (#1389). A blocking
+finding (a blocking or same-plan/same-PR entry, or a carried item kept active)
+must concern one of:
+
+1. a stated requirement or acceptance criterion of the issue, or a signed human
+   requirement;
+2. a regression or correctness bug in behaviour the change touches; or
+3. a security or data-loss risk introduced by the change.
+
+Reviewers decide this scope eligibility first. Hardening, robustness, or
+lifecycle edge cases beyond it (cross-process concurrency, signal or
+cancellation paths, crash recovery, new permission or deploy gates the issue
+did not ask for) go in `future_followups` or are omitted, unless the finding
+explicitly argues which criterion it meets. A trivially small off-scope
+suggestion stays optional and never becomes same-plan or same-PR work. The
+exhaustiveness rule and "missing edge cases" wording are scoped to the issue.
+
+### Operator-declared out of scope
+
+An issue body or a signed human comment may include an `## Out of scope` or
+`## Non-goals` section (any heading level `#`..`######`; `Out-of-scope`,
+`Non goals`, a trailing colon, and a suffix such as `for this issue` are also
+accepted). The section runs until the next heading of the same or higher level;
+headings inside fenced code blocks are ignored, and empty sections are skipped.
+Each declared section is rendered, with its source, as an
+`Operator-declared out of scope (binding):` block in the planner prompt (fresh,
+full and compact revision, and semantic-patch revision) and in every plan- and
+PR-review prompt. Reviewers must downgrade a block that only concerns a
+declared area to a future follow-up unless it is also a regression or an
+introduced security/data-loss risk. A later signed human instruction overrides
+the declaration. There is no deterministic out-of-scope classifier; the rule is
+enforced through the reviewer prompt. Issues without such a section get
+unchanged prompts.
 
 Each plan-review finding entry is normally a string. A reviewer may instead
 emit a finding object using only the keys `title`, `text`, `issue`, `finding`,
@@ -6975,8 +7019,8 @@ provider/auth mode instead of treating the failure as a deterministic protocol
 or code issue.
 
 When `--approved-followups` is set to `summarize`, `issue`, or a `fix-and-*`
-mode, approved reviewer responses may also include optional future-work items
-under a dedicated heading:
+mode, approved and blocking reviewer responses may also include optional
+future-work items under a dedicated heading:
 
 ```md
 ### Future follow-ups
@@ -7006,11 +7050,18 @@ include Same-PR follow-ups, blocking items, or carried-forward items that remain
 round-to-round ledger so later reviewers can explicitly confirm they are still
 future work, resolved, or should be promoted back to same-PR or blocking
 status. The final summary or issue creation uses the remaining future items
-from that ledger. Without a `fix-and-*` mode, reviewers should mark same-PR
+from that ledger. Future follow-ups from a blocking review (#1389) are recorded
+and published at approval exactly like approved-review ones and are never sent
+to the coder. In compact PR context, a carried item downgraded to `future` on a
+blocking round leaves the ledger; the loop holds it in a publication-only
+pending set, rebuilt on resume by replaying the posted round records, so it is
+still published once at the final approval unless a later review resolves or
+re-promotes it. Without a `fix-and-*` mode, reviewers should mark same-PR
 cleanup blocking instead.
 
 By default, `--approved-followups=ignore` asks reviewers not to include these
-sections. Reviewers should mark the review blocking instead when cleanup should
+sections in any review state and to omit off-scope hardening rather than block
+on it. Reviewers should mark the review blocking instead when cleanup should
 be fixed before merge.
 
 `--approved-followups` accepts:

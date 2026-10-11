@@ -65,6 +65,7 @@ from .protocol import (
 )
 from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
 from .risk_coverage_map import classify_required_level, coverage_map_applies, enforceable_rows
+from .scope_declarations import declared_out_of_scope_block
 from .finding_history import (
     PHASE_PLAN as _HISTORY_PHASE_PLAN,
     PHASE_PR as _HISTORY_PHASE_PR,
@@ -811,17 +812,51 @@ def _reviewer_exhaustiveness_guidance(flow: str) -> str:
     """
     blocking_list, followup_list, subject, full_pass, behind = _REVIEWER_EXHAUSTIVENESS_FLOWS[flow]
     return (
-        "Review exhaustively: report every defect you can independently substantiate on "
-        f"the {subject}, not only the first. Substantiating one blocking defect does not "
+        "Review exhaustively: report every in-scope defect (per the blocking scope criteria) "
+        f"you can independently substantiate on the {subject}, not only the first. Substantiating one blocking defect does not "
         f"end the review; finish the pass over the {full_pass} before responding. When you "
         "find a defect in a function, code path, or plan step, re-read that whole function "
-        "or path and enumerate every other independently evidenced defect there as separate "
+        "or path and enumerate every other independently evidenced in-scope defect there as separate "
         f"`{blocking_list}` or `{followup_list}` entries in the same response. Each entry "
         "still needs its own evidence; speculation, or padding the review with items you "
         "cannot evidence, is forbidden. If a defect genuinely prevents you from evaluating "
         f"{behind} behind it, say so in that entry's text and in `summary`, naming what "
         "could not be evaluated, so the coder knows another round is expected. Do not "
         "claim masking merely to stop early.\n"
+    )
+
+
+_REVIEWER_BLOCKING_SCOPE_FLOWS = {
+    "pr": ("blocking_items", "same_pr_followups", "same-pr", "PR"),
+    "plan": ("blocking_plan_issues", "same_plan_followups", "same-plan", "plan"),
+}
+
+
+def _reviewer_blocking_scope_guidance(flow: str) -> str:
+    """Return the static blocking-scope criteria for one review flow (#1389).
+
+    Like ``_reviewer_exhaustiveness_guidance`` the text depends only on
+    ``flow``, so it is safe inside the compact stable prefixes.
+    """
+    blocking_list, followup_list, same_status, change = _REVIEWER_BLOCKING_SCOPE_FLOWS[flow]
+    return (
+        "Blocking scope criteria: a blocking finding (a "
+        f"`{blocking_list}` or `{followup_list}` entry, or a carried item kept "
+        f"`blocking`/`{same_status}`) must concern one of: (i) a stated requirement or "
+        "acceptance criterion of the issue, or a signed human requirement; (ii) a "
+        f"regression or correctness bug in behaviour this {change} touches; or (iii) a "
+        f"security or data-loss risk introduced by this {change}. Decide this scope "
+        "eligibility first, before deciding whether a finding is small or fits the "
+        "current design. Hardening, robustness, or lifecycle edge cases beyond that "
+        "scope (for example cross-process concurrency, signal or cancellation paths, "
+        "crash recovery, persistence state machines, or new permission and deploy "
+        "gates the issue did not ask for) belong in `future_followups` when this "
+        "review's follow-up rules allow them, or are omitted, unless the finding text "
+        "explicitly names which of (i)-(iii) it falls under and why. A finding that is "
+        "not eligible stays optional however small it is: never put it in "
+        f"`{blocking_list}` or `{followup_list}`, and disposition a carried item that "
+        "is not eligible as `future` (or `resolved` when nothing remains) rather than "
+        "keeping it active.\n"
     )
 
 
@@ -1726,7 +1761,7 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
         "Prior unresolved review items from earlier rounds",
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
-        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge. Machine obligations must still be dispositioned, but reviewer approval is advisory evidence only and never CI success. For a managed exact-head CI obligation with lifecycle `awaiting_current_head_review`, the orchestrator can dispatch qualification only after every required reviewer approves the candidate head. If the failed-head defect is fixed and no code-level blocker remains, approve the review and mark the carried predicate `resolved`; do not block waiting for the post-approval dispatch. The machine obligation remains active until authoritative qualification clears it; the same correlated exact-head qualification also retires a carried ordinary `github-pr-checks` obligation when its exact-head board is clean.",
+        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later PR changes already handled it, or promote it to `same-pr`/`still blocking` if it must be fixed before merge. A blocking review may also disposition a carried item as `future` when it falls outside blocking scope criteria (i)-(iii) or concerns an operator-declared out-of-scope area. Machine obligations must still be dispositioned, but reviewer approval is advisory evidence only and never CI success. For a managed exact-head CI obligation with lifecycle `awaiting_current_head_review`, the orchestrator can dispatch qualification only after every required reviewer approves the candidate head. If the failed-head defect is fixed and no code-level blocker remains, approve the review and mark the carried predicate `resolved`; do not block waiting for the post-approval dispatch. The machine obligation remains active until authoritative qualification clears it; the same correlated exact-head qualification also retires a carried ordinary `github-pr-checks` obligation when its exact-head board is clean.",
         "Every `blocking` or `same-pr` prior-item disposition requires an actionable `note`: explain what remains wrong on this head, cite relevant code or test evidence, and say what change or test would resolve it. A bare status or summary alone is insufficient. A different defect needs a new item, not a repurposed ID. Resolved dispositions may omit the note.",
         "",
     ]
@@ -1782,7 +1817,7 @@ def _format_unresolved_plan_items(unresolved_items: Sequence[UnresolvedReviewIte
         "Prior unresolved plan items from earlier rounds",
         "",
         "Explicitly evaluate every item below before approving. Use the item IDs exactly as written.",
-        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_plan_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later plan changes already handled it, or promote it to `same-plan`/`still blocking` if it must be fixed before implementation.",
+        "Each item has an immutable Original claim and separate Updates/evidence. Evaluate the Original claim, not a replacement concern. For carried future follow-ups, record their status only in `prior_plan_item_dispositions`; do not repeat the same concern in new `future_followups`. Use `resolved` if later plan changes already handled it, or promote it to `same-plan`/`still blocking` if it must be fixed before implementation. A blocking review may also disposition a carried item as `future` when it falls outside blocking scope criteria (i)-(iii) or concerns an operator-declared out-of-scope area.",
         "",
     ]
     for item in unresolved_items:
@@ -2455,23 +2490,33 @@ provisioning, or other named integration artifact in the plan; an `admin.html`
 view alone is not coverage. If the plan cannot satisfy the request, record a
 visible `blocked` or `not-applicable` reason and approve only if you accept it.
 
-""" + _reviewer_exhaustiveness_guidance("plan") + """Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
+""" + _reviewer_exhaustiveness_guidance("plan") + _reviewer_blocking_scope_guidance("plan") + """Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
-plan is approved; they are allowed only in approved plan reviews. Before adding a
-`future_followups` entry, ask whether the finding is a one-line or trivially small
-mechanical change — initialising a variable, renaming for clarity, adding a missing
-annotation. If so, put it in `same_plan_followups` instead; a separate PR just for a
-one-liner adds overhead without value. A concern or
+plan is approved; they are allowed in both approved and blocking plan reviews,
+never block, are not required work for the planner, and are published when the
+plan is approved. Classify each finding in this order. First decide scope
+eligibility under the blocking scope criteria: a finding that is not eligible
+goes in `future_followups` or is omitted, however small it is, and never becomes
+`same_plan_followups` or `blocking_plan_issues` work; that includes a trivially
+small suggestion touching an operator-declared out-of-scope area. Only for an
+eligible finding: if it is satisfiable within the current plan's design (a small
+addition with no new mechanism, state machine, persistence, or process
+boundary), put it in `same_plan_followups`, not `blocking_plan_issues`;
+otherwise it blocks. An eligible one-line or trivially small mechanical change —
+initialising a variable, renaming for clarity, adding a missing annotation —
+also belongs in `same_plan_followups`, never in `future_followups`; a separate
+PR just for a one-liner adds overhead without value. A concern or
 paraphrase belongs in exactly one current-round list: `blocking_plan_issues`,
 `same_plan_followups`, or `future_followups`. Do not duplicate or reclassify
 the same concern across Same-plan and Future follow-up lists.
 Approved means there are no blocking plan issues, no Same-plan follow-ups, and
 no carried-forward plan items left active for this planning round. If you
-return `<!-- AGENT_PLAN_STATE: blocking -->`, do not use structured Future
-follow-ups; keep all required current-round issues in the main blocking
-content so they are not missed during plan revision.
+return `<!-- AGENT_PLAN_STATE: blocking -->`, keep all required current-round
+issues in `blocking_plan_issues` or `same_plan_followups` so they are not missed
+during plan revision; `future_followups` in a blocking review may hold only
+off-scope independent later work.
 Only items listed under `Prior unresolved plan items from earlier rounds` are
 eligible for dispositions in this round. If same-round findings from other
 reviewers appear elsewhere in the issue discussion, treat them as
@@ -2781,6 +2826,7 @@ def _compact_plan_stable_prefix(
             response_protocol,
             _memory_block(memory, config),
             _compact_issue_context_block(issue_context),
+            declared_out_of_scope_block(issue_context),
             human_requirements_block,
             human_requirements_guidance,
             _canonical_plan_ledger_rules(),
@@ -3352,7 +3398,7 @@ prose between the JSON object and footer.
     ),
 )}
 {format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
-{_issue_context_block(issue_context)}
+{_issue_context_block(issue_context)}{declared_out_of_scope_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
 
 {_agent_unavailable_guidance(coder_signature)}
@@ -3451,7 +3497,7 @@ branch, commit, push, or open a pull request during this planning review.
 {_architecture_impact_guidance()}
 {_architecture_context_block(config, protected_context=(human_requirements_block,))}
 {_scratch_file_guidance()}
-{human_requirements_block}{_issue_context_block(issue_context)}
+{human_requirements_block}{_issue_context_block(issue_context)}{declared_out_of_scope_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config)}
 
 Plan from {coder_name}:
@@ -3459,8 +3505,8 @@ Plan from {coder_name}:
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
 {_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}
-Review the plan for correctness, architecture fit, missing edge cases, test
-strategy, and ambiguity. Use this mandatory structured JSON response format:
+Review the plan for correctness, architecture fit, missing edge cases within
+the issue's scope, test strategy, and ambiguity. Use this mandatory structured JSON response format:
 
 {{
   "schema_version": 1,
@@ -3479,23 +3525,33 @@ strategy, and ambiguity. Use this mandatory structured JSON response format:
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}
 
-{_reviewer_exhaustiveness_guidance('plan')}Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
+{_reviewer_exhaustiveness_guidance('plan')}{_reviewer_blocking_scope_guidance('plan')}Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
-plan is approved; they are allowed only in approved plan reviews. Before adding a
-`future_followups` entry, ask whether the finding is a one-line or trivially small
-mechanical change — initialising a variable, renaming for clarity, adding a missing
-annotation. If so, put it in `same_plan_followups` instead; a separate PR just for a
-one-liner adds overhead without value. A concern or
+plan is approved; they are allowed in both approved and blocking plan reviews,
+never block, are not required work for the planner, and are published when the
+plan is approved. Classify each finding in this order. First decide scope
+eligibility under the blocking scope criteria: a finding that is not eligible
+goes in `future_followups` or is omitted, however small it is, and never becomes
+`same_plan_followups` or `blocking_plan_issues` work; that includes a trivially
+small suggestion touching an operator-declared out-of-scope area. Only for an
+eligible finding: if it is satisfiable within the current plan's design (a small
+addition with no new mechanism, state machine, persistence, or process
+boundary), put it in `same_plan_followups`, not `blocking_plan_issues`;
+otherwise it blocks. An eligible one-line or trivially small mechanical change —
+initialising a variable, renaming for clarity, adding a missing annotation —
+also belongs in `same_plan_followups`, never in `future_followups`; a separate
+PR just for a one-liner adds overhead without value. A concern or
 paraphrase belongs in exactly one current-round list: `blocking_plan_issues`,
 `same_plan_followups`, or `future_followups`. Do not duplicate or reclassify
 the same concern across Same-plan and Future follow-up lists.
 Approved means there are no blocking plan issues, no Same-plan follow-ups, and
 no carried-forward plan items left active for this planning round. If you
-return `<!-- AGENT_PLAN_STATE: blocking -->`, do not use structured Future
-follow-ups; keep all required current-round issues in the main blocking
-content so they are not missed during plan revision.
+return `<!-- AGENT_PLAN_STATE: blocking -->`, keep all required current-round
+issues in `blocking_plan_issues` or `same_plan_followups` so they are not missed
+during plan revision; `future_followups` in a blocking review may hold only
+off-scope independent later work.
 Only items listed under `Prior unresolved plan items from earlier rounds` are
 eligible for dispositions in this round. If same-round findings from other
 reviewers appear elsewhere in the issue discussion, treat them as
@@ -3593,7 +3649,7 @@ def _build_compact_plan_review_prompt(
     action = (
         compact_tail.action
         if compact_tail and compact_tail.action
-        else "Review the current plan for correctness, architecture fit, missing edge cases, test strategy, and ambiguity."
+        else "Review the current plan for correctness, architecture fit, missing edge cases within the issue's scope, test strategy, and ambiguity."
     )
     return f"""{stable_prefix}
 {COMPACT_PLANNING_VOLATILE_TAIL_MARKER}
@@ -3747,7 +3803,7 @@ authenticated base and assemble the complete generation-1 plan.
 {_coder_workdir_guidance(config, implementation=False)}
 {_scratch_file_guidance()}
 {human_requirements_context.block}
-{_issue_context_block(issue_context)}
+{_issue_context_block(issue_context)}{declared_out_of_scope_block(issue_context)}
 {_memory_block(memory, config, include_runtime=True)}
 {format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 
@@ -3922,7 +3978,7 @@ branch, commit, push, or open a pull request during this planning stage.
 )}
 {format_plan_validation_diagnostic_context(plan_validation_diagnostic)}{render_inherited_matrix_obligations(inherited_matrix_binding)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, previous_plan))}
-{_issue_context_block(issue_context)}
+{_issue_context_block(issue_context)}{declared_out_of_scope_block(issue_context)}
 {unresolved_items_block}{_memory_block(memory, config, include_runtime=True)}
 
 Previous plan:
@@ -4538,7 +4594,7 @@ the pull request to be considered approved.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-{_reviewer_exhaustiveness_guidance('pr')}Treat the GitHub PR checks block in the volatile tail as authoritative for current CI state.
+{_reviewer_exhaustiveness_guidance('pr')}{_reviewer_blocking_scope_guidance('pr')}Treat the GitHub PR checks block in the volatile tail as authoritative for current CI state.
 Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
@@ -4575,6 +4631,7 @@ adds a merge migration.
             ),
             _labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context"),
             _compact_pr_review_issue_context_block(issue_context, pr_metadata.body),
+            declared_out_of_scope_block(parent_issue_context, issue_context),
             managed_human_block if managed_human_block is not None else _human_requirements_block(human_requirements),
             _canonical_pr_review_ledger_rules(),
             _format_unresolved_review_items(non_future_items)
@@ -4705,9 +4762,11 @@ or bullet list for prior items outside the JSON object. Valid `disposition` valu
 - `"resolved"` — item is fixed in this PR.
 - `"blocking"` — the displayed Original claim is still a merge-blocking problem.
 - `"same-pr"` — the displayed Original claim needs to be fixed before merge.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
+- `"future"` — deferred; must include a `"note"` field; valid in approved and blocking reviews.
 
-Only use `"future"` when returning `approved`. If an item should still be fixed before
+Use `"future"` (in an approved or a blocking review) for an item that is independent
+later work, including a carried item outside the blocking scope criteria (i)-(iii) or
+in an operator-declared out-of-scope area. If an item should still be fixed before
 merge, use `"blocking"` or `"same-pr"` instead. For any prior item already marked
 `"future"`, explicitly re-evaluate: `"resolved"`, still `"future"`, or back to
 `"blocking"`/`"same-pr"`.
@@ -4746,9 +4805,11 @@ or bullet list for prior items outside the JSON object. Valid `disposition` valu
 - `"resolved"` — the displayed Original claim is fixed in this revision.
 - `"blocking"` — the displayed Original claim is still a blocking plan problem.
 - `"same-plan"` — the displayed Original claim needs to be incorporated before implementation.
-- `"future"` — deferred; must include a `"note"` field; only valid when approving.
+- `"future"` — deferred; must include a `"note"` field; valid in approved and blocking reviews.
 
-Only use `"future"` when returning `approved`. If a plan item still needs to be fixed
+Use `"future"` (in an approved or a blocking review) for an item that is independent
+later work, including a carried item outside the blocking scope criteria (i)-(iii) or
+in an operator-declared out-of-scope area. If a plan item still needs to be fixed
 before implementation starts, use `"blocking"` or `"same-plan"` instead. For any prior
 item already marked `"future"`, explicitly re-evaluate.
 
@@ -4772,6 +4833,9 @@ when cleanup should be fixed before merge.
 Trivial style nits in touched code should be omitted unless worth requiring
 before merge; if required, they are current-PR work and the review is blocking,
 not approved with Future follow-ups.
+Do not use structured Future follow-ups in any review state in this run. Omit
+off-scope hardening that falls outside the blocking scope criteria rather than
+blocking on it.
 """
     elif config.approved_followups.startswith("fix-and-"):
         return f"""For small, localized, low-risk cleanup that must still be fixed in this PR
@@ -4794,9 +4858,9 @@ Same-PR follow-ups may appear only in blocking reviews. If any Same-PR
 follow-up remains, including a carried-forward prior item that stays
 `still blocking` or `same-pr`, the review is not approved yet.
 
-If the PR is otherwise fully complete for this round but you notice substantial
-work that is better handled separately in a future issue or PR, list at most
-three highest-value items under this exact heading:
+If you notice substantial work that is better handled separately in a future
+issue or PR, list at most three highest-value items under this exact heading,
+in an approved or a blocking review:
 
 ### Future follow-ups
 
@@ -4810,18 +4874,24 @@ carried-forward prior unresolved items left active for this round.
 Same-PR follow-ups will be sent back to {coder_name} and require another review
 round before final approval. Before returning approved, self-check that no
 Future follow-up is trivial or local to the current PR; reclassify it as
-Same-PR or omit it. One-line correctness fixes (e.g. initialising a needed variable)
-belong in `blocking_items`; one-line cleanup (e.g. renaming for clarity, adding an
-annotation) belongs in `same_pr_followups`. Neither belongs in `future_followups`.
+Same-PR or omit it. Apply the blocking scope criteria first: only in-scope
+one-line fixes are current-PR work. An in-scope one-line correctness fix (e.g.
+initialising a needed variable) belongs in `blocking_items`; in-scope one-line
+cleanup (e.g. renaming for clarity, adding an annotation) belongs in
+`same_pr_followups`. Neither belongs in `future_followups`. A trivially small
+suggestion that is out of scope, or concerns an operator-declared out-of-scope
+area, stays optional: put it in `future_followups` or omit it, never in
+`blocking_items` or `same_pr_followups`.
 Do not put trivial style nits in either follow-up section.
-If you return `<!-- AGENT_STATE: blocking -->`, do not use structured Future
-follow-ups; keep all required current-round work in the blocking review so it
-is not missed during revision.
+If you return `<!-- AGENT_STATE: blocking -->`, you may still list off-scope
+independent later work in `future_followups`; those items never block and are
+carried to approval-time publication. Keep all required current-round work in
+`blocking_items` or `same_pr_followups` so it is not missed during revision.
 """
     else:
-        return """If you approve but notice substantial work that is better handled separately in
-a future issue or PR, list at most three highest-value items under this exact
-heading:
+        return """If you notice substantial work that is better handled separately in a future
+issue or PR, list at most three highest-value items under this exact heading, in
+an approved or a blocking review:
 
 ### Future follow-ups
 
@@ -4836,9 +4906,14 @@ Do not use the Same-PR follow-ups section in this mode; mark the review blocking
 instead when small or local cleanup should be fixed before merge.
 Before returning approved, self-check that no Future follow-up is trivial or
 local to the current PR; reclassify it as blocking current-PR work or omit it.
-One-line or trivially small mechanical fixes — whether a correctness issue (initialising a
-needed variable) or cleanup (renaming for clarity, adding an annotation) — belong in the
-current round as blocking work, not in a future issue.
+Apply the blocking scope criteria first. In-scope one-line or trivially small mechanical
+fixes — whether a correctness issue (initialising a needed variable) or cleanup (renaming
+for clarity, adding an annotation) — belong in the current round as blocking work, not in a
+future issue. A trivially small suggestion that is out of scope, or concerns an
+operator-declared out-of-scope area, stays optional: put it in Future follow-ups or omit it.
+If you return `<!-- AGENT_STATE: blocking -->`, you may still list off-scope independent
+later work under Future follow-ups; those items never block and are carried to
+approval-time publication. Keep all required current-round work in `blocking_items`.
 The legacy heading `### Non-blocking follow-ups` is still accepted as future
 follow-ups for compatibility, but prefer `### Future follow-ups`.
 """
@@ -5145,7 +5220,7 @@ are present in the PR diff.
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
 {_pr_review_scheduling_guidance(config)}
-{checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}
+{checks_block}{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}{_labeled_issue_context_block(issue_context, label="Primary/child issue context")}{declared_out_of_scope_block(parent_issue_context, issue_context)}
 {approved_plan_block}
 {human_requirements_block}
 {architecture_block}
@@ -5163,7 +5238,7 @@ already available, or produce a blocking review explaining the limitation.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-{_reviewer_exhaustiveness_guidance('pr')}Treat the GitHub PR checks block above as authoritative for current CI state.
+{_reviewer_exhaustiveness_guidance('pr')}{_reviewer_blocking_scope_guidance('pr')}Treat the GitHub PR checks block above as authoritative for current CI state.
 Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.

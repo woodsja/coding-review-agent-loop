@@ -623,16 +623,9 @@ def _validate_review_grounding(
                     and source_disposition in active_values
                     and coverage_predicate(source_note if isinstance(source_note, str) else "")
                 )
-                # The schema forbids a `future` disposition in a blocking
-                # review while still requiring every carried item to appear, so
-                # the repair prompt must re-state it.  Permit only the
-                # non-resolving active value, which keeps the item open.
-                schema_mandated_future_change = (
-                    source_disposition == "future"
-                    and target.get("state") == "blocking"
-                    and disposition in active_values
-                )
-                if not (authorized_resolution or schema_mandated_future_change):
+                # Blocking reviews may keep a `future` disposition (#1389), so
+                # no schema rule forces a carried future item to change.
+                if not authorized_resolution:
                     reject(
                         f"`{disposition_field}` changes item `{item_id}` from "
                         f"`{source_disposition}` to `{disposition}` without source support"
