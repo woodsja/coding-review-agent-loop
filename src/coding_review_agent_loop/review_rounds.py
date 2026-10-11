@@ -408,7 +408,8 @@ def _unavailable_reviewer_amendment_advisory(
             amend_contract(
                 contract,
                 amendment,
-                base_board=tuple(getattr(getattr(lineage, "contracts")[0], "required_reviewers")),
+                base_board=getattr(lineage, "segment_base_board", None)
+                or tuple(getattr(getattr(lineage, "contracts")[0], "required_reviewers")),
                 previously_removed=tuple(getattr(lineage, "removed_reviewers", ())),
             )
         except AgentLoopError:

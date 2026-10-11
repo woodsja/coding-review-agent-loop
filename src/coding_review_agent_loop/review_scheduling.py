@@ -409,6 +409,10 @@ class SchedulerSnapshot:
     panel_evidence: bool = False
     # Human-readable automatic fallback reasons for the current decision.
     fallback_reasons: tuple[str, ...] = ()
+    # Item IDs of active secondary obligations created before a board change
+    # restarted the primary phase (#1376).  They stay open with their owners
+    # and are exempt from the pre-panel stop only.
+    carried_obligations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -552,7 +556,13 @@ def select_reviewers(
         fallback_detail = "; ".join(snapshot.fallback_reasons)
         if not panel_opened:
             secondaries = required_names - {primary}
-            secondary_pending = pending_owner_set & secondaries
+            carried = set(snapshot.carried_obligations)
+            secondary_pending = {
+                owner
+                for obligation in active_obligations
+                if obligation.item_id not in carried
+                for owner in obligation.pending_owners
+            } & secondaries
             if secondary_pending:
                 # Secondaries are never finding owners before their first
                 # legitimate panel invocation; do not guess ownership and do
@@ -560,7 +570,8 @@ def select_reviewers(
                 item_ids = sorted(
                     obligation.item_id
                     for obligation in active_obligations
-                    if set(obligation.pending_owners) & secondary_pending
+                    if obligation.item_id not in carried
+                    and set(obligation.pending_owners) & secondary_pending
                 )
                 raise PrePanelSafetyError(
                     pre_panel_safety_message(

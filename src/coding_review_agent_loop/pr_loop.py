@@ -7,6 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import sys
 import time
@@ -26,7 +27,6 @@ from .config import (
     sync_reviewer_pr_before_review,
 )
 from .board_amendment import (
-    ContractLineage,
     amendment_audit_already_posted,
     amendment_summary_line,
     apply_board_amendment_to_ledger,
@@ -35,8 +35,37 @@ from .board_amendment import (
     reject_misplaced_pr_amendments,
     render_amendment_audit_comment,
     require_amendment_activation,
-    resolve_contract_lineage,
 )
+from .plan_verification import (
+    board_change_audit_already_posted,
+    board_change_digest,
+    board_change_payload,
+    derive_plan_verification_context,
+    plan_verification_inputs,
+    render_board_change_audit,
+)
+from .reviewer_floor import board_floor_enabled
+from .board_change import (
+    pre_epoch_panel_items,
+    board_reentry_round,
+    name_agents,
+    identity_agents,
+    carried_secondary_obligations,
+    carry_over_anchor_round,
+    board_anchor,
+    comments_bear_board_change_links,
+    link_already_posted,
+    render_board_change_link,
+    stamp_for_lineage,
+    identity_from_config,
+)
+from .pr_board_state import (
+    check_lineage_floor,
+    qualification_board_check,
+    resolve_pr_board_state,
+)
+from .round_state import reset_pr_board_stamp, set_pr_board_stamp
+from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
     _decode_json_payload,
     approved_plan_hash,
@@ -125,6 +154,7 @@ from .managed_ci import (
     find_actor_round_metadata_comment_ids,
     publish_issue_created_continuity_authorization,
     publish_manual_v2_qualification,
+    rejected_recovery_correlation_inputs,
     prepare_v2_merge,
     publish_round_readiness,
     release_adopted_managed_ci,
@@ -326,6 +356,7 @@ from .panel_evidence import (
     _superseded_prepanel_review,
     _scheduler_recorded_force_full,
     _board_amendment_template,
+    _board_amendment_route_clause,
     _require_handoff_plan_growth_verdict,
     _require_complete_canonical_plan_approval,
 )
@@ -422,7 +453,6 @@ from .pr_loop_support import (
     _reviewer_history_is_reconstructible,
     _returning_reviewer_context,
     _observe_pr_transition,
-    _scheduler_contract_from_metadata,
     _pr_contract_drift_error,
     _post_reduced_board_completion_note,
     _pr_amendment_start_round,
@@ -447,6 +477,252 @@ def unchanged_head_stop_message(
         f"{unsuperseded_receipts_sentence(evidence)}"
         f"{route}"
     )
+
+
+def _enforce_pr_board_floor(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    handoff_authorizations: Sequence[object] = (),
+) -> None:
+    """Resolve the PR board lineage read-only, then check the effective-board floor.
+
+    Malformed, unauthenticated or not-yet-activatable lineage history (signed
+    amendments and board-change links) fails closed here, and a board-change
+    candidate is floor-checked against the lineage that would exist after
+    posting it, so every caller refuses before any write (#1376).  Without a
+    floor, signed amendments or link records there is nothing to refuse
+    early: startup resolves the lineage before any agent invocation.
+    """
+    if not (
+        board_floor_enabled(config)
+        or comments_bear_board_change_links(pr_context.comments)
+        or collect_reviewer_board_amendments(
+            pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
+        )
+    ):
+        return
+    capabilities = policy_capabilities(config.pr_review_policy)
+    configured = reviewers(config)
+    configured_contract = make_contract(
+        tuple(agent_display_name(reviewer) for reviewer in configured),
+        config.pr_review_policy,
+        config.pr_review_broad_rules,
+        (
+            agent_display_name(config.primary_reviewer)
+            if config.primary_reviewer is not None
+            else None
+        ),
+    )
+
+    def resume_round(effective_config: object, _lineage: object) -> int:
+        resumed = _resume_pr_round_admitted(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            comments=pr_context.comments,
+            head_sha=pr_context.metadata.head_sha,
+            configured_reviewers=reviewers(effective_config),
+            reconciliation_mode=(
+                "owner-scoped" if capabilities.owner_scoped_reconciliation else "aggregate"
+            ),
+        )
+        return board_reentry_round(
+            pr_context.comments, resumed.round_number if resumed is not None else None,
+            signed_amendment=True,
+        )
+
+    resolve_pr_board_state(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        comments=pr_context.comments,
+        drift_error=lambda persisted, detail: _pr_contract_drift_error(
+            persisted,
+            detail,
+            pr_number=pr_number,
+            configured=configured_contract,
+            start_round_number=lambda: _pr_amendment_start_round(
+                pr_context, configured, capabilities, runner=runner, config=config,
+            ),
+            amendments_recognized=True,
+        ),
+        handoff_authorizations=handoff_authorizations,
+        resume_round=resume_round,
+        floor_refusal_hint=lambda persisted, refused: _board_amendment_route_clause(
+            flow="pr",
+            issue_number=None,
+            pr_number=pr_number,
+            persisted=persisted,
+            configured=refused,
+            start_round_number=lambda: _pr_amendment_start_round(
+                pr_context, configured, capabilities, runner=runner, config=config,
+            ),
+            amendments_recognized=True,
+        ),
+    )
+
+
+def _canonical_plan_without_handoff(
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    *,
+    source_locator: str,
+    error_message: str,
+) -> ApprovedPlanContext | None:
+    """The completely approved canonical plan of an issue with no handoff record.
+
+    Approval is verified against the approving plan board, never the PR
+    invocation's board (#1373).  ``None`` means the issue has no plan round;
+    incomplete approval raises ``error_message``.
+    """
+    plan_config, plan_comments = plan_verification_inputs(
+        config, issue_context.comments, issue_number=issue_context.number,
+    )
+    resumed_plan = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
+    if resumed_plan is None:
+        return None
+    plan_text, resumed_plan_round = resumed_plan
+    _require_complete_canonical_plan_approval(
+        plan_comments,
+        config=plan_config,
+        plan_text=plan_text,
+        plan_round=resumed_plan_round,
+        human_requirements=issue_context.human_requirements,
+        error_message=error_message,
+    )
+    return make_approved_plan_context(
+        plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
+    )
+
+
+def _entry_plan_handoff_board(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    issue_context: IssueContext | None,
+    parent_issue_context: IssueContext | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    managed_ci_issue_number: int | None,
+) -> PlanHandoffBoard | None:
+    """Read-only handoff board of the exact approved plan bound to this PR.
+
+    Runs before the first PR write, so it uses only authoritative scope: the
+    caller's issue, else an explicit managed-CI issue scope, else the PR-side
+    contract's primary issue.  The plan identity comes from the caller's
+    approved plan or the issue-side handoff that names this PR, and the board
+    is taken from the issue (child, else staged parent) holding exactly that
+    plan, the same selection the handoff seam applies.  ``None`` means no
+    plan is bound, so no plan authorization applies.
+    """
+    fresh_scope_number = managed_ci_issue_number or config.managed_ci_issue_number
+    branch_match = re.fullmatch(
+        r"agent-loop/managed-([1-9]\d*)", pr_context.metadata.head_branch or "",
+    )
+    branch_number = int(branch_match.group(1)) if branch_match is not None else None
+    ordinary_managed_recovery = config.managed_ci_pr_mode or fresh_scope_number is not None
+    owning_number = issue_context.number if issue_context is not None else None
+    if owning_number is None:
+        owning_number = fresh_scope_number
+    if owning_number is None:
+        recorded = find_latest_pr_contract(
+            pr_context.comments, repository=config.repo, pr_number=pr_number,
+        )
+        if recorded is not None:
+            owning_number = recorded.primary_issue_number
+    if owning_number is None and ordinary_managed_recovery:
+        # Ordinary managed-CI recovery binds the issue named by the managed
+        # branch, exactly as recover_issue_created_handoff does.
+        owning_number = branch_number
+    if owning_number is None:
+        # The same single-linked-issue fallback the provenance block applies;
+        # its handoff record must still name this PR to bind a plan.
+        linked = parse_linked_issue_numbers(pr_context.metadata.body, repo=config.repo)
+        if len(linked) == 1:
+            owning_number = linked[0]
+    if owning_number is None:
+        return None
+    # Only the managed-CI recovery paths bind an issue's canonical plan when
+    # no handoff record names this PR (#1378 review items 10-12).  Whether
+    # they run depends on the invocation's managed-CI scope and the managed
+    # branch, never on which lookup above supplied the owning issue.
+    canonical_recovery_scope = (
+        config.managed_ci_fresh_authorization and fresh_scope_number == owning_number
+    ) or (ordinary_managed_recovery and branch_number == owning_number)
+    owning = get_issue_context(runner, config=config, issue_number=owning_number)
+    if approved_plan_context is not None:
+        plan_hash: str | None = approved_plan_context.plan_hash
+        plan_subject = approved_plan_context.plan_subject
+    else:
+        handoff = find_latest_issue_pr_handoff(
+            owning.comments, issue_number=owning.number, repo=config.repo,
+        )
+        if handoff is None and not canonical_recovery_scope:
+            # An ordinary PR binds a plan only through a handoff record that
+            # names it; unrelated or unfinished planning is not consulted.
+            return None
+        if handoff is None:
+            # No handoff record: managed-CI fresh authorization and ordinary
+            # managed-CI resume bind the issue's completely approved canonical
+            # plan, verified the same way here.
+            canonical = _canonical_plan_without_handoff(
+                config,
+                owning,
+                source_locator=f"issue #{owning.number} canonical approved plan",
+                error_message=(
+                    f"Issue #{owning.number} has planning state without a complete "
+                    "canonical reviewer approval; no PR write was made."
+                    + _pr_amendment_plan_board_hint(
+                        pr_context.comments,
+                        pr_number=pr_number,
+                        supplied_reviewers=reviewers(config),
+                    )
+                ),
+            )
+            if canonical is None:
+                return None
+            # That plan was verified on this issue, which therefore owns its board.
+            plan = derive_plan_verification_context(owning.comments, issue_number=owning.number)
+            return resolve_plan_handoff_board(config, plan) if plan is not None else None
+        elif handoff.pr_number != pr_number or handoff.flow != "approved-plan-implementation":
+            return None
+        elif not handoff.plan_hash:
+            raise AgentLoopError(
+                f"Approved-plan handoff for issue #{owning.number} has no plan hash."
+            )
+        else:
+            plan_hash, plan_subject = handoff.plan_hash, None
+    parent_number = (
+        parent_issue_context.number
+        if parent_issue_context is not None
+        else _infer_staged_parent_issue(owning)
+    )
+    candidates: list[int] = [owning.number]
+    if parent_number is not None and parent_number != owning.number:
+        candidates.append(parent_number)
+    for number in candidates:
+        source = (
+            owning if number == owning.number
+            else get_issue_context(runner, config=config, issue_number=number)
+        )
+        recovered = recover_approved_plan_context(
+            source.comments, expected_hash=plan_hash, expected_subject=plan_subject,
+        )
+        if recovered.is_available:
+            if (
+                approved_plan_context is not None
+                and recovered.canonical_text != approved_plan_context.canonical_text
+            ):
+                raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            plan = derive_plan_verification_context(source.comments, issue_number=source.number)
+            return resolve_plan_handoff_board(config, plan) if plan is not None else None
+        if recovered.has_matching_candidate:
+            return None
+    return None
 
 
 @claimed_run("pr", "pr_number")
@@ -501,6 +777,7 @@ def run_pr_loop(
         )
 
     unchanged_head_tracker = _UnchangedHeadTracker()
+    pr_board_stamp_token = None
     telemetry_token = _begin_run_telemetry(
         runner, config, usage_context, owned_usage_context, pr_number=pr_number
     )
@@ -521,6 +798,40 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        # The first PR write (the retained-label release, managed-CI fresh
+        # authorization, activation, or any post) follows this point.  Whenever
+        # signed PR amendments exist or a floor is configured, resolve the
+        # authoritative plan board and the complete signed PR lineage read-only
+        # first, so malformed history or a below-floor board is refused with
+        # nothing written (#1378 review items 3, 6, 7, 9).  The handoff seam
+        # repeats the exact check.
+        entry_amendments = collect_reviewer_board_amendments(
+            initial_pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
+        )
+        if (
+            entry_amendments
+            or board_floor_enabled(config)
+            or comments_bear_board_change_links(initial_pr_context.comments)
+        ):
+            entry_board = _entry_plan_handoff_board(
+                runner,
+                config=config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                issue_context=issue_context,
+                parent_issue_context=parent_issue_context,
+                approved_plan_context=approved_plan_context,
+                managed_ci_issue_number=managed_ci_issue_number,
+            )
+            _enforce_pr_board_floor(
+                runner,
+                config=entry_board.config if entry_board is not None else config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                handoff_authorizations=(
+                    entry_board.signed_authorizations if entry_board is not None else ()
+                ),
+            )
         # A successful manual qualification retains the managed label on the
         # ready PR.  Release it before any managed-CI authentication so every
         # downstream path sees the ready/unlabeled state it already handles.
@@ -634,35 +945,23 @@ def run_pr_loop(
                         parent_issue_context = fetched_parent_issue_context
                         parent_issue_context_refreshed = True
             else:
-                resumed_plan = _resume_plan_round(
-                    issue_context.comments,
-                    configured_reviewers=reviewers(config),
+                # Plan approval is verified against the approving plan board,
+                # never this PR invocation's board (#1373).
+                recovered_plan_context = _canonical_plan_without_handoff(
+                    config,
+                    issue_context,
+                    source_locator=f"issue #{fresh_issue_number} canonical approved plan",
+                    error_message=(
+                        "Managed-CI fresh authorization found planning state without "
+                        "a complete canonical reviewer approval."
+                        + _pr_amendment_plan_board_hint(
+                            initial_pr_context.comments,
+                            pr_number=pr_number,
+                            supplied_reviewers=reviewers(config),
+                        )
+                    ),
                 )
-                if resumed_plan is not None:
-                    plan_text, resumed_plan_round = resumed_plan
-                    _require_complete_canonical_plan_approval(
-                        issue_context.comments,
-                        config=config,
-                        plan_text=plan_text,
-                        plan_round=resumed_plan_round,
-                        human_requirements=issue_context.human_requirements,
-                        error_message=(
-                            "Managed-CI fresh authorization found planning state without "
-                            "a complete canonical reviewer approval."
-                            + _pr_amendment_plan_board_hint(
-                                initial_pr_context.comments,
-                                pr_number=pr_number,
-                                supplied_reviewers=reviewers(config),
-                            )
-                        ),
-                    )
-                    recovered_plan_context = make_approved_plan_context(
-                        plan_text,
-                        source_locator=(
-                            f"issue #{fresh_issue_number} canonical approved plan"
-                        ),
-                        expected_hash=approved_plan_hash(plan_text),
-                    )
+                if recovered_plan_context is not None:
                     if (
                         approved_plan_context is not None
                         and approved_plan_context.plan_hash
@@ -780,35 +1079,22 @@ def run_pr_loop(
                             )
                         recovered_scope = candidate_scope
                     elif canonical_handoff is None:
-                        resumed_plan = _resume_plan_round(
-                            issue_context.comments,
-                            configured_reviewers=reviewers(config),
+                        recovered_scope = _canonical_plan_without_handoff(
+                            config,
+                            issue_context,
+                            source_locator=(
+                                f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
+                            ),
+                            error_message=(
+                                "Managed-CI ordinary resume found incomplete canonical "
+                                "plan approval."
+                                + _pr_amendment_plan_board_hint(
+                                    initial_pr_context.comments,
+                                    pr_number=pr_number,
+                                    supplied_reviewers=reviewers(config),
+                                )
+                            ),
                         )
-                        if resumed_plan is not None:
-                            plan_text, resumed_plan_round = resumed_plan
-                            _require_complete_canonical_plan_approval(
-                                issue_context.comments,
-                                config=config,
-                                plan_text=plan_text,
-                                plan_round=resumed_plan_round,
-                                human_requirements=issue_context.human_requirements,
-                                error_message=(
-                                    "Managed-CI ordinary resume found incomplete canonical "
-                                    "plan approval."
-                                    + _pr_amendment_plan_board_hint(
-                                        initial_pr_context.comments,
-                                        pr_number=pr_number,
-                                        supplied_reviewers=reviewers(config),
-                                    )
-                                ),
-                            )
-                            recovered_scope = make_approved_plan_context(
-                                plan_text,
-                                source_locator=(
-                                    f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
-                                ),
-                                expected_hash=approved_plan_hash(plan_text),
-                            )
                     if recovered_scope is not None:
                         if (
                             approved_plan_context is not None
@@ -1673,6 +1959,73 @@ def run_pr_loop(
                 body=initial_pr_context.metadata.body,
                 reject_unexpected=True,
             )
+        # Issue-to-PR handoff board (#1373).  The PR board is this
+        # invocation's board; the approved plan stays verified against the
+        # board that approved it.  Derived read-only, before any workdir
+        # setup, PR-side write or agent invocation, so a below-floor board is
+        # refused with nothing posted.
+        plan_handoff_board: PlanHandoffBoard | None = None
+        if issue_context is not None and approved_plan_context is not None:
+            plan_handoff_comments: Sequence[object] = issue_context.comments
+            plan_handoff_issue_number: int | None = issue_context.number
+            # Select the board from the issue that supplied this exact approved
+            # plan. Unrelated child plan rounds must not replace a parent board.
+            child_plan = recover_approved_plan_context(
+                issue_context.comments,
+                expected_hash=approved_plan_context.plan_hash,
+                expected_subject=approved_plan_context.plan_subject,
+            )
+            if child_plan.is_available:
+                if child_plan.canonical_text != approved_plan_context.canonical_text:
+                    raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            elif not child_plan.has_matching_candidate and parent_issue_context is not None:
+                parent_plan = recover_approved_plan_context(
+                    parent_issue_context.comments,
+                    expected_hash=approved_plan_context.plan_hash,
+                    expected_subject=approved_plan_context.plan_subject,
+                )
+                if parent_plan.is_available and parent_plan.canonical_text == approved_plan_context.canonical_text:
+                    plan_handoff_comments = parent_issue_context.comments
+                    plan_handoff_issue_number = parent_issue_context.number
+                else:
+                    plan_handoff_comments = ()
+            else:
+                plan_handoff_comments = ()
+            plan_verification = (
+                derive_plan_verification_context(
+                    plan_handoff_comments, issue_number=plan_handoff_issue_number,
+                )
+                if plan_handoff_comments
+                else None
+            )
+            if plan_verification is not None:
+                plan_handoff_board = resolve_plan_handoff_board(config, plan_verification)
+                config = plan_handoff_board.config
+                if plan_handoff_board.changed:
+                    log(
+                        config,
+                        f"PR #{pr_number}: reviewer board "
+                        f"{', '.join(seat.seat_id for seat in plan_handoff_board.pr_seats)} differs from "
+                        "the approved plan board "
+                        f"{', '.join(plan_verification.effective_reviewers)}; "
+                        "recording an operator reconfiguration.",
+                    )
+        handoff_floor_authorizations = (
+            plan_handoff_board.signed_authorizations
+            if plan_handoff_board is not None else ()
+        )
+        # A signed PR amendment can authorize a reduced PR board.  Its lineage
+        # is resolved read-only here, so a malformed amendment history or a
+        # below-floor board is refused before managed-CI activation, any
+        # PR-side write, workdir setup, or agent invocation.  The later
+        # startup block resolves the same lineage again for scheduling.
+        _enforce_pr_board_floor(
+            runner,
+            config=config,
+            pr_context=initial_pr_context,
+            pr_number=pr_number,
+            handoff_authorizations=handoff_floor_authorizations,
+        )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(
@@ -1821,63 +2174,9 @@ def run_pr_loop(
             log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
             managed_ci = None
             return False
-        plan_handoff_comments = issue_context.comments if issue_context is not None else ()
-        plan_handoff_issue_number = issue_context.number if issue_context is not None else None
-        plan_records = ()
-        if issue_context is not None and approved_plan_context is not None:
-            # Select the board from the issue that supplied this exact approved
-            # plan. Unrelated child plan rounds must not replace a parent board.
-            child_plan = recover_approved_plan_context(
-                issue_context.comments,
-                expected_hash=approved_plan_context.plan_hash,
-                expected_subject=approved_plan_context.plan_subject,
-            )
-            if child_plan.is_available:
-                if child_plan.canonical_text != approved_plan_context.canonical_text:
-                    raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
-            elif not child_plan.has_matching_candidate and parent_issue_context is not None:
-                parent_plan = recover_approved_plan_context(
-                    parent_issue_context.comments,
-                    expected_hash=approved_plan_context.plan_hash,
-                    expected_subject=approved_plan_context.plan_subject,
-                )
-                if parent_plan.is_available and parent_plan.canonical_text == approved_plan_context.canonical_text:
-                    plan_handoff_comments = parent_issue_context.comments
-                    plan_handoff_issue_number = parent_issue_context.number
-                elif config.reviewer_seats:
-                    raise AgentLoopError("Named issue-to-PR handoff has no matching parent plan reviewer board.")
-                else:
-                    plan_handoff_comments = ()
-            elif config.reviewer_seats:
-                raise AgentLoopError("Named issue-to-PR handoff has no verifiable approved plan reviewer board.")
-            else:
-                plan_handoff_comments = ()
-            plan_records = _extract_round_metadata_records(
-                plan_handoff_comments, flow="plan"
-            )
-            named_plan_board = any(
-                record.metadata.seat_binding is not None for record in plan_records
-            )
-            if named_plan_board and not config.reviewer_seats:
-                raise AgentLoopError(
-                    "Issue-to-PR handoff requires the named reviewer seats from the approved plan; "
-                    "supply the plan's --reviewer-seat configuration before PR review."
-                )
-            if config.reviewer_seats and not plan_records:
-                raise AgentLoopError(
-                    "Named issue-to-PR handoff has no verifiable approved plan reviewer board."
-                )
-            if config.reviewer_seats:
-                from .reviewer_seats import reconcile_plan_handoff_board
-                config = reconcile_plan_handoff_board(
-                    config, plan_handoff_comments, plan_handoff_issue_number,
-                )
         memory = prepare_agent_memory(runner, config)
-        from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
+        from .reviewer_seats import reviewer_seat_binding
         seat_binding = reviewer_seat_binding(config)
-        if issue_context is not None and approved_plan_context is not None and seat_binding is not None:
-            from .reviewer_seats import validate_plan_handoff_seats
-            validate_plan_handoff_seats(plan_records, config)
 
         def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
             metadata = PostedRoundMetadata(**fields)
@@ -1950,9 +2249,6 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
-        changed_seat_models = validate_pr_seat_bindings(startup_records, config)
-        if changed_seat_models:
-            log(config, "PR reviewer model-chain reconfiguration requires fresh review: " + ", ".join(sorted(changed_seat_models)))
         # Advisory per-run finding history (#1273), seeded once from the records
         # just extracted through the authoritative path above.
         pr_finding_history = FindingHistoryLedger(
@@ -1984,14 +2280,17 @@ def run_pr_loop(
         )
         for diagnostic in pr_amendment_diagnostics:
             log(config, f"PR #{pr_number}: {diagnostic}")
-        from .reviewer_seats import validate_pr_backend_outage_amendments
-        validate_pr_backend_outage_amendments(pr_board_amendments, config)
-        pr_contract_lineage: ContractLineage = resolve_contract_lineage(
-            startup_records,
-            pr_board_amendments,
-            scheduler_contract,
-            accept_base_configured=True,
-            contract_from_metadata=_scheduler_contract_from_metadata,
+        # The PR board lineage (#1376): the root anchor, orchestrator-authored
+        # board-change links and signed amendments (#943) in one ordered chain,
+        # resolved read-only from the PR's own comments for every policy.  A
+        # configured board that differs from the effective board becomes one
+        # board-change link, floor-checked before it is posted; a policy or
+        # broad-rule change stays contract drift.
+        pr_board_state = resolve_pr_board_state(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            comments=initial_pr_context.comments,
             drift_error=lambda persisted, detail: _pr_contract_drift_error(
                 persisted,
                 detail,
@@ -2003,19 +2302,31 @@ def run_pr_loop(
                 ),
                 amendments_recognized=bool(pr_board_amendments),
             ),
+            handoff_authorizations=(
+                plan_handoff_board.signed_authorizations
+                if plan_handoff_board is not None else ()
+            ),
+            floor_refusal_hint=lambda persisted, refused: _board_amendment_route_clause(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=persisted,
+                configured=refused,
+                start_round_number=lambda: _pr_amendment_start_round(
+                    initial_pr_context, configured_reviewers, scheduler_capabilities,
+                    runner=runner, config=config,
+                ),
+                amendments_recognized=bool(pr_board_amendments),
+            ),
         )
+        pr_contract_lineage = pr_board_state.lineage
         # The operator may keep the original board configured and let the signed
         # amendment do the removing (#1133).  Rebind every later board read to
         # the amended board so scheduling, prompts, and the gate agree.
         operator_reviewers = reviewers(config)
-        pr_effective_contract = pr_contract_lineage.contracts[-1]
-        if pr_effective_contract != scheduler_contract:
+        pr_effective_contract = pr_contract_lineage.current_contract
+        if pr_board_state.rebound:
             effective_names = set(pr_effective_contract.required_reviewers)
-            effective_reviewers = tuple(
-                reviewer
-                for reviewer in operator_reviewers
-                if agent_display_name(reviewer) in effective_names
-            )
             log(
                 config,
                 f"PR #{pr_number}: configured reviewer board "
@@ -2024,18 +2335,112 @@ def run_pr_loop(
                 f"{', '.join(pr_effective_contract.required_reviewers)}; using the amended board.",
             )
             config = dataclasses_replace(
-                config, reviewer=effective_reviewers,
-                pr_seat_binding_override=seat_binding,
+                pr_board_state.config, pr_seat_binding_override=seat_binding,
             )
             configured_reviewers = reviewers(config)
-            scheduler_contract = pr_effective_contract
             reviewer_acquisition_contract = {
                 name: value
                 for name, value in reviewer_acquisition_contract.items()
                 if name in effective_names
             }
+        scheduler_contract = pr_effective_contract
+        pr_reconciliation_mode = (
+            "owner-scoped" if scheduler_capabilities.owner_scoped_reconciliation else "aggregate"
+        )
+        pr_board_activation = pr_board_state.activation
+        pr_board_anchor_round: ResumedReviewRound | None = None
+        if (
+            pr_board_activation is not None
+            and pr_board_activation.link is not None
+            and pr_board_activation.link.advance
+        ):
+            # Collect the anchor round under the predecessor board, never the
+            # invocation board, so an outgoing reviewer's records are kept.  A
+            # resume that no longer re-enters the link's anchor round fails
+            # closed before any post (D4a).
+            anchor_round = pr_board_activation.link.anchor_round
+            predecessor = pr_board_state.predecessor_board
+            assert predecessor is not None
+            pr_board_anchor_round = _resume_pr_round_admitted(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                comments=initial_pr_context.comments,
+                head_sha=initial_pr_context.metadata.head_sha,
+                configured_reviewers=identity_agents(predecessor),
+                reconciliation_mode=pr_reconciliation_mode,
+            )
+            if pr_board_anchor_round is None:
+                anchor = board_anchor(startup_records)
+                pr_board_anchor_round = ResumedReviewRound(
+                    round_number=anchor.round_number,
+                    prior_items=tuple(anchor.ledger),
+                    coder_output=None,
+                    completed_reviews=(),
+                    next_unresolved_item_number=1,
+                )
+            if pr_board_anchor_round.round_number != anchor_round:
+                raise AgentLoopError(
+                    f"PR #{pr_number}: the reviewer-board change is anchored at round "
+                    f"{anchor_round}, but the durable resume re-enters round "
+                    f"{pr_board_anchor_round.round_number}; refusing to activate it. No agent "
+                    "was invoked."
+                )
+        if pr_board_state.candidate is not None:
+            candidate = pr_board_state.candidate
+            log(
+                config,
+                f"PR #{pr_number}: reviewer board changed from {candidate.old_board.label()} "
+                f"to {candidate.new_board.label()}; recording the change effective from round "
+                f"{candidate.effective_from_round}.",
+            )
+            if not link_already_posted(pr_board_state.comments, candidate.digest):
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=render_board_change_link(candidate.payload),
+                )
+        # Every PR round record this run posts carries the root anchor, the
+        # governing board identity and the governing element's digest.
+        pr_board_stamp = stamp_for_lineage(
+            pr_contract_lineage, configured=identity_from_config(config)
+        )
+        pr_board_stamp_token = set_pr_board_stamp(pr_board_stamp)
         pr_amendment_digest = pr_contract_lineage.active_digest
         pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
+        pr_qualification_board_check = qualification_board_check(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            expected=identity_from_config(config),
+            handoff_authorizations=(
+                plan_handoff_board.signed_authorizations
+                if plan_handoff_board is not None else ()
+            ),
+        )
+        pr_fresh_from_rounds = pr_contract_lineage.fresh_from_rounds
+        pr_primary_epoch_round = pr_contract_lineage.primary_epoch_round
+        pr_pre_epoch_panel_items = pre_epoch_panel_items(startup_records, pr_contract_lineage)
+        if plan_handoff_board is not None and plan_handoff_board.changed:
+            # One orchestrator-written audit record per derived board change,
+            # before round 1; its digest makes every rerun a no-op.
+            board_change = board_change_payload(
+                plan_handoff_board,
+                repo=config.repo,
+                pr_number=pr_number,
+                plan_hash=approved_plan_context.plan_hash if approved_plan_context is not None else None,
+            )
+            board_change_id = board_change_digest(board_change)
+            if not board_change_audit_already_posted(initial_pr_context.comments, board_change_id):
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=render_board_change_audit(
+                        plan_handoff_board, board_change, board_change_id,
+                    ),
+                )
         for record in startup_records:
             if record.metadata.scheduler_force_full:
                 if record.metadata.scheduler_force_full_source == "operator":
@@ -2081,19 +2486,105 @@ def run_pr_loop(
         # the coder round made no progress -- stop cleanly instead of looping.
         conflict_dispatch_head_sha: str | None = None
         latest_mergeability: PullRequestMergeability | None = None
-        resumed_round = _resume_pr_round_admitted(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            comments=initial_pr_context.comments,
-            head_sha=initial_pr_context.metadata.head_sha,
-            configured_reviewers=configured_reviewers,
-            reconciliation_mode=(
-                "owner-scoped"
-                if scheduler_capabilities.owner_scoped_reconciliation
-                else "aggregate"
-            ),
+        pr_board_carried = False
+        pr_board_reentry = (
+            pr_board_activation.effective_from_round
+            if pr_board_anchor_round is not None and pr_board_activation is not None
+            else None
         )
+        if pr_board_anchor_round is None:
+            resumed_round = _resume_pr_round_admitted(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                comments=initial_pr_context.comments,
+                head_sha=initial_pr_context.metadata.head_sha,
+                configured_reviewers=configured_reviewers,
+                reconciliation_mode=pr_reconciliation_mode,
+            )
+            if (
+                (resumed_round is None or pr_contract_lineage.pending_amendments)
+                and startup_records
+                and comments_bear_board_change_links(initial_pr_context.comments)
+            ):
+                # With link history, re-enter after the highest recorded round
+                # when it holds no record by a current seat (a recorded board
+                # change removed them), or when a pending signed amendment takes
+                # effect (every element takes effect after the one before it).
+                # Its records are collected under every seat the lineage has
+                # known, instead of restarting at round 1.
+                anchor = board_anchor(startup_records)
+                pr_board_anchor_round = _resume_pr_round_admitted(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    comments=initial_pr_context.comments,
+                    head_sha=initial_pr_context.metadata.head_sha,
+                    configured_reviewers=name_agents(tuple(pr_contract_lineage.last_seen)),
+                    reconciliation_mode=pr_reconciliation_mode,
+                )
+                if (
+                    pr_board_anchor_round is None
+                    or pr_board_anchor_round.round_number != anchor.round_number
+                ):
+                    pr_board_anchor_round = ResumedReviewRound(
+                        round_number=anchor.round_number,
+                        prior_items=tuple(anchor.ledger),
+                        coder_output=None,
+                        completed_reviews=(),
+                        next_unresolved_item_number=1,
+                    )
+                pr_board_reentry = anchor.round_number + 1
+        if pr_board_anchor_round is not None:
+            # Board-change carry-over (D4b): reconcile the anchor round's
+            # persisted dispositions, merge its new findings and rebuild its
+            # evidence requests, then re-enter the link's effective round once
+            # with the anchor round's coder output as the artifact.  New-board
+            # ownership is applied by the ledger view.
+            assert pr_board_reentry is not None
+            carry = carry_over_anchor_round(
+                prior_items=pr_board_anchor_round.prior_items,
+                completed_reviews=pr_board_anchor_round.completed_reviews,
+                settled_new_items=pr_board_anchor_round.current_round_new_items,
+                records=startup_records,
+                round_number=pr_board_anchor_round.round_number,
+                reconciliation_mode=pr_reconciliation_mode,
+                evidence_clearances=pr_board_anchor_round.evidence_clearances,
+                next_item_number=pr_board_anchor_round.next_unresolved_item_number,
+            )
+            resumed_round = dataclasses_replace(
+                pr_board_anchor_round,
+                round_number=pr_board_reentry,
+                prior_items=tuple(carry.items),
+                completed_reviews=(),
+                current_round_new_items=(),
+                next_unresolved_item_number=carry.next_item_number,
+                reconciled=False,
+                ledger_may_be_incomplete=False,
+                qualification_checkpoint=None,
+                # An evidence freeze stays in force across the change: the new
+                # board answers new signed input at the frozen head in an
+                # evidence-response pass (a removed requester's request then
+                # needs every configured reviewer).  A release boundary is
+                # dropped, so the new board reviews the head itself.
+                evidence_boundary=(
+                    pr_board_anchor_round.evidence_boundary
+                    if pr_board_anchor_round.evidence_boundary is not None
+                    and pr_board_anchor_round.evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
+                    else None
+                ),
+                broken_evidence_freeze_head=None,
+                evidence_clearances=tuple(carry.evidence_clearances),
+                recovery_round_budget=None,
+                head_review_recovery=None,
+                head_review_recovery_post_required=False,
+            )
+            pr_board_carried = True
+            log(
+                config,
+                f"PR #{pr_number}: reviewer-board change carried round "
+                f"{pr_board_anchor_round.round_number} findings into round {pr_board_reentry}",
+            )
         pr_amendment_start_round = (
             resumed_round.round_number if resumed_round is not None else 1
         )
@@ -2104,9 +2595,7 @@ def run_pr_loop(
                 flow="pr",
                 issue_number=None,
                 pr_number=pr_number,
-                persisted=pr_contract_lineage.contracts[
-                    pr_contract_lineage.amendments.index(amendment)
-                ],
+                persisted=pr_contract_lineage.contract_before(amendment),
                 removed=amendment.removed_reviewers,
                 restored=amendment.restored_reviewers,
                 start_round_number=round_number,
@@ -2164,10 +2653,14 @@ def run_pr_loop(
         def pr_ledger_view(
             items: Sequence[UnresolvedReviewItem],
         ) -> tuple[UnresolvedReviewItem, ...]:
-            """Derived ledger with removed reviewers' ownership reassigned (#943)."""
-            if pr_contract_lineage.active_amendment is None:
+            """Derived ledger with removed reviewers' ownership reassigned (#943, #1376).
+
+            Seats removed by a signed amendment or a board-change link hand
+            their unresolved items to the remaining board; nothing is cleared.
+            """
+            if not pr_contract_lineage.removed_reviewers:
                 return tuple(items)
-            amended = pr_contract_lineage.contracts[-1]
+            amended = pr_contract_lineage.current_contract
             view, _reassignments = apply_board_amendment_to_ledger(
                 items,
                 removed_reviewers=pr_contract_lineage.removed_reviewers,
@@ -2212,29 +2705,9 @@ def run_pr_loop(
             qualification_checkpoint = resumed_round.qualification_checkpoint
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
             start_round_number = resumed_round.round_number
-            if changed_seat_models:
-                # A published peer cannot be re-invoked within its old
-                # parallel round. Begin a new round at the same head while
-                # carrying both the prior ledger and this round's verified
-                # new findings. The latter have not yet been reconciled into
-                # prior_items when a run stopped immediately after review.
-                carried_by_id = {item.item_id: item for item in unresolved_items}
-                for review_record in resumed_round.completed_reviews:
-                    for item in review_record.metadata.new_items:
-                        if item.reviewer != review_record.metadata.agent:
-                            raise AgentLoopError(
-                                "PR seat reconfiguration cannot verify the owner of a carried finding."
-                            )
-                        existing = carried_by_id.get(item.item_id)
-                        if existing is not None and existing != item:
-                            raise AgentLoopError(
-                                "PR seat reconfiguration found conflicting provenance for a carried finding."
-                            )
-                        carried_by_id[item.item_id] = item
-                unresolved_items = list(carried_by_id.values())
-                start_round_number += 1
-                qualification_checkpoint = None
-                resumed_round = None
+            if pr_board_carried:
+                # The re-entered round reviews the anchor round's artifact on
+                # the new board; every required reviewer must see this head.
                 final_sweep_pending = True
             log(config, f"PR #{pr_number}: resuming round {start_round_number}")
             if latest_coder_metadata is not None and any(
@@ -2439,6 +2912,16 @@ def run_pr_loop(
         # Step-back entries recorded by the previous iteration's coder turn (#1251).
         pending_step_back_sweeps: dict = {}
         for round_number in round_sequence:
+            # The effective-board floor is checked at every round (pure, no I/O).
+            check_lineage_floor(
+                config,
+                pr_contract_lineage,
+                context=f"PR #{pr_number} round {round_number} reviewer board",
+                handoff_authorizations=(
+                    plan_handoff_board.signed_authorizations
+                    if plan_handoff_board is not None else ()
+                ),
+            )
             evidence_pass = pending_evidence_pass
             pending_evidence_pass = None
             if round_number > allowed_rounds:
@@ -2971,6 +3454,14 @@ def run_pr_loop(
                         round_number=round_number,
                     )
                 else:
+                    if pr_primary_epoch_round is not None:
+                        # A board change restarted the primary phase (#1376):
+                        # panel openings and approvals before the epoch never
+                        # count for the new primary.
+                        panel_history = tuple(
+                            record for record in panel_history
+                            if record.metadata.round_number >= pr_primary_epoch_round
+                        )
                     panel_evidence = _derive_pr_panel_evidence(
                         panel_history,
                         primary_reviewer=scheduler_contract.primary_reviewer,
@@ -3069,14 +3560,14 @@ def run_pr_loop(
                         operator_force_full=scheduler_operator_force_full,
                     )
                 }
-            # A restored reviewer (#984) must re-approve the current head: an
-            # approval from before its restoration round is never carried.
-            pr_restoration_rounds = pr_contract_lineage.restoration_rounds
+            # A restored (#984), added, rebound or role-changed (#1376) reviewer
+            # must re-approve the current head: an approval from before the
+            # round its board change took effect is never carried.
             unchanged_head_approvals = {
                 name: record
                 for name, record in unchanged_head_approvals.items()
                 if not predates_restoration(
-                    pr_restoration_rounds, name, record.metadata.round_number
+                    pr_fresh_from_rounds, name, record.metadata.round_number
                 )
             }
             checkpoint_expected_plan_digest = (
@@ -3577,6 +4068,12 @@ def run_pr_loop(
                     operator_force_full=scheduler_operator_force_full,
                     panel_evidence=bool(panel_evidence is not None and panel_evidence.opened),
                     fallback_reasons=scheduler_fallback_notes,
+                    carried_obligations=carried_secondary_obligations(
+                        pr_ledger_view(prior_unresolved_items),
+                        epoch_round=pr_primary_epoch_round,
+                        primary=scheduler_contract.primary_reviewer,
+                        eligible=pr_pre_epoch_panel_items,
+                    ),
                 )
                 try:
                     scheduler_decision = select_reviewers(
@@ -5047,6 +5544,44 @@ def run_pr_loop(
             # repair go to the coder.  A current, fully reviewed CI candidate
             # proceeds to source-authoritative qualification instead.
             must_fix_items = list(item_partitions["coder_blockers"])
+            carried_panel_ids = (
+                set(carried_secondary_obligations(
+                    pr_ledger_view(unresolved_items),
+                    epoch_round=pr_primary_epoch_round,
+                    primary=scheduler_contract.primary_reviewer,
+                    eligible=pr_pre_epoch_panel_items,
+                ))
+                if scheduler_capabilities.requires_primary else set()
+            )
+            if (
+                carried_panel_ids
+                and must_fix_items
+                and not unavailable_reviewer_failures
+                and evidence_pass is None
+                and all(item.item_id in carried_panel_ids for item in must_fix_items)
+                and scheduler_decision is not None
+                and scheduler_decision.phase == "primary"
+                and scheduler_contract.primary_reviewer in {
+                    *unchanged_head_approvals,
+                    *(name for name, _output in approved_review_outputs),
+                }
+            ):
+                # A board change restarted the primary phase (#1376) and the new
+                # primary approved this head.  The only open items are carried
+                # secondary obligations: their owners recheck them when the panel
+                # reopens at this head, so no coder turn is dispatched.
+                log(
+                    config,
+                    f"Round {round_number}: restarted primary approved; reopening the panel for "
+                    f"carried obligation(s) {', '.join(sorted(carried_panel_ids))}; no coder dispatch",
+                )
+                if round_number == allowed_rounds:
+                    raise AgentLoopError(
+                        f"PR #{pr_number} carried panel obligation(s) "
+                        f"{', '.join(sorted(carried_panel_ids))} still need their owners after the "
+                        "restarted primary approved. No coder follow-up or merge was attempted."
+                    )
+                continue
             if unavailable_reviewer_failures:
                 # Decide at the point of detection (#1129): a required reviewer
                 # that cannot be reached can never be satisfied by continuing.
@@ -5411,6 +5946,7 @@ def run_pr_loop(
                         managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                         managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                         plan_binding_reviewers=operator_reviewers,
+                        board_check=pr_qualification_board_check,
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                         log(
@@ -5818,6 +6354,7 @@ def run_pr_loop(
                                 managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                                 managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                                 plan_binding_reviewers=operator_reviewers,
+                                board_check=pr_qualification_board_check,
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                 unresolved_items = _advance_machine_obligations_for_head(
@@ -6306,6 +6843,7 @@ def run_pr_loop(
                             managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                             managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                             plan_binding_reviewers=operator_reviewers,
+                            board_check=pr_qualification_board_check,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             prefetched_pr_context = fresh_context
@@ -6342,6 +6880,7 @@ def run_pr_loop(
                             managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                             managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                             plan_binding_reviewers=operator_reviewers,
+                            board_check=pr_qualification_board_check,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                             log(
@@ -6633,6 +7172,7 @@ def run_pr_loop(
                                         managed_protection_mode=_managed_binding_protection_mode(managed_ci_handoff),
                                         managed_retired_plan_hashes=_managed_binding_retired_plan_hashes(managed_ci_handoff),
                                         plan_binding_reviewers=operator_reviewers,
+                                        board_check=pr_qualification_board_check,
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
                                         prefetched_pr_context = fresh_context
@@ -7893,6 +8433,12 @@ def run_pr_loop(
                         after_comment_id=(
                             managed_ci_handoff.authorization_comment_id or 0
                         ),
+                        # A fresh grant may sit on the stranded head of a
+                        # rejected coder follow-up; let correlation verify
+                        # that exact recovery chain (#1367).
+                        **rejected_recovery_correlation_inputs(
+                            runner, config=config, handoff=managed_ci_handoff
+                        ),
                     )
                     managed_ci_handoff = publish_issue_created_continuity_authorization(
                         runner,
@@ -8012,6 +8558,8 @@ def run_pr_loop(
                         )
                     log(config, message + diagnostic)
         finally:
+            if pr_board_stamp_token is not None:
+                reset_pr_board_stamp(pr_board_stamp_token)
             _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:
             _persist_usage_summary(config, usage_context)

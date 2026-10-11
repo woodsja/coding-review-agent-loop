@@ -605,8 +605,20 @@ an explicit `--reviewer` adds one legacy default seat. Use
 select a named primary. Named seats work with `pr`, `task`, `managed-pr`, plain
 issue PR review, and issue `--plan-first`. `discuss` rejects them.
 Each seat has its own checkout, response file, logs, signature, approval, and
-saved plan and PR bindings. A changed model chain requires fresh review while
-verified open findings stay attributed to their original seat. Antigravity fallback
+saved plan and PR bindings. The PR board is chosen per invocation: a plan
+approved by one board can be reviewed as a PR by another. The plan stays
+verified against its own board, and a differing PR board gets one board-change
+audit record on the PR. `--min-reviewers N` and `--min-distinct-providers N`
+set an optional floor for the effective board (providers count by backend). A
+board below the floor is refused before any agent runs unless a signed
+reviewer-board amendment authorized it. Mid-PR board changes (an added, removed
+or swapped reviewer, or a seat's model, effort or backend) are recorded as one
+board-change record on the PR and need no signature; added and rebound reviewers
+must approve the current head, and removed reviewers' open findings stay open on
+the remaining board. See
+[Changing the PR reviewer board mid-run](docs/local_agent_loop.md#changing-the-pr-reviewer-board-mid-run).
+In planning, a changed model chain requires fresh review while verified open
+findings stay attributed to their original seat. Antigravity fallback
 stays inside one seat; seats share account quota and serialize turns through a
 bounded host settings lock. Existing `--reviewer agy` with
 `--antigravity-models` remains one reviewer with an ordered fallback chain.
@@ -930,11 +942,13 @@ hand-editing issue records. See
 
 ### Removing an unavailable reviewer from an in-flight run
 
-A persisted scheduler contract (the required reviewer board, the policy, and
-the primary) is immutable for the run. If one reviewer's backend becomes
-unavailable, for example because its quota is exhausted, rerunning without that
-reviewer stops with the contract-drift error. That error now also prints a
-filled-in **signed reviewer-board amendment** record. A human operator posts it
+In planning, a persisted scheduler contract (the required reviewer board, the
+policy, and the primary) is immutable for the run. If one reviewer's backend
+becomes unavailable, for example because its quota is exhausted, rerunning
+without that reviewer stops with the contract-drift error. On a PR, rerunning
+without the reviewer is a recorded board change (#1376) unless it takes the
+board below `--min-reviewers` or `--min-distinct-providers`. Both refusals print
+a filled-in **signed reviewer-board amendment** record. A human operator posts it
 to record a deliberate, audited reduction of the board:
 
 ````markdown
@@ -995,9 +1009,11 @@ Reviewer board amendment:
   automatic force-full latch. The reduced board is also accepted, except on an
   issue-created strict managed-CI PR, where the approved plan is re-verified
   against the flags you supply and the original board is required. Planning
-  reruns use the reduced board. Any other board fails closed with the
-  contract-drift error; if you posted a record and still see drift, the record
-  was not recognized, so look for an ignored-record diagnostic in the log.
+  reruns use the reduced board. In planning, any other board fails closed with
+  the contract-drift error; if you posted a record and still see drift, the
+  record was not recognized, so look for an ignored-record diagnostic in the log.
+  On a PR, a different board stops while the signed record is still pending,
+  and becomes a recorded board change once the record has taken effect.
 - **Record format.** Line endings may be LF or CRLF (a lone CR is not
   supported). A comment that consists only of one fenced block naming the
   record kind but not written as a ```` ```json ```` fence is reported as an ignored
@@ -1012,9 +1028,9 @@ Reviewer board amendment:
   reused, and the removed reviewer is never invoked again.
 - **What stays immutable.** `policy` and `primary_reviewer` must match the
   persisted contract. The primary cannot be removed, and a `primary-then-panel`
-  board must keep at least one secondary. Re-adding a removed reviewer by
-  changing the reviewer flags alone is contract drift; restore it with a signed
-  record instead (see below). Every scheduler record posted after the amendment carries the
+  board must keep at least one secondary. In planning, re-adding a removed
+  reviewer by changing the reviewer flags alone is contract drift; restore it
+  with a signed record instead (see below). On a PR it is a recorded board change. Every scheduler record posted after the amendment carries the
   amended board and the record's digest; any other contract fails closed, and
   at PR qualification it refuses the merge. Amendments can chain, with each
   record's `original_required_reviewers` equal to the previous amended board.

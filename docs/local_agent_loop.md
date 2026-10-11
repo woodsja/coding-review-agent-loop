@@ -399,11 +399,13 @@ PRs where only restoring the backend works. When the board cannot be reduced
 evidence pass is repeated in full on rerun. The PR comment never contains the
 amendment JSON.
 
-A persisted scheduler contract (the required reviewer board, the policy, and
-the primary) is immutable for the run. If one reviewer's backend becomes
-unavailable, for example because its quota is exhausted, rerunning without that
-reviewer stops with the contract-drift error. That error now also prints a
-filled-in **signed reviewer-board amendment** record. A human operator posts it
+In planning, a persisted scheduler contract (the required reviewer board, the
+policy, and the primary) is immutable for the run. If one reviewer's backend
+becomes unavailable, for example because its quota is exhausted, rerunning
+without that reviewer stops with the contract-drift error. On a PR, rerunning
+without the reviewer is a recorded board change (#1376) unless it takes the
+board below `--min-reviewers` or `--min-distinct-providers`. Both refusals print
+a filled-in **signed reviewer-board amendment** record. A human operator posts it
 to record a deliberate, audited reduction of the board:
 
 ````markdown
@@ -451,9 +453,11 @@ Reviewer board amendment:
   automatic force-full latch. The reduced board is also accepted, except on an
   issue-created strict managed-CI PR, where the approved plan is re-verified
   against the flags you supply and the original board is required. Planning
-  reruns use the reduced board. Any other board fails closed with the
-  contract-drift error; if you posted a record and still see drift, the record
-  was not recognized, so look for an ignored-record diagnostic in the log.
+  reruns use the reduced board. In planning, any other board fails closed with
+  the contract-drift error; if you posted a record and still see drift, the
+  record was not recognized, so look for an ignored-record diagnostic in the log.
+  On a PR, a different board stops while the signed record is still pending,
+  and becomes a recorded board change once the record has taken effect.
 - **Record format.** Line endings may be LF or CRLF (a lone CR is not
   supported). A comment that consists only of one fenced block naming the
   record kind but not written as a ```` ```json ```` fence is reported as an ignored
@@ -471,9 +475,9 @@ Reviewer board amendment:
   reused, and the removed reviewer is never invoked again.
 - **What stays immutable.** `policy` and `primary_reviewer` must match the
   persisted contract. The primary cannot be removed, and a `primary-then-panel`
-  board must keep at least one secondary. Re-adding a removed reviewer by
-  changing the reviewer flags alone is contract drift; restore it with a signed
-  record instead (see below). Every scheduler record posted after the amendment carries the
+  board must keep at least one secondary. In planning, re-adding a removed
+  reviewer by changing the reviewer flags alone is contract drift; restore it
+  with a signed record instead (see below). On a PR it is a recorded board change. Every scheduler record posted after the amendment carries the
   amended board and the record's digest; any other contract fails closed, and
   at PR qualification it refuses the merge. Amendments can chain, with each
   record's `original_required_reviewers` equal to the previous amended board.
@@ -596,15 +600,96 @@ seat. `--primary-reviewer-seat ID` selects the named PR primary; use
 `--primary-plan-reviewer-seat ID` for issue-plan `primary-then-panel` review.
 The PR, task, managed PR, plain issue PR, and issue `--plan-first` paths use
 seat IDs for scheduling, response validation, artifacts, approval, and resume.
-Saved plan and PR records bind seat IDs to backends and model chains. Changing a
-chain invalidates old approvals and response checkpoints, preserves verified open
-seat-owned findings, and starts a fresh review round. A backend change is
-refused. A plan-to-PR handoff checks the required seat board and binding before
-PR approvals can be reused. `discuss` continues to reject named seats.
+Saved plan and PR records bind seat IDs to backends and model chains. On a PR,
+changing a seat's model chain, effort or backend is a recorded board change (see
+[Changing the PR reviewer board mid-run](#changing-the-pr-reviewer-board-mid-run)).
+In planning, changing a chain invalidates old approvals and response
+checkpoints, preserves verified open seat-owned findings, and starts a fresh
+review round; a backend change is refused. `discuss` continues to reject named
+seats.
+
+The PR board is chosen per invocation. A plan approved by one board can be
+reviewed as a PR by another: plain `--reviewer` flags or different named seats,
+backends, or models. The approved plan stays verified against the board that
+approved it, including on managed-CI recovery and strict qualification. That
+check validates the plan's whole seat-binding history. An approval recorded
+before a later seat model or effort change does not count, even if the model
+was later switched back. Malformed plan scheduling history fails closed. If the
+PR command repeats the plan's original or signed-amended seat set, the PR board
+is the plan's amended board, so a signed plan removal carries over. Any other
+board is an operator reconfiguration. When the PR board differs from the plan's
+effective board, the orchestrator posts one board-change audit record on the PR
+before round 1 and continues without a signature. The record lists the old and
+new seats with their backends and models, effective round 1, and the reason
+`operator-reconfigured`. Reruns do not repeat it. Every PR reviewer must approve
+the PR's exact head; plan approvals never count as PR approvals.
+
+`--min-reviewers N` and `--min-distinct-providers N` (on `issue`, `pr`, and
+`managed-pr`) set an optional floor for the effective board. Two seats on one
+backend count as one provider. The floor is checked after history is read and
+before any workdir setup, managed-CI activation, agent run, or comment post. That
+covers issue start, `managed-pr` (before its branch and draft PR exist), and PR
+start or handoff. It also runs before a retained managed label is removed from a
+ready PR. That check uses the board of the exact approved plan bound to the PR,
+including for a standalone `agent-loop pr` run. A board below the floor is refused unless a validated signed
+reviewer-board amendment lowered that measure. The amended board's own counts
+and recorded bindings bound that exception. An unamended plan board, a
+reconfigured board, or a backend swap on an inherited seat set gets no
+exception. Without these flags nothing changes.
 Legacy `--reviewer agy` and `--antigravity-models` still describe one fallback
 reviewer. Same-account Antigravity seats share quota state and take turns under
 the host settings lock; lock waits are visible and bounded separately from the
 agent turn timeout.
+
+### Changing the PR reviewer board mid-run
+
+The PR board is chosen per invocation under every review policy, including the
+default `all-reviewers` policy. Rerun `agent-loop pr N` (or the issue command)
+with a different board: add a `--reviewer`, drop one, swap a named seat to
+another backend, or change its `--seat-model` or `--seat-effort`. When the board
+differs from the PR's current board, the orchestrator posts one
+**board-change record** on the PR and continues. No signature is needed. The
+record lists the previous and new boards, the added, removed and rebound
+reviewers, the round the change takes effect from, and the reason
+`operator-reconfigured`. A rerun with the same board posts nothing new.
+
+- **Approvals.** Added and rebound reviewers, and any seat whose primary or
+  secondary role changed, must approve the current head; their earlier
+  approvals do not count. Removed reviewers' approvals stop counting.
+- **Findings.** A removed reviewer's unresolved findings stay open and are
+  reassigned to the primary, or to every remaining reviewer without a primary.
+  They block until the remaining board gives them a disposition. Findings
+  already resolved stay resolved, and findings and evidence requests the
+  removed reviewer raised in the round it last published are carried forward.
+- **Rounds.** The change takes effect from the round after the latest recorded
+  round, so final decisions of earlier rounds are never reinterpreted. If a run
+  stops right after posting the record, the next run with the same board picks
+  it up without posting it again.
+- **Primary changes.** Under `primary-then-panel`, a new primary, or a model or
+  backend change on the primary seat, restarts the primary phase on the current
+  head. Open findings owned by secondaries stay open with their owners, and the
+  panel reopens at the same head after the new primary approves. This holds
+  through repeated primary changes too.
+- **Evidence freezes.** A board change while the PR is frozen awaiting
+  human-only evidence keeps the freeze. Signed evidence posted for that head is
+  answered by the new board. A request whose reviewer left the board then needs
+  every remaining reviewer to resolve it.
+- **The floor.** With `--min-reviewers` or `--min-distinct-providers`, the new
+  board is checked before the record is posted, at every round, and at
+  qualification. A board below the floor is refused before any agent runs or
+  comment is posted, and the error prints a filled-in signed reviewer-board
+  amendment for a removal. A signed reduction stays authorized through later
+  board changes, but never authorizes a further unsigned reduction.
+- **What stays fixed.** Changing `--pr-review-policy` or the broad-path rules is
+  still contract drift. Board-change records are accepted only from the
+  orchestrator's own GitHub account; any other comment carrying one stops the run
+  and the qualification gate. Planning boards keep the signed-amendment-only
+  rules until stage 3 of #1373.
+- **History from older versions.** A PR whose history predates board-change
+  records needs nothing. The first run under this version records the board
+  identity on its round records and posts a record only for a real change. For
+  plain boards, models were never recorded, so the first run adopts the
+  configured models; later model changes are recorded.
 
 ### Sub-items for conjunctive review findings
 
@@ -5369,6 +5454,41 @@ heads. The run therefore repairs a post-approval CI failure and continues to
 re-review, qualification, and merge in one invocation instead of stopping for a
 PR-mode resume (#1024). An older binary resuming such a chain cannot
 reauthenticate the link and stops rather than granting anything.
+
+A rejected-coder recovery across a fresh grant is the third exception, and it
+keeps a real reviewer (#1367). When a coder follow-up for round R pushes a
+stranded head and its response is rejected, a PR-mode resume needs
+`--managed-ci-fresh`, which mints a fresh grant at the stranded head after the
+blocking review. The fresh grant records an immutable link to the original
+authorization at the reviewed head. The predecessor cutoff is not relaxed:
+continuity binds the round-R blocking review of the original head only when it
+is newer than that original authorization. The chain must be, in strict
+comment order: the seat-bound blocking reviews of the original head; exactly one
+rejected-follow-up record (attempt 1, from the original head, observed at the
+stranded head); the fresh grant; exactly one attempt-2 recovery coder-dispatch
+record on the stranded head for round R+1; and exactly one round R+1 coder
+record for the new head. Every rejected or dispatch record of the round-R
+dispatch (or for round R or R+1), and every round R+1 coder record, counts toward
+"exactly one" wherever it sits and whatever its fields, so an extra, misplaced or
+malformed one fails closed rather than being skipped; only the original attempt-1
+dispatch of the original head is exempt, and it must precede the rejected record. Both recovery
+records must pass their structural checks, including a valid round budget and
+rejection reason. The heads must be
+exact: the review and the rejected record's origin are the original
+authorization's head, the fresh grant and both recovery records name the
+stranded head, and the new head differs from both. Under a named reviewer board
+every bound review must carry that board's seat binding; otherwise all bound
+reviews must carry one identical binding. Every authorization on the chain,
+including the original authorization's whole ancestry, must pass the same
+per-record and per-link authentication on the current approved plan only:
+actor, repository/issue/PR/base scope, waiver, protection waivable under this
+invocation, and an actor-owned managed-label event. A recovery across a signed
+plan rebind is therefore refused and needs an operator re-review. Publication,
+resume and plan binding re-authenticate the identical chain, and any missing,
+foreign, malformed, reordered, duplicated, unbound or mismatched link still
+fails closed: the PR stays draft and unmerged and no approval is synthesized. A
+fresh grant that superseded earlier records has no predecessor link and stays
+fail-closed. An older binary cannot re-authenticate such a chain and stops.
 
 A correlated, successful exact-head qualification also retires a carried
 ordinary `github-pr-checks` obligation at the qualified head (#1117). The

@@ -175,6 +175,23 @@ from .plan_first_loop import (
 )
 
 
+def _issue_floor_plan_owner(runner: Runner, *, config: AgentLoopConfig, issue_number: int):
+    """Read-only: the issue whose plan board governs this issue run's floor.
+
+    The plan bound to the run is the one the routing in ``run_issue_loop``
+    selects: a direct-implementation staged child implements its parent's
+    approved plan, so the parent's board and signed lineage apply (#1378
+    review item-13).  Every other run uses the issue's own plan history.
+    """
+    issue = get_issue_context(runner, config=config, issue_number=issue_number)
+    parent_number = _infer_staged_parent_issue(issue)
+    if parent_number is None or parent_number == issue_number:
+        return issue
+    parent = get_issue_context(runner, config=config, issue_number=parent_number)
+    child = _resolve_fresh_child_provenance(issue_context=issue, parent_issue_context=parent)
+    return parent if child is not None and child.route.is_direct else issue
+
+
 @claimed_run("issue", "issue_number")
 def run_issue_loop(
     runner: Runner,
@@ -203,6 +220,15 @@ def run_issue_loop(
             # the one normalized requested policy.  The reviewed recommendation
             # is still resolved only at the approval boundary.
             config = dataclasses_replace(config, plan_execution_mode=requested_policy)
+        # Reviewer-board floor (#1373): a read-only issue fetch and plan
+        # lineage resolution, before any workdir setup, agent, or post.
+        from .plan_verification import enforce_issue_board_floor
+        from .reviewer_floor import board_floor_enabled
+        if board_floor_enabled(config):
+            plan_owner = _issue_floor_plan_owner(runner, config=config, issue_number=issue_number)
+            enforce_issue_board_floor(
+                config, plan_owner.comments, issue_number=plan_owner.number,
+            )
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(runner, config)

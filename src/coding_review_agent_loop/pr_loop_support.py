@@ -32,7 +32,6 @@ from .config import (
 from .board_amendment import (
     collect_reviewer_board_amendments,
     reject_misplaced_pr_amendments,
-    resolve_contract_lineage,
 )
 from .decomposition import approved_plan_hash
 from .errors import (
@@ -2856,7 +2855,12 @@ def _pr_amendment_start_round(
     except AgentLoopError:
         # Only filling an error template; the real resume reports the refusal.
         return 1
-    return resumed.round_number if resumed is not None else 1
+    from .board_change import board_reentry_round
+
+    return board_reentry_round(
+        pr_context.comments, resumed.round_number if resumed is not None else None,
+        signed_amendment=True,
+    )
 
 
 def _is_completed_full_board_scheduler_record(
@@ -2967,16 +2971,26 @@ def _verify_strict_managed_plan_binding(
 
     if metadata.head_branch != f"agent-loop/managed-{issue_context.number}" or not metadata.head_sha:
         raise fail(f"the PR is not the reserved managed branch for issue #{issue_context.number}")
+    # The approving plan board comes from the issue's own history, never the
+    # PR board (#1373).  Without plan records there is nothing to derive.
+    from .plan_verification import plan_verification_inputs
+
+    try:
+        plan_config, plan_comments = plan_verification_inputs(
+            config, issue_context.comments, issue_number=issue_context.number,
+        )
+    except AgentLoopError as exc:
+        raise fail(f"the approving plan board cannot be verified: {exc}") from exc
     resumed_plan = _resume_plan_round(
-        issue_context.comments,
-        configured_reviewers=reviewers(config),
+        plan_comments,
+        configured_reviewers=reviewers(plan_config),
     )
     if resumed_plan is None:
         raise fail("the issue carries no canonical approved plan")
     plan_text, plan_round = resumed_plan
     _require_complete_canonical_plan_approval(
-        issue_context.comments,
-        config=config,
+        plan_comments,
+        config=plan_config,
         plan_text=plan_text,
         plan_round=plan_round,
         human_requirements=issue_context.human_requirements,
@@ -3000,6 +3014,7 @@ def _fresh_pr_qualification_snapshot(
     managed_protection_mode: str | None = None,
     managed_retired_plan_hashes: frozenset[str] = frozenset(),
     plan_binding_reviewers: Sequence[AgentName] | None = None,
+    board_check: Callable[[Sequence[object]], None] | None = None,
 ) -> tuple[PullRequestReviewContext, tuple[str, ...], ApprovedPlanContext | None, AgentLoopConfig]:
     """Refetch the PR-side qualification inputs immediately before a gate.
 
@@ -3087,48 +3102,18 @@ def _fresh_pr_qualification_snapshot(
                     "Contradictory PR review scheduler head metadata was observed during "
                     "qualification; no qualification or merge is permitted."
                 )
-        # Amendments are re-read from this same fresh PR comment fetch (#943),
-        # so the gate never relies on a stale or separately refreshed source.
-        # Pre-amendment contracts are accepted only by the lineage rules, and
-        # a post-amendment record only with the exact amendment digest.
-        try:
-            # Every fresh record takes part, contract-neutral ones included,
-            # so a digest on a coder or reviewer record posted during managed
-            # CI fails closed; only an invalid optimization record already
-            # superseded by the recovery rule above is left out.
-            fresh_amendment_diagnostics: list[str] = []
-            fresh_amendments = collect_reviewer_board_amendments(
-                context.comments,
-                flow="pr",
-                pr_number=pr_number,
-                ignored_sink=fresh_amendment_diagnostics,
-            )
-            for diagnostic in fresh_amendment_diagnostics:
-                log(config, f"PR #{pr_number}: {diagnostic}")
-            resolve_contract_lineage(
-                tuple(
-                    record
-                    for record in fresh_scheduler_records
-                    if record.index not in superseded_invalid_indexes
-                ),
-                fresh_amendments,
-                scheduler_contract,
-                contract_from_metadata=_scheduler_contract_from_metadata,
-                drift_error=lambda persisted, detail: _pr_contract_drift_error(
-                    persisted,
-                    detail,
-                    pr_number=pr_number,
-                    configured=scheduler_contract,
-                    start_round_number=lambda: None,
-                    during="qualification",
-                ),
-            )
-        except AgentLoopError as exc:
-            if "no qualification or merge is permitted" in str(exc):
-                raise
-            raise AgentLoopError(
-                f"{exc} No qualification or merge is permitted."
-            ) from exc
+    # Signed amendments and board-change links are re-read from this same
+    # fresh PR comment fetch (#943, #1376), so the gate never relies on a stale
+    # or separately refreshed source.  The unified lineage is re-resolved for
+    # every policy and the floor is rechecked.
+    if board_check is None:
+        from .board_change import identity_from_config
+        from .pr_board_state import qualification_board_check
+
+        board_check = qualification_board_check(
+            runner, config=config, pr_number=pr_number, expected=identity_from_config(config),
+        )
+    board_check(context.comments)
     fresh_issue = issue_context
     fresh_parent = parent_issue_context
     fresh_approved_plan_context = approved_plan_context

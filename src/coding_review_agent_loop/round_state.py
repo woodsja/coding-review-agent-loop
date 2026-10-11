@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import contextvars
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -284,6 +285,17 @@ class PostedRoundMetadata:
     # contract-bearing scheduler records posted under an amended contract;
     # absent on every historical record and omitted from the encoding.
     reviewer_board_amendment_digest: str | None = None
+    # PR board lineage (#1376).  ``pr_board_root`` is the immutable root board
+    # identity of the run and ``pr_board_identity`` the identity of the
+    # lineage element governing the record; ``reviewer_board_change_digest``
+    # binds a record to the board-change link that governs it, and
+    # ``pr_board_binding_init`` records, once, the configured binding of seats
+    # whose legacy binding was unknown.  All are absent on historical records
+    # and omitted from the encoding when absent.
+    pr_board_root: dict | None = None
+    pr_board_identity: dict | None = None
+    pr_board_binding_init: dict | None = None
+    reviewer_board_change_digest: str | None = None
     # Coder record round that last rendered the full visible matrix-evidence
     # row list (#959).  Writers set it iff they persist matrix evidence; it is
     # omitted from the encoding when None so legacy records stay byte-stable.
@@ -371,6 +383,18 @@ class PostedRoundMetadata:
             or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_amendment_digest)
         ):
             raise ValueError("invalid reviewer board amendment digest")
+        if self.reviewer_board_change_digest is not None and (
+            not isinstance(self.reviewer_board_change_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_change_digest)
+        ):
+            raise ValueError("invalid reviewer board change digest")
+        for board_field in ("pr_board_root", "pr_board_identity", "pr_board_binding_init"):
+            if getattr(self, board_field) is not None and not isinstance(
+                getattr(self, board_field), dict
+            ):
+                raise ValueError(f"invalid {board_field}")
+        if (self.pr_board_root is None) != (self.pr_board_identity is None):
+            raise ValueError("pr_board_root and pr_board_identity must be set together")
         if self.followup_dispatch_head is not None and not _is_followup_dispatch_head(
             self.followup_dispatch_head
         ):
@@ -2508,6 +2532,16 @@ def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
     return tuple(problems)
 
 
+def recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
+    """Public view of the per-phase recovery-record validation (#1367)."""
+    return _recovery_record_problems(metadata)
+
+
+def decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
+    """Decode one hydrated round-metadata payload with the canonical decoder."""
+    return _decode_round_metadata_mapping(payload)
+
+
 def _decode_recovery_fields(payload: Mapping[str, object]) -> dict[str, object]:
     """Decode the optional #1292 recovery fields; a malformed one is absent."""
     fields: dict[str, object] = {}
@@ -2694,6 +2728,11 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         )
     if metadata.reviewer_board_amendment_digest is not None:
         payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
+    if metadata.reviewer_board_change_digest is not None:
+        payload["reviewer_board_change_digest"] = metadata.reviewer_board_change_digest
+    for board_field in ("pr_board_root", "pr_board_identity", "pr_board_binding_init"):
+        if getattr(metadata, board_field) is not None:
+            payload[board_field] = getattr(metadata, board_field)
     if metadata.plan_candidate_key is not None:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.followup_dispatch_head is not None:
@@ -2929,6 +2968,16 @@ def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> 
     value = payload[key]
     if not isinstance(value, str) or not value:
         raise ValueError(f"{key} must be a non-empty string")
+    return value
+
+
+def _decode_board_object(payload: Mapping[str, object], key: str) -> dict | None:
+    # A present-but-malformed board field must not decode as legacy absence.
+    if key not in payload:
+        return None
+    value = payload[key]
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be an object")
     return value
 
 
@@ -3215,6 +3264,12 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             reviewer_board_amendment_digest=_decode_plan_supersession_field(
                 payload, "reviewer_board_amendment_digest"
             ),
+            reviewer_board_change_digest=_decode_plan_supersession_field(
+                payload, "reviewer_board_change_digest"
+            ),
+            pr_board_root=_decode_board_object(payload, "pr_board_root"),
+            pr_board_identity=_decode_board_object(payload, "pr_board_identity"),
+            pr_board_binding_init=_decode_board_object(payload, "pr_board_binding_init"),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             evidence_stall=_decode_evidence_stall(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
@@ -3260,7 +3315,25 @@ def followup_head_unchanged_sha(metadata: PostedRoundMetadata | None) -> str | N
     return subject if subject == dispatch_head else None
 
 
+# The PR board stamp of the running PR loop (#1376).  Every PR round record is
+# encoded here, so stamping at this one point covers every writer.
+_PR_BOARD_STAMP: "contextvars.ContextVar[object | None]" = contextvars.ContextVar(
+    "pr_board_stamp", default=None
+)
+
+
+def set_pr_board_stamp(stamp: object | None) -> "contextvars.Token":
+    return _PR_BOARD_STAMP.set(stamp)
+
+
+def reset_pr_board_stamp(token: "contextvars.Token") -> None:
+    _PR_BOARD_STAMP.reset(token)
+
+
 def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
+    stamp = _PR_BOARD_STAMP.get()
+    if stamp is not None and metadata.flow == "pr":
+        metadata = stamp.apply(metadata)  # type: ignore[attr-defined]
     marker = f"<!-- AGENT_LOOP_META: {_encode_round_metadata(metadata)} -->"
     degradations = render_parse_degradations_section(metadata.architecture_impact_degradations)
     if degradations is not None and degradations not in str(body):

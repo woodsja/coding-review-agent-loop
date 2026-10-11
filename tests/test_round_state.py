@@ -141,9 +141,14 @@ def test_named_pr_evidence_and_qualification_summaries_resume_with_binding(tmp_p
     assert validate_pr_seat_bindings(records, config) == set()
 
 
-def test_named_pr_resume_refuses_rebound_prelaunch_before_review(tmp_path, monkeypatch):
+def test_named_pr_resume_records_rebound_prelaunch_as_board_change(tmp_path, monkeypatch):
+    """A backend change on a named seat is a recorded board change (#1376).
+
+    It was refused as drift before; now one orchestrator link is posted
+    before any reviewer turn, and the rebound seat reviews on its new backend.
+    """
     import coding_review_agent_loop.orchestrator as orchestrator
-    from agent_loop_helpers import FakeRunner
+    from agent_loop_helpers import FakeRunner, structured_pr_review
 
     seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
     seat.workdir.mkdir()
@@ -167,10 +172,12 @@ def test_named_pr_resume_refuses_rebound_prelaunch_before_review(tmp_path, monke
     assert not any(command[0] == "agy" for command, _ in runner.commands)
     rebound = SeatAgent(ReviewerSeat("flash", "codex", ("Model B",)), seat.workdir)
     rebound_config = dataclasses.replace(config, reviewer=(rebound,), reviewer_seats=(rebound,))
-    before = len(runner.commands)
-    with pytest.raises(AgentLoopError, match="changed backend"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=rebound_config)
-    assert not any(command[0] in {"agy", "codex"} for command, _ in runner.commands[before:])
+    runner.codex_outputs.append(structured_pr_review(reviewer="flash (OpenAI Codex: Model B)"))
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=rebound_config) == 0
+    links = [c for c in runner.comments if c.startswith("Reviewer board change recorded.")]
+    assert len(links) == 1
+    assert "flash (antigravity: Model A) -> flash (codex: Model B)" in links[0]
+    assert not any(command[0] == "agy" for command, _ in runner.commands)
 
 
 def _checkpoint(**overrides):

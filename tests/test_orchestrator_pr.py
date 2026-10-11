@@ -9814,12 +9814,14 @@ def test_pr_loop_routes_unrecorded_head_advance_through_coder_before_reviewers(t
             prior_items=(),
         ),
     )
+    # The historical reviewer is the configured one: a reviewer missing from
+    # the configured board would be a recorded board change (#1376).
     old_review_comment = _attach_round_metadata(
-        "Blocked.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini",
+        "Blocked.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
         PostedRoundMetadata(
             flow="pr",
             role="reviewer",
-            agent="Gemini",
+            agent="Codex",
             round_number=1,
             subject="old-sha",
             prior_items=(),
@@ -11350,7 +11352,12 @@ def test_staged_legacy_selective_payload_is_contract_drift(tmp_path):
     assert _agent_sequence(runner) == []
 
 
-def test_staged_primary_drift_is_contract_drift(tmp_path):
+def test_staged_primary_change_is_a_recorded_board_change(tmp_path):
+    """A primary change is a board-change link that restarts the primary phase (#1376).
+
+    It was refused as contract drift before; now one link is posted and the
+    next round runs primary-only on the new primary for the current head.
+    """
     contract = orchestrator.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Gemini")
     checkpoint = _attach_round_metadata(
         "Staged checkpoint.",
@@ -11364,10 +11371,20 @@ def test_staged_primary_drift_is_contract_drift(tmp_path):
             scheduler_primary_reviewer="Gemini",
         ),
     )
-    runner = FakeRunner(pr_payload={"comments": [{"author": {"login": "bot"}, "body": checkpoint}]})
+    runner = FakeRunner(
+        pr_payload={"comments": [{"author": {"login": "bot"}, "body": checkpoint}]},
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+    )
     config = _staged_config(tmp_path, reviewer=("codex", "gemini"))
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
-        run_pr_loop(runner, pr_number=77, config=config)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    links = [c for c in runner.comments if c.startswith("Reviewer board change recorded.")]
+    assert len(links) == 1
+    assert "- Primary reviewer: Gemini -> Codex" in links[0]
+    assert "- Effective from round: 2" in links[0]
+    # The restarted primary phase runs the new primary alone first.
+    assert _agent_sequence(runner)[0] == "codex"
+    assert [phase for phase, _head in _audit_phases(runner)][0] == "primary"
 
 
 def _unavailable(reviewer):
@@ -13622,11 +13639,11 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
         else {}
     )
     runner = _m943_partial_pr_round(tmp_path, **payload)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     calls_before = _agent_sequence(runner)
 
     # No record: the drift error prints a filled PR amendment template.
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume") as excinfo:
+    with pytest.raises(AgentLoopError, match="2 reviewer\\(s\\) is below the floor of 3") as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     assert _agent_sequence(runner) == calls_before
     template = _m943_amendment_from_error(str(excinfo.value))
@@ -13652,17 +13669,16 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
         parent_issue_context=None,
         scheduler_contract=amended_contract,
     )
-    # The original board is no longer an acceptable configured contract.
-    with pytest.raises(AgentLoopError, match="no qualification or merge is permitted"):
+    # A board other than the amended one is a board change the gate never
+    # accepts: the run would not have reviewed with it (#1376).
+    with pytest.raises(AgentLoopError, match="No qualification or merge is permitted"):
         orchestrator._fresh_pr_qualification_snapshot(
             runner,
-            config=reduced,
+            config=_staged_config(tmp_path, reviewer=("codex", "antigravity"), auto_merge=True),
             pr_number=77,
             issue_context=None,
             parent_issue_context=None,
-            scheduler_contract=orchestrator.make_contract(
-                ("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex"
-            ),
+            scheduler_contract=amended_contract,
         )
     assert "agy" not in _agent_sequence(runner)[len(calls_before):]
     assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
@@ -13690,7 +13706,7 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
 def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, monkeypatch):
     """Rows pr-qualification and digest-binding: the gate re-reads fresh PR comments."""
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
@@ -13753,7 +13769,7 @@ def test_pr_board_amendment_managed_completion_names_the_reduced_board(
 ):
     """Managed-CI completion paths repeat the reduced-board note durably."""
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=auto_merge)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=auto_merge)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
@@ -13797,7 +13813,7 @@ def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral
     from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
 
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     template = _m943_amendment_from_error(str(excinfo.value))
@@ -15679,7 +15695,8 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
         PostedRoundMetadata(
             flow="pr",
             role="reviewer",
-            agent="OpenAI Codex",
+            # Round records name the reviewer by its board display name.
+            agent="Codex",
             round_number=1,
             subject="abc000",
             state="approved",
@@ -15836,7 +15853,7 @@ def _m1133_crlf(body):
 def _m1133_resume_with_amendment(tmp_path, monkeypatch, *, configured):
     """Partial 3-reviewer round, a CRLF signed amendment, then a resume."""
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
@@ -15899,15 +15916,22 @@ def test_1133_original_and_reduced_boards_produce_identical_records(tmp_path, mo
 
 
 def test_1133_other_configured_board_still_drifts(tmp_path, monkeypatch):
-    """Row other-board-still-drifts: only C0 or the amended board is accepted."""
+    """Row other-board-still-drifts: only C0 or the amended board is accepted.
+
+    While the signed amendment is still pending, any other board is refused
+    before any agent call; once it took effect, a different board would be a
+    recorded board change (#1376).
+    """
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
     reordered = _staged_config(tmp_path, reviewer=("codex", "antigravity"), auto_merge=True)
-    with pytest.raises(AgentLoopError, match="scheduler contract changed"):
+    calls_before = _agent_sequence(runner)
+    with pytest.raises(AgentLoopError, match="pending signed reviewer-board amendment"):
         run_pr_loop(runner, pr_number=77, config=reordered)
+    assert _agent_sequence(runner) == calls_before
 
 
 def test_1133_stale_records_posted_after_unread_amendment_print_repost_round(
@@ -15915,7 +15939,7 @@ def test_1133_stale_records_posted_after_unread_amendment_print_repost_round(
 ):
     """Rows stale-records-repost-hint and stale-record-no-unread-hint (PR #1124 shape)."""
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     template = _m943_amendment_from_error(str(excinfo.value))
@@ -15954,7 +15978,7 @@ def test_1133_unreadable_amendment_after_startup_is_logged_at_the_gate(
     """Row gate-unreadable-diagnostic: logged, requirements unchanged, no board change."""
     runner, _, _, _ = _m1133_resume_with_amendment(tmp_path, monkeypatch, configured="original")
     amended = orchestrator.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Codex")
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     before = orchestrator._fresh_pr_qualification_snapshot(
         runner, config=reduced, pr_number=77, issue_context=None,
         parent_issue_context=None, scheduler_contract=amended,
@@ -16007,7 +16031,7 @@ def _m1133_latch_run(tmp_path, monkeypatch, *, configured):
     assert latched and any(item.scheduler_force_full_source == "automatic" for item in latched)
 
     reduced = _staged_config(
-        tmp_path, coder="claude", reviewer=("codex", "gemini"), auto_merge=True
+        tmp_path, coder="claude", reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True
     )
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
@@ -16106,7 +16130,7 @@ def test_1133_unreadable_amendment_posted_during_managed_ci_does_not_block_quali
 ):
     """Row gate-unreadable-diagnostic, driven through run_pr_loop to the merge."""
     runner = _m943_partial_pr_round(tmp_path)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
@@ -16169,7 +16193,7 @@ def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
         pr_payload={"body": "Fixes #56"},
     )
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
@@ -16248,7 +16272,7 @@ def _m1133_post_panel_latch_run(tmp_path, monkeypatch, *, configured):
         }
 
     _rewrite_pr_metadata(runner, latch_after_opening)
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
@@ -16367,7 +16391,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/managed-56"},
     )
-    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), auto_merge=True)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
@@ -19026,8 +19050,11 @@ def _item_1292(number=1, text="Add a regression test."):
 
 def _meta_1292(role, phase="authoritative", *, subject=_A_1292, round_number=1, items=(),
                new_items=(), **extra):
+    # Reviewer records are by the configured reviewer (Codex): a historical
+    # reviewer missing from the board would be a recorded board change (#1376).
+    agent = {"summary": "Orchestrator", "reviewer": "Codex"}.get(role, "Claude")
     return PostedRoundMetadata(
-        flow="pr", role=role, agent="Claude" if role != "summary" else "Orchestrator",
+        flow="pr", role=role, agent=agent,
         round_number=round_number, subject=subject, prior_items=tuple(items),
         new_items=tuple(new_items), state="blocking", phase=phase, **extra,
     )
@@ -19048,11 +19075,15 @@ def _seed_1292(*records, actor=_ACTOR_1292, forged=()):
     return comments
 
 
-def _history_1292():
-    """A round-1 coder and a reviewer round on head A that raised item-1."""
+def _history_1292(reviewer="Codex"):
+    """A round-1 coder and a reviewer round on head A that raised item-1.
+
+    ``reviewer`` is the configured reviewer: a historical reviewer missing
+    from the configured board would be a recorded board change (#1376).
+    """
     return [
         _meta_1292("coder"),
-        _meta_1292("reviewer", new_items=(_item_1292(),)),
+        dataclasses.replace(_meta_1292("reviewer", new_items=(_item_1292(),)), agent=reviewer),
     ]
 
 
@@ -19218,7 +19249,7 @@ def test_head_review_handoff_survives_a_further_head_advance(tmp_path):
 
 def test_rejection_survives_a_further_head_advance_and_keeps_its_attempt(tmp_path):
     """Row resume-after-rejection variant (i)."""
-    records = [*_history_1292(), _dispatch_1292(), _rejection_1292()]
+    records = [*_history_1292("Claude"), _dispatch_1292(), _rejection_1292()]
     runner = FakeRunner(
         claude_outputs=[_approving_review_1292()],
         codex_outputs=[_LIVE_TARGET_FOLLOWUP],
@@ -19245,7 +19276,7 @@ def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_rec
     """Row rejection-budget-preserved."""
     budget = _Budget1292(3, True, False)  # max_rounds=2 plus the watcher extension
     records = [
-        *_history_1292(),
+        *_history_1292("Claude"),
         dataclasses.replace(_dispatch_1292(budget=budget), dispatch_round=2, round_number=3),
         dataclasses.replace(_rejection_1292(budget=budget), dispatch_round=2, round_number=2),
     ]
@@ -19267,7 +19298,7 @@ def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_rec
 
 def test_forged_rejection_does_not_anchor_resume_or_supply_its_reason(tmp_path):
     """Row recovery-record-auth."""
-    records = [*_history_1292(), _dispatch_1292(), _rejection_1292(reason="forged reason")]
+    records = [*_history_1292("Claude"), _dispatch_1292(), _rejection_1292(reason="forged reason")]
     runner = FakeRunner(
         claude_outputs=[_approving_review_1292()],
         codex_outputs=[_VALID_FOLLOWUP],
@@ -19308,7 +19339,11 @@ def test_ordinary_resume_on_a_head_with_records_makes_no_identity_calls(tmp_path
         support, "merge_pr_comment_transport_identity",
         lambda *args, **kwargs: merges.append(True) or real_merge(*args, **kwargs),
     )
-    runner = _stranded_runner_1292(_history_1292(), _A_1292)
+    # The configured reviewer's own review is still to come on head A.
+    runner = _stranded_runner_1292(
+        [_meta_1292("coder"), _meta_1292("summary", "provisional", items=(_item_1292(),))],
+        _A_1292,
+    )
     config = make_config(tmp_path, reviewer="codex", coder="claude")
     run_pr_loop(runner, pr_number=77, config=config)
     assert merges == []
