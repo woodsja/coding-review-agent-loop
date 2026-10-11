@@ -884,3 +884,89 @@ def test_direct_staged_child_entry_floor_uses_the_parent_plan(tmp_path, monkeypa
             )
     assert runner.comments == []
     assert _agent_commands(runner) == []
+
+
+# --- Issue preflight branches over plan approval (#1377) ---------------------------------
+
+
+def _unfinished_plan_runner(tmp_path):
+    """A plan published and reviewed by Codex and Gemini; Gemini still blocks."""
+    from agent_loop_helpers import structured_plan_review, structured_v1_plan_state
+    from coding_review_agent_loop.cli import run_issue_loop
+
+    runner = FakeRunner(
+        authenticated_actor=("agent-loop", 4242), serve_rest_issue_comments=True,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="x",
+            blocking_plan_issues=["Name the owner."],
+        )],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), plan_execution_mode="plan-only",
+        agent_max_retries=0,
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner
+
+
+def test_unfinished_plan_preflight_floor_checks_the_plan_board_candidate(tmp_path, monkeypatch):
+    """Preflight branch 2: an unfinished plan's board change is floor-checked read-only."""
+    import coding_review_agent_loop.issue_loop as issue_loop
+    from coding_review_agent_loop.cli import run_issue_loop
+
+    runner = _unfinished_plan_runner(tmp_path)
+    for name in ("ensure_agent_workdirs", "resolve_base_branch"):
+        monkeypatch.setattr(
+            issue_loop, name, lambda *_a, _n=name, **_k: pytest.fail(f"{_n} ran before the floor"),
+        )
+    comments = len(runner.issue_comments)
+    agents = _agent_commands(runner)
+    config = make_config(
+        tmp_path, reviewer=("codex",), min_reviewers=2, plan_execution_mode="plan-only",
+    )
+    with pytest.raises(AgentLoopError, match="Issue #56 plan reviewer board") as refusal:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    # The filled-in signed plan amendment template names the plan surface.
+    assert '"flow": "plan"' in str(refusal.value)
+    assert len(runner.issue_comments) == comments
+    assert _agent_commands(runner) == agents
+
+
+def test_approved_plan_preflight_keeps_the_stage_one_handoff_floor(tmp_path):
+    """Preflight branch 1: an approved plan is judged only by the handoff board rule."""
+    from agent_loop_helpers import structured_plan_review, structured_v1_plan_state
+    from coding_review_agent_loop.cli import run_issue_loop
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.plan_verification import enforce_issue_board_floor
+
+    runner = FakeRunner(
+        authenticated_actor=("agent-loop", 4242), serve_rest_issue_comments=True,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    board = make_config(tmp_path, reviewer=("codex", "gemini"), plan_execution_mode="plan-only")
+    assert run_issue_loop(runner, issue_number=56, config=board, plan_first=True) == 0
+    comments = tuple(
+        IssueComment(
+            author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
+            author_id=c.get("_rest_author_id"),
+        )
+        for c in runner.issue_comments
+    )
+    # A differing planning policy and primary are never compared for an approved plan.
+    staged = make_config(
+        tmp_path, reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="gemini", min_reviewers=2,
+    )
+    enforce_issue_board_floor(staged, comments, issue_number=56, runner=runner, planning=True)
+    # A below-floor invocation board meets the stage 1 handoff floor, not a plan floor.
+    with pytest.raises(AgentLoopError, match="Issue #56 reviewer board") as refusal:
+        enforce_issue_board_floor(
+            make_config(tmp_path, reviewer=("codex",), min_reviewers=2), comments,
+            issue_number=56, runner=runner, planning=True,
+        )
+    assert "plan reviewer board" not in str(refusal.value)

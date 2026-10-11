@@ -46,6 +46,7 @@
   "partial_round_recovery",
   "phase_progress",
   "plan_assembly",
+  "plan_board_state",
   "plan_growth",
   "plan_verification",
   "plan_review_scheduling",

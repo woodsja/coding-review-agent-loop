@@ -2428,7 +2428,9 @@ def test_staged_approvals_before_a_model_transition_never_qualify(tmp_path, mode
     """item-2: an interrupted A -> B (-> A) history needs fresh approvals."""
     approved = _bound_staged_plan(tmp_path)
     _strict_verify_comments(tmp_path, approved)
-    with pytest.raises(AgentLoopError, match="not completely approved"):
+    # Stamped plan history (#1377) records a model change only as a plan board
+    # link, so an unrecorded rebind is a malformed lineage: still fail closed.
+    with pytest.raises(AgentLoopError, match="not completely approved|lineage is inconsistent"):
         _strict_verify_comments(tmp_path, _with_checkpoint_rebinds(approved, *models))
 
 
@@ -2447,7 +2449,7 @@ def test_recovery_refuses_approvals_superseded_by_a_model_round_trip(tmp_path, m
         pr_payload={"headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
                     "baseRefName": "main", "body": "Fixes #56"},
     )
-    with pytest.raises(AgentLoopError, match="complete canonical"):
+    with pytest.raises(AgentLoopError, match="complete canonical|lineage is inconsistent"):
         run_pr_loop(runner, pr_number=77, config=make_config(
             tmp_path, managed_ci=True, managed_ci_pr_mode=True,
             managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
@@ -2455,3 +2457,161 @@ def test_recovery_refuses_approvals_superseded_by_a_model_round_trip(tmp_path, m
             reviewer=("claude", "antigravity"),
         ))
     assert _agent_commands(runner) == []
+
+
+# --- Recorded plan board changes verified at handoff, recovery and qualification (#1377)
+
+_PLAN_ACTOR = ("agent-loop", 4242)
+
+
+def _lineage_plan_comments(tmp_path):
+    """A plan whose board changed A -> B mid-plan, with an interleaved signed amendment.
+
+    A = (Codex, Gemini) reviews round 1; a recorded link adds Antigravity for
+    round 2; a signed plan amendment then removes Gemini; B = (Codex,
+    Antigravity) approves the unchanged plan in round 3.
+    """
+    import datetime
+
+    from agent_loop_helpers import structured_plan_review, structured_v1_plan_state
+    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
+    from coding_review_agent_loop.cli import run_issue_loop
+
+    plan_dir = tmp_path / "lineage-plan"
+    plan_dir.mkdir()
+    blocking = dict(state="blocking", summary="Missing owner.", blocking_plan_issues=["Name the owner."])
+    runner = FakeRunner(
+        authenticated_actor=_PLAN_ACTOR, serve_rest_issue_comments=True,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(reviewer="Google Gemini", **blocking)],
+    )
+
+    def plan_config(*reviewers):
+        return make_config(
+            plan_dir, reviewer=reviewers, max_rounds=6, plan_execution_mode="plan-only",
+            agent_max_retries=0,
+        )
+
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=plan_config("codex", "gemini"), plan_first=True)
+    still_open = [{"item_id": "item-1", "disposition": "blocking"}]
+    runner.codex_outputs.append(structured_plan_review(
+        prior_plan_item_dispositions=still_open, **blocking,
+    ))
+    runner.gemini_outputs.append(structured_plan_review(
+        reviewer="Google Gemini", prior_plan_item_dispositions=still_open, **blocking,
+    ))
+    runner.antigravity_outputs.append(structured_plan_review(
+        reviewer="Google Antigravity", prior_plan_item_dispositions=still_open, **blocking,
+    ))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56, config=plan_config("codex", "gemini", "antigravity"),
+            plan_first=True,
+        )
+    runner.issue_comments.append({
+        "body": format_reviewer_board_amendment_comment(
+            flow="plan", issue=56, pr_number=None,
+            original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+            policy="all-reviewers", primary_reviewer=None,
+            removed_reviewers=("Gemini",), effective_from_round=3,
+            rationale="Gemini quota exhausted.",
+        ),
+        "author": {"login": "operator"}, "_rest_author_id": 81,
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}, {"item_id": "item-2", "disposition": "resolved"}, {"item_id": "item-3", "disposition": "resolved"}, {"item_id": "item-4", "disposition": "resolved"}]
+    runner.codex_outputs.append(structured_plan_review(prior_plan_item_dispositions=resolved))
+    runner.antigravity_outputs.append(structured_plan_review(
+        reviewer="Google Antigravity", prior_plan_item_dispositions=resolved,
+    ))
+    assert run_issue_loop(
+        runner, issue_number=56, config=plan_config("codex", "antigravity"), plan_first=True,
+    ) == 0
+    return list(runner.issue_comments)
+
+
+def _lineage_strict_run(tmp_path, monkeypatch, comments, *, entry):
+    runner, config, merges, run_pr_loop = _strict_managed_pr_run(
+        tmp_path, monkeypatch, comments, entry=entry, pr_outputs=_board_b_outputs(),
+    )
+    runner.authenticated_actor = _PLAN_ACTOR
+    runner.serve_rest_issue_comments = True
+    return runner, config, merges, run_pr_loop
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_board_changed_plan_verifies_against_b_and_qualifies_a_pr_board_c(
+    tmp_path, monkeypatch, entry
+):
+    """Row plan-lineage-to-pr-verification: A -> B (+ signed amendment), approved by B, PR board C."""
+    from coding_review_agent_loop.board_change import PLAN_BOARD_CHANGE_LINK_MARKER
+    from coding_review_agent_loop.plan_verification import derive_plan_verification_context
+
+    comments = _lineage_plan_comments(tmp_path)
+    assert any(PLAN_BOARD_CHANGE_LINK_MARKER in c["body"] for c in comments)
+    context = derive_plan_verification_context(
+        [IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
+                      author_id=c.get("_rest_author_id")) for c in comments],
+        issue_number=56, trusted_actor=_PLAN_ACTOR,
+    )
+    # The approving board is B, never A or the PR board C.
+    assert context.derivation == "lineage"
+    assert context.effective_reviewers == ("Codex", "Antigravity")
+    runner, config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, comments, entry=entry,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Board C reviewed the exact head; planning was never reopened.
+    agents = [command[0] for command, _cwd in runner.commands if command[0] in _AGENT_COMMANDS]
+    assert sorted(agents) == ["agy", "claude"]
+    assert [merge["proof"].head_sha for merge in merges] == ["abc123"]
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_malformed_plan_lineage_never_qualifies(tmp_path, monkeypatch, entry):
+    """Row plan-link-forged at recovery and qualification: a forged link fails closed."""
+    from coding_review_agent_loop.board_change import PLAN_BOARD_CHANGE_LINK_MARKER
+
+    comments = _lineage_plan_comments(tmp_path)
+    for comment in comments:
+        if PLAN_BOARD_CHANGE_LINK_MARKER in comment["body"]:
+            comment["_rest_author_id"] = 99
+            comment["author"] = {"login": "intruder"}
+    runner, config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, comments, entry=entry,
+    )
+    with pytest.raises(AgentLoopError, match="lineage is inconsistent|not authored"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+    assert _agent_commands(runner) == []
+
+
+def test_managed_ci_recovery_refuses_an_open_obligation_and_a_stale_requirement_key(tmp_path):
+    """Row plan-approval-gate-live-inputs at managed-CI recovery (unit): never bind."""
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.github import HumanReviewRequirement, IssueContext as Issue
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    comments = _lineage_plan_comments(tmp_path)
+    issue_comments = tuple(
+        IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
+                     author_id=c.get("_rest_author_id"))
+        for c in comments
+    )
+    config = make_config(tmp_path, reviewer=("claude", "antigravity"))
+    assert classify_plan_approval(
+        issue_comments, config=config, issue_number=56, human_requirements=(),
+        trusted_actor=_PLAN_ACTOR,
+    ).approved
+    added = HumanReviewRequirement(
+        source_type="issue_comment", author="operator", created_at="2026-05-23T01:00:00Z",
+        url=None, body="Keep the rollout reversible.",
+    )
+    assert not classify_plan_approval(
+        issue_comments, config=config, issue_number=56, human_requirements=(added,),
+        trusted_actor=_PLAN_ACTOR,
+    ).approved
+    del SimpleNamespace, Issue

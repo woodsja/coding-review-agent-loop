@@ -2428,3 +2428,764 @@ def test_signed_first_upgrade_initializes_bindings_through_a_crash_then_links_a_
     assert payload["rebound"] == ["Codex"] and payload["binding_init"] == {}
     assert _agents(runner, start) == ["codex"]
     _qualify(runner, moved)
+
+
+# =====================================================================================
+# Recorded plan board changes (#1377): the same lineage on the issue owning a plan.
+# =====================================================================================
+
+from agent_loop_helpers import structured_plan_review, structured_v1_plan_state  # noqa: E402
+from coding_review_agent_loop.board_change import (  # noqa: E402
+    PLAN_BOARD_CHANGE_LINK_HEADING,
+    PLAN_BOARD_CHANGE_LINK_MARKER,
+    PLAN_SURFACE,
+)
+from coding_review_agent_loop.cli import run_issue_loop  # noqa: E402
+
+_PLAN_ACTOR = ("agent-loop", 4242)
+_PLAN_AGENTS = {"claude", "codex", "gemini", "agy"}
+
+
+def _plan_runner(**outputs):
+    return FakeRunner(
+        authenticated_actor=_PLAN_ACTOR, serve_rest_issue_comments=True, **outputs
+    )
+
+
+def _plan_cfg(tmp_path, reviewers, **overrides):
+    values = dict(
+        reviewer=tuple(reviewers), max_rounds=6, plan_execution_mode="plan-only",
+        agent_max_retries=0,
+    )
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def _plan_comments(runner):
+    return [
+        SimpleNamespace(body=c["body"], author_id=c.get("_rest_author_id"))
+        for c in runner.issue_comments
+    ]
+
+
+def _plan_records(runner):
+    return _extract_round_metadata_records(_plan_comments(runner), flow="plan")
+
+
+def _plan_links(runner):
+    return [
+        (index, c["body"]) for index, c in enumerate(runner.issue_comments)
+        if c["body"].startswith(PLAN_BOARD_CHANGE_LINK_HEADING)
+    ]
+
+
+def _plan_link_payloads(runner):
+    pattern = PLAN_SURFACE.link_re
+    return [
+        json.loads(base64.urlsafe_b64decode(pattern.search(body).group("payload")))
+        for _index, body in _plan_links(runner)
+    ]
+
+
+def _plan_agents(runner, start=0):
+    return [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd and cmd[0] in _PLAN_AGENTS]
+
+
+def _gemini_blocks_round_one(tmp_path, reviewers=("codex", "gemini")):
+    """Round 1: Codex approves, Gemini raises item-1; the planner revision never starts."""
+    reviews = {
+        "codex": ("codex_outputs", structured_plan_review(state="approved")),
+        "gemini": ("gemini_outputs", structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="Missing owner.",
+            blocking_plan_issues=["Name the rollout owner."],
+        )),
+        "antigravity": ("antigravity_outputs", structured_plan_review(
+            state="approved", reviewer="Google Antigravity",
+        )),
+    }
+    outputs = {"claude_outputs": [structured_v1_plan_state()]}
+    for name in reviewers:
+        key, review = reviews[name]
+        outputs[key] = [review]
+    runner = _plan_runner(**outputs)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56, config=_plan_cfg(tmp_path, reviewers), plan_first=True,
+        )
+    return runner
+
+
+def _append_issue_comment(runner, body, *, login="operator", author_id=81):
+    """An operator comment created now, after every comment the run posted."""
+    import datetime
+
+    runner.issue_comments.append({
+        "body": body, "author": {"login": login}, "_rest_author_id": author_id,
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+
+
+def _review(name, state="approved", dispositions=_RESOLVED_1, **extra):
+    signature = {
+        "codex": "OpenAI Codex", "gemini": "Google Gemini", "antigravity": "Google Antigravity",
+    }[name]
+    return structured_plan_review(
+        state=state, reviewer=signature, prior_plan_item_dispositions=dispositions, **extra,
+    )
+
+
+def test_plan_midrun_swap_posts_one_link_and_requires_the_new_reviewer(tmp_path):
+    """Rows plan-board-change-midrun / plan-all-reviewers-board-change: Gemini -> Antigravity."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    before_comments = len(runner.issue_comments)
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    start = len(runner.commands)
+    swapped = _plan_cfg(tmp_path, ("codex", "antigravity"))
+    assert run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True) == 0
+
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["flow"] == "plan" and payload["issue_number"] == 56
+    assert "pr_number" not in payload
+    assert payload["added"] == ["Antigravity"] and payload["removed"] == ["Gemini"]
+    assert payload["reason"] == "operator-reconfigured"
+    assert payload["anchor_round"] == 1 and payload["advance"] is True
+    assert payload["effective_from_round"] == 2
+    ((link_index, _body),) = _plan_links(runner)
+    # The link is the first comment of the rerun: posted before any agent turn.
+    assert link_index == before_comments
+    # Round 2 re-enters reviewer-only on the byte-identical plan: no planner turn.
+    assert _plan_agents(runner, start) == ["codex", "agy"]
+    records = _plan_records(runner)
+    round_two = [r for r in records if r.metadata.round_number == 2]
+    assert {r.metadata.role for r in round_two} == {"reviewer"}
+    assert {r.metadata.subject for r in records} == {records[0].metadata.subject}
+    # The removed reviewer's open finding was carried, never dropped.
+    assert all(
+        [item.item_id for item in r.metadata.prior_items] == ["item-1"] for r in round_two
+    )
+    assert all(
+        r.metadata.reviewer_board_change_digest == board_change_link_digest(payload)
+        and r.metadata.plan_board_root is not None
+        for r in round_two
+    )
+    # Idempotent resume: the approved plan is never reopened and no link repeats.
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True) == 0
+    assert _plan_agents(runner, start) == []
+    assert len(_plan_links(runner)) == 1
+
+
+def test_plan_swapped_out_reviewer_approval_never_counts(tmp_path):
+    """Row plan-board-change-midrun: the new seat must approve; the old one's approval is gone."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    # Swap Codex (which approved round 1) for Antigravity, which then blocks.
+    runner.gemini_outputs.append(_review("gemini"))
+    runner.antigravity_outputs.append(_review(
+        "antigravity", state="blocking", dispositions=[
+            {"item_id": "item-1", "disposition": "resolved"},
+        ],
+        summary="Still unclear.", blocking_plan_issues=["Clarify the rollback."],
+    ))
+    swapped = _plan_cfg(tmp_path, ("antigravity", "gemini"))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True)
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["removed"] == ["Codex"] and payload["added"] == ["Antigravity"]
+    # Codex's round-1 approval did not approve the plan: a planner revision followed.
+    assert not any("plan approved" in c["body"] for c in runner.issue_comments)
+    assert _plan_agents(runner)[-1] == "claude"
+
+
+def test_plan_removed_reviewer_finding_stays_open_and_blocks_approval(tmp_path):
+    """Row plan-all-reviewers-board-change: removing the finding's owner reassigns it."""
+    runner = _gemini_blocks_round_one(tmp_path, reviewers=("codex", "gemini", "antigravity"))
+    # Gemini (owner of item-1) leaves; its finding stays open for the remaining
+    # board, which keeps it blocking, so the plan is not approved.
+    still_open = [{"item_id": "item-1", "disposition": "blocking"}]
+    runner.codex_outputs.append(_review(
+        "codex", state="blocking", dispositions=still_open, summary="Owner still missing.",
+    ))
+    runner.antigravity_outputs.append(_review(
+        "antigravity", state="blocking", dispositions=still_open, summary="Owner still missing.",
+    ))
+    reduced = _plan_cfg(tmp_path, ("codex", "antigravity"))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True)
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["removed"] == ["Gemini"] and payload["added"] == []
+    assert not any("plan approved" in c["body"] for c in runner.issue_comments)
+    round_two = [r for r in _plan_records(runner) if r.metadata.round_number == 2]
+    assert round_two and all(
+        [item.item_id for item in r.metadata.prior_items] == ["item-1"] for r in round_two
+    )
+    # The next planner revision is asked to address the carried item.
+    assert _plan_agents(runner)[-1] == "claude"
+
+
+def test_plan_added_reviewer_is_required_from_the_effective_round(tmp_path):
+    """Row plan-board-change-midrun: an added reviewer reviews the current plan."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    runner.codex_outputs.append(_review("codex"))
+    runner.gemini_outputs.append(_review("gemini"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    widened = _plan_cfg(tmp_path, ("codex", "gemini", "antigravity"))
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=widened, plan_first=True) == 0
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["added"] == ["Antigravity"] and payload["removed"] == []
+    assert sorted(_plan_agents(runner, start)) == ["agy", "codex", "gemini"]
+
+
+def test_plan_named_model_rebind_is_a_rebound_seat_link(tmp_path):
+    """Row plan-board-change-midrun: a same-ID seat on another model is a swap."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model A")
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        antigravity_outputs=[structured_plan_review(
+            state="blocking", reviewer="flash (Google Antigravity: Model A)", summary="x",
+            blocking_plan_issues=["Name the owner."],
+        )],
+    )
+    config = _plan_cfg(tmp_path, ("codex", flash), reviewer_seats=(flash,))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    rebound = _seat(tmp_path, "flash", "antigravity", "Model B")
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="flash (Google Antigravity: Model B)",
+        prior_plan_item_dispositions=_RESOLVED_1,
+    ))
+    rebound_config = _plan_cfg(tmp_path, ("codex", rebound), reviewer_seats=(rebound,))
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=rebound_config, plan_first=True) == 0
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["rebound"] == ["flash"] and payload["added"] == [] == payload["removed"]
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[start:]
+              if cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model B"]
+
+
+def test_plan_plain_to_named_and_back_each_post_one_link(tmp_path):
+    """Row plan-all-reviewers-board-change: plain-to-named, then named-to-plain."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    flash = _seat(tmp_path, "flash", "antigravity", "Model A")
+    runner.codex_outputs.append(_review("codex", state="blocking", summary="More.",
+                                        blocking_plan_issues=["Add rollback steps."]))
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="flash (Google Antigravity: Model A)",
+        prior_plan_item_dispositions=_RESOLVED_1,
+    ))
+    named = _plan_cfg(tmp_path, ("codex", flash), reviewer_seats=(flash,))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=named, plan_first=True)
+    first = _plan_link_payloads(runner)
+    assert len(first) == 1 and first[0]["new_seat_binding"] is not None
+    assert first[0]["old_seat_binding"] is None
+    # Back to the plain board while the planner revision is still pending: a
+    # second link at the re-entry round; nothing is posted twice.
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=_plan_cfg(tmp_path, ("codex", "gemini")),
+                       plan_first=True)
+    payloads = _plan_link_payloads(runner)
+    assert len(payloads) == 2
+    assert payloads[1]["new_seat_binding"] is None
+    assert payloads[1]["predecessor"] == board_change_link_digest(payloads[0])
+
+
+def test_plan_link_crash_before_effective_round_is_recovered_once(tmp_path, monkeypatch):
+    """Row plan-link-crash-resume: the link is recovered, never reposted."""
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+
+    runner = _gemini_blocks_round_one(tmp_path)
+    swapped = _plan_cfg(tmp_path, ("codex", "antigravity"))
+    real = plan_first_loop.set_plan_board_stamp
+
+    def crash(stamp):
+        if stamp is not None:
+            raise AgentLoopError("simulated crash after the link post")
+        return real(stamp)
+
+    monkeypatch.setattr(plan_first_loop, "set_plan_board_stamp", crash)
+    with pytest.raises(AgentLoopError, match="simulated crash"):
+        run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True)
+    monkeypatch.setattr(plan_first_loop, "set_plan_board_stamp", real)
+    assert len(_plan_links(runner)) == 1
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    assert run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True) == 0
+    assert len(_plan_links(runner)) == 1
+    rounds = sorted({r.metadata.round_number for r in _plan_records(runner)})
+    assert rounds == [1, 2]
+
+
+def test_plan_further_change_while_a_link_is_pending_supersedes_it(tmp_path, monkeypatch):
+    """Row plan-link-crash-resume: a further differing board adds exactly one link."""
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+
+    runner = _gemini_blocks_round_one(tmp_path)
+    real = plan_first_loop.set_plan_board_stamp
+
+    def crash(stamp):
+        if stamp is not None:
+            raise AgentLoopError("simulated crash after the link post")
+        return real(stamp)
+
+    monkeypatch.setattr(plan_first_loop, "set_plan_board_stamp", crash)
+    with pytest.raises(AgentLoopError, match="simulated crash"):
+        run_issue_loop(runner, issue_number=56, config=_plan_cfg(tmp_path, ("codex", "antigravity")),
+                       plan_first=True)
+    monkeypatch.setattr(plan_first_loop, "set_plan_board_stamp", real)
+    runner.codex_outputs.append(_review("codex"))
+    runner.gemini_outputs.append(_review("gemini"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    widened = _plan_cfg(tmp_path, ("codex", "gemini", "antigravity"))
+    assert run_issue_loop(runner, issue_number=56, config=widened, plan_first=True) == 0
+    first, second = _plan_link_payloads(runner)
+    assert second["predecessor"] == board_change_link_digest(first)
+    assert (second["anchor_round"], second["advance"]) == (first["anchor_round"], first["advance"])
+    assert second["effective_from_round"] == 2
+
+
+def _plan_link_body(runner, **overrides):
+    payload = dict(_plan_link_payloads(runner)[0])
+    payload.update(overrides)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    return f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: {encoded} -->"
+
+
+@pytest.mark.parametrize("defect", ["foreign-author", "malformed", "wrong-issue", "unknown-digest"])
+def test_forged_or_malformed_plan_link_fails_closed(tmp_path, defect):
+    """Row plan-link-forged: resume refuses before any agent invocation or post."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    swapped = _plan_cfg(tmp_path, ("codex", "antigravity"))
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    assert run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True) == 0
+    link = next(c for c in runner.issue_comments if c["body"].startswith(PLAN_BOARD_CHANGE_LINK_HEADING))
+    if defect == "foreign-author":
+        link["_rest_author_id"] = 99
+        link["author"] = {"login": "someone-else"}
+    elif defect == "malformed":
+        link["body"] = f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->"
+    elif defect == "wrong-issue":
+        link["body"] = _plan_link_body(runner, issue_number=57)
+    else:
+        _rewrite_last_plan_record(runner, reviewer_board_change_digest="f" * 64)
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="lineage is inconsistent"):
+        run_issue_loop(runner, issue_number=56, config=swapped, plan_first=True)
+    assert _plan_agents(runner, start) == []
+    assert len(runner.issue_comments) == comments
+
+
+def _planned_round_one(tmp_path, reviewers=("codex", "gemini")):
+    """Round 1 holds only the published plan: the first reviewer turn never ran."""
+    runner = _plan_runner(claude_outputs=[structured_v1_plan_state()])
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56,
+            config=_plan_cfg(tmp_path, reviewers, review_parallel=False), plan_first=True,
+        )
+    return runner
+
+
+def test_plan_floor_shrink_refused_unsigned_and_allowed_signed(tmp_path):
+    """Rows plan-floor-shrink / plan-all-reviewers-board-change (signed floor case)."""
+    runner = _planned_round_one(tmp_path)
+    one = _plan_cfg(tmp_path, ("codex",), min_reviewers=2)
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="below the floor of 2") as refusal:
+        run_issue_loop(runner, issue_number=56, config=one, plan_first=True)
+    # The refusal prints the filled-in signed plan amendment template and posts nothing.
+    assert '"kind": "reviewer-board-amendment"' in str(refusal.value)
+    assert '"flow": "plan"' in str(refusal.value)
+    assert _plan_agents(runner, start) == [] and len(runner.issue_comments) == comments
+    assert _plan_links(runner) == []
+
+    signed = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini"),
+        policy="all-reviewers", primary_reviewer=None,
+        removed_reviewers=("Gemini",), effective_from_round=1,
+        rationale="Gemini quota exhausted.",
+    )
+    _append_issue_comment(runner, signed)
+    runner.codex_outputs.append(structured_plan_review(state="approved"))
+    # Explicitly reduced flags are accepted under the signed reduction.
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=one, plan_first=True) == 0
+    assert _plan_agents(runner, start) == ["codex"]
+    assert _plan_links(runner) == []
+
+
+def test_plan_signed_reduction_with_original_flags_rebinds_to_the_signed_board(tmp_path):
+    """Row plan-all-reviewers-board-change: original flags are rebound (#1133) under the floor."""
+    runner = _planned_round_one(tmp_path)
+    signed = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini"),
+        policy="all-reviewers", primary_reviewer=None,
+        removed_reviewers=("Gemini",), effective_from_round=1,
+        rationale="Gemini quota exhausted.",
+    )
+    _append_issue_comment(runner, signed)
+    runner.codex_outputs.append(structured_plan_review(state="approved"))
+    start = len(runner.commands)
+    original = _plan_cfg(tmp_path, ("codex", "gemini"), min_reviewers=2, min_distinct_providers=2)
+    assert run_issue_loop(runner, issue_number=56, config=original, plan_first=True) == 0
+    assert _plan_agents(runner, start) == ["codex"]
+    assert _plan_links(runner) == []
+
+
+def test_plan_provider_floor_refuses_an_unsigned_same_provider_board(tmp_path):
+    """Row plan-all-reviewers-board-change: the distinct-provider floor on a plan link."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    flash = _seat(tmp_path, "flash", "antigravity", "Model A")
+    opus = _seat(tmp_path, "opus", "antigravity", "Model B")
+    same_provider = _plan_cfg(
+        tmp_path, (flash, opus), reviewer_seats=(flash, opus), min_distinct_providers=2,
+    )
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="distinct provider"):
+        run_issue_loop(runner, issue_number=56, config=same_provider, plan_first=True)
+    assert _plan_agents(runner, start) == [] and len(runner.issue_comments) == comments
+
+
+def _rewrite_last_plan_record(runner, **changes):
+    """Rewrite the newest plan round record carrying a board-change digest."""
+    import re
+
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+
+    for comment in reversed(runner.issue_comments):
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow != "plan" or metadata.reviewer_board_change_digest is None:
+            continue
+        body = comment["body"][: match.start()].rstrip("\n")
+        comment["body"] = _attach_round_metadata(body, dataclasses.replace(metadata, **changes))
+        return
+    raise AssertionError("no stamped plan record")
+
+
+def _strip_plan_stamps(runner):
+    """Rewrite every plan record as pre-upgrade (unstamped) history."""
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+
+    import re
+
+    for comment in runner.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow != "plan":
+            continue
+        stripped = dataclasses.replace(
+            metadata, plan_board_root=None, plan_board_identity=None,
+            plan_board_binding_init=None, reviewer_board_change_digest=None,
+            reviewer_board_amendment_digest=None,
+        )
+        body = comment["body"][: match.start()].rstrip("\n")
+        comment["body"] = _attach_round_metadata(body, stripped)
+
+
+def test_plan_legacy_plain_history_upgrades_without_any_record(tmp_path):
+    """Row plan-legacy-regression: unchanged board on unstamped history posts nothing."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    _strip_plan_stamps(runner)
+    assert all(r.metadata.plan_board_root is None for r in _plan_records(runner))
+    runner.claude_outputs.append(structured_plan_review())  # unused guard
+    runner.claude_outputs.clear()
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=_plan_cfg(tmp_path, ("codex", "gemini")),
+                       plan_first=True)
+    # Exactly today's continuation: the planner revision, no link, no new record.
+    assert _plan_agents(runner, start) == ["claude"]
+    assert _plan_links(runner) == []
+    assert len(runner.issue_comments) == comments
+
+
+def test_plan_legacy_plain_history_migrates_its_root_from_posters(tmp_path):
+    """Row plan-all-reviewers-board-change: legacy root = configured board plus posters."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    _strip_plan_stamps(runner)
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    assert run_issue_loop(
+        runner, issue_number=56, config=_plan_cfg(tmp_path, ("codex", "antigravity")),
+        plan_first=True,
+    ) == 0
+    (payload,) = _plan_link_payloads(runner)
+    root = BoardIdentity.from_payload(payload["root"])
+    # The configured board plus every historical plan reviewer poster, read-only.
+    assert root.names == ("Codex", "Antigravity", "Gemini")
+    assert root.policy == "all-reviewers" and root.primary is None
+    assert payload["removed"] == ["Gemini"] and payload["added"] == []
+    # Persisted legacy rounds are never rewritten.
+    assert all(
+        r.metadata.plan_board_root is None
+        for r in _plan_records(runner) if r.metadata.round_number == 1
+    )
+
+
+def test_plan_policy_change_stays_drift_including_legacy_history(tmp_path):
+    """Row plan-policy-drift: legacy plain history roots at all-reviewers, no primary."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    for strip in (False, True):
+        if strip:
+            _strip_plan_stamps(runner)
+        staged = _plan_cfg(
+            tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
+            primary_plan_reviewer="codex",
+        )
+        start, comments = len(runner.commands), len(runner.issue_comments)
+        with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+            run_issue_loop(runner, issue_number=56, config=staged, plan_first=True)
+        assert _plan_agents(runner, start) == []
+        assert len(runner.issue_comments) == comments
+        assert _plan_links(runner) == []
+
+
+def test_plan_legacy_partial_approval_is_undetermined_and_resumes_as_today(tmp_path):
+    """Row plan-legacy-partial-approval: posters alone never prove completion."""
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = _plan_cfg(tmp_path, ("codex", "gemini"), review_parallel=False)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    _strip_plan_stamps(runner)
+    # Only Codex approved; Gemini never posted.
+    assert {r.metadata.agent for r in _plan_records(runner) if r.metadata.role == "reviewer"} == {
+        "Codex"
+    }
+    classification = classify_plan_approval(
+        _plan_comments(runner), config=config, issue_number=56, human_requirements=(),
+    )
+    assert classification.state == "undetermined"
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer="Google Gemini"))
+    start = len(runner.commands)
+    floor = _plan_cfg(tmp_path, ("codex", "gemini"), min_reviewers=2, review_parallel=False)
+    assert run_issue_loop(runner, issue_number=56, config=floor, plan_first=True) == 0
+    assert _plan_agents(runner, start) == ["gemini"]
+    assert _plan_links(runner) == []
+
+
+def test_approved_plan_is_never_reopened_by_a_different_board(tmp_path):
+    """Row plan-approved-board-change: approved by B, resumed with C and below the floor."""
+    runner = _gemini_blocks_round_one(tmp_path)
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    board_b = _plan_cfg(tmp_path, ("codex", "antigravity"))
+    assert run_issue_loop(runner, issue_number=56, config=board_b, plan_first=True) == 0
+    links = len(_plan_links(runner))
+    for board_c in (
+        _plan_cfg(tmp_path, ("gemini", "antigravity")),
+        _plan_cfg(tmp_path, ("gemini", "codex"), plan_review_policy="primary-then-panel",
+                  primary_plan_reviewer="gemini", min_reviewers=2),
+    ):
+        start, comments = len(runner.commands), len(runner.issue_comments)
+        assert run_issue_loop(runner, issue_number=56, config=board_c, plan_first=True) == 0
+        assert _plan_agents(runner, start) == []
+        assert len(_plan_links(runner)) == links
+        assert len(runner.issue_comments) == comments
+    # A below-floor invocation board meets only the stage 1 handoff floor of
+    # the approved plan, never a planning candidate floor or a plan link.
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="Issue #56 reviewer board") as refusal:
+        run_issue_loop(runner, issue_number=56, config=_plan_cfg(tmp_path, ("gemini",), min_reviewers=2),
+                       plan_first=True)
+    assert "plan reviewer board" not in str(refusal.value)
+    assert _plan_agents(runner, start) == [] and len(runner.issue_comments) == comments
+
+
+def test_approval_classification_is_independent_of_the_invocation_board(tmp_path):
+    """Row plan-approved-board-change (unit parity): the approving identity governs."""
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    runner = _gemini_blocks_round_one(tmp_path)
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    assert run_issue_loop(
+        runner, issue_number=56, config=_plan_cfg(tmp_path, ("codex", "antigravity")),
+        plan_first=True,
+    ) == 0
+    comments = _plan_comments(runner)
+    results = set()
+    for invocation in (
+        _plan_cfg(tmp_path, ("codex", "antigravity")),
+        _plan_cfg(tmp_path, ("gemini",)),
+        _plan_cfg(tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
+                  primary_plan_reviewer="gemini"),
+    ):
+        classification = classify_plan_approval(
+            comments, config=invocation, issue_number=56, human_requirements=(),
+            trusted_actor=_PLAN_ACTOR,
+        )
+        results.add((classification.state, classification.context.effective_reviewers))
+    assert results == {("approved", ("Codex", "Antigravity"))}
+
+
+def test_unanimous_approvals_with_an_open_carried_obligation_are_not_approved():
+    """Row plan-approval-gate-open-obligation (unit): a reassigned item blocks completion."""
+    from coding_review_agent_loop.plan_verification import plan_open_obligations
+    from coding_review_agent_loop.round_state import PostedRoundRecord, ResumedReviewRound
+
+    gemini_item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Gemini", source_round=1, text="Name the owner.",
+        status="blocking",
+    )
+
+    def approval(index, agent, dispositions=()):
+        return PostedRoundRecord(
+            index=index, body="",
+            metadata=PostedRoundMetadata(
+                flow="plan", role="reviewer", agent=agent, round_number=2, subject="s",
+                state="approved", prior_items=(gemini_item,), dispositions=tuple(dispositions),
+            ),
+        )
+
+    unanimous = ResumedReviewRound(
+        round_number=2, prior_items=(gemini_item,), coder_output=None,
+        completed_reviews=(approval(1, "Codex"), approval(2, "Antigravity")),
+        next_unresolved_item_number=2,
+    )
+    # Every remaining reviewer approved, but the removed reviewer's finding was
+    # never dispositioned: it is reassigned to the remaining board and stays open.
+    assert plan_open_obligations(unanimous, board=("Codex", "Antigravity")) == ("item-1",)
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+
+    resolved = ResumedReviewRound(
+        round_number=2, prior_items=(gemini_item,), coder_output=None,
+        completed_reviews=(
+            approval(1, "Codex", [ReviewItemDisposition(item_id="item-1", disposition="resolved",
+                                                        reviewer="Codex")]),
+            approval(2, "Antigravity"),
+        ),
+        next_unresolved_item_number=2,
+    )
+    assert plan_open_obligations(resolved, board=("Codex", "Antigravity")) == ()
+
+
+def test_requirement_evidence_is_recorded_under_all_reviewers_and_binds_approval(tmp_path):
+    """Row plan-approval-requirement-evidence: recorded keys bind; a change unbinds."""
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _plan_cfg(tmp_path, ("codex", "gemini"))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    reviews = [r for r in _plan_records(runner) if r.metadata.role == "reviewer"]
+    # Generation-1 reviewer records carry the exact-plan key as evidence only.
+    assert all(r.metadata.plan_candidate_key is not None for r in reviews)
+    assert all(r.metadata.scheduler_contract is None for r in _plan_records(runner))
+    comments = _plan_comments(runner)
+    unchanged = classify_plan_approval(
+        comments, config=config, issue_number=56, human_requirements=(),
+        trusted_actor=_PLAN_ACTOR,
+    )
+    assert unchanged.state == "approved"
+    from coding_review_agent_loop.github import HumanReviewRequirement
+
+    added = HumanReviewRequirement(
+        source_type="issue_comment", author="operator", created_at="2026-05-23T01:00:00Z",
+        url=None, body="Keep the rollout reversible.",
+    )
+    # A signed requirement added after the approvals: the recorded key no longer
+    # matches, so the approval cannot be shortcut.
+    changed = classify_plan_approval(
+        comments, config=config, issue_number=56, human_requirements=(added,),
+        trusted_actor=_PLAN_ACTOR,
+    )
+    assert changed.state in {"unfinished", "undetermined"}
+
+
+def test_plan_verification_resolves_the_lineage_and_judges_the_approving_board(tmp_path):
+    """Row plan-lineage-to-pr-verification (unit): A -> B approved by B verifies against B."""
+    from coding_review_agent_loop.plan_verification import derive_plan_verification_context
+
+    runner = _gemini_blocks_round_one(tmp_path)
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(_review("antigravity"))
+    assert run_issue_loop(
+        runner, issue_number=56, config=_plan_cfg(tmp_path, ("codex", "antigravity")),
+        plan_first=True,
+    ) == 0
+    context = derive_plan_verification_context(
+        _plan_comments(runner), issue_number=56, trusted_actor=_PLAN_ACTOR,
+    )
+    assert context.derivation == "lineage"
+    assert context.effective_reviewers == ("Codex", "Antigravity")
+    # Gemini's round-1 record is not an approving-board approval; nothing else is stale.
+    with pytest.raises(AgentLoopError, match="not authored by the authenticated orchestrator"):
+        derive_plan_verification_context(
+            _plan_comments(runner), issue_number=56, trusted_actor=("intruder", 7),
+        )
+
+
+def test_plan_primary_change_restarts_the_primary_phase_and_carries_the_panel_item(tmp_path):
+    """Row plan-primary-change-midrun: Codex -> Antigravity as primary-then-panel primary."""
+    def staged(primary, **extra):
+        return _plan_cfg(
+            tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+            primary_plan_reviewer=primary, **extra,
+        )
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="x",
+            blocking_plan_issues=["Name the owner."],
+        )],
+        antigravity_outputs=[structured_plan_review(state="approved", reviewer="Google Antigravity")],
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    records = _plan_records(runner)
+    gemini_items = [
+        item.item_id for r in records if r.metadata.agent == "Gemini" for item in r.metadata.new_items
+    ]
+    assert gemini_items == ["item-1"]
+    anchor = max(r.metadata.round_number for r in records)
+    # The new primary approves the unchanged plan; the panel then needs Codex and
+    # Gemini, whose outputs are not scripted, so the run stops there.
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="Google Antigravity", prior_plan_item_dispositions=_RESOLVED_1,
+    ))
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56, config=staged("antigravity", plan_primary_stall_rounds=1),
+            plan_first=True,
+        )
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["old_board"]["primary"] == "Codex"
+    assert payload["new_board"]["primary"] == "Antigravity"
+    assert payload["effective_from_round"] == anchor + 1
+    # The next round is primary-only on the new primary: no pre-panel safety
+    # stop for Gemini's carried item, and the old primary's opening is not reused.
+    assert _plan_agents(runner, start)[0] == "agy"
+    prelaunch = [
+        r.metadata for r in _plan_records(runner)
+        if r.metadata.phase == "scheduler-prelaunch" and r.metadata.round_number == anchor + 1
+    ]
+    assert prelaunch and prelaunch[0].scheduler_phase == "primary"
+    assert prelaunch[0].scheduler_selected_reviewers == ("Antigravity",)
+    assert prelaunch[0].scheduler_primary_reviewer == "Antigravity"
+    assert [item.item_id for item in prelaunch[0].prior_items] == ["item-1"]
+    assert not any("Plan review scheduling diagnostic" in c["body"] for c in runner.issue_comments)

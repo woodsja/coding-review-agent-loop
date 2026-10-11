@@ -229,12 +229,25 @@ def test_named_plan_resume_refuses_unamended_board_shrink(tmp_path):
     with pytest.raises(AgentLoopError):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     calls = len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"])
+    comments = len(runner.issue_comments)
+    # Below the reviewer floor an unsigned shrink is still refused before any
+    # agent turn or post (#1377).
+    floored = dataclasses.replace(
+        config, reviewer=(flash,), reviewer_seats=(flash,), min_reviewers=2,
+    )
+    with pytest.raises(AgentLoopError, match="below the floor of 2"):
+        run_issue_loop(runner, issue_number=56, config=floored, plan_first=True)
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == calls
+    assert len(runner.issue_comments) == comments
+    # Without a floor the shrink is a recorded plan board change, posted once
+    # before the remaining seat's next turn.
     reduced = dataclasses.replace(
         config, reviewer=(flash,), reviewer_seats=(flash,),
     )
-    with pytest.raises(AgentLoopError, match="board changed during resume"):
+    with pytest.raises(AgentLoopError):
         run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True)
-    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == calls
+    links = [c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]
+    assert len(links) == 1 and "Removed reviewer(s): opus" in links[0]["body"]
 
 
 def test_named_plan_resume_refuses_backend_rebinding_before_reviewer_turn(tmp_path):
@@ -254,13 +267,21 @@ def test_named_plan_resume_refuses_backend_rebinding_before_reviewer_turn(tmp_pa
     with pytest.raises(AgentLoopError):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     calls = len([cmd for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}])
+    comments = len(runner.issue_comments)
     rebound = SeatAgent(ReviewerSeat("flash", "codex", ("gpt-6-sol",)), tmp_path / "flash")
     changed = dataclasses.replace(
         config, reviewer=(rebound, opus), reviewer_seats=(rebound, opus),
     )
-    with pytest.raises(AgentLoopError, match="changed backend"):
+    # A backend rebinding is a recorded plan board change (#1377): one link,
+    # posted before the rebound seat's first turn on the new backend.
+    with pytest.raises(AgentLoopError):
         run_issue_loop(runner, issue_number=56, config=changed, plan_first=True)
-    assert len([cmd for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}]) == calls
+    links = [c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]
+    assert len(links) == 1 and "Rebound reviewer(s): flash (antigravity" in links[0]["body"]
+    assert runner.issue_comments.index(links[0]) == comments
+    assert [cmd[0] for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}][calls:][:1] == [
+        "codex"
+    ]
 
 
 def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkeypatch):

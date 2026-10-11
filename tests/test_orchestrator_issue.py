@@ -9198,7 +9198,14 @@ def test_default_full_board_planning_writes_no_scheduler_metadata(tmp_path):
     records = _plan_round_records(runner)
     assert records, "the planning flow must still post durable round records"
     assert all(record.scheduler_metadata_status == "absent" for record in records)
-    assert all(record.plan_candidate_key is None for record in records)
+    # Reviewer records of a generation-1 plan carry the exact-plan key as
+    # requirement-binding evidence only (#1377); no other record carries it.
+    assert all(
+        record.plan_candidate_key is None for record in records if record.role != "reviewer"
+    )
+    assert all(
+        record.plan_candidate_key is not None for record in records if record.role == "reviewer"
+    )
     assert all(record.phase != "scheduler-prelaunch" for record in records)
     reviewer_rounds = {
         (record.agent, record.round_number)
@@ -10380,15 +10387,25 @@ def test_staged_planning_contract_drift_stops_a_default_policy_restart(tmp_path)
         cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
     )
 
-    # A restart that changes only the primary is rejected the same way.
+    # A restart that changes only the primary is a recorded plan board change
+    # (#1377), not contract drift: exactly one plan board-change link is posted
+    # before the new primary's primary-only round.
     drifted = _FakeRunner(issue_comments=comments)
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_issue_loop(
             drifted,
             issue_number=56,
             config=_staged_plan_config(tmp_path, primary_plan_reviewer="gemini"),
             plan_first=True,
         )
+    links = [
+        comment for comment in drifted.issue_comments
+        if "AGENT_PLAN_BOARD_CHANGE" in comment["body"]
+    ]
+    assert len(links) == 1
+    assert [cmd[0] for cmd, _cwd in drifted.commands if cmd[0] in {"claude", "codex", "gemini"}] == [
+        "gemini"
+    ]
 
 
 def _invalid_plan_scheduler_comment(subject, *, created_at="2026-01-01T00:00:30Z"):
@@ -11890,6 +11907,17 @@ def _m943_reduced_config(tmp_path):
     return _staged_plan_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=8)
 
 
+def _m943_floor_config(tmp_path):
+    """The reduced board under a three-reviewer floor (#1377).
+
+    Without a floor an unsigned removal is a recorded plan board change; only a
+    below-floor reduction still needs the signed amendment.
+    """
+    from dataclasses import replace
+
+    return replace(_m943_reduced_config(tmp_path), min_reviewers=3)
+
+
 def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(tmp_path):
     """Rows legacy-no-amendment, partial-round-activation, legacy-retroactive-amend,
     sole-owner-reassign, and activation-mismatch on one real history."""
@@ -11911,9 +11939,9 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
     calls_before = _m943_reviewer_calls(runner)
     comments_before = len(runner.issue_comments)
 
-    # legacy-no-amendment: the drift error prints a filled amendment template.
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume") as excinfo:
-        run_issue_loop(runner, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
+    # legacy-no-amendment: the below-floor refusal prints a filled amendment template.
+    with pytest.raises(AgentLoopError, match="below the floor of 3") as excinfo:
+        run_issue_loop(runner, issue_number=56, config=_m943_floor_config(tmp_path), plan_first=True)
     message = str(excinfo.value)
     assert '"kind": "reviewer-board-amendment"' in message
     assert '"effective_from_round": 3' in message
@@ -11990,9 +12018,10 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
         and tuple(record.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini")
         for record in post_amendment_checkpoints
     )
-    # Contract-neutral records never carry the digest.
+    # Contract-neutral records carry the digest only beside the plan board
+    # root anchor that every stamped record carries (#1377).
     assert all(
-        record.reviewer_board_amendment_digest is None
+        record.reviewer_board_amendment_digest is None or record.plan_board_root is not None
         for record in records
         if record.scheduler_contract is None
     )
@@ -12016,14 +12045,17 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
         for record in records
     )
 
-    # re-add-reviewer: widening the board again after the amendment is drift.
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
-        run_issue_loop(
-            runner,
-            issue_number=56,
-            config=_staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8),
-            plan_first=True,
-        )
+    # re-add-reviewer (#1377): widening the board after the plan is completely
+    # approved never reopens planning and records no plan board change.
+    calls_after_approval = _m943_reviewer_calls(runner)
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=_staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8),
+        plan_first=True,
+    ) == 0
+    assert _m943_reviewer_calls(runner) == calls_after_approval
+    assert not any("AGENT_PLAN_BOARD_CHANGE" in c["body"] for c in runner.issue_comments)
 
 
 def test_board_amendment_rejects_an_old_board_checkpoint_after_the_record(tmp_path):
@@ -12064,8 +12096,8 @@ def test_board_amendment_invalid_records_fail_closed_or_are_ignored(tmp_path):
             ).replace("-- Human Reviewer", "-- Anthropic Claude"),
         }
     )
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
-        run_issue_loop(unsigned, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
+    with pytest.raises(AgentLoopError, match="below the floor of 3"):
+        run_issue_loop(unsigned, issue_number=56, config=_m943_floor_config(tmp_path), plan_first=True)
 
     removes_primary = _m943_interrupted_history(tmp_path)
     _m943_post_amendment(removes_primary, effective_from_round=3, removed=("Codex",))
@@ -12157,7 +12189,13 @@ def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp
     assert run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True) == 0
 
     records = _plan_round_records(runner)
-    amended = [record for record in records if record.reviewer_board_amendment_digest is not None]
+    # Every plan record of a stamped run carries its governing digest (#1377);
+    # the contract-bearing ones carry the amended contract.
+    amended = [
+        record for record in records
+        if record.reviewer_board_amendment_digest is not None
+        and record.scheduler_contract is not None
+    ]
     # Round 2 is re-entered with a fresh digest-bound checkpoint, then the
     # blocking Antigravity finding moves the loop to coder round 3.
     assert amended[0].round_number == 2 and amended[0].phase == "scheduler-prelaunch"
@@ -15498,7 +15536,16 @@ def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
     assert status(scheduler_stall_reset=False) == "invalid"
     assert status(scheduler_stall_reset="yes") == "invalid"
     assert status(scheduler_stall_reset=True, scheduler_phase="full-board") == "invalid"
-    assert status(flow="pr") == "invalid"
+    # Plan board identity fields are flow-scoped (#1377): a PR-flow record
+    # carrying them is malformed, so compare the scheduler status without them.
+    with pytest.raises(AgentLoopError, match="only valid on plan-flow records"):
+        status(flow="pr")
+    unstamped = {
+        key: value for key, value in base.items() if not key.startswith("plan_board_")
+    }
+    assert _decode_round_metadata_mapping(
+        {**unstamped, "flow": "pr"}
+    ).scheduler_metadata_status == "invalid"
 
     # Unset fields serialize with no new keys (byte-stable legacy shape).
     decoded = _decode_round_metadata_mapping(base)

@@ -544,9 +544,10 @@ The default policy invokes all reviewers. Opt-in selective intermediate review
 can pause already-approved reviewers for bounded fixes, but their old approvals
 remain head-bound. Changed scope, incomplete state, and final qualification can
 require a full review. The review policy and broad-path rules are immutable
-across a resume. The planning scheduler contract is immutable apart from signed
-amendments; the PR board changes only through the recorded board lineage
-described under "Recorded PR board changes" below (#1376). A signed human
+across a resume. The PR board and the plan board change only through the
+recorded board lineages described under "Recorded PR board changes" (#1376) and
+"Recorded plan board changes" (#1377) below; the planning policy stays
+immutable. A signed human
 `reviewer-board-amendment` record (#943) may remove unavailable non-primary
 reviewers. It is read from the same
 comment surface as the round records it amends: the issue for planning, the PR
@@ -2063,10 +2064,8 @@ same selection the handoff seam applies, and the seam repeats the check. The
 exception covers only the measures the chain
 lowered from C0 to Cn, and never goes below the signed board's own counts with
 its recorded bindings. A binding swap therefore cannot inherit a provider
-exception. In-run PR board changes are recorded as described next (#1376).
-Recording unsigned plan board changes is later work (stage 3 of #1373), so a
-persisted plan scheduler contract is still immutable apart from signed
-amendments.
+exception. In-run PR board changes are recorded as described next (#1376),
+and in-run plan board changes as described after that (#1377).
 
 ### Recorded PR board changes (#1376)
 
@@ -2173,3 +2172,117 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   the same validated lineage, including each link's recorded previous binding.
   Any lineage defect fails the chain. Current-head checks use the current board.
 
+### Recorded plan board changes (#1377)
+
+Issue plan-review runs use the same board lineage as PR runs, kept on the issue
+that owns the plan. `board_change.py` describes each surface with a small
+`BoardSurface` descriptor. `PR_SURFACE` keeps the PR link marker, payload,
+digests, audit text and round-metadata fields byte-identical. `PLAN_SURFACE`
+uses the reserved `AGENT_PLAN_BOARD_CHANGE` marker (issue comments only), a
+payload naming `issue_number` instead of `pr_number`, the planning policies and
+no broad-path rules. `plan_board_state.resolve_plan_board_state` is the
+read-only plan resolver, called by the issue-entry floor preflight and by plan
+startup.
+
+- **Approval classification first.** `plan_verification.classify_plan_approval`
+  decides read-only, from history alone, whether the current canonical plan is
+  provably completely approved. It runs before any configuration-dependent
+  root migration, policy-drift check, link candidacy or planning floor, and
+  returns `no-plan`, `unfinished`, `undetermined` or `approved`. Its inputs
+  are the approving plan identity from the plan verification context (never
+  the invocation's reviewers, planning policy or primary), the reconstructed
+  latest round, and the reconciled ledger. That ledger includes a removed
+  reviewer's reassigned items, and any open blocking, same-plan or machine
+  item means not approved. The current signed requirement set is checked
+  against each counted approval's requirement binding. Other inputs are the
+  inherited-matrix admissibility of a planning child, any pending signed
+  supersession, the execution-mode guard and the plan-growth gate. Any input
+  it cannot derive means not approved.
+- **Requirement-binding evidence.** Reviewer records of generation-1 plans now
+  persist `plan_candidate_key` (and, when acknowledged,
+  `surfaced_reviewer_requirement_ids`) under every planning policy. Under
+  `all-reviewers` these fields are evidence only. Full-board scheduling and
+  approval never read them. A recorded key binds only when it equals the key
+  recomputed against the current requirement set. A legacy keyless approval
+  binds only when the plan's own dispositions cover exactly the current set,
+  and every approval text carries the acknowledgement when that set is
+  non-empty. Otherwise the binding is unproven and the plan is `undetermined`.
+- **Legacy plain history.** Unanchored plain `all-reviewers` history proves
+  membership by its reviewer posters, never completion. Without an issue-side
+  implementation handoff bound to the current plan hash it is `undetermined`
+  and resumes exactly as before, so a configured reviewer that never reviewed
+  still reviews.
+- **An approved plan is never reopened.** An `approved` plan takes no link,
+  no planning-policy drift check and no planning candidate floor. The run is
+  re-pointed at the approving board and enters the existing approval boundary
+  with no planner or reviewer turn. That boundary still checks the exact key,
+  inherited rows, supersession, growth, narrowing and the pre-implementation
+  requirement refresh. A plan-only run reports the approved outcome. An
+  implement-after-approval run restores the invocation's board, and the stage
+  1 handoff rule alone governs the PR board and its floor. A board change
+  recorded after approval is not activated. If the live boundary would
+  invoke a reviewer or start a revision, the run fails closed instead.
+- **Plan root anchor and legacy root.** Every plan round record carries
+  `plan_board_root` and `plan_board_identity`, stamped at the single
+  round-metadata encoder (`set_plan_board_stamp`). Board identity fields are
+  flow-scoped: `plan_board_*` fields on a PR-flow record, `pr_board_*` fields on
+  a plan-flow record, or half a pair, decode as malformed. Unanchored history
+  derives its root read-only, the same way as on a PR. Contract-neutral plan
+  history only ever happened under `all-reviewers`, so its root policy is
+  `all-reviewers` with no primary, whatever the invocation's planning flags.
+  Resuming it as `primary-then-panel` is refused as drift before any post or
+  agent invocation. The configured policy and primary seed the root only when
+  no plan reviewer has reviewed yet. Persisted rounds are never rewritten.
+- **Plan board-change links.** For a plan that is not approved, a configured
+  plan board that differs from the effective one is posted as one
+  orchestrator-authored link on the issue. That covers membership, primary,
+  backend, model chain and effort. The link is posted after the floor check
+  and before any agent invocation, and an identical link is never reposted.
+  Only links by the authenticated actor are admitted, through
+  `admitted_issue_comments`. It reads REST author IDs and the actor whenever
+  a plan link record is present, and an incomplete read fails closed. Links
+  and signed plan amendments form one ordered chain. Plan records carry the
+  governing element's digest. Changing the planning policy stays contract
+  drift. The old refusals are gone: a named plan board change and a changed
+  seat model are now recorded links. A signed plan amendment no longer needs
+  contract-bearing history, because the root supplies the segment base.
+- **Re-entry, approvals and ledger.** A link anchors at the highest recorded
+  plan round. The anchor round's records are collected under the predecessor
+  board and carried over (`carry_over_anchor_round` with `same-plan` status).
+  The run then re-enters the effective round once, as a reviewer-only round on
+  the byte-identical plan. Required plan reviewers are the effective board
+  only. Added, rebound, restored and role-changed seats need an exact-plan
+  approval from the effective round, applied through the staged carried
+  approvals. Removed reviewers' unresolved items are reassigned by the derived
+  plan ledger view. The audit and scheduler summaries carry a one-line
+  board-change note.
+- **Primary epoch.** Under `primary-then-panel`, a change of the primary seat,
+  its binding or a seat's role sets a plan primary epoch at the link's
+  effective round. Plan history before it is excluded from panel evidence,
+  carried approvals, the primary stall streak and the step-back counters. So
+  the next round is primary-only on the new primary, and the old primary's
+  blocking reviews never trip `--plan-primary-stall-rounds`. Eligible
+  pre-epoch secondary-owned items are carried obligations
+  (`PlanSchedulerSnapshot.carried_obligations`). They are exempt only from the
+  pre-panel safety stop and keep blocking approval.
+- **Plan floor.** The issue-entry preflight branches on the classification.
+  An approved plan, or no plan, keeps the stage 1 behavior: the handoff board
+  rule against the approving plan context. Any other plan is resolved through
+  `resolve_plan_board_state`, so a below-floor plan board change is refused
+  before any agent invocation or comment post, with the filled-in signed plan
+  amendment template. Plan startup repeats the resolution, and the floor is
+  checked again at every planning round. Floor authorizations come only from
+  signed plan segments.
+- **Plan verification.** `derive_plan_verification_context` resolves plan
+  history that carries a root anchor or a link through the plan lineage,
+  never from the invocation's planning configuration. The approving identity
+  is the board of the latest element that took effect. `original_reviewers`
+  is that segment's base board. Approvals by removed seats, by added, rebound
+  or role-changed seats before their effective round, and pre-epoch reviews
+  are neutralized. A forged, non-orchestrator or digest-mismatched link, or a
+  record carrying an unknown change digest, raises. Admitted comments and the
+  actor are threaded through managed-CI fresh authorization, ordinary resume
+  without an issue-side handoff, the handoff seam, strict managed-CI
+  qualification and the issue floor preflight. Plans without links or root
+  anchors verify exactly as before. Managed-CI recovery also refuses a
+  canonical plan whose latest round leaves an open obligation.
