@@ -4224,16 +4224,17 @@ def test_signed_amendment_after_the_primary_approval_stops_before_the_phase_adva
     assert max(r.metadata.round_number for r in _plan_records(runner)) == 1
 
 
-def _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement):
-    """Unstamped legacy plain history: keyless, acknowledged approvals of a plan whose
-    dispositions name ``requirement``, plus an issue-side handoff bound to the plan hash."""
+def _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement, *, acknowledged=True):
+    """Unstamped legacy plain history: keyless approvals of a plan whose dispositions
+    name ``requirement``, plus an issue-side handoff bound to the plan hash.  Without
+    the acknowledgement the fallback cannot prove the binding."""
     from coding_review_agent_loop.decomposition import format_one_shot_impl_handoff_comment
     from coding_review_agent_loop.round_state import _plan_subject
 
     _patch_requirements(monkeypatch, [requirement])
     runner, config = _approved_plain_plan(tmp_path, requirement=requirement)
     _strip_plan_stamps(runner)
-    _strip_requirement_keys(runner, acknowledged=True)
+    _strip_requirement_keys(runner, acknowledged=acknowledged)
     assert all(r.metadata.plan_board_root is None for r in _plan_records(runner))
     unanchored = _classify(runner, config, [requirement])
     # Posters prove membership only: without the handoff it is undetermined.
@@ -4243,8 +4244,62 @@ def _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement):
         parent_issue=56, mode="implement-one-shot", plan_hash=unanchored.plan_hash,
         plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="abc123",
     ), login="agent-loop", author_id=_PLAN_ACTOR[1])
-    assert _classify(runner, config, [requirement]).state == "approved"
+    classified = _classify(runner, config, [requirement])
+    if acknowledged:
+        assert classified.state == "approved"
+    else:
+        assert (classified.state, classified.reason) == (
+            "undetermined", "an approval's requirement binding is unproven",
+        )
     return runner, config
+
+
+@pytest.mark.parametrize(
+    ("evidence", "mode"),
+    [("matching", "plan-only"), ("unprovable", "plan-only"), ("unprovable", "implement-one-shot")],
+)
+def test_legacy_keyless_fallback_through_the_public_resume(tmp_path, monkeypatch, evidence, mode):
+    """Item-9.s3: a public ``run_issue_loop`` resume of legacy keyless history.
+
+    Matching evidence (versioned dispositions naming the surfaced requirement and
+    acknowledged approvals) completes with no agent turn and no new record.
+    Unprovable evidence (approvals without the acknowledgement) never takes the
+    approval shortcut or implements, in either execution mode: the run asks the
+    planner for an unapproved revision before any reviewer turn.  Full-board
+    scheduling never reads the carried approval evidence on either path.
+    """
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+
+    requirement = _signed_requirement()
+    runner, config = _legacy_keyless_plan_with_handoff(
+        tmp_path, monkeypatch, requirement, acknowledged=evidence == "matching",
+    )
+    config = dataclasses.replace(config, plan_execution_mode=mode)
+
+    def evidence_read(*_args, **_kwargs):
+        raise AssertionError("full-board scheduling read carried approval evidence")
+
+    monkeypatch.setattr(plan_first_loop, "_carried_plan_approvals", evidence_read)
+    start, records_before = len(runner.commands), len(_plan_records(runner))
+    comments_before = len(runner.issue_comments)
+    if evidence == "matching":
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+        assert _plan_agents(runner, start) == []
+        assert len(_plan_records(runner)) == records_before
+        assert _plan_links(runner) == []
+        return
+    # The approvals cannot prove the binding: the run asks the planner for an
+    # unapproved revision before any reviewer turn, approval or implementation.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert _plan_agents(runner, start) == ["claude"]
+    planner_prompt = [cmd[-1] for cmd, _cwd in runner.commands[start:] if cmd[0] == "claude"][0]
+    assert "This is an eligible unapproved planning revision." in planner_prompt
+    assert len(_plan_records(runner)) == records_before
+    new_comments = [c["body"] for c in runner.issue_comments[comments_before:]]
+    assert not any("plan approved" in body.lower() for body in new_comments)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands[start:])
+    assert _plan_links(runner) == []
 
 
 @pytest.mark.parametrize("entry", ["ordinary", "fresh"])
@@ -4453,3 +4508,77 @@ def test_primary_change_mid_streak_restarts_the_stall_count(tmp_path, next_prima
     (payload,) = _plan_link_payloads(runner)
     assert payload["new_board"]["primary"] == "Antigravity"
     assert _plan_agents(runner, start) == ["agy", "claude"]
+
+
+@pytest.mark.parametrize("next_primary", ["codex", "gemini"])
+def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, next_primary):
+    """Item-9.s5: Codex's crossed-plan blocks earn a step-back revision at round 5 and
+    Codex rejects it, so --plan-step-back-escalation-rounds 1 stops for a human
+    decision.  Resuming with Codex stops again before any agent turn.  After a
+    primary change, the episode and its escalation count belong to the old primary:
+    Gemini reviews the candidate, its single block neither escalates nor earns a
+    step-back, and the run revises without approving."""
+    from coding_review_agent_loop.review_step_back import derive_plan_step_back_state
+    from test_orchestrator_issue import (
+        _STEP_BACK_MARKER,
+        _m1103_blocking_chain,
+        _m1103_fresh_base,
+        _m1251_justify_patch,
+    )
+
+    def staged(primary):
+        return _plan_cfg(
+            tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
+            primary_plan_reviewer=primary, max_rounds=8, plan_growth_max_chars=4500,
+            plan_growth_max_revisions=3, plan_step_back_escalation_rounds=1,
+            review_parallel=False,
+        )
+
+    fresh, base0 = _m1103_fresh_base()
+    codex1, claude1, base2 = _m1103_blocking_chain(1, 1, base=base0)
+    codex2, _claude2, _base = _m1103_blocking_chain(2, 2, base=base2)
+    justify, base3 = _m1251_justify_patch(base2, resolved_item="item-2")
+    codex_rest, claude_rest, _base = _m1103_blocking_chain(3, 5, base=base3)
+    runner = _plan_runner(
+        claude_outputs=[fresh, *claude1, justify, *claude_rest[:-1]],
+        codex_outputs=[*codex1, *codex2, *codex_rest],
+    )
+    with pytest.raises(AgentLoopError, match="human decision required"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    records = _plan_records(runner)
+    (step_back,) = [r.metadata for r in records if r.metadata.step_back_entries]
+    assert (step_back.round_number, step_back.step_back_entries) == (
+        5, ({"phase": "plan", "reviewer": "Codex", "trigger_round": 4},),
+    )
+    old = derive_plan_step_back_state(records, primary="Codex")
+    assert old.episode is not None and old.escalation_count == 1
+    start, comments_before = len(runner.commands), len(runner.issue_comments)
+    if next_primary == "codex":
+        with pytest.raises(AgentLoopError, match="human decision required"):
+            run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+        assert _plan_agents(runner, start) == []
+        return
+
+    runner.gemini_outputs.append(_review(
+        "gemini", state="blocking", blocking_plan_issues=["Name the metric."],
+        dispositions=[{"item_id": "item-5", "disposition": "blocking", "note": "Still open."}],
+    ))
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("gemini"), plan_first=True)
+    # One link moves the primary; Gemini reviews and the planner is asked for an
+    # ordinary revision: no human-decision stop and no second step-back.
+    (payload,) = _plan_link_payloads(runner)
+    assert (payload["old_board"]["primary"], payload["new_board"]["primary"]) == ("Codex", "Gemini")
+    assert _plan_agents(runner, start) == ["gemini", "claude"]
+    planner_prompt = [cmd[-1] for cmd, _cwd in runner.commands[start:] if cmd[0] == "claude"][-1]
+    assert _STEP_BACK_MARKER not in planner_prompt
+    records = _plan_records(runner)
+    new = derive_plan_step_back_state(records, primary="Gemini")
+    assert new.episode is None and new.escalation_count == 0
+    assert [r.classification for r in new.reviews] == ["new-finding"]
+    assert sum(1 for r in records if r.metadata.step_back_entries) == 1
+    assert not any(r.metadata.phase == "plan-phase-advance" for r in records)
+    assert not any(
+        "human decision required" in c["body"]
+        for c in runner.issue_comments[comments_before:]
+    )
