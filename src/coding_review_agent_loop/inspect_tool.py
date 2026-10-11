@@ -27,6 +27,7 @@ changed in its checkout.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import stat
@@ -192,11 +193,44 @@ class ExecResult:
 Executor = Callable[[Sequence[str], Mapping[str, str], str, bool], ExecResult]
 
 
+_GIT_BASENAMES = frozenset({"git", "git.exe"})
+
+
+def _is_git_command(command: Sequence[str], git: str | None) -> bool:
+    """Identify a Git launch by the request's pinned Git, not its basename alone.
+
+    A Windows pinned path ends in ``git.exe``; matching only ``git`` would
+    launch it outside the shared local boundary and its capability preflight.
+    """
+    if not command:
+        return False
+    if git is not None and command[0] == git:
+        return True
+    return os.path.basename(command[0].replace("\\", "/")).lower() in _GIT_BASENAMES
+
+
 def _subprocess_executor(
-    argv: Sequence[str], env: Mapping[str, str], cwd: str, capture: bool
+    argv: Sequence[str], env: Mapping[str, str], cwd: str, capture: bool,
+    *, git: str | None = None,
 ) -> ExecResult:
+    command = list(argv)
+    if _is_git_command(command, git):
+        # The inspect interpreter still imports only this stdlib-only module.
+        # A pinned isolated helper applies the shared local Git boundary.
+        import hashlib
+        from pathlib import Path
+
+        helper = Path(__file__).with_name("inspect_git_subprocess.py")
+        try:
+            source = helper.read_bytes()
+        except OSError as exc:
+            raise InspectRejected("Pinned Git inspection helper is unavailable.") from exc
+        if hashlib.sha256(source).hexdigest() != "c26a6dfc36da89e05cd22e9c633a236c6bd50efea71c8c31eae4a6a48e8efa96":
+            raise InspectRejected("Pinned Git inspection helper identity changed.")
+        command = [sys.executable, "-I", "-S", "-c", source.decode("utf-8"),
+                   str(helper.parent.parent), *command]
     completed = subprocess.run(
-        list(argv),
+        command,
         env=dict(env),
         cwd=cwd,
         shell=False,
@@ -474,7 +508,7 @@ def run_hardened_git(
     workdir snapshot before a sandboxed turn); ``sub`` and ``args`` come from
     agent-loop, not from an agent, so they bypass the argument allowlist.
     """
-    execute = executor or _subprocess_executor
+    execute = executor or functools.partial(_subprocess_executor, git=git)
     env = build_subprocess_env(os.environ if environ is None else environ, [os.path.dirname(git)])
     run_config_gate(git, env, cwd, execute)
     return execute(git_argv(git, sub, args), env, cwd, True)
@@ -490,11 +524,11 @@ def run_inspect(
     stderr=None,
 ) -> int:
     values = os.environ if environ is None else environ
-    execute = executor or _subprocess_executor
     out = stdout or sys.stdout.buffer
     err = stderr or sys.stderr
     try:
         request = parse_request(argv)
+        execute = executor or functools.partial(_subprocess_executor, git=request.git)
         if request.tool == "git":
             sub, args = validate_git_args(request.argv)
             command = git_argv(request.git, sub, args)

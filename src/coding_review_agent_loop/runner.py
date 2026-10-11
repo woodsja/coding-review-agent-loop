@@ -116,6 +116,11 @@ class BinaryCommandResult:
     returncode: int | None = None
 
 
+def _is_git_launch(cmd: Sequence[str]) -> bool:
+    """Route any Git launch, bare or by path (including ``git.exe``), to the boundary."""
+    return bool(cmd) and os.path.basename(cmd[0].replace("\\", "/")).lower() in {"git", "git.exe"}
+
+
 def run_binary_capture(
     args: Sequence[str],
     *,
@@ -135,13 +140,20 @@ def run_binary_capture(
     if timeout_seconds <= 0:
         raise AgentLoopError("Binary command timeout must be positive.")
     cmd = [str(value) for value in args]
+    pass_fds: tuple[int, ...] = ()
+    protected_git = _is_git_launch(cmd)
+    if protected_git:
+        from .secure_git import local_command
+
+        cmd, env, pass_fds = local_command(cmd[1:], environ=env, checkout=cwd)
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=({**os.environ, **env} if env is not None else None),
+        env=(env if protected_git else ({**os.environ, **env} if env is not None else None)),
+        pass_fds=pass_fds,
     )
     assert proc.stdout is not None
     assert proc.stderr is not None
@@ -2032,6 +2044,12 @@ class Runner:
                 "Runner is shutting down after an interrupt; refusing to start new commands."
             )
 
+        pass_fds: tuple[int, ...] = ()
+        protected_git = _is_git_launch(cmd)
+        if protected_git:
+            from .secure_git import local_command
+
+            cmd, env, pass_fds = local_command(cmd[1:], environ=env, checkout=cwd)
         proc = subprocess.run(
             cmd,
             cwd=cwd,
@@ -2040,7 +2058,8 @@ class Runner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env=({**os.environ, **env} if env is not None else None),
+            env=(env if protected_git else ({**os.environ, **env} if env is not None else None)),
+            pass_fds=pass_fds,
         )
         result = CommandResult(cmd, cwd, proc.stdout, proc.stderr, proc.returncode)
         if check and proc.returncode != 0:

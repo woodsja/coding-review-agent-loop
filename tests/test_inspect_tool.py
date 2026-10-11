@@ -29,6 +29,18 @@ GIT = shutil.which("git")
 pytestmark = pytest.mark.skipif(GIT is None, reason="git is required")
 
 
+def test_replaced_inspection_helper_is_rejected_before_python_launch(tmp_path, monkeypatch):
+    package = tmp_path / "coding_review_agent_loop"
+    package.mkdir()
+    (package / "inspect_tool.py").write_text("# installed controller\n")
+    marker = tmp_path / "launched"
+    (package / "inspect_git_subprocess.py").write_text(f"open({str(marker)!r}, 'w').close()\n")
+    monkeypatch.setattr(inspect_tool, "__file__", str(package / "inspect_tool.py"))
+    with pytest.raises(InspectRejected, match="helper identity changed"):
+        inspect_tool._subprocess_executor((GIT, "status"), {}, str(tmp_path), True)
+    assert not marker.exists()
+
+
 def _executable(path: Path, body: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
@@ -548,8 +560,13 @@ def test_real_process_checkout_local_git_and_gh_never_run(repo, tmp_path):
 
 def test_module_entry_point_loads_only_inspect_tool(repo, tmp_path):
     """`python -I -m coding_review_agent_loop.cli inspect` must not import the rest."""
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    # An isolated interpreter ignores pytest's PYTHONPATH; bootstrap the
+    # checkout source path while retaining -I for the inspected entry point.
+    bootstrap = (f"import sys, runpy; sys.path.insert(0, {source_root!r}); "
+                 "runpy.run_module('coding_review_agent_loop.cli', run_name='__main__')")
     completed = subprocess.run(
-        [sys.executable, "-I", "-X", "importtime", "-m", "coding_review_agent_loop.cli",
+        [sys.executable, "-I", "-X", "importtime", "-c", bootstrap,
          "inspect", f"--git={GIT}", "git", "rev-parse", "HEAD"],
         cwd=repo, capture_output=True, text=True, timeout=60,
         env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "")},
@@ -562,3 +579,40 @@ def test_module_entry_point_loads_only_inspect_tool(repo, tmp_path):
     }
     ours = {name for name in imported if name.startswith("coding_review_agent_loop")}
     assert ours <= {"coding_review_agent_loop", "coding_review_agent_loop.inspect_tool"}
+
+
+@pytest.mark.parametrize("name", ["git", "git.exe", "GIT.EXE", "git-2.45"])
+def test_hardened_probes_delegate_pinned_git_regardless_of_basename(tmp_path, monkeypatch, name):
+    """Gate and probe both go through the confined helper, including git.exe."""
+    git = str(tmp_path / "Program Files" / "Git" / "bin" / name)
+    launched: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        launched.append(list(command))
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+    monkeypatch.setattr(inspect_tool.subprocess, "run", fake_run)
+    inspect_tool.run_hardened_git(git, "status", ("--porcelain",), cwd=str(tmp_path), environ={})
+
+    assert len(launched) == 2
+    for command in launched:
+        assert command[:4] == [sys.executable, "-I", "-S", "-c"]
+        assert command[6] == git, "the pinned Git must reach the confined helper, not launch directly"
+        assert git not in command[:6]
+
+
+def test_failed_boundary_preflight_stops_before_consequential_probe(tmp_path, monkeypatch):
+    """A helper that refuses (unsupported backend) blocks the probe after the gate."""
+    git = str(tmp_path / "Git" / "bin" / "git.exe")
+    launched: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        launched.append(list(command))
+        return subprocess.CompletedProcess(command, 1, b"", b"Unsupported Git confinement")
+
+    monkeypatch.setattr(inspect_tool.subprocess, "run", fake_run)
+    with pytest.raises(InspectRejected, match="config gate"):
+        inspect_tool.run_hardened_git(git, "status", (), cwd=str(tmp_path), environ={})
+    assert len(launched) == 1
+    assert launched[0][:4] == [sys.executable, "-I", "-S", "-c"]
+    assert git not in launched[0][:6]

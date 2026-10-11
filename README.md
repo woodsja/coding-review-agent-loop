@@ -641,6 +641,53 @@ metadata, so a later run can reconstruct the active review state. When the PR
 number is known, resume with `agent-loop pr <number>` instead of starting issue
 implementation again.
 
+Agent-loop's own Git commands in agent checkouts use a closed environment,
+a pinned executable, settings that disable hooks, fsmonitor, external diff,
+submodule traversal, pagers, credentials, and trace targets, and command-time
+child-execution denial. Linux verifies a preload/seccomp guard; macOS verifies
+a preload/Seatbelt guard; Windows assigns a suspended Git process to a
+one-process Job Object before resume. A host without a verified boundary
+fails before its first checkout Git probe. Checkout settings that require
+external filters or helpers may make the operation fail; the planted program
+does not run.
+Host prerequisites: on Linux, agent-loop needs a root-owned Git at
+`/usr/bin/git`, `/bin/git`, or `/usr/local/bin/git`; a root-owned C compiler at
+`/usr/bin/cc` or `/usr/bin/clang`; the Linux UAPI headers (`linux-libc-dev` on
+Debian/Ubuntu, `kernel-headers` on Fedora/RHEL); and an x86_64 or aarch64 CPU.
+On macOS, agent-loop tries `/opt/homebrew/bin/git`, `/usr/local/bin/git`, then
+`/usr/bin/git`, and pins the first one in a root-owned, preloadable install.
+Apple Silicon Homebrew is owned by the installing user, so it is skipped.
+Without these, checkout Git operations fail with
+`Unsupported Git confinement: ...` before any checkout Git runs.
+On POSIX hosts the pinned Git binary and every component of its installation
+path must be root-owned. Private HTTPS authentication uses the same rule for
+the GitHub CLI and SSH client. Guard source and the Windows launcher are
+checked against identities held in the loaded controller before use; the C
+compiler reads verified source bytes from stdin, and Windows runs the verified
+launcher bytes directly.
+
+Base and PR commits are fetched into a private transport repository from the
+exact GitHub HTTPS or SSH origin selected by `--repo`, using trusted GitHub CLI
+authentication when private HTTPS needs it. Agent-loop streams the reachable
+pack into the checkout, verifies the commit, and updates its tracking ref by
+compare-and-swap under a checkout or store lock before changing HEAD. A
+checkout origin with a different host, URL rewrite, or untrusted local path
+is refused before transport. For an explicitly trusted offline repository,
+pass `--trusted-local-origin /absolute/path/to/origin`; the checkout origin
+must match that resolved path exactly.
+New checkouts use HTTPS by default. Pass `--trusted-origin-protocol ssh` when
+the operator has configured SSH authentication; agent-loop creates the exact
+`git@host:owner/repo.git` origin before its private fetch (or an `ssh://` URL
+when the trusted host includes a port). The pinned SSH client ignores the
+user's SSH config; default identity files and `SSH_AUTH_SOCK` remain available.
+This option cannot
+be combined with `--trusted-local-origin`.
+SSH transport on Windows is untested: no Windows CI runner exists, so only
+its command construction is covered (tracked in #1371). This boundary covers
+settings, hooks, environment, and transport options planted in a checkout; a
+live, unrestricted agent running as the same OS user that races agent-loop
+while it runs needs OS-level isolation and is out of scope (#1371).
+
 Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.
 
 ### Sub-items for conjunctive findings
