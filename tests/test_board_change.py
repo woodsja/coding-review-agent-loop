@@ -4582,3 +4582,133 @@ def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, 
         "human decision required" in c["body"]
         for c in runner.issue_comments[comments_before:]
     )
+
+
+def _legacy_plan_with_one_shot_handoff(tmp_path, monkeypatch, requirement):
+    """Approved legacy keyless plain history (board A = Codex, Gemini) with matching
+    requirement evidence and a complete one-shot handoff to PR #77 bound to its hash."""
+    from coding_review_agent_loop.decomposition import (
+        approved_plan_hash,
+        format_one_shot_impl_handoff_comment,
+    )
+    from coding_review_agent_loop.execution_policy import _current_execution_recommendation
+    from coding_review_agent_loop.round_state import _plan_subject
+
+    _patch_requirements(monkeypatch, [requirement])
+    runner, _config = _approved_plain_plan(tmp_path, requirement=requirement)
+    _strip_plan_stamps(runner)
+    _strip_requirement_keys(runner, acknowledged=True)
+    plan = next(r.metadata.canonical_plan for r in _plan_records(runner) if r.metadata.role == "coder")
+    identity = _current_execution_recommendation(plan, []).identity()
+    _append_issue_comment(runner, format_one_shot_impl_handoff_comment(
+        parent_issue=56, mode="implement-one-shot", plan_hash=approved_plan_hash(plan),
+        plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="abc123",
+        strategy="one-shot", topology_source=identity["topology_source"],
+        execution_strategy_contract_version=1,
+        recommendation_digest=identity["recommendation_sha256"],
+    ), login="agent-loop", author_id=_PLAN_ACTOR[1])
+    return runner
+
+
+@pytest.mark.parametrize("implement", [False, True], ids=["plan-only", "implement-after-approval"])
+@pytest.mark.parametrize("board", ["a-plus-b", "named-replacements"])
+def test_legacy_hash_bound_plan_resumed_with_another_board_is_not_reopened(
+    tmp_path, monkeypatch, board, implement
+):
+    """Item-9.s2 / row plan-approved-board-change: legacy plain history approved by
+    A (Codex, Gemini) with a hash-bound one-shot handoff record is resumed with A plus
+    Antigravity, or with named replacement seats (sol on Codex, flash on Antigravity).
+    No plan link is posted and no planner or plan reviewer runs.  Plan-only reports
+    the approved plan; implement-after-approval resumes PR #77 review on the
+    invocation board, whose handoff audit record compares it with A."""
+    from test_issue_pr_handoff import _audits
+
+    requirement = _signed_requirement()
+    runner = _legacy_plan_with_one_shot_handoff(tmp_path, monkeypatch, requirement)
+    assert all(r.metadata.plan_board_root is None for r in _plan_records(runner))
+    if board == "a-plus-b":
+        config = _plan_cfg(tmp_path, ("codex", "gemini", "antigravity"))
+    else:
+        sol = _seat(tmp_path, "sol", "codex", "gpt-sol")
+        flash = _seat(tmp_path, "flash", "antigravity", "Model A")
+        config = _plan_cfg(tmp_path, (sol, flash), reviewer_seats=(sol, flash))
+    assert _classify(runner, config, [requirement]).state == "approved"
+    if implement:
+        config = dataclasses.replace(config, plan_execution_mode="implement-one-shot")
+    start, records = len(runner.commands), len(_plan_records(runner))
+    if not implement:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    else:
+        # PR review starts on the invocation board; its acknowledgement turns are
+        # not scripted here, so the run stops inside PR review.
+        with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+            run_issue_loop(
+                runner, issue_number=56, config=config, plan_first=True,
+                implement_after_approval=True,
+            )
+    agents = [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd[0] in _PLAN_AGENTS]
+    # Never a planner turn, and no plan review: plan records are unchanged.
+    assert "claude" not in agents
+    assert len(_plan_records(runner)) == records
+    assert _plan_links(runner) == []
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands[start:])
+    if not implement:
+        assert agents == []
+        assert _audits(runner) == []
+        return
+    # The existing handoff routes to PR #77 review: a PR reviewer of the invocation
+    # board runs, and the handoff audit record compares it with the approving A.
+    assert agents and agents[0] == "codex"
+    assert any(
+        cmd[:2] == ["gh", "pr"] and "77" in cmd for cmd, _cwd in runner.commands[start:]
+    )
+    (audit,) = _audits(runner)
+    if board == "a-plus-b":
+        assert "- Added reviewer(s): Antigravity" in audit
+        assert "- Removed reviewer(s): none" in audit
+    else:
+        assert "- Added reviewer(s): sol, flash" in audit
+        assert "- Removed reviewer(s): Codex, Gemini" in audit
+
+
+def test_approved_staged_plan_implemented_under_default_flags_is_not_reopened(tmp_path):
+    """Item-9.s2 / row plan-approved-board-change: an approved primary-then-panel plan
+    resumed for implementation under default (all-reviewers) planning flags and a
+    floor proceeds to implementation: no planner revision, no plan review, no link."""
+    staged = _plan_cfg(
+        tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    assert run_issue_loop(runner, issue_number=56, config=staged, plan_first=True) == 0
+    start, records = len(runner.commands), len(_plan_records(runner))
+    default_flags = _plan_cfg(
+        tmp_path, ("codex", "gemini"), min_reviewers=2, plan_execution_mode="implement-one-shot",
+    )
+    # The implementation coder's turn is not scripted, so the run stops there.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56, config=default_flags, plan_first=True,
+            implement_after_approval=True,
+        )
+    turns = [cmd for cmd, _cwd in runner.commands[start:] if cmd[0] in _PLAN_AGENTS]
+    # Exactly one turn: the implementation coder.  No planner revision, no plan
+    # reviewer, and no drift refusal of the primary-then-panel history.
+    assert [cmd[0] for cmd in turns] == ["claude"]
+    assert turns[0][-1].startswith("Implement the approved plan for GitHub issue #56")
+    new = [r.metadata for r in _plan_records(runner)[records:]]
+    # The only new plan record is the pre-implementation final-sweep checkpoint,
+    # judged under the approving identity (primary-then-panel, primary Codex),
+    # never the invocation's all-reviewers flags, and selecting no reviewer.
+    (sweep,) = new
+    assert (sweep.phase, sweep.scheduler_phase, sweep.scheduler_selected_reviewers) == (
+        "scheduler-prelaunch", "final-secondary-sweep", (),
+    )
+    assert (sweep.scheduler_contract["policy"], sweep.scheduler_contract["primary_reviewer"]) == (
+        "primary-then-panel", "Codex",
+    )
+    assert _plan_links(runner) == []
