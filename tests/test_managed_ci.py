@@ -14634,6 +14634,119 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
         _plan_binding_1367(published, config)
 
 
+_NO_OVERRIDE_1376 = object()
+
+
+def _board_link_comment_1376(comment_id, old_binding, new_binding, *, effective_round=2,
+                             login="agent-loop", user_id=1, recorded_old=_NO_OVERRIDE_1376):
+    """An orchestrator board-change link rebinding seat ``sol`` (#1376)."""
+    from coding_review_agent_loop.board_change import (
+        BoardIdentity,
+        board_change_link_payload,
+        render_board_change_link,
+    )
+    from coding_review_agent_loop.review_scheduling import normalize_broad_rules
+    from coding_review_agent_loop.reviewer_floor import BoardSeat
+
+    def identity(binding):
+        (entry,) = binding["seats"]
+        return BoardIdentity(
+            policy="all-reviewers", primary=None, broad_rules=normalize_broad_rules(None),
+            seats=(BoardSeat("sol", entry["backend"], tuple(entry["model_chain"]), None),),
+        )
+
+    old, new = identity(old_binding), identity(new_binding)
+    payload = board_change_link_payload(
+        pr_number=7, root=old, predecessor=old.digest, old_board=old, new_board=new,
+        old_seat_binding=old_binding if recorded_old is _NO_OVERRIDE_1376 else recorded_old,
+        binding_init={}, anchor_round=effective_round - 1, advance=True,
+    )
+    assert payload["new_seat_binding"] == new_binding
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": user_id},
+        "body": str(render_board_change_link(payload)),
+    }
+
+
+@pytest.mark.parametrize("history", [
+    "governing-board", "tampered", "foreign-link", "tampered-old-binding", "null-old-binding",
+    "ordinary-ancestor", "ordinary-ancestor-tampered",
+])
+def test_m1376_historical_recovery_review_uses_the_board_that_governed_it(tmp_path, history):
+    """Row pr-managed-ci-historical-binding: board A history, a link to board B.
+
+    The blocking review of the rejected-coder recovery (and, with an ordinary
+    continuity ancestor, that ancestor's round records) were bound to board A;
+    a later board-change link rebound the seat to board B.  Historical records
+    are validated against the binding of the lineage element that governed
+    them, never the current board; current-board checks use B.  A tampered
+    historical binding, a link that misstates or nulls its previous binding,
+    or a link no orchestrator wrote fails closed.
+    """
+    board_a = {"version": 1, "seats": [
+        {"id": "sol", "backend": "codex", "model_chain": ["gpt-a"], "effort": None},
+    ]}
+    board_b = {"version": 1, "seats": [
+        {"id": "sol", "backend": "codex", "model_chain": ["gpt-b"], "effort": None},
+    ]}
+    tampered = {"version": 1, "seats": [
+        {"id": "sol", "backend": "codex", "model_chain": ["gpt-z"], "effort": None},
+    ]}
+    ancestor = history.startswith("ordinary-ancestor")
+    chain, round_number = _recovery_chain_1367(
+        continuity_root=ancestor,
+        seat_binding=tampered if history == "tampered" else board_a,
+    )
+    # Every round record of the named board carries its seat binding.
+    rebinds = [
+        ("first-dispatch", 51, _dispatch_meta_1367(round_number, attempt=1, head=_H0_1367)),
+        ("rejected", 52, _rejected_meta_1367(round_number)),
+        ("dispatch", 61, _dispatch_meta_1367(round_number)),
+        ("coder", 62, _coder_meta_1367(round_number + 1)),
+    ]
+    if ancestor:
+        rebinds += [
+            ("origin-review", 31, _review_meta_1367(subject=_ORIGIN_1367)),
+            ("origin-coder", 32, _coder_meta_1367(2, _H0_1367)),
+        ]
+    for key, comment_id, metadata in rebinds:
+        binding = tampered if (history, key) == ("ordinary-ancestor-tampered", "origin-review") else board_a
+        chain[key] = _meta_comment_1367(comment_id, replace(metadata, seat_binding=binding))
+    # The board change came after the recovery: those rounds stay under A.
+    link_kwargs = {}
+    if history == "foreign-link":
+        link_kwargs = {"login": "mallory", "user_id": 9}
+    elif history == "tampered-old-binding":
+        link_kwargs = {"recorded_old": tampered}
+    elif history == "null-old-binding":
+        link_kwargs = {"recorded_old": None}
+    chain["link"] = _board_link_comment_1376(
+        66, board_a, board_b, effective_round=round_number + 2, **link_kwargs,
+    )
+    config = _config_1367(tmp_path, pr_seat_binding_override=board_b)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain)
+    published = _runner_1367(_published_chain_1367(chain))
+    if history in {"governing-board", "ordinary-ancestor"}:
+        assert _correlate_1367(runner, config, handoff, round_number=round_number) == _RECOVERY_IDS_1367
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+        assert _authorization_posts_1367(runner) == 1
+        audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+        assert audit is not None and audit[0] == 70
+        _plan_binding_1367(published, config)
+        return
+    if not history.startswith("ordinary-ancestor"):
+        with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+            _correlate_1367(runner, config, handoff, round_number=round_number)
+    assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config)
+
+
 def test_m1367_earlier_dispatch_records_are_not_recovery_candidates(tmp_path):
     """Row recovery-link-mismatch: only this dispatch's records are counted.
 
@@ -14980,3 +15093,259 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
     assert not any(kind == "merge" for kind, _payload in events)
     assert runner.rest_pr["draft"] is True
+
+
+def _m1376_seat_config(tmp_path, model, **overrides):
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    workdir = tmp_path / "sol"
+    workdir.mkdir(exist_ok=True)
+    seat = SeatAgent(ReviewerSeat("sol", "codex", (model,), "medium"), workdir)
+    return make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=(seat,), reviewer_seats=(seat,),
+        max_rounds=8, **overrides,
+    )
+
+
+def _m1376_review(model, **kwargs):
+    return structured_pr_review(reviewer=f"sol (OpenAI Codex: {model})", **kwargs)
+
+
+def _m1376_rebind_review(runner, comment_id, binding):
+    """Rewrite one historical reviewer record's seat binding in both comment views."""
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        decode_mapping,
+        encode_mapping,
+    )
+
+    (comment,) = [c for c in runner.intent_comments if c["id"] == comment_id]
+    original = comment["body"]
+    match = list(ROUND_RESUME_MARKER_RE.finditer(original))[-1]
+    payload = dict(decode_mapping(match.group("payload")))
+    payload["seat_binding"] = binding
+    body = original[: match.start("payload")] + encode_mapping(payload) + original[match.end("payload"):]
+    comment["body"] = body
+    for mirrored in runner.pr_payload["comments"]:
+        if mirrored["body"] == original:
+            mirrored["body"] = body
+
+
+_PLAN_1376 = "5e1f6a0c2b9d4e77"
+
+
+def _m1376_plan_bound(monkeypatch):
+    """Bind every run to an approved plan on issue 643, so fresh qualification
+    walks the PR-side authorization chain itself (#966 binding path)."""
+    from coding_review_agent_loop.github import IssueContext
+    from coding_review_agent_loop.round_state import ApprovedPlanContext
+
+    issue = IssueContext(
+        number=643, repo="OWNER/REPO", title="t", body="b", url=None, comments=(),
+    )
+    plan = ApprovedPlanContext(
+        canonical_text="plan", plan_hash=_PLAN_1376, plan_subject="subject",
+        availability="available",
+    )
+    monkeypatch.setattr(orchestrator, "get_issue_context", lambda *a, **k: issue)
+    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", lambda *a, **k: plan)
+    walks = []
+    real_verify = orchestrator.verify_managed_pr_plan_binding
+
+    def verify(*args, **kwargs):
+        walks.append(kwargs["live_head"])
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "verify_managed_pr_plan_binding", verify)
+    return {"issue_context": issue, "approved_plan_context": plan}, walks
+
+
+@pytest.mark.parametrize("history", ["governing-board", "tampered-before-rerun",
+                                     "tampered-before-qualification"])
+def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_transition(
+    tmp_path, monkeypatch, history,
+):
+    """Item-9.s6 (row pr-managed-ci-historical-binding), driven by run_pr_loop.
+
+    Under board A (seat ``sol`` on gpt-a) a rejected follow-up is recovered
+    through a fresh grant and continuity H1 -> H2.  The operator then moves
+    ``sol`` to gpt-b: one board-change link is posted, and the rebound seat
+    reviews H2 afresh and blocks.  The coder pushes H3, and publishing
+    continuity H2 -> H3 re-authenticates the whole authorization chain, whose
+    ancestors and rejected-recovery review were recorded under A.  The new
+    seat approves H3, and managed CI qualifies it under B.
+    The plan-bound fresh qualification snapshot itself walks that chain.
+    When the historical review is rewritten to carry B's binding (the current
+    board, not the one that governed it) before the rerun, it fails closed
+    before any agent or post; rewritten after the final approval, the fresh
+    qualification snapshot refuses before any dispatch, qualification or
+    merge.
+    """
+    config_a = _m1376_seat_config(tmp_path, "gpt-a")
+    runner = _RecoveryRoundCommentRunner1367(
+        issue_events=[label_event()], authenticated_actor=("agent-loop", 1),
+    )
+    runner.pr_payload.update({
+        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "baseRefName": "main", "body": runner.rest_pr["body"],
+    })
+    root = publish_issue_created_authorization(
+        runner, config=config_a,
+        handoff=replace(
+            _authorization_handoff(), opening_override_nonce="nonce-643",
+            approved_plan_hash=_PLAN_1376,
+        ),
+        metadata=metadata(), approved_plan_hash=_PLAN_1376,
+    )
+    events = []
+    handoff_box = [root, False]
+    _pr_loop_stubs_1367(monkeypatch, handoff_box, events)
+    plan_bound, walks = _m1376_plan_bound(monkeypatch)
+    runner.codex_outputs = [_m1376_review(
+        "gpt-a", state="blocking", summary="Needs a test.", blocking_items=["Add a regression test."],
+    )]
+    runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367]
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        orchestrator.run_pr_loop(
+            runner, pr_number=7, config=config_a, managed_ci_handoff=root,
+            managed_ci_issue_number=643, **plan_bound,
+        )
+    stranded = runner.pr_payload["headRefOid"]
+    runner.rest_pr["head"]["sha"] = stranded
+    runner.compare_payload = {
+        "status": "ahead", "base_commit": {"sha": "abc123"},
+        "merge_base_commit": {"sha": "abc123"},
+    }
+    fresh = authorize_fresh_issue_created_resume(
+        runner, config=config_a, pr_number=7, issue_number=643,
+        metadata=replace(
+            metadata(), head_branch="agent-loop/managed-643", head_sha=stranded,
+            body=runner.rest_pr["body"],
+        ),
+        approved_plan_hash=_PLAN_1376,
+    )
+    handoff_box[:] = [fresh, True]
+    runner.codex_outputs = [_m1376_review(
+        "gpt-a", state="approved", summary="Resolved.",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )]
+    runner.claude_outputs = [_VALID_FOLLOWUP_1367]
+    with pytest.raises(_ReviewReached):
+        orchestrator.run_pr_loop(
+            runner, pr_number=7, config=config_a, managed_ci_handoff=fresh,
+            managed_ci_issue_number=643, **plan_bound,
+        )
+    recovered = runner.pr_payload["headRefOid"]
+    (first_grant,) = [r for _cid, r in _authorization_records(runner) if r.kind == "continuity"]
+    assert (first_grant.predecessor_head, first_grant.head_sha) == (stranded, recovered)
+
+    # Board B: the same seat on another model.  The rebound seat reviews H2
+    # afresh and blocks; the coder pushes H3; the new seat approves H3.
+    config_b = _m1376_seat_config(tmp_path, "gpt-b")
+    handoff_box[:] = [fresh, False]
+    runner.codex_outputs = [
+        _m1376_review("gpt-b", state="blocking", summary="One more case.",
+                      blocking_items=["Cover the empty input."]),
+        _m1376_review("gpt-b", state="approved", summary="Covered.",
+                      prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}]),
+    ]
+    runner.claude_outputs = [structured_coder_followup(
+        summary="Covered the empty input.", addressed_items=["item-2"],
+        tests_run=["pytest tests/test_foo.py"],
+    )]
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *_a, metadata, **_k: managed_ci.ManagedCiOutcome(
+            status="passed", head_sha=metadata.head_sha,
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification",
+        lambda *_a, expected_head_sha, **_k: (
+            events.append(("manual-qualify", expected_head_sha)) or expected_head_sha
+        ),
+    )
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+
+    (review_id,) = [
+        comment["id"] for comment in runner.intent_comments
+        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        and decoded["role"] == "reviewer"
+        and comment["id"] < fresh.authorization_comment_id
+    ]
+    if history == "tampered-before-rerun":
+        _m1376_rebind_review(runner, review_id, reviewer_seat_binding(config_b))
+        commands, posted = len(runner.commands), len(runner.pr_payload["comments"])
+        # Every reader of that history -- the PR lineage at startup and the
+        # managed-CI chain checks -- judges it by the board that governed it.
+        with pytest.raises(AgentLoopError, match="differs from the board that governs it"):
+            orchestrator.run_pr_loop(
+                runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
+                managed_ci_issue_number=643, **plan_bound,
+            )
+        assert not any(
+            command[:1] in (["codex"], ["claude"]) for command, _cwd in runner.commands[commands:]
+        )
+        assert len(runner.pr_payload["comments"]) == posted
+        assert events == []
+        assert [r.kind for _cid, r in _authorization_records(runner)].count("continuity") == 1
+        return
+    if history == "tampered-before-qualification":
+        # The history is rewritten after the new seat approves the final head,
+        # so only the fresh qualification snapshot can see it.
+        current_post = orchestrator.post_pr_comment
+
+        def post_then_tamper(*args, **kwargs):
+            result = current_post(*args, **kwargs)
+            body = str(kwargs.get("body") or "")
+            if body.startswith("**Review verdict:** Approved") and "Covered." in body:
+                _m1376_rebind_review(runner, review_id, reviewer_seat_binding(config_b))
+            return result
+
+        monkeypatch.setattr(orchestrator, "post_pr_comment", post_then_tamper)
+        with pytest.raises(AgentLoopError, match="No qualification or merge is permitted"):
+            orchestrator.run_pr_loop(
+                runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
+                managed_ci_issue_number=643, **plan_bound,
+            )
+        # The approval exists, but nothing was dispatched, qualified or merged.
+        assert events == []
+        assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
+        return
+    assert orchestrator.run_pr_loop(
+        runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
+        managed_ci_issue_number=643, **plan_bound,
+    ) == 0
+    links = [c["body"] for c in runner.pr_payload["comments"]
+             if c["body"].startswith("Reviewer board change recorded.")]
+    assert len(links) == 1
+    final = runner.pr_payload["headRefOid"]
+    assert final not in {"abc123", stranded, recovered}
+    continuity = [(cid, r) for cid, r in _authorization_records(runner) if r.kind == "continuity"]
+    assert [(r.predecessor_head, r.head_sha) for _cid, r in continuity] == [
+        (stranded, recovered), (recovered, final),
+    ]
+    # The H2 -> H3 grant chains to the grant authenticated under board A.
+    assert continuity[1][1].predecessor_comment_id == continuity[0][0]
+    # Managed CI qualified exactly the final head; this unprotected PR then
+    # needs a manual merge, so no merge command runs.
+    assert events == [("qualify", final), ("manual-qualify", final)]
+    # The loop's own fresh qualification snapshot walked the plan-bound chain
+    # from the final head back to the root with B as the current board: the
+    # recovery link's review and every ancestor recorded under A validated
+    # against A, the board that governed them.
+    assert walks[-1] == final
+    # An ordinary resume at the final head re-reads the lineage and the whole
+    # chain, reuses the exact-head approval under B, posts no second link and
+    # qualifies the same head again.
+    commands = len(runner.commands)
+    events.clear()
+    assert orchestrator.run_pr_loop(
+        runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
+        managed_ci_issue_number=643, **plan_bound,
+    ) == 0
+    assert not any(command[:1] in (["codex"], ["claude"]) for command, _cwd in runner.commands[commands:])
+    assert len([c for c in runner.pr_payload["comments"]
+                if c["body"].startswith("Reviewer board change recorded.")]) == 1
+    assert events == [("qualify", final), ("manual-qualify", final)]

@@ -417,11 +417,19 @@ def test_invalid_signed_pr_lineage_keeps_the_retained_label_without_a_floor(
     assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]
 
 
-@pytest.mark.parametrize("floor", [{}, {"min_reviewers": 2}], ids=["no-floor", "floor"])
+@pytest.mark.parametrize(
+    "floor",
+    [{"min_reviewers": 3}, {"min_reviewers": 3, "min_distinct_providers": 2}],
+    ids=["reviewer-floor", "both-floors"],
+)
 def test_staged_malformed_history_with_a_signed_amendment_writes_nothing(
     tmp_path, monkeypatch, floor
 ):
-    """item-3: a primary-then-panel PR never swallows undecodable history."""
+    """item-3: a primary-then-panel PR never swallows undecodable history.
+
+    An unsigned reduction at or above the floor is a recorded board change
+    (#1376), so the floor here makes the reduction need the signed record.
+    """
     import base64
     import os
 
@@ -681,16 +689,20 @@ def test_persisted_seat_binding_drift_never_authorizes_the_floor_or_writes(tmp_p
     )
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **board)) == 0
     assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
-    # opus stays a seat ID but moves from Antigravity to Codex.
+    # opus stays a seat ID but moves from Antigravity to Codex.  The swap is an
+    # unsigned board change (#1376): the signed removal never lowered the
+    # provider count, so it cannot authorize the provider floor the swap breaks.
     opus = _seat(tmp_path, "opus", "codex", "gpt-b")
-    drifted = dict(board, reviewer=("codex", "gemini", board["reviewer"][2], opus),
-                   reviewer_seats=(board["reviewer_seats"][0], opus))
+    drifted = dict(board, reviewer=("codex", "gemini", opus), reviewer_seats=(opus,))
     comments_before = len(runner.comments)
     commands_before = len(runner.commands)
     releases = _watch_retained_label(monkeypatch)
-    with pytest.raises(AgentLoopError, match="backend"):
-        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **drifted, min_reviewers=4),
-                    workdirs_ready=True)
+    with pytest.raises(AgentLoopError, match="2 distinct provider\\(s\\) is below the floor of 3"):
+        run_pr_loop(
+            runner, pr_number=77,
+            config=make_config(tmp_path, **drifted, min_distinct_providers=3),
+            workdirs_ready=True,
+        )
     assert releases == []
     assert len(runner.comments) == comments_before
     assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]

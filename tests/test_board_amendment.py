@@ -1539,3 +1539,115 @@ def test_plan_board_hint_only_when_a_pr_amendment_explains_the_reduced_flags():
     assert hint([], pr_number=77, supplied_reviewers=("codex", "claude")) == ""
     # A record naming another PR is undecodable for this surface: no hint.
     assert hint(comments, pr_number=78, supplied_reviewers=("codex", "claude")) == ""
+
+
+# --- Historical chains keep their digests, audit text and lineage (#1376) ----------
+
+
+def test_historical_signed_chain_digests_and_audit_text_are_pinned():
+    """Row signed-amendment-regression: recorded board changes change nothing here."""
+    from coding_review_agent_loop.board_amendment import (
+        amendment_summary_line,
+        render_amendment_audit_comment,
+    )
+
+    comments = _remove_restore_comments()
+    amendments = _plan_amendments(comments)
+    assert [record.digest for record in amendments] == [
+        "da8ce775cd5aac3b05a903e88bf5bbc7bb61a32342c449a09614c50768740774",
+        "df286cfcc8624ea87771e658176bb1689dafdb3feb98c8ab5de0e75ba83edccc",
+    ]
+    d1, d2 = (record.digest for record in amendments)
+    lineage = _resolve(
+        [_checkpoint(0, 1, C0), _checkpoint(2, 2, C1, digest=d1), _checkpoint(5, 4, C0, digest=d2)],
+        amendments,
+        C0,
+    )
+    assert render_amendment_audit_comment(lineage, start_round_number=4, reassignments=()) == (
+        "Reviewer board amendment applied.\n\n"
+        "- Signed record: issue #942 comment 5 (digest "
+        "`df286cfcc8624ea87771e658176bb1689dafdb3feb98c8ab5de0e75ba83edccc`)\n"
+        "- Activation round: 4\n"
+        "- Removed reviewer(s): none (backend-recovered)\n"
+        "- Restored reviewer(s): Antigravity; required again from the restoration round and "
+        "must re-approve the current artifact (earlier approvals do not count). Findings "
+        "reassigned while removed stay reassigned and are not re-opened.\n"
+        "- Original board: Codex, Claude, Antigravity\n"
+        "- Required board now: Codex, Claude, Antigravity\n"
+        "- Reassigned findings: none\n\n"
+        "-- Orchestrator"
+    )
+    assert amendment_summary_line(lineage) == (
+        "Reviewer board amended from round 4 by signed record df286cfcc8624ea8: restored "
+        "Antigravity (from round 4, must re-approve) (backend-recovered); required board now "
+        "Codex, Claude, Antigravity; reassigned findings none."
+    )
+    pr_body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=77,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=2,
+        rationale="Antigravity quota exhausted.",
+    )
+    (pr_record,) = collect_reviewer_board_amendments(
+        [_comment(pr_body)], flow="pr", pr_number=77
+    )
+    assert pr_record.digest == "f556ffd35ccd6fbbcdfea2ebb09f24789c0ae4c890b2bd8567724c05ef846cea"
+
+
+def test_pr_board_lineage_resolves_signed_only_history_exactly_as_before():
+    """Row signed-amendment-regression: the unified PR resolver over legacy history."""
+    from coding_review_agent_loop.board_change import resolve_board_lineage
+    from coding_review_agent_loop.pr_loop_support import _scheduler_contract_from_metadata
+    from coding_review_agent_loop.review_scheduling import make_contract as make_pr_contract
+
+    original = make_pr_contract(BOARD, "primary-then-panel", None, "Codex")
+    reduced = make_pr_contract(("Codex", "Claude"), "primary-then-panel", None, "Codex")
+
+    def pr_checkpoint(index, round_number, contract, digest=None):
+        record = _checkpoint(index, round_number, original, digest)
+        return PostedRoundRecord(
+            index=index, body="",
+            metadata=PostedRoundMetadata(
+                **{**record.metadata.__dict__, "flow": "pr",
+                   "scheduler_contract": contract.as_dict()},
+            ),
+        )
+
+    body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=77, original_required_reviewers=BOARD,
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=2,
+        rationale="Antigravity quota exhausted.",
+    )
+    comments = [_comment("x"), _comment(body), _comment("x"), _comment("x")]
+    amendments = collect_reviewer_board_amendments(comments, flow="pr", pr_number=77)
+    (digest,) = (record.digest for record in amendments)
+    records = [pr_checkpoint(0, 1, original), pr_checkpoint(3, 2, reduced, digest)]
+    old = resolve_contract_lineage(
+        records, amendments, original, accept_base_configured=True,
+        contract_from_metadata=_scheduler_contract_from_metadata, drift_error=_drift,
+    )
+    new = resolve_board_lineage(
+        records, comments, amendments=amendments,
+        configured=_pr_identity(original), pr_number=77, trusted_actor=None,
+        contract_from_metadata=_scheduler_contract_from_metadata, drift_error=_drift,
+    )
+    assert new.contracts == old.contracts
+    assert new.amendments == old.amendments
+    assert new.pending_amendments == old.pending_amendments == ()
+    assert new.current_board == old.current_board == ("Codex", "Claude")
+    assert new.restoration_rounds == old.restoration_rounds
+    assert new.removed_reviewers == old.removed_reviewers == ("Antigravity",)
+
+
+def _pr_identity(contract):
+    from coding_review_agent_loop.board_change import BoardIdentity
+    from coding_review_agent_loop.reviewer_floor import BoardSeat
+
+    backends = {"Codex": "codex", "Claude": "claude", "Antigravity": "antigravity"}
+    return BoardIdentity(
+        policy=contract.policy, primary=contract.primary_reviewer,
+        broad_rules=contract.broad_rules,
+        seats=tuple(BoardSeat(name, backends[name]) for name in contract.required_reviewers),
+    )
