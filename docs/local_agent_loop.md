@@ -399,13 +399,12 @@ PRs where only restoring the backend works. When the board cannot be reduced
 evidence pass is repeated in full on rerun. The PR comment never contains the
 amendment JSON.
 
-In planning, a persisted scheduler contract (the required reviewer board, the
-policy, and the primary) is immutable for the run. If one reviewer's backend
-becomes unavailable, for example because its quota is exhausted, rerunning
-without that reviewer stops with the contract-drift error. On a PR, rerunning
-without the reviewer is a recorded board change (#1376) unless it takes the
-board below `--min-reviewers` or `--min-distinct-providers`. Both refusals print
-a filled-in **signed reviewer-board amendment** record. A human operator posts it
+If one reviewer's backend becomes unavailable, for example because its quota is
+exhausted, rerunning without that reviewer is a recorded board change, on a PR
+(#1376) and in planning (#1377), unless it takes the board below
+`--min-reviewers` or `--min-distinct-providers`. The planning policy stays
+immutable for the run. A below-floor refusal prints a filled-in **signed
+reviewer-board amendment** record. A human operator posts it
 to record a deliberate, audited reduction of the board:
 
 ````markdown
@@ -453,11 +452,10 @@ Reviewer board amendment:
   automatic force-full latch. The reduced board is also accepted, except on an
   issue-created strict managed-CI PR, where the approved plan is re-verified
   against the flags you supply and the original board is required. Planning
-  reruns use the reduced board. In planning, any other board fails closed with
-  the contract-drift error; if you posted a record and still see drift, the
-  record was not recognized, so look for an ignored-record diagnostic in the log.
-  On a PR, a different board stops while the signed record is still pending,
-  and becomes a recorded board change once the record has taken effect.
+  reruns use the reduced board. A different board stops while the signed record
+  is still pending, and becomes a recorded board change once the record has
+  taken effect. If you posted a record and still see a refusal, the record was
+  not recognized, so look for an ignored-record diagnostic in the log.
 - **Record format.** Line endings may be LF or CRLF (a lone CR is not
   supported). A comment that consists only of one fenced block naming the
   record kind but not written as a ```` ```json ```` fence is reported as an ignored
@@ -475,9 +473,9 @@ Reviewer board amendment:
   reused, and the removed reviewer is never invoked again.
 - **What stays immutable.** `policy` and `primary_reviewer` must match the
   persisted contract. The primary cannot be removed, and a `primary-then-panel`
-  board must keep at least one secondary. In planning, re-adding a removed
-  reviewer by changing the reviewer flags alone is contract drift; restore it
-  with a signed record instead (see below). On a PR it is a recorded board change. Every scheduler record posted after the amendment carries the
+  board must keep at least one secondary. Re-adding a removed reviewer by
+  changing the reviewer flags alone is a recorded board change, on a PR and in
+  planning; a signed restoration (see below) also works. Every scheduler record posted after the amendment carries the
   amended board and the record's digest; any other contract fails closed, and
   at PR qualification it refuses the merge. Amendments can chain, with each
   record's `original_required_reviewers` equal to the previous amended board.
@@ -683,13 +681,59 @@ reviewers, the round the change takes effect from, and the reason
 - **What stays fixed.** Changing `--pr-review-policy` or the broad-path rules is
   still contract drift. Board-change records are accepted only from the
   orchestrator's own GitHub account; any other comment carrying one stops the run
-  and the qualification gate. Planning boards keep the signed-amendment-only
-  rules until stage 3 of #1373.
+  and the qualification gate. Planning boards change the same way; see
+  [Changing the plan reviewer board mid-run](#changing-the-plan-reviewer-board-mid-run).
 - **History from older versions.** A PR whose history predates board-change
   records needs nothing. The first run under this version records the board
   identity on its round records and posts a record only for a real change. For
   plain boards, models were never recorded, so the first run adopts the
   configured models; later model changes are recorded.
+
+### Changing the plan reviewer board mid-run
+
+Plan review (`agent-loop issue N --plan-first`) chooses its board per
+invocation too, under every planning policy, including the default
+`all-reviewers` policy (#1377). Rerun with a different board: add a
+`--reviewer`, drop one, swap a named seat to another backend, change its
+`--seat-model` or `--seat-effort`, or change the primary plan reviewer. When the
+board differs from the plan's current board, the orchestrator posts one **plan
+board-change record** on the issue before any agent runs, and continues. No
+signature is needed. A rerun with the same board posts nothing new.
+
+- **Approved plans are never reopened.** If the current plan is already
+  completely approved, a rerun with a different board, or with different
+  planning flags, posts no record and runs no planner or plan reviewer. An
+  implementation run then uses your board as the PR board, under the handoff
+  board rule. Approval is judged from the plan's history alone. Old plain
+  `all-reviewers` history without an implementation handoff for the current
+  plan cannot prove completion, so it resumes as before.
+- **Approvals.** Added and rebound reviewers, and a reviewer whose role
+  changed, must approve the current plan revision; their earlier approvals do
+  not count. Removed reviewers' approvals stop counting.
+- **Findings.** A removed reviewer's unresolved findings stay open, reassigned
+  to the primary or to every remaining reviewer. Settled findings stay settled.
+- **Rounds.** The change takes effect from the round after the latest recorded
+  plan round. That round is a reviewer-only round on the unchanged plan. A
+  record posted just before a crash is picked up by the next run, which never
+  posts it again.
+- **Primary changes.** Under `primary-then-panel`, a new primary plan reviewer
+  restarts the primary-only phase on the current plan. The old primary's
+  blocking reviews do not count towards `--plan-primary-stall-rounds`, and
+  open secondary findings keep their owners until the panel reopens.
+- **The floor.** With `--min-reviewers` or `--min-distinct-providers`, the plan
+  board is checked before the record is posted and at every planning round. A
+  board below the floor is refused before any agent runs or comment is posted.
+  The error prints a filled-in signed plan amendment, and posting it
+  authorizes the reduction.
+- **What stays fixed.** Changing `--plan-review-policy` is still contract drift.
+  Plan board-change records are accepted only from the orchestrator's own
+  GitHub account. The approved plan is verified against the board that
+  approved it, after any recorded changes, at the issue-to-PR handoff, in
+  managed-CI recovery and at strict qualification.
+- **Requirement evidence.** Plan review records now store the exact plan key
+  under every planning policy, as evidence that an approval covered the
+  current signed requirements. Default full-board planning does not use it to
+  choose reviewers.
 
 ### Sub-items for conjunctive review findings
 
@@ -3660,11 +3704,12 @@ later rounds, so a class-B fallback costs one round and then the run advances on
 its next exact-plan primary approval instead of repeating the primary-only turn
 until `--max-rounds` is exhausted.
 
-The persisted planning scheduler contract is immutable for the run, and that is
-checked under **both** policies. Restarting an issue that already carries a
-staged planning contract with the compatibility default, with a different
-primary, or with a different reviewer board stops with an actionable message
-naming the persisted contract instead of silently continuing on a different one.
+The persisted planning policy is immutable for the run, and that is checked
+under **both** policies. Restarting an issue that already carries a staged
+planning contract with the compatibility default stops with an actionable
+message naming the persisted contract instead of silently continuing on a
+different one. A different primary or reviewer board is a recorded plan board
+change instead (#1377), unless the plan is already completely approved.
 
 The run stops with a plain `Plan review scheduling diagnostic` comment, and no
 reviewer and no planner turn, in exactly four cases: an active plan finding

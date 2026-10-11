@@ -364,6 +364,9 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         # Orchestrator-only PR reviewer-board change link (#1376).  Agent text
         # naming it is neutralized; only the orchestrator's record path writes it.
         _b64_definition("AGENT_PR_BOARD_CHANGE", surfaces=frozenset({PR_COMMENT_SURFACE})),
+        # Orchestrator-only plan reviewer-board change link (#1377), posted on
+        # the issue that owns the plan; same admission rule as the PR link.
+        _b64_definition("AGENT_PLAN_BOARD_CHANGE", surfaces=frozenset({ISSUE_COMMENT_SURFACE})),
         # Cross-surface workflow transaction record (#827).  Prepared and
         # terminal records live only in trusted PR comments.
         MarkerDefinition(

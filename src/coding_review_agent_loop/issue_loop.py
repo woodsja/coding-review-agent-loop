@@ -226,8 +226,23 @@ def run_issue_loop(
         from .reviewer_floor import board_floor_enabled
         if board_floor_enabled(config):
             plan_owner = _issue_floor_plan_owner(runner, config=config, issue_number=issue_number)
+            # A plan-first run on its own plan resolves the plan board when the
+            # plan is not provably approved (#1377), judged with the same
+            # read-only approval inputs the plan loop and recovery use.
+            from .plan_verification import build_plan_approval_inputs
+
+            planning = plan_first and plan_owner.number == issue_number
             enforce_issue_board_floor(
-                config, plan_owner.comments, issue_number=plan_owner.number,
+                config,
+                plan_owner.comments,
+                issue_number=plan_owner.number,
+                runner=runner,
+                human_requirements=plan_owner.human_requirements,
+                planning=planning,
+                inputs=(
+                    build_plan_approval_inputs(runner, config=config, issue_context=plan_owner)
+                    if planning else None
+                ),
             )
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)

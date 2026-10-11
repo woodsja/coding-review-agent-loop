@@ -2488,6 +2488,8 @@ def _merge_transport_comments(
         "AGENT_PLAN_VALIDATION_DIAGNOSTIC",
         "AGENT_LOOP_META",
         "AGENT_LOOP_SIDECAR",
+        # Plan board-change links (#1377) are lineage elements too.
+        "AGENT_PLAN_BOARD_CHANGE",
     )
     for transport in transport_comments:
         if (

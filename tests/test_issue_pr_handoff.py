@@ -25,7 +25,7 @@ from coding_review_agent_loop.issue_pr_handoff import (
     format_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
 )
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import FakeRunner, make_config, structured_plan_state
 
 
 def _staged_plan_checkpoint(binding, names, primary, round_number=1):
@@ -324,6 +324,8 @@ def _named_plan_comments(approved, plan_config, *, removed=(), restored=False, i
         _attach_round_metadata(approved.canonical_text, PostedRoundMetadata(
             flow="plan", role="coder", agent="Claude", round_number=1,
             subject="plan", canonical_plan=approved.canonical_text, seat_binding=binding,
+            # Versioned dispositions (empty): a keyless approval needs them (#1377).
+            raw_structured_coder_response=structured_plan_state(),
         )),
         checkpoint(1, board),
     ]
@@ -610,7 +612,12 @@ def test_unamended_plan_board_gets_no_floor_exception(tmp_path, floor, message):
     assert _agent_commands(runner) == []
 
 
-def _plain_plan_comments(plan, approvals):
+def _plain_plan_comments(plan, approvals, *, versioned=True, change_digest=None):
+    """A legacy keyless plan history; ``versioned`` keeps the structured coder response.
+
+    ``change_digest`` forges a board-change digest onto every reviewer record
+    of the otherwise rootless history.
+    """
     from coding_review_agent_loop.round_state import (
         PostedRoundMetadata, _attach_round_metadata, _plan_subject,
     )
@@ -618,12 +625,13 @@ def _plain_plan_comments(plan, approvals):
     subject = _plan_subject(plan)
     bodies = [_attach_round_metadata(plan, PostedRoundMetadata(
         flow="plan", role="coder", agent="Claude", round_number=1, subject=subject,
-        canonical_plan=plan, raw_structured_coder_response=plan,
+        canonical_plan=plan,
+        raw_structured_coder_response=structured_plan_state() if versioned else plan,
     ))]
     for agent, state in approvals:
         bodies.append(_attach_round_metadata(f"{state}.", PostedRoundMetadata(
             flow="plan", role="reviewer", agent=agent, round_number=1,
-            subject=subject, state=state,
+            subject=subject, state=state, reviewer_board_change_digest=change_digest,
         )))
     return [
         {"author": {"login": "coding-review-agent-loop"},
@@ -672,6 +680,117 @@ def test_strict_qualification_verifies_the_plan_against_its_own_board(tmp_path):
         _strict_verify(
             tmp_path, approved_by_a, pr_reviewers=("claude",), expected_hash="0" * 16,
         )
+
+
+def test_unversioned_keyless_plan_is_never_recovered_even_without_requirements(tmp_path):
+    """Item-10: an empty requirement set still needs a versioned disposition set."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import IssueContext as Issue
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    plan = "Approved plan.\n\n### Plan steps\n1. Keep plan identity bound."
+    approvals = (("Codex", "approved"), ("Gemini", "approved"))
+
+    def classify(comments):
+        issue = Issue(959, "OWNER/REPO", "t", "b", None, tuple(
+            IssueComment(author="agent-loop", created_at=c["createdAt"], body=c["body"])
+            for c in comments
+        ))
+        return classify_plan_approval(
+            issue.comments, config=make_config(tmp_path, reviewer=("claude",)),
+            issue_number=959, human_requirements=(), poster_completion_proven=True,
+            execution_mode_guard=False,
+        )
+
+    versioned = _plain_plan_comments(plan, approvals)
+    assert classify(versioned).state == "approved"
+    _strict_verify(tmp_path, versioned, pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan))
+    unversioned = _plain_plan_comments(plan, approvals, versioned=False)
+    result = classify(unversioned)
+    assert result.state == "undetermined"
+    assert "requirement binding is unproven" in result.reason
+    with pytest.raises(AgentLoopError, match="requirement binding is unproven"):
+        _strict_verify(
+            tmp_path, unversioned, pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan),
+        )
+    # Managed-CI fresh authorization without a handoff refuses before any agent.
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    runner = FakeRunner(
+        issue_comments=_plain_plan_comments(plan, (("Codex", "approved"),), versioned=False),
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    with pytest.raises(AgentLoopError, match="requirement binding is unproven"):
+        run_pr_loop(runner, pr_number=77, config=make_config(
+            tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+            managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+            reviewer=("claude", "gemini"), managed_ci_fresh_authorization=True,
+            managed_ci_issue_number=56,
+        ))
+    assert _agent_commands(runner) == []
+
+
+@pytest.mark.parametrize("entry", ["fresh", "ordinary", "strict"])
+def test_rootless_plan_change_digest_never_verifies_on_legacy_paths(tmp_path, monkeypatch, entry):
+    """Item-15: a board-change digest without a plan root or link fails closed at
+    managed-CI fresh authorization, ordinary recovery and strict qualification."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    plan = "Approved plan.\n\n### Plan steps\n1. Keep plan identity bound."
+    forged = _plain_plan_comments(
+        plan, (("Codex", "approved"), ("Gemini", "approved")), change_digest="ab" * 32,
+    )
+    refusal = "board-change digest, but the issue has neither a plan board root"
+    if entry == "strict":
+        # Without the forged digest the same history verifies.
+        _strict_verify(
+            tmp_path, _plain_plan_comments(plan, (("Codex", "approved"), ("Gemini", "approved"))),
+            pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan),
+        )
+        with pytest.raises(AgentLoopError, match=refusal):
+            _strict_verify(
+                tmp_path, forged, pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan),
+            )
+        return
+    managed = dict(
+        managed_ci=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("claude", "gemini"),
+    )
+    reached = []
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume",
+        lambda *_a, **_k: reached.append("fresh") or (_ for _ in ()).throw(_ScopeCaptured()),
+    )
+    if entry == "fresh":
+        managed.update(managed_ci_fresh_authorization=True, managed_ci_issue_number=56)
+    else:
+        handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+            pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+            head_sha="abc123", branch="agent-loop/managed-56",
+            trusted_actor_login="agent-loop", trusted_actor_id=1,
+            protection_mode="voluntary", override_nonce="opening-nonce",
+        )
+        monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
+        monkeypatch.setattr(
+            orchestrator, "revalidate_issue_created_handoff",
+            lambda *_a, **_k: reached.append("ordinary") or (_ for _ in ()).throw(_ScopeCaptured()),
+        )
+    runner = FakeRunner(
+        issue_comments=forged,
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    with pytest.raises(AgentLoopError, match=refusal):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **managed))
+    assert reached == []
+    assert _agent_commands(runner) == []
 
 
 def test_plan_verification_context_keeps_a_primary_then_panel_plan_policy(tmp_path):
@@ -2156,7 +2275,7 @@ def _bound_plan_history(tmp_path, *, mutate):
     plan = "Approved bound plan.\n\n### Plan steps\n1. Keep bindings honest."
     subject = _plan_subject(plan)
     records = [
-        dict(role="coder", agent="Claude", canonical_plan=plan, raw_structured_coder_response=plan),
+        dict(role="coder", agent="Claude", canonical_plan=plan, raw_structured_coder_response=structured_plan_state()),
         dict(role="summary", agent="Orchestrator", scheduler_contract=make_plan_contract(
             ("a", "b"), "all-reviewers", None).as_dict()),
         dict(role="reviewer", agent="a", state="approved"),
@@ -2428,7 +2547,9 @@ def test_staged_approvals_before_a_model_transition_never_qualify(tmp_path, mode
     """item-2: an interrupted A -> B (-> A) history needs fresh approvals."""
     approved = _bound_staged_plan(tmp_path)
     _strict_verify_comments(tmp_path, approved)
-    with pytest.raises(AgentLoopError, match="not completely approved"):
+    # Stamped plan history (#1377) records a model change only as a plan board
+    # link, so an unrecorded rebind is a malformed lineage: still fail closed.
+    with pytest.raises(AgentLoopError, match="not completely approved|lineage is inconsistent"):
         _strict_verify_comments(tmp_path, _with_checkpoint_rebinds(approved, *models))
 
 
@@ -2447,11 +2568,217 @@ def test_recovery_refuses_approvals_superseded_by_a_model_round_trip(tmp_path, m
         pr_payload={"headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
                     "baseRefName": "main", "body": "Fixes #56"},
     )
-    with pytest.raises(AgentLoopError, match="complete canonical"):
+    with pytest.raises(AgentLoopError, match="complete canonical|lineage is inconsistent"):
         run_pr_loop(runner, pr_number=77, config=make_config(
             tmp_path, managed_ci=True, managed_ci_pr_mode=True,
             managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
             managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
             reviewer=("claude", "antigravity"),
         ))
+    assert _agent_commands(runner) == []
+
+
+# --- Recorded plan board changes verified at handoff, recovery and qualification (#1377)
+
+_PLAN_ACTOR = ("agent-loop", 4242)
+
+
+def _lineage_plan_comments(tmp_path):
+    """A plan whose board changed A -> B mid-plan, with an interleaved signed amendment.
+
+    A = (Codex, Gemini) reviews round 1; a recorded link adds Antigravity for
+    round 2; a signed plan amendment then removes Gemini; B = (Codex,
+    Antigravity) approves the unchanged plan in round 3.
+    """
+    import datetime
+
+    from agent_loop_helpers import structured_plan_review, structured_v1_plan_state
+    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
+    from coding_review_agent_loop.cli import run_issue_loop
+
+    plan_dir = tmp_path / "lineage-plan"
+    plan_dir.mkdir()
+    blocking = dict(state="blocking", summary="Missing owner.", blocking_plan_issues=["Name the owner."])
+    runner = FakeRunner(
+        authenticated_actor=_PLAN_ACTOR, serve_rest_issue_comments=True,
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(reviewer="Google Gemini", **blocking)],
+    )
+
+    def plan_config(*reviewers):
+        return make_config(
+            plan_dir, reviewer=reviewers, max_rounds=6, plan_execution_mode="plan-only",
+            agent_max_retries=0,
+        )
+
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=plan_config("codex", "gemini"), plan_first=True)
+    still_open = [{"item_id": "item-1", "disposition": "blocking"}]
+    runner.codex_outputs.append(structured_plan_review(
+        prior_plan_item_dispositions=still_open, **blocking,
+    ))
+    runner.gemini_outputs.append(structured_plan_review(
+        reviewer="Google Gemini", prior_plan_item_dispositions=still_open, **blocking,
+    ))
+    runner.antigravity_outputs.append(structured_plan_review(
+        reviewer="Google Antigravity", prior_plan_item_dispositions=still_open, **blocking,
+    ))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56, config=plan_config("codex", "gemini", "antigravity"),
+            plan_first=True,
+        )
+    runner.issue_comments.append({
+        "body": format_reviewer_board_amendment_comment(
+            flow="plan", issue=56, pr_number=None,
+            original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+            policy="all-reviewers", primary_reviewer=None,
+            removed_reviewers=("Gemini",), effective_from_round=3,
+            rationale="Gemini quota exhausted.",
+        ),
+        "author": {"login": "operator"}, "_rest_author_id": 81,
+        "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}, {"item_id": "item-2", "disposition": "resolved"}, {"item_id": "item-3", "disposition": "resolved"}, {"item_id": "item-4", "disposition": "resolved"}]
+    runner.codex_outputs.append(structured_plan_review(prior_plan_item_dispositions=resolved))
+    runner.antigravity_outputs.append(structured_plan_review(
+        reviewer="Google Antigravity", prior_plan_item_dispositions=resolved,
+    ))
+    assert run_issue_loop(
+        runner, issue_number=56, config=plan_config("codex", "antigravity"), plan_first=True,
+    ) == 0
+    return list(runner.issue_comments)
+
+
+def _lineage_strict_run(tmp_path, monkeypatch, comments, *, entry):
+    runner, config, merges, run_pr_loop = _strict_managed_pr_run(
+        tmp_path, monkeypatch, comments, entry=entry, pr_outputs=_board_b_outputs(),
+    )
+    runner.authenticated_actor = _PLAN_ACTOR
+    runner.serve_rest_issue_comments = True
+    return runner, config, merges, run_pr_loop
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_board_changed_plan_verifies_against_b_and_qualifies_a_pr_board_c(
+    tmp_path, monkeypatch, entry
+):
+    """Row plan-lineage-to-pr-verification: A -> B (+ signed amendment), approved by B, PR board C."""
+    from coding_review_agent_loop.board_change import PLAN_BOARD_CHANGE_LINK_MARKER
+    from coding_review_agent_loop.plan_verification import derive_plan_verification_context
+
+    comments = _lineage_plan_comments(tmp_path)
+    assert any(PLAN_BOARD_CHANGE_LINK_MARKER in c["body"] for c in comments)
+    context = derive_plan_verification_context(
+        [IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
+                      author_id=c.get("_rest_author_id")) for c in comments],
+        issue_number=56, trusted_actor=_PLAN_ACTOR,
+    )
+    # The approving board is B, never A or the PR board C.
+    assert context.derivation == "lineage"
+    assert context.effective_reviewers == ("Codex", "Antigravity")
+    runner, config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, comments, entry=entry,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Board C reviewed the exact head; planning was never reopened.
+    agents = [command[0] for command, _cwd in runner.commands if command[0] in _AGENT_COMMANDS]
+    assert sorted(agents) == ["agy", "claude"]
+    assert [merge["proof"].head_sha for merge in merges] == ["abc123"]
+    # The PR handoff audit record compares board C against the approving board B.
+    (audit,) = _audits(runner)
+    assert "- Added reviewer(s): Claude" in audit
+    assert "- Removed reviewer(s): Codex" in audit
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_malformed_plan_lineage_never_qualifies(tmp_path, monkeypatch, entry):
+    """Row plan-link-forged at recovery and qualification: a forged link fails closed."""
+    from coding_review_agent_loop.board_change import PLAN_BOARD_CHANGE_LINK_MARKER
+
+    comments = _lineage_plan_comments(tmp_path)
+    for comment in comments:
+        if PLAN_BOARD_CHANGE_LINK_MARKER in comment["body"]:
+            comment["_rest_author_id"] = 99
+            comment["author"] = {"login": "intruder"}
+    runner, config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, comments, entry=entry,
+    )
+    with pytest.raises(AgentLoopError, match="lineage is inconsistent|not authored"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+    assert _agent_commands(runner) == []
+
+
+def _forge_lost_plan_obligation(comments):
+    """Publish item-9 on the first Gemini review; no ledger ever carries or clears it."""
+    import dataclasses
+    import re
+
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.round_state import (
+        _attach_round_metadata, _decode_round_metadata,
+    )
+
+    lost = UnresolvedReviewItem(
+        item_id="item-9", reviewer="Gemini", source_round=1, text="Lost finding.",
+        status="blocking",
+    )
+    for comment in comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if metadata.flow == "plan" and metadata.role == "reviewer" and metadata.agent == "Gemini":
+            body = comment["body"][: match.start()].rstrip("\n")
+            comment["body"] = _attach_round_metadata(
+                body, dataclasses.replace(metadata, new_items=(*metadata.new_items, lost)),
+            )
+            return
+    raise AssertionError("no Gemini plan review")
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+@pytest.mark.parametrize("defect", ["added-requirement", "lost-obligation"])
+def test_managed_ci_recovery_refuses_an_unbound_requirement_and_a_lost_obligation(
+    tmp_path, monkeypatch, entry, defect
+):
+    """Row plan-approval-gate-live-inputs through managed-CI recovery and strict
+    qualification: the shared predicate refuses before any reviewer or merge."""
+    import dataclasses
+
+    import coding_review_agent_loop.pr_loop as pr_loop
+    import coding_review_agent_loop.pr_loop_support as pr_loop_support
+    from coding_review_agent_loop.github import HumanReviewRequirement
+
+    comments = _lineage_plan_comments(tmp_path)
+    if defect == "added-requirement":
+        added = HumanReviewRequirement(
+            source_type="issue_comment", author="operator", created_at="2026-05-23T01:00:00Z",
+            url=None, body="Keep the rollout reversible.",
+        )
+        for module in (pr_loop, pr_loop_support):
+            real = module.get_issue_context
+
+            def with_requirement(*args, _real=real, **kwargs):
+                context = _real(*args, **kwargs)
+                if context.number != 56:
+                    return context
+                return dataclasses.replace(context, human_requirements=(added,))
+
+            monkeypatch.setattr(module, "get_issue_context", with_requirement)
+    else:
+        _forge_lost_plan_obligation(comments)
+    runner, config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, comments, entry=entry,
+    )
+    reason = {
+        # The plan never dispositioned the new requirement (the coder gate).
+        "added-requirement": "lacks complete requirement dispositions",
+        "lost-obligation": "unreconstructible plan obligation\\(s\\) item-9",
+    }[defect]
+    with pytest.raises(AgentLoopError, match=reason):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
     assert _agent_commands(runner) == []

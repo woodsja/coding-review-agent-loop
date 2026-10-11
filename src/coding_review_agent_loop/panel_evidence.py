@@ -719,6 +719,7 @@ def _carried_plan_approvals(
     panel_evidence: PlanPanelEvidence,
     primary_reviewer: str | None,
     restoration_rounds: dict[str, int] | None = None,
+    parent_requirement_ids: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
     """Reviewers holding a qualifying exact-key approval carried from history.
 
@@ -755,6 +756,12 @@ def _carried_plan_approvals(
             # artifacts: never approvals, never ownership.
             continue
         record_key = _plan_key_from_payload(metadata.plan_candidate_key)
+        # A staged child's approval also binds the authoritative parent's
+        # signed requirement set (#1377); a record without that evidence
+        # carries only while the parent set is empty.
+        parent_bound = parent_requirement_ids is None or (
+            set(metadata.parent_requirement_ids or ()) == set(parent_requirement_ids)
+        )
         qualifies = (
             metadata.state == "approved"
             and record_key is not None
@@ -763,6 +770,7 @@ def _carried_plan_approvals(
                 not surfaced
                 or set(metadata.surfaced_reviewer_requirement_ids) == surfaced
             )
+            and parent_bound
         )
         # A later record for the same reviewer supersedes an earlier one.
         carried[metadata.agent] = bool(qualifies)
@@ -1247,6 +1255,14 @@ def _require_complete_canonical_plan_approval(
         error_message=error_message,
     )
     configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
+    # Unanimous approvals with an open carried obligation, including a removed
+    # reviewer's reassigned finding, are not a completed plan (#1377).
+    from .plan_verification import plan_open_obligations
+
+    if plan_open_obligations(
+        plan_round, board=tuple(agent_display_name(reviewer) for reviewer in reviewers(config)),
+    ):
+        raise AgentLoopError(error_message)
     if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
         round_approved = {
             record.metadata.agent

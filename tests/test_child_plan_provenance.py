@@ -4649,3 +4649,315 @@ def test_m1333_patch_with_non_tool_unknown_key_still_routes_to_replan(caplog):
     candidate, diagnostic = rejection
     assert candidate == rejected
     assert "has unknown field(s): extra_note" in diagnostic
+
+
+# ---------------------------------------------------------------------------
+# #1377 item-9.s1: real planning-child entry and recovery against live inputs
+# ---------------------------------------------------------------------------
+
+_M1377_ACTOR = ("agent", 7)
+# The #936 world forbids repair; the requirement-acknowledgement path needs it.
+_M1377_REAL_REPAIR = orchestrator._run_structured_repair
+_M1377_PARENT_RULE = HumanReviewRequirement(
+    source_type="Issue body", author="maintainer", created_at="2026-05-17T08:00:00Z",
+    url="https://github.com/OWNER/REPO/issues/55", body="Preserve the parent audit trail.",
+)
+
+
+class _M1377World(_M936World):
+    """The #936 planning child, read through authenticated REST issue comments.
+
+    Durable history lives on the runner, so plan board-change links and the
+    lineage revalidation see the same comments as every other reader, and the
+    authoritative parent's signed requirements can change between runs.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, *, handoff=True, **kwargs):
+        super().__init__(tmp_path, monkeypatch, **kwargs)
+        self.durable = [
+            {
+                "author": {"login": "maintainer" if self._signed(c.body) else _M1377_ACTOR[0]},
+                "createdAt": f"2026-09-13T00:00:{index:02d}Z", "body": c.body,
+                "_rest_author_id": 99 if self._signed(c.body) else _M1377_ACTOR[1],
+            }
+            for index, c in enumerate(self.comments)
+            if handoff or not AGENT_ISSUE_PR_HANDOFF_RE.search(c.body)
+        ]
+        self.base = len(self.durable)
+        for name in (
+            "github", "pr_loop", "pr_loop_support", "plan_verification", "execution_policy",
+            "child_plan_binding", "issue_loop", "plan_first_loop", "phase_progress",
+        ):
+            module = __import__(f"coding_review_agent_loop.{name}", fromlist=["_"])
+            if hasattr(module, "get_issue_context"):
+                monkeypatch.setattr(module, "get_issue_context", self._issue_context)
+
+    @staticmethod
+    def _signed(body):
+        return body.rstrip().endswith("-- Human Reviewer")
+
+    def set_parent_requirements(self, *requirements):
+        self.parent = dataclasses.replace(self.parent, human_requirements=tuple(requirements))
+
+    def _issue_context(self, _runner, *, config, issue_number):
+        if issue_number != 56:
+            return self.parent
+        source = self.runner.issue_comments if self.runner is not None else self.durable
+        return dataclasses.replace(self.child, comments=tuple(
+            IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"],
+                         author_id=c.get("_rest_author_id"))
+            for c in source
+        ))
+
+    def settle(self):
+        if self.runner is not None:
+            self.durable = list(self.runner.issue_comments)
+            self.runner = None
+
+    def run_issue(self, *, pr_state="OPEN", config=None, **outputs):
+        self.settle()
+        self.base = len(self.durable)
+        self.runner = _ChildPlanningRunner(
+            pr_payload={
+                "number": 77, "body": "Fixes #56", "state": pr_state,
+                "url": "https://github.com/OWNER/REPO/pull/77",
+            },
+            issue_comments=list(self.durable), authenticated_actor=_M1377_ACTOR,
+            serve_rest_issue_comments=True, **outputs,
+        )
+        return orchestrator.run_issue_loop(
+            self.runner, issue_number=56, config=config or self.config(), plan_first=True
+        )
+
+    def run_managed_recovery(self, monkeypatch, *, entry):
+        """Managed-CI no-handoff recovery of the child's plan into PR #77.
+
+        Returns ``(outcome, merges, runner)``; a refusal is returned as its error.
+        """
+        from test_issue_pr_handoff import _lineage_strict_run
+
+        self.settle()
+        runner, config, merges, run_pr_loop = _lineage_strict_run(
+            self.tmp_path, monkeypatch, list(self.durable), entry=entry,
+        )
+        runner.authenticated_actor = _M1377_ACTOR
+        self.runner = runner
+        try:
+            outcome = run_pr_loop(runner, pr_number=77, config=config)
+        except AgentLoopError as exc:
+            outcome = exc
+        finally:
+            self.runner = None
+        return outcome, merges, runner
+
+    def posted(self):
+        return [str(item["body"]) for item in self.runner.issue_comments[self.base:]]
+
+    def plan_records(self):
+        source = self.runner.issue_comments if self.runner is not None else self.durable
+        return _extract_round_metadata_records(
+            [comment(str(item["body"])) for item in source], flow="plan",
+        )
+
+
+def _m1377_agents(runner):
+    return [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini", "agy"}]
+
+
+def _m1377_requirement_patch(world, requirement):
+    """A planner revision that disposes of ``requirement`` against the child plan."""
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(world.old_state), round_number=1,
+    )
+    payload = {
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Address the parent requirement.", "prior_plan_item_dispositions": [],
+        "base_round_number": 1, "base_state_identity": base.state_identity,
+        "operations": [{
+            "op": "replace", "field": "human_requirement_dispositions",
+            "value": [{
+                "requirement_id": requirement.requirement_id, "disposition": "addressed",
+                "evidence": "Step 1 keeps the parent audit trail.",
+            }],
+        }],
+    }
+    return (
+        json.dumps(payload)
+        + "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n### Human requirements\n"
+        + f"- {requirement.requirement_id}: the plan keeps the parent audit trail."
+        + PLAN_FOOTER
+    )
+
+
+@pytest.mark.parametrize("case", ["unchanged", "parent-requirement-added", "inherited-row-weakened"])
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_m1377_real_child_managed_recovery_honors_parent_and_inherited_inputs(
+    tmp_path, monkeypatch, entry, case
+):
+    """Item-9.s1 / row plan-approval-gate-live-inputs (managed-CI recovery): a real
+    planning child (#936 world: parent #55, stage-one, inherited row-stage-one) with no
+    issue-side handoff.  Its unchanged approved plan binds and merges; after a signed
+    requirement is added on the authoritative parent, or with an inadmissible
+    inherited row, ordinary and fresh recovery refuse before any agent or merge."""
+    from test_issue_pr_handoff import _agent_commands
+
+    world = _M1377World(
+        tmp_path, monkeypatch, weak=case == "inherited-row-weakened", signed=False, handoff=False,
+    )
+    if case == "parent-requirement-added":
+        world.set_parent_requirements(_M1377_PARENT_RULE)
+    outcome, merges, runner = world.run_managed_recovery(monkeypatch, entry=entry)
+    if case == "unchanged":
+        assert outcome == 0 and len(merges) == 1 and _agent_commands(runner)
+        return
+    assert isinstance(outcome, AgentLoopError)
+    assert (
+        "lacks complete requirement dispositions" if case == "parent-requirement-added"
+        else "fails its inherited parent matrix rows"
+    ) in str(outcome)
+    assert merges == [] and _agent_commands(runner) == []
+
+
+@pytest.mark.parametrize("mode", ["plan-only", "auto"])
+def test_m1377_real_child_public_entry_after_parent_requirement_addition_and_withdrawal(
+    tmp_path, monkeypatch, mode
+):
+    """Item-9.s1 / row plan-approval-gate-live-inputs (public entry): the approved real
+    planning child, not yet handed off.  A signed requirement added on the parent makes
+    the public entry revise the plan (never an approved outcome or handoff); the
+    revision addressing it is re-reviewed and approved with the acknowledgement.  When
+    the requirement is then withdrawn, that approval is stale again: the entry
+    goes back to fresh review and managed recovery refuses to bind it."""
+    world = _M1377World(tmp_path, monkeypatch, weak=False, signed=False, handoff=False)
+    monkeypatch.setattr(orchestrator, "_run_structured_repair", _M1377_REAL_REPAIR)
+    config = world.config(plan_execution_mode=mode)
+    approvals_before = sum(1 for r in world.plan_records() if r.metadata.role == "reviewer")
+
+    # Addition: the planner is asked for an unapproved revision that sees the rule.
+    world.set_parent_requirements(_M1377_PARENT_RULE)
+    patch = _m1377_requirement_patch(world, _M1377_PARENT_RULE)
+    acknowledged = structured_plan_review(
+        state="approved", human_requirements_resolved=True,
+        prior_plan_item_dispositions=[
+            {"item_id": item_id, "disposition": "resolved"} for item_id in ("item-1", "item-2")
+        ],
+        human_requirement_dispositions=[{
+            "requirement_id": _M1377_PARENT_RULE.requirement_id, "disposition": "addressed",
+            "evidence": "The plan keeps the parent audit trail.",
+        }],
+    )
+    if mode == "plan-only":
+        assert world.run_issue(config=config, claude_outputs=[patch], codex_outputs=[acknowledged]) == 0
+    else:
+        # Implementation after approval is not scripted: the run stops at the coder.
+        with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+            world.run_issue(config=config, claude_outputs=[patch], codex_outputs=[acknowledged])
+    prompts = _agent_prompts(world.runner, "claude")
+    assert "This is an eligible unapproved planning revision." in prompts[0]
+    assert _M1377_PARENT_RULE.body in prompts[0]
+    assert _agent_prompts(world.runner, "codex") and _M1377_PARENT_RULE.body in (
+        _agent_prompts(world.runner, "codex")[0]
+    )
+    reviews = [r.metadata for r in world.plan_records() if r.metadata.role == "reviewer"]
+    assert len(reviews) == approvals_before + 1
+    assert reviews[-1].parent_requirement_ids == (_M1377_PARENT_RULE.requirement_id,)
+    # The old approval never produced an approved outcome or handoff before review.
+    assert not any(AGENT_ISSUE_PR_HANDOFF_RE.search(body) for body in world.posted()[:2])
+    if mode == "auto":
+        implement = prompts[-1]
+        assert implement.startswith("Implement the approved plan for GitHub issue #56")
+        return
+
+    # Withdrawal: the acknowledged approval names a rule no longer in force.
+    world.set_parent_requirements()
+    world.settle()
+    outcome, merges, runner = world.run_managed_recovery(monkeypatch, entry="ordinary")
+    assert isinstance(outcome, AgentLoopError) and merges == []
+    assert [cmd for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "agy"}] == []
+    # The public entry does not reuse the stale approval: the plan goes back to
+    # fresh review (unscripted here), with no approved outcome or handoff.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        world.run_issue(config=config)
+    assert _m1377_agents(world.runner) == ["codex"]
+    (fresh_review,) = _agent_prompts(world.runner, "codex")
+    assert _M1377_PARENT_RULE.body not in fresh_review
+    assert not any("plan approved" in body.lower() for body in world.posted())
+    assert not any(AGENT_ISSUE_PR_HANDOFF_RE.search(body) for body in world.posted())
+
+
+@pytest.mark.parametrize("board", ["same", "differing"])
+def test_m1377_signed_supersession_revises_and_approves_before_the_pr_is_rebound(
+    tmp_path, monkeypatch, board
+):
+    """Item-9.s1 / row plan-supersession-not-shortcut: a handed-off planning child whose
+    approved plan is inadmissible, with a matching signed supersession record, enters
+    through the public issue run with the same board (Codex) and with a differing one
+    (Codex plus Gemini).  The superseded plan's approval never approves the
+    replacement: the planner revises, every reviewer of the effective board approves
+    the replacement, and only then is open PR #77 rebound, once, to the new hash."""
+    from coding_review_agent_loop.board_change import PLAN_BOARD_CHANGE_LINK_HEADING
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+
+    world = _M1377World(tmp_path, monkeypatch)
+    outputs = {
+        "claude_outputs": [world.good_patch()],
+        "codex_outputs": [structured_plan_review(state="approved"), PR_APPROVAL],
+    }
+    config = world.config()
+    board_names = {"Codex"}
+    if board == "differing":
+        config = world.config(reviewer=("codex", "gemini"))
+        board_names = {"Codex", "Gemini"}
+        # The link re-enters reviewer-only on the superseded candidate first.
+        outputs["codex_outputs"] = [structured_plan_review(state="approved")] * 2 + [PR_APPROVAL]
+        outputs["gemini_outputs"] = [
+            structured_plan_review(state="approved", reviewer="Google Gemini")
+        ] * 2 + [PR_APPROVAL.replace("OpenAI Codex", "Google Gemini")]
+    assert world.run_issue(config=config, **outputs) == 0
+
+    posted = world.posted()
+    metadata = {}
+    for index, body in enumerate(posted):
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", body)
+        if match is not None:
+            decoded = _decode_round_metadata(match.group("payload"))
+            if decoded.flow == "plan":
+                metadata[index] = decoded
+    (revision_index,) = [
+        index for index, m in metadata.items()
+        if m.role == "coder" and m.plan_supersession_digest is not None
+    ]
+    new_hash = approved_plan_hash(metadata[revision_index].canonical_plan)
+    assert new_hash != world.old_hash
+    replacement_approvals = {
+        m.agent: index for index, m in metadata.items()
+        if index > revision_index and m.role == "reviewer" and m.state == "approved"
+    }
+    # Every reviewer of the effective board approved the replacement itself.
+    assert set(replacement_approvals) == board_names
+    rebinds = [index for index, body in enumerate(posted) if CHILD_PLAN_REBIND_MARKER_RE.search(body)]
+    assert len(rebinds) == 1
+    # The PR is rebound only after the replacement's approvals, never before.
+    assert rebinds[0] > max(replacement_approvals.values())
+    assert sum(1 for body in posted if AGENT_ISSUE_PR_HANDOFF_RE.search(body)) == 1
+    latest = find_latest_issue_pr_handoff(
+        [comment(str(item["body"])) for item in world.runner.issue_comments],
+        issue_number=56, repo="OWNER/REPO",
+    )
+    assert (latest.pr_number, latest.plan_hash) == (77, new_hash)
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in world.runner.commands)
+    planner_prompts = _agent_prompts(world.runner, "claude")
+    assert len(planner_prompts) == 1
+    links = [index for index, body in enumerate(posted) if body.startswith(PLAN_BOARD_CHANGE_LINK_HEADING)]
+    if board == "same":
+        assert links == []
+        return
+    # The differing board is recorded by one link before any agent turn, and the
+    # approvals of the superseded candidate (re-entry round) did not approve it.
+    assert links == [0]
+    superseded_approvals = {
+        m.agent for index, m in metadata.items()
+        if index < revision_index and m.role == "reviewer" and m.state == "approved"
+    }
+    assert superseded_approvals == board_names

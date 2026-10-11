@@ -343,6 +343,11 @@ def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
             raise AgentLoopError(error_message)
 
     monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    # The fixture stubs the completion predicate, including the shared
+    # classification recovery now applies to real plan history (#1377).
+    import coding_review_agent_loop.plan_verification as plan_verification
+
+    monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
     monkeypatch.setattr(
         orchestrator, "approved_plan_hash",
         lambda text: PLAN if text == "approved plan" else "0" * 16,

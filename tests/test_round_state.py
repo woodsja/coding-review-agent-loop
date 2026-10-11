@@ -1293,3 +1293,81 @@ def test_consistent_non_qualifying_stall_snapshot_round_trips():
     decoded = _decode_round_metadata(_encode_round_metadata(record))
     assert decoded.evidence_stall["reasons"] == ["checks-failing", "untagged-finding"]
     assert decoded.evidence_stall["qualifies"] is False
+
+
+# --- plan board identity fields are flow-scoped (#1377) --------------------------------
+
+
+_PLAN_ROOT = {
+    "policy": "all-reviewers", "primary": None, "broad_rules": [],
+    "seats": [{"id": "Codex", "backend": "codex", "model_chain": None, "effort": None}],
+}
+
+
+@pytest.mark.parametrize(
+    "flow,fields",
+    [
+        ("plan", {"pr_board_root": _PLAN_ROOT, "pr_board_identity": _PLAN_ROOT}),
+        ("pr", {"plan_board_root": _PLAN_ROOT, "plan_board_identity": _PLAN_ROOT}),
+        ("plan", {"plan_board_root": _PLAN_ROOT}),
+        ("plan", {"plan_board_identity": _PLAN_ROOT}),
+        ("plan", {"plan_board_root": "not-an-object", "plan_board_identity": _PLAN_ROOT}),
+    ],
+    ids=["pr-fields-on-plan", "plan-fields-on-pr", "root-only", "identity-only", "malformed"],
+)
+def test_board_identity_fields_are_flow_scoped_and_paired(flow, fields):
+    """Row plan-metadata-cross-flow: the wrong flow's fields, or half a pair, are malformed."""
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _decode_round_metadata_mapping,
+        _extract_round_metadata_records,
+    )
+
+    payload = {"flow": flow, "role": "reviewer", "agent": "Codex", "round_number": 1,
+               "subject": "abc123", **fields}
+    with pytest.raises(AgentLoopError, match="Invalid AGENT_LOOP_META payload"):
+        _decode_round_metadata_mapping(payload)
+    with pytest.raises(ValueError):
+        PostedRoundMetadata(flow=flow, role="reviewer", agent="Codex", round_number=1,
+                            subject="abc123", **fields)
+    # A well-formed plan record round-trips its plan board fields through the encoder.
+    good = PostedRoundMetadata(
+        flow="plan", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+        plan_board_root=_PLAN_ROOT, plan_board_identity=_PLAN_ROOT,
+    )
+    (record,) = _extract_round_metadata_records(
+        [SimpleNamespace(body=_attach_round_metadata("Review.\n-- OpenAI Codex", good))], flow="plan",
+    )
+    assert record.metadata.plan_board_root == _PLAN_ROOT
+    assert record.metadata.pr_board_root is None
+
+
+def test_plan_board_stamp_applies_only_to_plan_flow_records():
+    """Row plan-metadata-cross-flow: the plan stamp never touches PR-flow records."""
+    from coding_review_agent_loop.board_change import PLAN_SURFACE, PrBoardStamp
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        _attach_round_metadata,
+        _extract_round_metadata_records,
+        reset_plan_board_stamp,
+        set_plan_board_stamp,
+    )
+
+    token = set_plan_board_stamp(PrBoardStamp(
+        root=_PLAN_ROOT, identity=_PLAN_ROOT, change_digest=None, amendment_digest=None,
+        surface=PLAN_SURFACE,
+    ))
+    try:
+        bodies = [
+            _attach_round_metadata("x\n-- Orchestrator", PostedRoundMetadata(
+                flow=flow, role="summary", agent="Orchestrator", round_number=1, subject="s",
+            ))
+            for flow in ("plan", "pr")
+        ]
+    finally:
+        reset_plan_board_stamp(token)
+    (plan,) = _extract_round_metadata_records([SimpleNamespace(body=bodies[0])], flow="plan")
+    (pr,) = _extract_round_metadata_records([SimpleNamespace(body=bodies[1])], flow="pr")
+    assert plan.metadata.plan_board_root == _PLAN_ROOT
+    assert pr.metadata.plan_board_root is None and pr.metadata.pr_board_root is None

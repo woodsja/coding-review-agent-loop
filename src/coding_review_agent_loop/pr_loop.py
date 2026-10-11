@@ -565,21 +565,36 @@ def _enforce_pr_board_floor(
     )
 
 
+def _admitted_plan_comments(
+    runner: Runner | None, config: AgentLoopConfig, issue_context: IssueContext,
+) -> tuple[tuple[object, ...], tuple[str, int] | None]:
+    """Plan history with plan board-change links admitted (#1377)."""
+    from .plan_board_state import admitted_issue_comments
+
+    return admitted_issue_comments(
+        runner, config=config, issue_number=issue_context.number,
+        comments=issue_context.comments,
+    )
+
+
 def _canonical_plan_without_handoff(
     config: AgentLoopConfig,
     issue_context: IssueContext,
     *,
     source_locator: str,
     error_message: str,
+    runner: Runner | None = None,
 ) -> ApprovedPlanContext | None:
     """The completely approved canonical plan of an issue with no handoff record.
 
     Approval is verified against the approving plan board, never the PR
-    invocation's board (#1373).  ``None`` means the issue has no plan round;
-    incomplete approval raises ``error_message``.
+    invocation's board (#1373), resolving any recorded plan board change
+    lineage (#1377).  ``None`` means the issue has no plan round; incomplete
+    approval, including an open carried obligation, raises ``error_message``.
     """
+    comments, trusted_actor = _admitted_plan_comments(runner, config, issue_context)
     plan_config, plan_comments = plan_verification_inputs(
-        config, issue_context.comments, issue_number=issue_context.number,
+        config, comments, issue_number=issue_context.number, trusted_actor=trusted_actor,
     )
     resumed_plan = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
     if resumed_plan is None:
@@ -592,6 +607,15 @@ def _canonical_plan_without_handoff(
         plan_round=resumed_plan_round,
         human_requirements=issue_context.human_requirements,
         error_message=error_message,
+    )
+    # The shared approval classification: requirement binding (issue and
+    # authoritative parent), a reconstructible ledger, inherited
+    # admissibility and signed supersession (#1377).
+    from .plan_verification import require_recoverable_plan_approval
+
+    require_recoverable_plan_approval(
+        runner, config=config, issue_context=issue_context, comments=comments,
+        trusted_actor=trusted_actor, error_message=error_message,
     )
     return make_approved_plan_context(
         plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
@@ -672,6 +696,7 @@ def _entry_plan_handoff_board(
             canonical = _canonical_plan_without_handoff(
                 config,
                 owning,
+                runner=runner,
                 source_locator=f"issue #{owning.number} canonical approved plan",
                 error_message=(
                     f"Issue #{owning.number} has planning state without a complete "
@@ -686,7 +711,10 @@ def _entry_plan_handoff_board(
             if canonical is None:
                 return None
             # That plan was verified on this issue, which therefore owns its board.
-            plan = derive_plan_verification_context(owning.comments, issue_number=owning.number)
+            owning_comments, owning_actor = _admitted_plan_comments(runner, config, owning)
+            plan = derive_plan_verification_context(
+                owning_comments, issue_number=owning.number, trusted_actor=owning_actor,
+            )
             return resolve_plan_handoff_board(config, plan) if plan is not None else None
         elif handoff.pr_number != pr_number or handoff.flow != "approved-plan-implementation":
             return None
@@ -718,7 +746,10 @@ def _entry_plan_handoff_board(
                 and recovered.canonical_text != approved_plan_context.canonical_text
             ):
                 raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
-            plan = derive_plan_verification_context(source.comments, issue_number=source.number)
+            source_comments, source_actor = _admitted_plan_comments(runner, config, source)
+            plan = derive_plan_verification_context(
+                source_comments, issue_number=source.number, trusted_actor=source_actor,
+            )
             return resolve_plan_handoff_board(config, plan) if plan is not None else None
         if recovered.has_matching_candidate:
             return None
@@ -950,6 +981,7 @@ def run_pr_loop(
                 recovered_plan_context = _canonical_plan_without_handoff(
                     config,
                     issue_context,
+                    runner=runner,
                     source_locator=f"issue #{fresh_issue_number} canonical approved plan",
                     error_message=(
                         "Managed-CI fresh authorization found planning state without "
@@ -1082,6 +1114,7 @@ def run_pr_loop(
                         recovered_scope = _canonical_plan_without_handoff(
                             config,
                             issue_context,
+                            runner=runner,
                             source_locator=(
                                 f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
                             ),
@@ -1991,13 +2024,21 @@ def run_pr_loop(
                     plan_handoff_comments = ()
             else:
                 plan_handoff_comments = ()
-            plan_verification = (
-                derive_plan_verification_context(
-                    plan_handoff_comments, issue_number=plan_handoff_issue_number,
+            plan_verification = None
+            if plan_handoff_comments:
+                from .plan_board_state import admitted_issue_comments
+
+                plan_handoff_comments, plan_handoff_actor = admitted_issue_comments(
+                    runner,
+                    config=config,
+                    issue_number=plan_handoff_issue_number,
+                    comments=plan_handoff_comments,
                 )
-                if plan_handoff_comments
-                else None
-            )
+                plan_verification = derive_plan_verification_context(
+                    plan_handoff_comments,
+                    issue_number=plan_handoff_issue_number,
+                    trusted_actor=plan_handoff_actor,
+                )
             if plan_verification is not None:
                 plan_handoff_board = resolve_plan_handoff_board(config, plan_verification)
                 config = plan_handoff_board.config

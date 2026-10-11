@@ -2948,6 +2948,7 @@ def _verify_strict_managed_plan_binding(
     metadata: PullRequestMetadata,
     expected_plan_hash: str,
     pr_comments: Sequence[object] = (),
+    runner: Runner | None = None,
 ) -> None:
     """Bind a strict-protection managed PR to the issue's canonical plan.
 
@@ -2973,11 +2974,18 @@ def _verify_strict_managed_plan_binding(
         raise fail(f"the PR is not the reserved managed branch for issue #{issue_context.number}")
     # The approving plan board comes from the issue's own history, never the
     # PR board (#1373).  Without plan records there is nothing to derive.
+    from .plan_board_state import admitted_issue_comments
     from .plan_verification import plan_verification_inputs
 
     try:
+        # The plan's own lineage, admitted on the same fresh fetch (#1377).
+        issue_comments, trusted_actor = admitted_issue_comments(
+            runner, config=config, issue_number=issue_context.number,
+            comments=issue_context.comments,
+        )
         plan_config, plan_comments = plan_verification_inputs(
-            config, issue_context.comments, issue_number=issue_context.number,
+            config, issue_comments, issue_number=issue_context.number,
+            trusted_actor=trusted_actor,
         )
     except AgentLoopError as exc:
         raise fail(f"the approving plan board cannot be verified: {exc}") from exc
@@ -2996,6 +3004,15 @@ def _verify_strict_managed_plan_binding(
         human_requirements=issue_context.human_requirements,
         error_message=str(fail("the canonical plan is not completely approved")),
     )
+    from .plan_verification import require_recoverable_plan_approval
+
+    try:
+        require_recoverable_plan_approval(
+            runner, config=config, issue_context=issue_context, comments=issue_comments,
+            trusted_actor=trusted_actor, error_message="the canonical plan is not completely approved",
+        )
+    except AgentLoopError as exc:
+        raise fail(str(exc)) from exc
     if approved_plan_hash(plan_text) != expected_plan_hash:
         raise fail("the issue's canonical approved plan changed")
 
@@ -3163,6 +3180,7 @@ def _fresh_pr_qualification_snapshot(
                     metadata=context.metadata,
                     expected_plan_hash=approved_plan_context.plan_hash,
                     pr_comments=context.comments,
+                    runner=runner,
                 )
             else:
                 verify_managed_pr_plan_binding(

@@ -4606,7 +4606,11 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
         quiet=False,
     )
 
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    # item-1 was published and never resolved, yet the resumed coder record
+    # carries nothing: the ledger is unreconstructible, so the approval
+    # boundary fails closed after the full-context review (#1377).
+    with pytest.raises(AgentLoopError, match="obligation\\(s\\) item-1 published earlier"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     review_prompt = [
         cmd[-1]
@@ -4616,6 +4620,7 @@ def test_issue_loop_plan_first_uses_full_context_when_plan_ledger_incomplete(tmp
     assert COMPACT_PLANNING_VOLATILE_TAIL_MARKER not in review_prompt
     captured = capsys.readouterr()
     assert "Planning round 2: Codex reviewing issue #56 (context mode: full (ledger incomplete))" in captured.err
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
 
 def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomplete_ledger(
     tmp_path, monkeypatch
@@ -4923,9 +4928,10 @@ def test_issue_loop_plan_revision_proof_covers_items_resolved_in_the_same_round(
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    # Both revisions saw only the empty pre-loop fetch, so the recorded history
-    # alone could not have supplied the item-2 proof.
-    assert revision_snapshot_sizes == [(0,), (0,)]
+    # The pre-loop fetch was empty.  Later reads are the board-history
+    # revalidation reads (#1377), taken once each round's reviews are in and at
+    # each later round; they validate the lineage and never feed the proof.
+    assert all(sizes[0] == 0 for sizes in revision_snapshot_sizes)
     assert revision_history_ids[0] == ()
     assert revision_history_ids[1] == ("item-2",)
 
@@ -9198,7 +9204,14 @@ def test_default_full_board_planning_writes_no_scheduler_metadata(tmp_path):
     records = _plan_round_records(runner)
     assert records, "the planning flow must still post durable round records"
     assert all(record.scheduler_metadata_status == "absent" for record in records)
-    assert all(record.plan_candidate_key is None for record in records)
+    # Reviewer records of a generation-1 plan carry the exact-plan key as
+    # requirement-binding evidence only (#1377); no other record carries it.
+    assert all(
+        record.plan_candidate_key is None for record in records if record.role != "reviewer"
+    )
+    assert all(
+        record.plan_candidate_key is not None for record in records if record.role == "reviewer"
+    )
     assert all(record.phase != "scheduler-prelaunch" for record in records)
     reviewer_rounds = {
         (record.agent, record.round_number)
@@ -10380,15 +10393,25 @@ def test_staged_planning_contract_drift_stops_a_default_policy_restart(tmp_path)
         cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
     )
 
-    # A restart that changes only the primary is rejected the same way.
+    # A restart that changes only the primary is a recorded plan board change
+    # (#1377), not contract drift: exactly one plan board-change link is posted
+    # before the new primary's primary-only round.
     drifted = _FakeRunner(issue_comments=comments)
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         run_issue_loop(
             drifted,
             issue_number=56,
             config=_staged_plan_config(tmp_path, primary_plan_reviewer="gemini"),
             plan_first=True,
         )
+    links = [
+        comment for comment in drifted.issue_comments
+        if "AGENT_PLAN_BOARD_CHANGE" in comment["body"]
+    ]
+    assert len(links) == 1
+    assert [cmd[0] for cmd, _cwd in drifted.commands if cmd[0] in {"claude", "codex", "gemini"}] == [
+        "gemini"
+    ]
 
 
 def _invalid_plan_scheduler_comment(subject, *, created_at="2026-01-01T00:00:30Z"):
@@ -11890,6 +11913,17 @@ def _m943_reduced_config(tmp_path):
     return _staged_plan_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=8)
 
 
+def _m943_floor_config(tmp_path):
+    """The reduced board under a three-reviewer floor (#1377).
+
+    Without a floor an unsigned removal is a recorded plan board change; only a
+    below-floor reduction still needs the signed amendment.
+    """
+    from dataclasses import replace
+
+    return replace(_m943_reduced_config(tmp_path), min_reviewers=3)
+
+
 def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(tmp_path):
     """Rows legacy-no-amendment, partial-round-activation, legacy-retroactive-amend,
     sole-owner-reassign, and activation-mismatch on one real history."""
@@ -11911,9 +11945,9 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
     calls_before = _m943_reviewer_calls(runner)
     comments_before = len(runner.issue_comments)
 
-    # legacy-no-amendment: the drift error prints a filled amendment template.
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume") as excinfo:
-        run_issue_loop(runner, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
+    # legacy-no-amendment: the below-floor refusal prints a filled amendment template.
+    with pytest.raises(AgentLoopError, match="below the floor of 3") as excinfo:
+        run_issue_loop(runner, issue_number=56, config=_m943_floor_config(tmp_path), plan_first=True)
     message = str(excinfo.value)
     assert '"kind": "reviewer-board-amendment"' in message
     assert '"effective_from_round": 3' in message
@@ -11990,9 +12024,10 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
         and tuple(record.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini")
         for record in post_amendment_checkpoints
     )
-    # Contract-neutral records never carry the digest.
+    # Contract-neutral records carry the digest only beside the plan board
+    # root anchor that every stamped record carries (#1377).
     assert all(
-        record.reviewer_board_amendment_digest is None
+        record.reviewer_board_amendment_digest is None or record.plan_board_root is not None
         for record in records
         if record.scheduler_contract is None
     )
@@ -12016,14 +12051,17 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
         for record in records
     )
 
-    # re-add-reviewer: widening the board again after the amendment is drift.
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
-        run_issue_loop(
-            runner,
-            issue_number=56,
-            config=_staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8),
-            plan_first=True,
-        )
+    # re-add-reviewer (#1377): widening the board after the plan is completely
+    # approved never reopens planning and records no plan board change.
+    calls_after_approval = _m943_reviewer_calls(runner)
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=_staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8),
+        plan_first=True,
+    ) == 0
+    assert _m943_reviewer_calls(runner) == calls_after_approval
+    assert not any("AGENT_PLAN_BOARD_CHANGE" in c["body"] for c in runner.issue_comments)
 
 
 def test_board_amendment_rejects_an_old_board_checkpoint_after_the_record(tmp_path):
@@ -12064,8 +12102,8 @@ def test_board_amendment_invalid_records_fail_closed_or_are_ignored(tmp_path):
             ).replace("-- Human Reviewer", "-- Anthropic Claude"),
         }
     )
-    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
-        run_issue_loop(unsigned, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
+    with pytest.raises(AgentLoopError, match="below the floor of 3"):
+        run_issue_loop(unsigned, issue_number=56, config=_m943_floor_config(tmp_path), plan_first=True)
 
     removes_primary = _m943_interrupted_history(tmp_path)
     _m943_post_amendment(removes_primary, effective_from_round=3, removed=("Codex",))
@@ -12157,7 +12195,13 @@ def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp
     assert run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True) == 0
 
     records = _plan_round_records(runner)
-    amended = [record for record in records if record.reviewer_board_amendment_digest is not None]
+    # Every plan record of a stamped run carries its governing digest (#1377);
+    # the contract-bearing ones carry the amended contract.
+    amended = [
+        record for record in records
+        if record.reviewer_board_amendment_digest is not None
+        and record.scheduler_contract is not None
+    ]
     # Round 2 is re-entered with a fresh digest-bound checkpoint, then the
     # blocking Antigravity finding moves the loop to coder round 3.
     assert amended[0].round_number == 2 and amended[0].phase == "scheduler-prelaunch"
@@ -12778,23 +12822,63 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         if record.role == "reviewer" and record.agent == "Codex"
     ]
     _ack_nonstaged_run.repair_results = repair_results
+    _ack_nonstaged_run.state = (runner, config, requirement)
     return outcome, codex_records, repair_calls
 
 
-def test_nonstaged_acknowledgement_repair_posts_one_comment_with_the_record(
+def test_nonstaged_acknowledgement_repair_persists_the_bound_record(
     tmp_path, monkeypatch
 ):
     outcome, codex_records, repair_calls = _ack_nonstaged_run(tmp_path, monkeypatch)
     assert outcome == 0, outcome
     assert repair_calls, "the acknowledgement repair must run through the flow"
-    # The comment posted before the gate, from the accepted carrier, is the
-    # only reviewer publication; a successful repair posts nothing new.
-    assert len(codex_records) == 1
-    (record,) = codex_records
-    assert record.architecture_impact is None
-    assert [r.outcome for r in record.architecture_impact_degradations] == [
-        "degraded-to-undetermined"
-    ]
+    # The comment posted before the gate comes from the accepted carrier.  The
+    # repaired approval is then persisted with its requirement binding
+    # (#1377), so a restart or qualification can bind it; both records keep
+    # the carrier's degraded assessment.
+    assert len(codex_records) == 2
+    carrier, repaired = codex_records
+    assert carrier.surfaced_reviewer_requirement_ids == ()
+    assert len(repaired.surfaced_reviewer_requirement_ids) == 1
+    assert repaired.plan_candidate_key is not None
+    for record in codex_records:
+        assert record.state == "approved"
+        assert record.architecture_impact is None
+        assert [r.outcome for r in record.architecture_impact_degradations] == [
+            "degraded-to-undetermined"
+        ]
+    # The persisted binding is what a restart and strict qualification read.
+    from coding_review_agent_loop.github import IssueComment
+    from coding_review_agent_loop.plan_verification import (
+        classify_plan_approval,
+        require_recoverable_plan_approval,
+    )
+
+    runner, config, requirement = _ack_nonstaged_run.state
+    issue = IssueContext(
+        number=56, repo="OWNER/REPO", title="Issue", body="Issue body", url=None,
+        comments=tuple(
+            IssueComment(author=c["author"]["login"], created_at=c["createdAt"], body=c["body"])
+            for c in runner.issue_comments
+        ),
+        human_requirements=(requirement,),
+    )
+    assert classify_plan_approval(
+        issue.comments, config=config, issue_number=56, human_requirements=(requirement,),
+    ).state == "approved"
+    require_recoverable_plan_approval(
+        None, config=config, issue_context=issue, comments=issue.comments,
+        trusted_actor=None, error_message="not recoverable",
+    )
+    # An unchanged restart reuses the bound approvals: no reviewer runs again.
+    start = len(runner.commands)
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        pass
+    assert not any(
+        cmd[0] in {"codex", "gemini"} for cmd, _cwd in runner.commands[start:]
+    )
 
 
 @pytest.mark.parametrize("status", ["unchanged", "none"])
@@ -12922,7 +13006,11 @@ def test_resumed_publication_plan_review_accepts_acknowledgement_only_repair(
         codex_impact=_DEG_UNCORROBORATED, repaired_impact=None,
     )
     assert run.resumed_without_reinvocation
-    assert [record.phase for record in run.records] == ["publication"]
+    # The repaired approval is persisted with its requirement binding (#1377).
+    assert [record.phase for record in run.records] == ["publication", "authoritative"]
+    assert run.records[0].surfaced_reviewer_requirement_ids == ()
+    assert len(run.records[-1].surfaced_reviewer_requirement_ids) == 1
+    _assert_degraded_carrier(run.records[-1])
     (carrier,) = run.carriers
     _assert_degraded_carrier(carrier)
     assert len(run.repair_calls) == 1
@@ -15498,7 +15586,16 @@ def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
     assert status(scheduler_stall_reset=False) == "invalid"
     assert status(scheduler_stall_reset="yes") == "invalid"
     assert status(scheduler_stall_reset=True, scheduler_phase="full-board") == "invalid"
-    assert status(flow="pr") == "invalid"
+    # Plan board identity fields are flow-scoped (#1377): a PR-flow record
+    # carrying them is malformed, so compare the scheduler status without them.
+    with pytest.raises(AgentLoopError, match="only valid on plan-flow records"):
+        status(flow="pr")
+    unstamped = {
+        key: value for key, value in base.items() if not key.startswith("plan_board_")
+    }
+    assert _decode_round_metadata_mapping(
+        {**unstamped, "flow": "pr"}
+    ).scheduler_metadata_status == "invalid"
 
     # Unset fields serialize with no new keys (byte-stable legacy shape).
     decoded = _decode_round_metadata_mapping(base)
@@ -18876,3 +18973,112 @@ def test_workflow_correction_repairs_a_deficient_reask_without_a_second_reask(tm
     # The deficiency that survived the re-ask disappears once correction supplies the level.
     assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
     assert "missing-level" not in comment.split("### Risk-matrix coverage map")[1]
+
+
+@pytest.mark.parametrize(
+    "event", ["forged-link", "signed-amendment", "requirement-added", "requirement-withdrawn"],
+)
+def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
+    tmp_path, monkeypatch, event
+):
+    """#1377 items 16/17: the acknowledgement repair is an agent turn, so the
+    run re-reads the issue after it.  Board history changed during the repair
+    refuses before the repaired record is published, and a requirement change
+    during it refuses at the approval boundary; neither approves nor hands off."""
+    import datetime
+
+    from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
+    from coding_review_agent_loop.board_change import (
+        PLAN_BOARD_CHANGE_LINK_HEADING,
+        PLAN_BOARD_CHANGE_LINK_MARKER,
+    )
+
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output], codex_outputs=[unacknowledged], gemini_outputs=[panel],
+        serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
+    )
+    requirements = [requirement]
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=tuple(requirements))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+
+    def operator_comment(body):
+        runner.issue_comments.append({
+            "body": body, "author": {"login": "operator"}, "_rest_author_id": 81,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        })
+
+    def fake_repair(raw, cmd, **kwargs):
+        if event == "forged-link":
+            operator_comment(
+                f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->"
+            )
+        elif event == "signed-amendment":
+            operator_comment(format_reviewer_board_amendment_comment(
+                flow="plan", issue=56, pr_number=None,
+                original_required_reviewers=("Codex", "Gemini"),
+                policy="all-reviewers", primary_reviewer=None,
+                removed_reviewers=("Gemini",), effective_from_round=1,
+                rationale="Gemini quota exhausted.",
+            ))
+        elif event == "requirement-added":
+            requirements.append(HumanReviewRequirement(
+                source_type="Issue comment", author="maintainer",
+                created_at="2026-05-17T09:00:00Z",
+                url="https://github.com/OWNER/REPO/issues/56#issuecomment-9",
+                body="Also keep the audit trail.",
+            ))
+        else:
+            requirements.clear()
+        return repaired
+
+    refusal = {
+        "forged-link": "history is inconsistent after an acknowledgement repair",
+        "signed-amendment": "recorded while this run was active .*after an acknowledgement repair",
+        "requirement-added": "requirement\\(s\\) changed after plan approval: added",
+        "requirement-withdrawn": "requirement\\(s\\) changed after plan approval: withdrawn",
+    }[event]
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+        agent_max_retries=0, agent_retry_backoff_seconds=0,
+    )
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        with pytest.raises(AgentLoopError, match=refusal):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    codex_records = [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    if event in {"forged-link", "signed-amendment"}:
+        # The repaired result is never published under the old board history.
+        assert len(codex_records) == 1
+        assert codex_records[0].surfaced_reviewer_requirement_ids == ()
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+    # Only the initial planner turn ran: no revision and no implementation coder.
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]) == 1
+    if event == "signed-amendment":
+        # A clean rerun resolves and activates the amendment: the board becomes
+        # Codex alone and Gemini is never invoked again.  (The resumed Codex
+        # record is rendered prose, which the existing substance gate never
+        # repairs, so this one-round rerun then stops at its round budget.)
+        event = "none"
+        start_commands, start_comments = len(runner.commands), len(runner.issue_comments)
+        with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        assert not any(
+            cmd[:1] == ["gemini"] for cmd, _cwd in runner.commands[start_commands:]
+        )
+        (audit,) = [c["body"] for c in runner.issue_comments[start_comments:]]
+        assert audit.startswith("Reviewer board amendment applied.")
+        assert "Required board now: Codex" in audit
+        assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
