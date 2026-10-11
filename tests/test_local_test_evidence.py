@@ -937,6 +937,66 @@ def _init_snapshot_repo(root: Path) -> None:
     subprocess.run(["git", "-C", str(root), "commit", "-qm", "initial"], check=True)
 
 
+def _repo_with_submodule(tmp_path: Path) -> Path:
+    dependency = tmp_path / "dependency"
+    _init_snapshot_repo(dependency)
+    outer = tmp_path / "outer"
+    _init_snapshot_repo(outer)
+    subprocess.run(
+        ["git", "-C", str(outer), "-c", "protocol.file.allow=always", "submodule", "add",
+         "-q", str(dependency), "vendor/dependency"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(outer), "commit", "-qm", "add submodule"], check=True)
+    return outer
+
+
+@pytest.mark.parametrize("layout", ["clone-without-init", "deinitialized", "removed-placeholder"])
+def test_snapshot_keeps_clean_uninitialized_submodule_attributable(tmp_path, layout):
+    outer = _repo_with_submodule(tmp_path)
+    if layout == "clone-without-init":
+        checkout = tmp_path / "clone"
+        subprocess.run(["git", "clone", "-q", str(outer), str(checkout)], check=True)
+    else:
+        checkout = outer
+        subprocess.run(
+            ["git", "-C", str(checkout), "submodule", "deinit", "-q", "-f", "vendor/dependency"],
+            check=True,
+        )
+    placeholder = checkout / "vendor" / "dependency"
+    assert placeholder.is_dir() and not any(placeholder.iterdir())
+    if layout == "removed-placeholder":
+        placeholder.rmdir()
+
+    snapshot = capture_tracked_tree_snapshot(checkout)
+
+    assert snapshot.complete is True, snapshot.caveats
+    assert snapshot.status_clean is True
+    assert snapshot.tracked_digest is not None
+    assert not snapshot.caveats
+    if layout == "removed-placeholder":
+        return
+
+    (placeholder / "stray.txt").write_text("unindexed\n", encoding="utf-8")
+    dirty = capture_tracked_tree_snapshot(checkout)
+    assert dirty.complete is True
+    assert dirty.status_clean is False
+    assert dirty.tracked_digest is None
+
+
+def test_snapshot_still_flags_dirty_populated_submodule(tmp_path):
+    outer = _repo_with_submodule(tmp_path)
+    clean = capture_tracked_tree_snapshot(outer)
+    assert clean.complete is True, clean.caveats
+    assert clean.status_clean is True
+
+    (outer / "vendor" / "dependency" / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+    dirty = capture_tracked_tree_snapshot(outer)
+    assert dirty.complete is True
+    assert dirty.status_clean is False
+    assert dirty.tracked_digest is None
+
+
 def test_current_head_marks_all_untracked_content_unverified(tmp_path):
     _init_snapshot_repo(tmp_path)
     (tmp_path / "notes.tmp").write_text("scratch\n", encoding="utf-8")

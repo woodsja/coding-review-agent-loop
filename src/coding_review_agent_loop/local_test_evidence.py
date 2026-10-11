@@ -1701,11 +1701,18 @@ def _dirty_populated_gitlinks(
         budget[0] -= 1
         _snapshot_checkpoint(started, timeout_seconds, cancel)
         path = root / relative
-        if not path.exists():
-            dirty.append(relative)
+        if not os.path.lexists(path):
+            # An uninitialized gitlink without its placeholder directory has
+            # no submodule worktree, so no unattributable content exists.
             continue
         if path.is_symlink() or not path.is_dir():
             raise AgentLoopError("gitlink worktree has an unsafe path")
+        if not os.path.lexists(path / ".git"):
+            # An uninitialized submodule is an empty placeholder directory.
+            # Any content there is outside the index and cannot be attributed.
+            if any(path.iterdir()):
+                dirty.append(relative)
+            continue
         sub_root = path.resolve(strict=True)
         if os.path.commonpath((str(root), str(sub_root))) != str(root):
             raise AgentLoopError("gitlink worktree escapes snapshot root")
