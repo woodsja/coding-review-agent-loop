@@ -64,6 +64,10 @@ class PlanVerificationContext:
     # link, #1377), ``contract``, ``binding`` or ``posters`` (plain legacy
     # history, which proves membership but never completion by itself).
     derivation: str = "contract"
+    # Lineage-derived history (#1377): the frozen authorization of every
+    # signed segment that governed the approving prefix, kept through later
+    # board-change links.  ``None`` for the other derivations.
+    lineage_authorizations: tuple[SignedBoardAuthorization, ...] | None = None
 
     def verification_comments(self, comments: Sequence[object]) -> tuple[object, ...]:
         """``comments`` with superseded-model approvals neutralized in place.
@@ -94,6 +98,19 @@ class PlanVerificationContext:
                 < distinct_providers(self.original_seats)
             ),
         )
+
+    @property
+    def signed_authorizations(self) -> tuple[SignedBoardAuthorization, ...]:
+        """Every floor authorization the approving plan board carries.
+
+        A lineage keeps each signed segment's frozen authorization, so a later
+        board-change link never erases a signed reduction; other derivations
+        supply the single trailing-amendment authorization.
+        """
+        if self.lineage_authorizations is not None:
+            return self.lineage_authorizations
+        authorization = self.signed_authorization
+        return (authorization,) if authorization is not None else ()
 
     def reviewer_agents(self) -> tuple[object, ...]:
         from .agents.registry import agent_display_name
@@ -223,9 +240,7 @@ def derive_plan_verification_context(
     records = _extract_round_metadata_records(comments, flow="plan")
     if not records:
         return None
-    if comments_bear_board_change_links(comments, surface=PLAN_SURFACE) or any(
-        record.metadata.plan_board_root is not None for record in records
-    ):
+    if plan_history_bears_lineage(comments, records):
         return _lineage_verification_context(
             comments, records, issue_number=issue_number, trusted_actor=trusted_actor,
         )
@@ -295,6 +310,22 @@ def derive_plan_verification_context(
     )
 
 
+def plan_history_bears_lineage(comments: Sequence[object], records: Sequence[object]) -> bool:
+    """Whether plan history must be judged through its board lineage (#1377).
+
+    A link record, a root anchor, or any record carrying a board-change
+    digest all do: a change digest is validated against the lineage on every
+    path, never ignored by the legacy derivations.
+    """
+    from .board_change import PLAN_SURFACE, comments_bear_board_change_links
+
+    return comments_bear_board_change_links(comments, surface=PLAN_SURFACE) or any(
+        record.metadata.plan_board_root is not None
+        or record.metadata.reviewer_board_change_digest is not None
+        for record in records
+    )
+
+
 def _lineage_verification_context(
     comments: Sequence[object],
     records: Sequence[object],
@@ -314,6 +345,7 @@ def _lineage_verification_context(
     from .board_change import (
         PLAN_SURFACE,
         BoardIdentity,
+        _segment_authorization,
         apply_inits,
         collect_board_change_links,
     )
@@ -334,6 +366,12 @@ def _lineage_verification_context(
         links = collect_board_change_links(
             comments, pr_number=issue_number, trusted_actor=trusted_actor, surface=PLAN_SURFACE,
         )
+        if not links:
+            raise AgentLoopError(
+                "Approved plan board history is inconsistent with its lineage: a plan round "
+                "record carries a board-change digest, but the issue has neither a plan board "
+                "root nor an admitted board-change record."
+            )
         root = links[0].root
     lineage = resolve_plan_lineage(
         comments,
@@ -374,6 +412,21 @@ def _lineage_verification_context(
         ):
             stale.add(record.index)
     binding = base.seat_binding() if base.named else effective.seat_binding()
+    # Each signed segment of the approving prefix keeps its frozen
+    # authorization, also when a later link follows it.
+    authorizations: list[SignedBoardAuthorization] = []
+    previous = lineage.root
+    position = 0
+    while position < len(view.elements):
+        if view.elements[position].kind != "amendment":
+            previous = view.elements[position].identity
+            position += 1
+            continue
+        pre = previous
+        while position < len(view.elements) and view.elements[position].kind == "amendment":
+            previous = view.elements[position].identity
+            position += 1
+        authorizations.append(_segment_authorization(pre, previous))
     return PlanVerificationContext(
         issue_number=issue_number,
         original_reviewers=base.names,
@@ -386,6 +439,7 @@ def _lineage_verification_context(
         signed_amendment_count=segment_amendments,
         stale_approval_indices=frozenset(stale),
         derivation="lineage",
+        lineage_authorizations=tuple(authorizations),
     )
 
 
@@ -1067,9 +1121,7 @@ def classify_plan_approval(
     records = _extract_round_metadata_records(comments, flow="plan")
     if not records:
         return PlanApprovalClassification("no-plan", "no plan round records")
-    lineage_bearing = comments_bear_board_change_links(comments, surface=PLAN_SURFACE) or any(
-        record.metadata.plan_board_root is not None for record in records
-    )
+    lineage_bearing = plan_history_bears_lineage(comments, records)
     try:
         context = derive_plan_verification_context(
             comments, issue_number=issue_number, trusted_actor=trusted_actor,
@@ -1148,8 +1200,10 @@ def classify_plan_approval(
     # A reconstructible ledger: nothing published in history may be lost.
     # Recorded reconciliation evidence, not the resume reader's conservative
     # incompleteness flag, distinguishes cleared history from lost items.
+    # Publication and reconciliation history is never filtered: a primary
+    # epoch or stale approval neutralizes evidence, not obligations.
     verification_records = _extract_round_metadata_records(plan_comments, flow="plan")
-    lost = plan_ledger_unreconstructible_items(verification_records, plan_round)
+    lost = plan_ledger_unreconstructible_items(records, plan_round)
     if lost:
         return result("undetermined", "unreconstructible plan obligation(s) " + ", ".join(lost))
     open_items = plan_open_obligations(plan_round, board=board)

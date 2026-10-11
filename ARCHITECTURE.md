@@ -2206,8 +2206,11 @@ startup.
   item that history published but that is neither in the resumed ledger nor
   provably cleared means not approved. Recorded reconciliation evidence, not
   the resume reader's conservative incompleteness flag, tells cleared history
-  from a lost obligation. The live approval boundary applies the same rule to
-  its freshly re-read history and fails closed. With requirements surfaced, the
+  from a lost obligation. The rule reads the complete publication and
+  reconciliation history: a primary epoch, a seat-binding change or a stale
+  approval neutralizes approval evidence, never an obligation. The live
+  approval boundary applies the same rule to its freshly re-read history and
+  fails closed. With requirements surfaced, the
   plan's own coder dispositions must name exactly that set (a semantic patch
   inherits them from its authenticated assembled state), or the plan is
   `unfinished`. Approving reviewers never stand in for the coder's
@@ -2308,12 +2311,21 @@ startup.
   before any agent invocation or comment post, with the filled-in signed plan
   amendment template. Plan startup repeats the resolution, and the floor is
   checked again at every planning round. Floor authorizations come only from
-  signed plan segments.
+  signed plan segments. Each later round, and the approval boundary, re-reads
+  the issue, re-admits link records through the authenticated actor and
+  re-resolves the plan lineage. Inconsistent history, or any board change
+  recorded while the run was active, refuses before another agent turn, post
+  or approval; a rerun resolves and applies it.
 - **Plan verification.** `derive_plan_verification_context` resolves plan
   history that carries a root anchor or a link through the plan lineage,
   never from the invocation's planning configuration. The approving identity
   is the board of the latest element that took effect. `original_reviewers`
-  is that segment's base board. Approvals by removed seats, by added, rebound
+  is that segment's base board. Every signed segment of that prefix keeps its
+  frozen floor authorization at the handoff, also when a later link (for
+  example a model-only rebind) follows it. A record carrying a board-change
+  digest is always judged through the lineage, so a rootless digest with no
+  admitted link fails closed on every recovery and qualification path.
+  Approvals by removed seats, by added, rebound
   or role-changed seats before their effective round, and pre-epoch reviews
   are neutralized. A forged, non-orchestrator or digest-mismatched link, or a
   record carrying an unknown change digest, raises. Admitted comments and the

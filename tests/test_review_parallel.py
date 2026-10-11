@@ -188,6 +188,8 @@ def test_named_plan_model_change_invalidates_primary_approval(tmp_path):
             structured_plan_review(reviewer="opus (Google Antigravity: Model B)"),
             ("flash unavailable", 1),
         ],
+        # Later rounds re-admit the posted plan board-change record (#1377).
+        serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
     )
     config = make_config(
         tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),

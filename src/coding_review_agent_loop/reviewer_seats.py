@@ -241,9 +241,8 @@ class PlanHandoffBoard:
 
     @property
     def signed_authorizations(self) -> tuple[object, ...]:
-        """The plan's signed board, only for an inherited seat set."""
-        authorization = self.plan.signed_authorization if self.inherited else None
-        return (authorization,) if authorization is not None else ()
+        """The plan's signed authorizations, only for an inherited seat set."""
+        return tuple(self.plan.signed_authorizations) if self.inherited else ()
 
 
 def resolve_plan_handoff_board(config: object, plan: object) -> PlanHandoffBoard:

@@ -3829,3 +3829,303 @@ def test_staged_child_public_entry_merges_parent_requirements(tmp_path, monkeypa
     with pytest.raises(AgentLoopError):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert _plan_agents(runner, start)
+
+
+# --- Round 3 review: frozen signed authorizations, refreshed lineage, epoch history
+
+
+def test_signed_reduction_survives_a_later_model_link_into_implementation(tmp_path):
+    """Item-14: amendment -> model-only link -> approval keeps the frozen signed
+    authorization for both floor measures at the implementation and PR handoff."""
+    from coding_review_agent_loop.plan_verification import (
+        derive_plan_verification_context,
+        enforce_issue_board_floor,
+    )
+    from coding_review_agent_loop.reviewer_seats import resolve_plan_handoff_board
+
+    floor = dict(min_reviewers=3, min_distinct_providers=3)
+    flash_a = _seat(tmp_path, "flash", "antigravity", "Model A")
+    runner = _plan_runner(claude_outputs=[structured_v1_plan_state()])
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=_plan_cfg(
+            tmp_path, ("codex", "gemini", flash_a), reviewer_seats=(flash_a,),
+            review_parallel=False, **floor,
+        ), plan_first=True)
+    _append_issue_comment(runner, format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini", "flash"),
+        policy="all-reviewers", primary_reviewer=None,
+        removed_reviewers=("Gemini",), effective_from_round=1,
+        rationale="Gemini quota exhausted.",
+    ))
+    runner.codex_outputs.append(structured_plan_review(
+        state="blocking", summary="x", blocking_plan_issues=["Name the owner."],
+    ))
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="flash (Google Antigravity: Model A)",
+    ))
+    signed = _plan_cfg(
+        tmp_path, ("codex", flash_a), reviewer_seats=(flash_a,), review_parallel=False, **floor,
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=signed, plan_first=True)
+    # A model-only link on the signed two-seat board, then approval by it.
+    flash_b = _seat(tmp_path, "flash", "antigravity", "Model B")
+    runner.codex_outputs.append(_review("codex"))
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="flash (Google Antigravity: Model B)",
+        prior_plan_item_dispositions=_RESOLVED_1,
+    ))
+    rebound = _plan_cfg(
+        tmp_path, ("codex", flash_b), reviewer_seats=(flash_b,), review_parallel=False, **floor,
+    )
+    assert run_issue_loop(runner, issue_number=56, config=rebound, plan_first=True) == 0
+    (payload,) = _plan_link_payloads(runner)
+    assert payload["rebound"] == ["flash"]
+    comments = _issue_context(runner).comments
+    context = derive_plan_verification_context(
+        comments, issue_number=56, trusted_actor=_PLAN_ACTOR,
+    )
+    # The trailing element is the link, yet the signed segment's frozen
+    # authorization (three seats and providers to two) is kept.
+    assert context.signed_amendment_count == 0
+    (authorization,) = context.signed_authorizations
+    assert len(authorization.seats) == 2
+    assert authorization.lowered_reviewers and authorization.lowered_providers
+    handoff = resolve_plan_handoff_board(rebound, context)
+    assert handoff.inherited and handoff.signed_authorizations == (authorization,)
+    # The implementation preflight accepts the inherited signed board under both
+    # floor measures...
+    enforce_issue_board_floor(rebound, comments, issue_number=56, runner=runner)
+    # ...but an operator-chosen two-seat board gets no signed exception.
+    other = _plan_cfg(tmp_path, ("codex", "gemini"), **floor)
+    with pytest.raises(AgentLoopError, match="below the floor of 3"):
+        enforce_issue_board_floor(other, comments, issue_number=56, runner=runner)
+
+
+def _inject_during_first(runner, agent, body):
+    """Append an operator comment right after ``agent``'s first turn of the run."""
+    real = runner._run_with_log_locked
+    injected = []
+
+    def run_with_log_locked(args, **kwargs):
+        result = real(args, **kwargs)
+        if not injected and [str(arg) for arg in args][:1] == [agent]:
+            injected.append(True)
+            _append_issue_comment(runner, body)
+        return result
+
+    runner._run_with_log_locked = run_with_log_locked
+    return injected
+
+
+def test_forged_link_arriving_mid_plan_refuses_approval(tmp_path):
+    """Item-16: a forged plan link posted while reviewers run never lets the
+    approval boundary report approval."""
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    injected = _inject_during_first(
+        runner, "codex",
+        f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->",
+    )
+    config = _plan_cfg(tmp_path, ("codex", "gemini"), review_parallel=False)
+    with pytest.raises(AgentLoopError, match="history is inconsistent before approval"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert injected
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    with pytest.raises(AgentLoopError, match="lineage is inconsistent"):
+        classify_plan_approval(
+            _plan_comments(runner), config=config, issue_number=56, trusted_actor=_PLAN_ACTOR,
+        )
+
+
+def test_signed_amendment_arriving_mid_plan_stops_before_the_next_round(tmp_path):
+    """Item-16: a signed amendment recorded while the plan runs would govern the
+    next round, so the refreshed lineage stops the run before that round's agent
+    turns (round 2's planner record followed the unread amendment, which the
+    existing rule never reinterprets)."""
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="x",
+            blocking_plan_issues=["Name the owner."],
+        )],
+    )
+    runner.claude_outputs.append(
+        _semantic_patch(runner, round_number=1, summary="Name the owner.", item_id="item-1")
+    )
+    injected = _inject_during_first(runner, "codex", format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini"),
+        policy="all-reviewers", primary_reviewer=None,
+        removed_reviewers=("Gemini",), effective_from_round=2,
+        rationale="Gemini quota exhausted.",
+    ))
+    config = _plan_cfg(tmp_path, ("codex", "gemini"), review_parallel=False)
+    with pytest.raises(
+        AgentLoopError,
+        match="history is inconsistent before this round's agent turns.*stale-unread-amendment",
+    ):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert injected
+    # Round 1 finished (both reviews and the revision); round 2 never started.
+    assert _plan_agents(runner) == ["claude", "codex", "gemini", "claude"]
+    assert max(r.metadata.round_number for r in _plan_records(runner)) == 2
+    assert not any(
+        r.metadata.round_number == 2 and r.metadata.role == "reviewer"
+        for r in _plan_records(runner)
+    )
+
+
+
+def _epoch_plan_losing_a_pre_epoch_finding(tmp_path):
+    """A primary change (Codex -> Antigravity) whose post-epoch ledger lost the
+    secondary's pre-epoch finding: it is neither carried nor dispositioned."""
+    def staged(primary):
+        return _plan_cfg(
+            tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+            primary_plan_reviewer=primary,
+        )
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="x",
+            blocking_plan_issues=["Name the owner."],
+        )],
+        antigravity_outputs=[structured_plan_review(state="approved", reviewer="Google Antigravity")],
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=staged("codex"), plan_first=True)
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="approved", reviewer="Google Antigravity", prior_plan_item_dispositions=_RESOLVED_1,
+    ))
+    runner.codex_outputs.append(_review("codex"))
+    runner.gemini_outputs.append(_review("gemini"))
+    config = staged("antigravity")
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    (payload,) = _plan_link_payloads(runner)
+    epoch = payload["effective_from_round"]
+    assert _classify(runner, config).state == "approved"
+    # Every post-epoch record drops item-1 from its ledger and dispositions.
+    _rewrite_plan_records(
+        runner, lambda metadata: metadata.round_number >= epoch and metadata.role != "coder",
+        prior_items=(), dispositions=(),
+    )
+    published = [
+        record.metadata for record in _plan_records(runner)
+        if any(item.item_id == "item-1" for item in record.metadata.new_items)
+    ]
+    assert [(m.agent, m.round_number < epoch) for m in published] == [("Gemini", True)]
+    return runner, config
+
+
+def test_pre_epoch_finding_lost_after_a_primary_change_is_never_approved(tmp_path):
+    """Item-8: the lost-obligation rule reads complete publication history, so a
+    primary epoch never hides an undispositioned pre-epoch finding."""
+    runner, config = _epoch_plan_losing_a_pre_epoch_finding(tmp_path)
+    lost = _classify(runner, config)
+    assert lost.state == "undetermined"
+    assert "unreconstructible plan obligation(s) item-1" in lost.reason
+    with pytest.raises(AgentLoopError, match="not recoverable"):
+        _recover(runner, config)
+    # A public restart never reports approval over the lost finding.
+    runner.codex_outputs.append(_review("codex", dispositions=()))
+    runner.gemini_outputs.append(_review("gemini", dispositions=()))
+    runner.antigravity_outputs.append(_review("antigravity", dispositions=()))
+    with pytest.raises(AgentLoopError, match="item-1"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_pre_epoch_finding_lost_after_a_primary_change_refuses_managed_recovery(
+    tmp_path, monkeypatch, entry
+):
+    """Item-8: managed-CI recovery of the same history refuses before any PR turn."""
+    from test_issue_pr_handoff import _agent_commands, _lineage_strict_run
+
+    runner, _config = _epoch_plan_losing_a_pre_epoch_finding(tmp_path)
+    pr_runner, pr_config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, list(runner.issue_comments), entry=entry,
+    )
+    with pytest.raises(AgentLoopError, match="unreconstructible plan obligation\\(s\\) item-1"):
+        run_pr_loop(pr_runner, pr_number=77, config=pr_config)
+    assert merges == []
+    assert _agent_commands(pr_runner) == []
+
+
+def _unanimous_with_open_same_plan_item(tmp_path):
+    """Round 2's reviewers both approve, but neither dispositions Gemini's carried
+    same-plan item-1 (their resolutions are dropped from the records)."""
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(
+            state="blocking", reviewer="Google Gemini", summary="x",
+            same_plan_followups=["Mention the owner in the summary."],
+        )],
+    )
+    config = _plan_cfg(tmp_path, ("codex", "gemini"), review_parallel=False)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    runner.claude_outputs.append(
+        _semantic_patch(runner, round_number=1, summary="Mention the owner.", item_id="item-1")
+    )
+    runner.codex_outputs.append(_review("codex"))
+    runner.gemini_outputs.append(_review("gemini"))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert _classify(runner, config).state == "approved"
+    _rewrite_plan_records(
+        runner,
+        lambda metadata: metadata.role == "reviewer" and metadata.round_number == 2,
+        dispositions=(),
+    )
+    reviews = [
+        r.metadata for r in _plan_records(runner)
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 2
+    ]
+    assert {m.state for m in reviews} == {"approved"} and len(reviews) == 2
+    assert all([item.status for item in m.prior_items] == ["same-plan"] for m in reviews)
+    return runner, config
+
+
+def test_unanimous_approvals_with_an_open_same_plan_item_resume_planning(tmp_path):
+    """Item-9.s4: the open same-plan obligation keeps the plan unfinished at
+    classification and recovery, and a restart resumes into the revision."""
+    runner, config = _unanimous_with_open_same_plan_item(tmp_path)
+    # The shared complete-approval check finds the undispositioned carried item.
+    assert _classify(runner, config).state == "unfinished"
+    with pytest.raises(AgentLoopError, match="not recoverable"):
+        _recover(runner, config)
+    start, comments = len(runner.commands), len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    # No reviewer is re-run and nothing is approved: the planner revises.
+    assert _plan_agents(runner, start) == ["claude"]
+    assert _plan_links(runner) == []
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_unanimous_approvals_with_an_open_same_plan_item_refuse_managed_recovery(
+    tmp_path, monkeypatch, entry
+):
+    """Item-9.s4: managed-CI recovery never binds the plan with an open obligation."""
+    from test_issue_pr_handoff import _agent_commands, _lineage_strict_run
+
+    runner, _config = _unanimous_with_open_same_plan_item(tmp_path)
+    pr_runner, pr_config, merges, run_pr_loop = _lineage_strict_run(
+        tmp_path, monkeypatch, list(runner.issue_comments), entry=entry,
+    )
+    with pytest.raises(
+        AgentLoopError,
+        match="incomplete canonical plan approval|without a complete canonical reviewer approval",
+    ):
+        run_pr_loop(pr_runner, pr_number=77, config=pr_config)
+    assert merges == []
+    assert _agent_commands(pr_runner) == []

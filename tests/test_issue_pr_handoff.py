@@ -612,8 +612,12 @@ def test_unamended_plan_board_gets_no_floor_exception(tmp_path, floor, message):
     assert _agent_commands(runner) == []
 
 
-def _plain_plan_comments(plan, approvals, *, versioned=True):
-    """A legacy keyless plan history; ``versioned`` keeps the structured coder response."""
+def _plain_plan_comments(plan, approvals, *, versioned=True, change_digest=None):
+    """A legacy keyless plan history; ``versioned`` keeps the structured coder response.
+
+    ``change_digest`` forges a board-change digest onto every reviewer record
+    of the otherwise rootless history.
+    """
     from coding_review_agent_loop.round_state import (
         PostedRoundMetadata, _attach_round_metadata, _plan_subject,
     )
@@ -627,7 +631,7 @@ def _plain_plan_comments(plan, approvals, *, versioned=True):
     for agent, state in approvals:
         bodies.append(_attach_round_metadata(f"{state}.", PostedRoundMetadata(
             flow="plan", role="reviewer", agent=agent, round_number=1,
-            subject=subject, state=state,
+            subject=subject, state=state, reviewer_board_change_digest=change_digest,
         )))
     return [
         {"author": {"login": "coding-review-agent-loop"},
@@ -726,6 +730,66 @@ def test_unversioned_keyless_plan_is_never_recovered_even_without_requirements(t
             reviewer=("claude", "gemini"), managed_ci_fresh_authorization=True,
             managed_ci_issue_number=56,
         ))
+    assert _agent_commands(runner) == []
+
+
+@pytest.mark.parametrize("entry", ["fresh", "ordinary", "strict"])
+def test_rootless_plan_change_digest_never_verifies_on_legacy_paths(tmp_path, monkeypatch, entry):
+    """Item-15: a board-change digest without a plan root or link fails closed at
+    managed-CI fresh authorization, ordinary recovery and strict qualification."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+
+    plan = "Approved plan.\n\n### Plan steps\n1. Keep plan identity bound."
+    forged = _plain_plan_comments(
+        plan, (("Codex", "approved"), ("Gemini", "approved")), change_digest="ab" * 32,
+    )
+    refusal = "board-change digest, but the issue has neither a plan board root"
+    if entry == "strict":
+        # Without the forged digest the same history verifies.
+        _strict_verify(
+            tmp_path, _plain_plan_comments(plan, (("Codex", "approved"), ("Gemini", "approved"))),
+            pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan),
+        )
+        with pytest.raises(AgentLoopError, match=refusal):
+            _strict_verify(
+                tmp_path, forged, pr_reviewers=("claude",), expected_hash=approved_plan_hash(plan),
+            )
+        return
+    managed = dict(
+        managed_ci=True, managed_ci_pr_mode=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("claude", "gemini"),
+    )
+    reached = []
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume",
+        lambda *_a, **_k: reached.append("fresh") or (_ for _ in ()).throw(_ScopeCaptured()),
+    )
+    if entry == "fresh":
+        managed.update(managed_ci_fresh_authorization=True, managed_ci_issue_number=56)
+    else:
+        handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+            pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+            head_sha="abc123", branch="agent-loop/managed-56",
+            trusted_actor_login="agent-loop", trusted_actor_id=1,
+            protection_mode="voluntary", override_nonce="opening-nonce",
+        )
+        monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
+        monkeypatch.setattr(
+            orchestrator, "revalidate_issue_created_handoff",
+            lambda *_a, **_k: reached.append("ordinary") or (_ for _ in ()).throw(_ScopeCaptured()),
+        )
+    runner = FakeRunner(
+        issue_comments=forged,
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    with pytest.raises(AgentLoopError, match=refusal):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **managed))
+    assert reached == []
     assert _agent_commands(runner) == []
 
 

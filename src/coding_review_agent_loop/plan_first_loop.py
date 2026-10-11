@@ -800,6 +800,15 @@ _PLAN_BOARD_CONFIG_FIELDS = (
 )
 
 
+def _lineage_digests(lineage: object) -> frozenset[str]:
+    """Every element, pending link and pending amendment digest of a plan lineage."""
+    return frozenset((
+        *(element.digest for element in lineage.elements),  # type: ignore[attr-defined]
+        *(element.digest for element in lineage.pending_links),  # type: ignore[attr-defined]
+        *(amendment.digest for amendment in lineage.pending_amendments),  # type: ignore[attr-defined]
+    ))
+
+
 def _with_planning_requirements(
     issue_context: IssueContext, parent_issue_context: IssueContext | None
 ) -> IssueContext:
@@ -1167,8 +1176,7 @@ def _run_plan_first_loop_body(
         raise AssertionError("unreachable inherited replan state")
 
     def plan_history_records(
-        *, refresh: bool = False, round_number: int | None = None,
-        comments: Sequence[object] | None = None,
+        *, refresh: bool = False, round_number: int | None = None
     ) -> tuple[PostedRoundRecord, ...]:
         """Planning round-metadata records, or the class-D stop.
 
@@ -1176,12 +1184,10 @@ def _run_plan_first_loop_body(
         cannot be extracted at all makes panel state, finding ownership, and
         exact-plan approvals unknowable, and the operator override cannot
         authorize a board over it.  Round boundaries re-read the durable
-        history so records this run posted are part of it; a caller that
-        already re-read the issue passes those ``comments``.
+        history so records this run posted are part of it.
         """
-        if comments is None:
-            comments = issue_context.comments
-        if refresh and comments is issue_context.comments:
+        comments = issue_context.comments
+        if refresh:
             comments = get_issue_context(
                 runner, config=config, issue_number=issue_number
             ).comments
@@ -1339,6 +1345,13 @@ def _run_plan_first_loop_body(
             trusted_actor=plan_trusted_actor,
             drift_error=plan_contract_drift_error,
         )
+        plan_lineage_configured = BoardIdentity(
+            policy=approving.policy,
+            primary=approving.primary_reviewer,
+            broad_rules=(),
+            seats=approving.effective_seats,
+        )
+        plan_known_lineage_digests = _lineage_digests(plan_contract_lineage)
         # A pending element never governed the approval and never reopens it:
         # the run keeps the lineage prefix that took effect.
         plan_approved_shortcut = True
@@ -1396,6 +1409,8 @@ def _run_plan_first_loop_body(
             ),
         )
         plan_contract_lineage = plan_board_state.lineage
+        plan_lineage_configured = plan_identity_from_config(invocation_config)
+        plan_known_lineage_digests = _lineage_digests(plan_contract_lineage)
         if plan_board_state.rebound:
             # The operator may keep the original board configured and let the
             # signed amendment do the removing (#1133).
@@ -1462,6 +1477,43 @@ def _run_plan_first_loop_body(
         stamp_for_lineage(plan_contract_lineage, configured=plan_identity_from_config(config))
     )
     plan_amendment_digest = plan_contract_lineage.active_digest
+
+    def revalidate_plan_lineage(
+        comments: Sequence[object], *, round_number: int, boundary: str
+    ) -> None:
+        """Re-admit and re-resolve refreshed plan history (#1377).
+
+        Forged, malformed or inconsistent board history, and any plan board
+        change recorded while this run was active, refuse before another
+        agent turn, post or approval.  A rerun resolves and applies it.
+        """
+        admitted, actor = admitted_issue_comments(
+            runner, config=config, issue_number=issue_number, comments=comments,
+        )
+        try:
+            refreshed = resolve_plan_lineage(
+                admitted,
+                issue_number=issue_number,
+                configured=plan_lineage_configured,
+                trusted_actor=actor if actor is not None else plan_trusted_actor,
+                drift_error=plan_contract_drift_error,
+            )
+        except AgentLoopError as exc:
+            raise AgentLoopError(
+                f"Planning round {round_number}: the plan board history is inconsistent "
+                f"{boundary}: {exc} No further agent was invoked and nothing was approved."
+            ) from exc
+        recorded = [
+            digest for digest in _lineage_digests(refreshed)
+            if digest not in plan_known_lineage_digests
+        ]
+        if recorded:
+            raise AgentLoopError(
+                f"Planning round {round_number}: a plan reviewer board change was recorded "
+                f"while this run was active ({', '.join(recorded)}), {boundary}. Rerun so the "
+                "changed board is resolved, floor-checked and applied; no further agent was "
+                "invoked and nothing was approved."
+            )
     for record in plan_drift_records:
         metadata = record.metadata
         if not staged_planning or plan_approved_shortcut:
@@ -2082,6 +2134,14 @@ def _run_plan_first_loop_body(
                 f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} was classified "
                 "completely approved, but the approval boundary did not approve it. Rerun "
                 "after resolving the reported condition; no planner turn was started."
+            )
+        if round_number != start_round_number:
+            # Later rounds re-read and re-validate the durable board history
+            # before any agent turn (#1377).
+            revalidate_plan_lineage(
+                get_issue_context(runner, config=config, issue_number=issue_number).comments,
+                round_number=round_number,
+                boundary="before this round's agent turns",
             )
         if not plan_approved_shortcut and board_floor_enabled(config):
             # The floor is checked at every planning round on the effective
@@ -3896,10 +3956,15 @@ def _run_plan_first_loop_body(
             # The shared completion predicate's ledger rule (#1377): an
             # obligation history published but neither carried nor provably
             # cleared fails closed instead of being approved over.
+            revalidate_plan_lineage(
+                refreshed_issue_context.comments,
+                round_number=round_number,
+                boundary="before approval",
+            )
+            # The complete history: the epoch and binding filters of
+            # plan_history_records select approval evidence, never obligations.
             lost_obligations = plan_ledger_unreconstructible_items(
-                plan_history_records(
-                    round_number=round_number, comments=refreshed_issue_context.comments,
-                ),
+                _extract_round_metadata_records(refreshed_issue_context.comments, flow="plan"),
                 SimpleNamespace(
                     prior_items=(*prior_unresolved_items, *unresolved_items),
                     current_round_new_items=tuple(round_new_unresolved_items),
