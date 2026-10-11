@@ -60,6 +60,7 @@ MARKERS = (
         f"<!-- AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1: {_b64({'actor': 'agent-loop', 'actor_id': 1, 'base': 'main', 'head': 'abc', 'issue': 1, 'kind': 'creation', 'label_event_id': 1, 'nonce': 'n', 'pr': 1, 'protection': 'voluntary', 'repository': 'OWNER/REPO', 'version': 1, 'waiver': 'allow-unprotected-managed-ci'})} -->",
         PR_COMMENT_SURFACE,
     ),
+    ("AGENT_PR_BOARD_CHANGE", f"<!-- AGENT_PR_BOARD_CHANGE: {_b64({'kind': 'reviewer-board-change'})} -->", PR_COMMENT_SURFACE),
     ("AGENT_WORKFLOW_TRANSACTION", f"<!-- AGENT_WORKFLOW_TRANSACTION: {_b64({'phase': 'prepared', 'schema_version': 1})} -->", PR_COMMENT_SURFACE),
     ("AGENT_MANAGED_PR_SOURCE_V1", f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {_b64({'source_branch': 'fix', 'source_sha': 'a'})} -->", PR_BODY_SURFACE),
     ("AGENT_SPLIT_CHILD", "<!-- AGENT_SPLIT_CHILD: parent=1 key=" + "a" * 64 + " -->", ISSUE_BODY_SURFACE),
@@ -213,7 +214,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 34
+    assert len(RESERVED_MARKER_REGISTRY) == 35
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():

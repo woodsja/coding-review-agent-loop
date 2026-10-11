@@ -2869,6 +2869,14 @@ def _rejected_recovery_round_ids(
     if any(not metadata.get("seat_binding_valid", False) for _id, metadata in reviewers):
         return None
     bindings = {_seat_binding_key(metadata.get("seat_binding")) for _id, metadata in reviewers}
+    # Historical reviews are judged by the board that governed their round,
+    # never the current one: a recorded board change (#1376) may have rebound
+    # the board since.  Without any change record this is the current binding.
+    from .board_change import governing_seat_binding_from_comments
+
+    expected_seat_binding = governing_seat_binding_from_comments(
+        comments, round_number=round_number, actor_id=actor_id, current=expected_seat_binding,
+    )
     if expected_seat_binding is not None:
         if bindings != {_seat_binding_key(expected_seat_binding)}:
             return None
