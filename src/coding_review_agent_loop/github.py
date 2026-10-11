@@ -2285,7 +2285,7 @@ def _merge_issue_comment_transport_identity(
 ) -> tuple[IssueComment, ...]:
     """Attach numeric REST identities only when a durable audit marker exists.
 
-    ``gh issue view --comments`` supplies the convenient GraphQL projection,
+    ``gh issue view --json comments`` supplies the convenient GraphQL projection,
     but it does not expose the numeric comment/user IDs required by the
     authenticated diagnostic protocol.  The REST endpoint is therefore read
     to completion and matched by immutable visible fields.  An incomplete
@@ -2297,7 +2297,7 @@ def _merge_issue_comment_transport_identity(
         and "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment.body
         for comment in comments
     )
-    # ``gh issue view --comments`` is itself a bounded projection.  A full
+    # ``gh issue view --json comments`` is itself a bounded projection.  A full
     # page without the marker may simply mean that the durable record is on a
     # later REST page, so probe REST at the projection boundary too.
     page_size = _REST_ISSUE_COMMENT_PAGE_SIZE
@@ -2327,7 +2327,7 @@ def read_rest_issue_comments(
 ) -> tuple[IssueComment, ...]:
     """Read an issue's complete comment history from REST, with numeric IDs.
 
-    Unlike the ``gh issue view --comments`` projection, every comment carries
+    Unlike the ``gh issue view --json comments`` projection, every comment carries
     its numeric comment ID and immutable author user ID, and no older comment
     is dropped at a connection cap.  Any incomplete read fails closed; the
     ``purpose`` clause names what cannot proceed safely without it.
@@ -2523,7 +2523,8 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
             str(issue_number),
             "--repo",
             config.repo,
-            "--comments",
+            # gh >= 2.102 refuses ``--comments`` with ``--json``; the
+            # ``comments`` field below already projects the comments.
             "--json",
             "number,title,body,url,author,createdAt,comments",
         ],

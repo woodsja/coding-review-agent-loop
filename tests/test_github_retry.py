@@ -511,3 +511,27 @@ def test_surface_decorator_is_scoped_and_does_not_leak(tmp_path, sleeps):
     with pytest.raises(AgentLoopError) as other:
         unrelated()
     assert "scoped-final" not in str(other.value)
+
+
+def test_get_issue_context_omits_comments_flag_and_parses_json_comments(tmp_path, sleeps):
+    """#1351: gh >= 2.102 refuses ``--comments`` combined with ``--json``."""
+    config = make_config(tmp_path)
+    payload = json.dumps(
+        {
+            "number": 5,
+            "title": "t",
+            "body": "b",
+            "url": "u",
+            "comments": [
+                {"author": {"login": "bob"}, "createdAt": "2026-10-02T00:00:00Z", "body": "hello"}
+            ],
+        }
+    )
+    runner = ScriptedRunner([(0, payload, "")])
+    context = get_issue_context(runner, config=config, issue_number=5)
+    view_calls = [call for call in runner.calls if call[1:3] == ["issue", "view"]]
+    assert len(view_calls) == 1
+    argv = view_calls[0]
+    assert "--comments" not in argv
+    assert "comments" in argv[argv.index("--json") + 1].split(",")
+    assert [(c.author, c.body) for c in context.comments] == [("bob", "hello")]

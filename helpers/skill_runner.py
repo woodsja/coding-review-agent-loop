@@ -1163,8 +1163,10 @@ def _fetch_issue_json(repo: str, issue: int, gh_cmd: str = "gh") -> dict:
 
 def _fetch_issue_context(repo: str, issue: int, gh_cmd: str = "gh") -> IssueContext:
     """Fetch the complete issue context used by a skill-mode PR review."""
+    # gh >= 2.102 refuses ``--comments`` with ``--json``; the ``comments``
+    # JSON field already projects the comments.
     result = subprocess.run(
-        [gh_cmd, "issue", "view", str(issue), "--repo", repo, "--comments",
+        [gh_cmd, "issue", "view", str(issue), "--repo", repo,
          "--json", "number,title,body,url,author,createdAt,comments"],
         capture_output=True, text=True, check=False,
     )
