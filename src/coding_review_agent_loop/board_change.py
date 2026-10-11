@@ -31,11 +31,18 @@ startup and at qualification.
 Floor authorizations come only from signed segments, frozen from the board
 identity immediately before the segment; a link never creates or enlarges an
 exception.
+
+Issue plan-review runs (#1377) use the same lineage on the issue that owns
+the plan, described by :data:`PLAN_SURFACE`: a separate reserved marker, a
+payload naming ``issue_number`` instead of ``pr_number``, the planning
+policies, no broad-path rules, and the ``plan_board_*`` round-metadata
+fields.  :data:`PR_SURFACE` keeps the PR records byte-identical.
 """
 
 from __future__ import annotations
 
 import base64
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -78,6 +85,7 @@ _LINK_KEYS = frozenset(
         "reason",
     }
 )
+_PLAN_LINK_KEYS = (_LINK_KEYS - {"pr_number"}) | {"issue_number"}
 _IDENTITY_KEYS = frozenset({"policy", "primary", "broad_rules", "seats"})
 _SEAT_KEYS = frozenset({"id", "backend", "model_chain", "effort"})
 _INIT_KEYS = frozenset({"model_chain", "effort"})
@@ -85,12 +93,109 @@ _BACKENDS = frozenset({"claude", "codex", "gemini", "antigravity"})
 _POLICIES = frozenset({"all-reviewers", "selective-intermediate", "primary-then-panel"})
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
+PLAN_BOARD_CHANGE_LINK_MARKER = "AGENT_PLAN_BOARD_CHANGE"
+PLAN_BOARD_CHANGE_LINK_HEADING = "Plan reviewer board change recorded."
+
+
+@dataclass(frozen=True)
+class BoardSurface:
+    """Where a board lineage lives: a PR (#1376) or the issue owning a plan (#1377)."""
+
+    flow: str  # "pr" | "plan"
+    number_key: str  # payload key naming the surface number
+    marker: str
+    heading: str
+    policies: frozenset[str]
+    lineage_label: str
+    artifact: str  # what added/rebound reviewers must approve
+    link_keys: frozenset[str]
+
+    @property
+    def link_re(self) -> re.Pattern[str]:
+        return re.compile(
+            rf"<!--\s*{self.marker}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", re.I
+        )
+
+    @property
+    def presence_re(self) -> re.Pattern[str]:
+        return re.compile(rf"<!--\s*{self.marker}\b", re.I)
+
+    @property
+    def root_field(self) -> str:
+        return f"{self.flow}_board_root"
+
+    @property
+    def identity_field(self) -> str:
+        return f"{self.flow}_board_identity"
+
+    @property
+    def init_field(self) -> str:
+        return f"{self.flow}_board_binding_init"
+
+    def locator(self, number: int) -> str:
+        return f"PR #{number}" if self.flow == "pr" else f"issue #{number}"
+
+    def contract(self, identity: "BoardIdentity") -> object:
+        """The scheduler contract of ``identity`` on this surface."""
+        if self.flow == "pr":
+            return identity.contract()
+        from .plan_review_scheduling import make_plan_contract
+
+        try:
+            return make_plan_contract(identity.names, identity.policy, identity.primary)
+        except AgentLoopError as exc:
+            raise _fail(
+                f"board {list(identity.names)} is not a valid {identity.policy} plan board: {exc}"
+            ) from exc
+
+
+PR_SURFACE = BoardSurface(
+    flow="pr",
+    number_key="pr_number",
+    marker=BOARD_CHANGE_LINK_MARKER,
+    heading=BOARD_CHANGE_LINK_HEADING,
+    policies=_POLICIES,
+    lineage_label="PR",
+    artifact="the current head",
+    link_keys=_LINK_KEYS,
+)
+PLAN_SURFACE = BoardSurface(
+    flow="plan",
+    number_key="issue_number",
+    marker=PLAN_BOARD_CHANGE_LINK_MARKER,
+    heading=PLAN_BOARD_CHANGE_LINK_HEADING,
+    policies=frozenset({"all-reviewers", "primary-then-panel"}),
+    lineage_label="Plan",
+    artifact="the current plan revision",
+    link_keys=_PLAN_LINK_KEYS,
+)
+
+# Labels diagnostics with the surface whose lineage is being resolved.
+_FAIL_LABEL: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "board_lineage_label", default="PR"
+)
+
 
 def _fail(detail: str) -> AgentLoopError:
     return AgentLoopError(
-        f"PR reviewer-board lineage is inconsistent: {detail}. Rerun is refused until the "
-        "history is corrected; no agent was invoked and no comment was posted."
+        f"{_FAIL_LABEL.get()} reviewer-board lineage is inconsistent: {detail}. Rerun is "
+        "refused until the history is corrected; no agent was invoked and no comment was posted."
     )
+
+
+class _labelled:
+    """Context manager labelling lineage diagnostics with ``surface``."""
+
+    def __init__(self, surface: BoardSurface) -> None:
+        self._surface = surface
+        self._token: contextvars.Token | None = None
+
+    def __enter__(self) -> None:
+        self._token = _FAIL_LABEL.set(self._surface.lineage_label)
+
+    def __exit__(self, *_exc: object) -> None:
+        assert self._token is not None
+        _FAIL_LABEL.reset(self._token)
 
 
 def _canonical_json(value: object) -> bytes:
@@ -253,6 +358,20 @@ def identity_from_config(config: object) -> BoardIdentity:
     )
 
 
+def plan_identity_from_config(config: object) -> BoardIdentity:
+    """The configured plan board identity (#1377): planning policy and primary."""
+    from .agents.registry import agent_display_name
+    from .reviewer_floor import board_seats_from_config
+
+    primary = getattr(config, "primary_plan_reviewer", None)
+    return BoardIdentity(
+        policy=getattr(config, "plan_review_policy", "all-reviewers"),
+        primary=agent_display_name(primary) if primary is not None else None,
+        broad_rules=(),
+        seats=board_seats_from_config(config),
+    )
+
+
 def identity_agents(identity: BoardIdentity) -> tuple[object, ...]:
     """Reviewer agents for a board identity, keyed by the same display names."""
     from pathlib import Path
@@ -289,6 +408,7 @@ def name_agents(names: Sequence[str]) -> tuple[object, ...]:
 
 def board_reentry_round(
     comments: Sequence[object], resumed_round: int | None, *, signed_amendment: bool = False,
+    surface: "BoardSurface" = PR_SURFACE,
 ) -> int:
     """The round a PR resume re-enters (#1376).
 
@@ -303,13 +423,13 @@ def board_reentry_round(
     records are carried over exactly as for a link.
     """
     if resumed_round is not None and not (
-        signed_amendment and comments_bear_board_change_links(comments)
+        signed_amendment and comments_bear_board_change_links(comments, surface=surface)
     ):
         return resumed_round
-    if comments_bear_board_change_links(comments):
+    if comments_bear_board_change_links(comments, surface=surface):
         from .round_state import _extract_round_metadata_records
 
-        records = _extract_round_metadata_records(comments, flow="pr")
+        records = _extract_round_metadata_records(comments, flow=surface.flow)
         if records:
             return board_anchor(records).round_number + 1
     return 1
@@ -446,6 +566,7 @@ def board_change_link_payload(
     *,
     pr_number: int,
     root: BoardIdentity,
+    surface: BoardSurface = PR_SURFACE,
     predecessor: str,
     old_board: BoardIdentity,
     new_board: BoardIdentity,
@@ -458,8 +579,9 @@ def board_change_link_payload(
     return {
         "kind": BOARD_CHANGE_LINK_KIND,
         "schema_version": BOARD_CHANGE_LINK_SCHEMA_VERSION,
-        "flow": "pr",
-        "pr_number": pr_number,
+        "flow": surface.flow,
+        # ``pr_number`` is the surface number: the PR, or the plan's issue.
+        surface.number_key: pr_number,
         "root": root.payload(),
         "predecessor": predecessor,
         "old_board": old_board.payload(),
@@ -494,7 +616,9 @@ def _describe_seat(seat: BoardSeat) -> str:
     return f"{seat.seat_id} ({seat.backend}: {models}{effort})"
 
 
-def render_board_change_link(payload: Mapping[str, object]) -> object:
+def render_board_change_link(
+    payload: Mapping[str, object], *, surface: BoardSurface = PR_SURFACE
+) -> object:
     """The orchestrator-authored link comment: audit text plus the reserved record."""
     from .protocol_markers import TrustedBody
 
@@ -507,7 +631,7 @@ def render_board_change_link(payload: Mapping[str, object]) -> object:
         if before is not None and after is not None:
             rebound.append(f"{_describe_seat(before)} -> {_describe_seat(after)}")
     lines = [
-        BOARD_CHANGE_LINK_HEADING,
+        surface.heading,
         "",
         f"- Record digest: `{digest}`",
         f"- Reason: {BOARD_CHANGE_LINK_REASON}",
@@ -521,15 +645,15 @@ def render_board_change_link(payload: Mapping[str, object]) -> object:
     if old.primary != new.primary or new.policy == "primary-then-panel":
         lines.append(f"- Primary reviewer: {old.primary or '(none)'} -> {new.primary or '(none)'}")
     lines += [
-        "- Added and rebound reviewers must approve the current head; their earlier "
+        f"- Added and rebound reviewers must approve {surface.artifact}; their earlier "
         "approvals do not count. Removed reviewers' approvals no longer count, and their "
         "unresolved findings stay open, reassigned to the remaining board.",
         "",
-        f"<!-- {BOARD_CHANGE_LINK_MARKER}: {_encode_payload(payload)} -->",
+        f"<!-- {surface.marker}: {_encode_payload(payload)} -->",
         "",
         "-- Orchestrator",
     ]
-    return TrustedBody.canonical("\n".join(lines), expected_tokens=(BOARD_CHANGE_LINK_MARKER,))
+    return TrustedBody.canonical("\n".join(lines), expected_tokens=(surface.marker,))
 
 
 def _is_positive_int(value: object) -> bool:
@@ -545,16 +669,19 @@ def _name_list(value: object) -> bool:
 
 
 def parse_board_change_link(
-    payload: object, *, comment_index: int, pr_number: int
+    payload: object, *, comment_index: int, pr_number: int,
+    surface: BoardSurface = PR_SURFACE,
 ) -> BoardChangeLink:
-    locator = f"PR #{pr_number} comment {comment_index + 1}"
-    if not isinstance(payload, dict) or set(payload) != _LINK_KEYS:
+    locator = f"{surface.locator(pr_number)} comment {comment_index + 1}"
+    if not isinstance(payload, dict) or set(payload) != surface.link_keys:
         raise _fail(f"board-change record at {locator} has missing or unknown fields")
     if payload["kind"] != BOARD_CHANGE_LINK_KIND or payload["schema_version"] != (
         BOARD_CHANGE_LINK_SCHEMA_VERSION
     ) or isinstance(payload["schema_version"], bool):
         raise _fail(f"board-change record at {locator} has an unsupported kind or version")
-    if payload["flow"] != "pr" or payload["pr_number"] != pr_number:
+    if payload["flow"] != surface.flow or payload[surface.number_key] != pr_number or isinstance(
+        payload[surface.number_key], bool
+    ):
         raise _fail(f"board-change record at {locator} names another surface")
     if payload["reason"] != BOARD_CHANGE_LINK_REASON:
         raise _fail(f"board-change record at {locator} has an unknown reason")
@@ -585,7 +712,12 @@ def parse_board_change_link(
         raise _fail(f"board-change record at {locator} has an inconsistent seat binding")
     if payload["old_seat_binding"] is not None and not isinstance(payload["old_seat_binding"], dict):
         raise _fail(f"board-change record at {locator} has an invalid previous seat binding")
-    new.contract()
+    for identity in (root, old, new):
+        if identity.policy not in surface.policies or (
+            surface.flow == "plan" and identity.broad_rules
+        ):
+            raise _fail(f"board-change record at {locator} names a board invalid on this surface")
+    surface.contract(new)
     _inits_from_payload(payload["binding_init"], board=new)
     return BoardChangeLink(
         payload=payload,
@@ -601,10 +733,13 @@ def parse_board_change_link(
     )
 
 
-def comments_bear_board_change_links(comments: Sequence[object]) -> bool:
+def comments_bear_board_change_links(
+    comments: Sequence[object], *, surface: BoardSurface = PR_SURFACE
+) -> bool:
     """Whether any comment carries a record-shaped link span, well-formed or not."""
+    presence = surface.presence_re
     return any(
-        isinstance(body := _body(comment), str) and BOARD_CHANGE_LINK_PRESENCE_RE.search(body)
+        isinstance(body := _body(comment), str) and presence.search(body)
         for comment in comments
     )
 
@@ -620,6 +755,7 @@ def collect_board_change_links(
     *,
     pr_number: int,
     trusted_actor: tuple[str, int] | None,
+    surface: BoardSurface = PR_SURFACE,
 ) -> tuple[BoardChangeLink, ...]:
     """Admit board-change links authored by the authenticated orchestrator actor.
 
@@ -628,15 +764,16 @@ def collect_board_change_links(
     records collapse by digest, keeping the earliest.
     """
     links: dict[str, BoardChangeLink] = {}
+    presence, pattern = surface.presence_re, surface.link_re
     for index, comment in enumerate(comments):
         body = _body(comment)
         if not isinstance(body, str):
             continue
-        shaped = list(BOARD_CHANGE_LINK_PRESENCE_RE.finditer(body))
+        shaped = list(presence.finditer(body))
         if not shaped:
             continue
-        matches = list(BOARD_CHANGE_LINK_RE.finditer(body))
-        locator = f"PR #{pr_number} comment {index + 1}"
+        matches = list(pattern.finditer(body))
+        locator = f"{surface.locator(pr_number)} comment {index + 1}"
         if len(shaped) > 1:
             raise _fail(f"{locator} carries more than one board-change record")
         if len(matches) != 1:
@@ -656,7 +793,9 @@ def collect_board_change_links(
             )
         except (ValueError, UnicodeDecodeError) as exc:
             raise _fail(f"the board-change record at {locator} cannot be decoded") from exc
-        link = parse_board_change_link(raw, comment_index=index, pr_number=pr_number)
+        link = parse_board_change_link(
+            raw, comment_index=index, pr_number=pr_number, surface=surface
+        )
         links.setdefault(link.digest, link)
     return tuple(sorted(links.values(), key=lambda link: link.comment_index))
 
@@ -695,12 +834,13 @@ class BoardLineage:
     # Seat IDs every PR round record has published as a reviewer.
     posters: tuple[str, ...] = ()
     last_seen: Mapping[str, BoardSeat] = field(default_factory=dict)
+    surface: BoardSurface = PR_SURFACE
 
     # -- ContractLineage-compatible surface ---------------------------------
 
     @property
     def contracts(self) -> tuple[object, ...]:
-        return (self.root.contract(), *(element.contract for element in self.elements))
+        return (self.surface.contract(self.root), *(element.contract for element in self.elements))
 
     @property
     def amendments(self) -> tuple[object, ...]:
@@ -734,7 +874,7 @@ class BoardLineage:
 
     @property
     def current_contract(self) -> object:
-        return self.current_identity.contract()
+        return self.surface.contract(self.current_identity)
 
     @property
     def current_board(self) -> tuple[str, ...]:
@@ -877,6 +1017,7 @@ def derive_legacy_root(
     configured: BoardIdentity,
     amendments: Sequence[object],
     contract_from_metadata: Callable[[object], object | None],
+    surface: BoardSurface = PR_SURFACE,
 ) -> BoardIdentity:
     """Derive the root of history that carries no root anchor yet (D1a).
 
@@ -888,6 +1029,11 @@ def derive_legacy_root(
     original board when signed amendments exist, otherwise the configured
     board plus every historical reviewer poster.  No reviewer history means a
     fresh run whose root is the configured board.
+
+    On the plan surface (#1377) contract-neutral history only ever happened
+    under all-reviewers planning, so its root policy is all-reviewers with no
+    primary whatever the invocation's planning flags; the configured policy
+    and primary seed the root only when no reviewer has reviewed the plan yet.
     """
     plain = _plain_backends()
     contract = next(
@@ -939,13 +1085,21 @@ def derive_legacy_root(
         return BoardIdentity(
             policy=contract.policy,
             primary=contract.primary_reviewer,
-            broad_rules=tuple(contract.broad_rules),
+            broad_rules=tuple(getattr(contract, "broad_rules", ())),
             seats=tuple(seat_for(name) for name in contract.required_reviewers),
         )
+    # Plan history without a persisted contract was all-reviewers planning.
+    neutral_policy = configured.policy if surface.flow == "pr" else "all-reviewers"
+
+    def neutral_primary(names: Sequence[str]) -> str | None:
+        if surface.flow != "pr":
+            return None
+        return configured.primary if configured.primary in names else None
+
     if binding_entries:
         return BoardIdentity(
-            policy=configured.policy,
-            primary=configured.primary if configured.primary in binding_entries else None,
+            policy=neutral_policy,
+            primary=neutral_primary(tuple(binding_entries)),
             broad_rules=configured.broad_rules,
             seats=tuple(seat_for(name) for name in binding_entries),
         )
@@ -971,10 +1125,9 @@ def derive_legacy_root(
         return configured
     else:
         names = tuple(dict.fromkeys((*configured.names, *posters)))
-    primary = configured.primary if configured.primary in names else None
     return BoardIdentity(
-        policy=configured.policy,
-        primary=primary,
+        policy=neutral_policy,
+        primary=neutral_primary(names),
         broad_rules=configured.broad_rules,
         seats=tuple(seat_for(name) for name in names),
     )
@@ -990,7 +1143,7 @@ def _contract_identity(contract: object, previous: BoardIdentity, last_seen: Map
     return BoardIdentity(
         policy=getattr(contract, "policy"),
         primary=getattr(contract, "primary_reviewer"),
-        broad_rules=tuple(getattr(contract, "broad_rules")),
+        broad_rules=tuple(getattr(contract, "broad_rules", ())),
         seats=tuple(seats),
     )
 
@@ -1005,24 +1158,63 @@ def resolve_board_lineage(
     trusted_actor: tuple[str, int] | None,
     contract_from_metadata: Callable[[object], object | None],
     drift_error: Callable[[object, str], AgentLoopError],
+    surface: BoardSurface = PR_SURFACE,
 ) -> BoardLineage:
-    """Resolve and validate the complete PR board lineage, read-only (D3).
+    """Resolve and validate the complete board lineage of one surface, read-only (D3).
 
     The configured board is used only to derive a legacy root.  Comparing the
     configured board with the effective board (a board-change candidate, or
-    policy drift) is the caller's job.
+    policy drift) is the caller's job.  ``pr_number`` is the surface number:
+    the PR, or the issue that owns the plan.
     """
+    with _labelled(surface):
+        return _resolve_board_lineage(
+            records,
+            comments,
+            amendments=amendments,
+            configured=configured,
+            pr_number=pr_number,
+            trusted_actor=trusted_actor,
+            contract_from_metadata=contract_from_metadata,
+            drift_error=drift_error,
+            surface=surface,
+        )
+
+
+def _resolve_board_lineage(
+    records: Sequence[object],
+    comments: Sequence[object],
+    *,
+    amendments: Sequence[object],
+    configured: BoardIdentity,
+    pr_number: int,
+    trusted_actor: tuple[str, int] | None,
+    contract_from_metadata: Callable[[object], object | None],
+    drift_error: Callable[[object, str], AgentLoopError],
+    surface: BoardSurface,
+) -> BoardLineage:
     from .board_amendment import build_amendment_chain
     from .reviewer_seats import validate_backend_outage_amendments_for_binding
 
+    def root_of(metadata: object) -> object:
+        return getattr(metadata, surface.root_field)
+
+    def identity_of(metadata: object) -> object:
+        return getattr(metadata, surface.identity_field)
+
+    def init_of(metadata: object) -> object:
+        return getattr(metadata, surface.init_field)
+
     ordered = sorted(records, key=lambda record: record.index)
-    links = collect_board_change_links(comments, pr_number=pr_number, trusted_actor=trusted_actor)
-    identity_records = [r for r in ordered if r.metadata.pr_board_root is not None]
+    links = collect_board_change_links(
+        comments, pr_number=pr_number, trusted_actor=trusted_actor, surface=surface
+    )
+    identity_records = [r for r in ordered if root_of(r.metadata) is not None]
     for record in ordered:
         metadata = record.metadata
-        if metadata.pr_board_root is None and (
-            metadata.pr_board_identity is not None
-            or metadata.pr_board_binding_init is not None
+        if root_of(metadata) is None and (
+            identity_of(metadata) is not None
+            or init_of(metadata) is not None
             or metadata.reviewer_board_change_digest is not None
         ):
             raise _fail(
@@ -1030,7 +1222,7 @@ def resolve_board_lineage(
                 "without a root anchor"
             )
     anchors: list[tuple[int, BoardIdentity]] = [
-        (record.index, BoardIdentity.from_payload(record.metadata.pr_board_root))
+        (record.index, BoardIdentity.from_payload(root_of(record.metadata)))
         for record in identity_records
     ] + [(link.comment_index, link.root) for link in links]
     anchors.sort(key=lambda item: item[0])
@@ -1049,9 +1241,12 @@ def resolve_board_lineage(
             configured=configured,
             amendments=amendments,
             contract_from_metadata=contract_from_metadata,
+            surface=surface,
         )
         anchored = False
-    root_contract = root.contract()
+    if root.policy not in surface.policies:
+        raise _fail(f"the root board names policy {root.policy!r}, invalid on this surface")
+    root_contract = surface.contract(root)
     posters = tuple(
         dict.fromkeys(
             record.metadata.agent
@@ -1159,7 +1354,7 @@ def resolve_board_lineage(
                 effective_from_round=link.effective_from_round,
                 digest=link.digest,
                 identity=link.new_board,
-                contract=link.new_board.contract(),
+                contract=surface.contract(link.new_board),
                 segment_base=link.new_board,
                 link=link,
             )
@@ -1170,7 +1365,7 @@ def resolve_board_lineage(
         current_contract = elements[-1].contract
         segment_base = link.new_board
 
-    _validate_legacy_seat_bindings([r for r in ordered if r.metadata.pr_board_root is None])
+    _validate_legacy_seat_bindings([r for r in ordered if root_of(r.metadata) is None])
 
     # Pass 2: walk records and links in comment order, accumulating binding
     # initializations and validating every record against its governing element.
@@ -1227,7 +1422,7 @@ def resolve_board_lineage(
             else None
         )
         locator = f"round {metadata.round_number} record (comment {record.index + 1})"
-        if metadata.pr_board_root is not None:
+        if root_of(metadata) is not None:
             if metadata.reviewer_board_amendment_digest is not None and metadata.reviewer_board_change_digest is not None:
                 raise _fail(f"{locator} carries both a signed-amendment and a board-change digest")
             known = {element.digest for element in elements}
@@ -1270,11 +1465,11 @@ def resolve_board_lineage(
                 raise _fail(
                     f"{locator} does not carry the digest of the lineage element that governs it"
                 )
-            own = _inits_from_payload(metadata.pr_board_binding_init, board=governing_identity)
+            own = _inits_from_payload(init_of(metadata), board=governing_identity)
             _merge_inits(inits, own, locator=locator, view=apply_inits(governing_identity, inits))
             expected_identity = apply_inits(governing_identity, inits)
             try:
-                recorded_identity = BoardIdentity.from_payload(metadata.pr_board_identity)
+                recorded_identity = BoardIdentity.from_payload(identity_of(metadata))
             except AgentLoopError:
                 raise _fail(f"{locator} carries a malformed board identity") from None
             if recorded_identity != expected_identity:
@@ -1404,6 +1599,7 @@ def resolve_board_lineage(
         authorizations=tuple(authorizations),
         posters=posters,
         last_seen=dict(last_seen),
+        surface=surface,
     )
 
 
@@ -1527,7 +1723,10 @@ def build_board_change_candidate(
     records: Sequence[object],
     pr_number: int,
 ) -> BoardChangeCandidate:
-    """The link a differing configured board would post (D4)."""
+    """The link a differing configured board would post (D4).
+
+    The surface is the lineage's own; ``pr_number`` is its surface number.
+    """
     if lineage.pending_amendments:
         raise AgentLoopError(
             "Human decision required: the configured reviewer board differs from the board "
@@ -1550,6 +1749,7 @@ def build_board_change_candidate(
     }
     payload = board_change_link_payload(
         pr_number=pr_number,
+        surface=lineage.surface,
         root=lineage.root,
         predecessor=latest.digest if latest is not None else lineage.root.digest,
         old_board=view,
@@ -1577,19 +1777,25 @@ class _SyntheticComment:
 
 
 def comments_with_candidate(
-    comments: Sequence[object], candidate: BoardChangeCandidate, *, actor_id: int
+    comments: Sequence[object], candidate: BoardChangeCandidate, *, actor_id: int,
+    surface: BoardSurface = PR_SURFACE,
 ) -> tuple[object, ...]:
     """``comments`` with the unposted candidate appended, for read-only validation."""
     return (
         *comments,
-        _SyntheticComment(body=str(render_board_change_link(candidate.payload)), author_id=actor_id),
+        _SyntheticComment(
+            body=str(render_board_change_link(candidate.payload, surface=surface)),
+            author_id=actor_id,
+        ),
     )
 
 
-def link_already_posted(comments: Sequence[object], digest: str) -> bool:
+def link_already_posted(
+    comments: Sequence[object], digest: str, *, surface: BoardSurface = PR_SURFACE
+) -> bool:
     return any(
         isinstance(body := _body(comment), str)
-        and BOARD_CHANGE_LINK_HEADING in body
+        and surface.heading in body
         and digest in body
         for comment in comments
     )
@@ -1607,18 +1813,21 @@ class PrBoardStamp:
     change_digest: str | None
     amendment_digest: str | None
     pending_init: dict[str, object] | None = None
+    surface: BoardSurface = PR_SURFACE
 
     def apply(self, metadata: object) -> object:
         # The initialization rides on every record of the run: a render that
         # is never posted must not consume it, and an identical repeat is a
         # no-op when the lineage is resolved.
-        if getattr(metadata, "flow", None) != "pr":
+        if getattr(metadata, "flow", None) != self.surface.flow:
             return metadata
         return dataclasses.replace(
             metadata,
-            pr_board_root=self.root,
-            pr_board_identity=self.identity,
-            pr_board_binding_init=self.pending_init or None,
+            **{
+                self.surface.root_field: self.root,
+                self.surface.identity_field: self.identity,
+                self.surface.init_field: self.pending_init or None,
+            },
             reviewer_board_change_digest=self.change_digest,
             reviewer_board_amendment_digest=self.amendment_digest,
         )
@@ -1637,6 +1846,7 @@ def stamp_for_lineage(
         change_digest=lineage.active_change_digest,
         amendment_digest=lineage.active_digest,
         pending_init=init_payload(inits) if inits else None,
+        surface=lineage.surface,
     )
 
 
@@ -1660,6 +1870,8 @@ def carry_over_anchor_round(
     reconciliation_mode: str,
     evidence_clearances: Sequence[tuple[str, str]],
     next_item_number: int,
+    same_status: str = "same-pr",
+    surface: BoardSurface = PR_SURFACE,
 ) -> CarryOver:
     """Collect, reconcile, merge and rebuild evidence for the anchor round.
 
@@ -1682,7 +1894,7 @@ def carry_over_anchor_round(
         for item in review.metadata.new_items:
             if item.reviewer != review.metadata.agent:
                 raise AgentLoopError(
-                    "PR board change cannot verify the owner of a carried finding: "
+                    f"{surface.lineage_label} board change cannot verify the owner of a carried finding: "
                     f"{item.item_id} names {item.reviewer!r} but was published by "
                     f"{review.metadata.agent!r}."
                 )
@@ -1697,15 +1909,17 @@ def carry_over_anchor_round(
             if clearance not in clearances:
                 clearances.append(clearance)
     reconciled_clearances: list[tuple[str, str]] = []
+    active = {"blocking", same_status}
     items, _future = _apply_unresolved_item_dispositions(
         prior_items,
         _aggregate_record_dispositions(completed_reviews),
+        same_status=same_status,
         retain_future=False,
         reconciliation_mode=reconciliation_mode,
         round_number=round_number,
         evidence_clearances=reconciled_clearances,
     )
-    items = [item for item in items if item.status in {"blocking", "same-pr"}]
+    items = [item for item in items if item.status in active]
     by_id = {item.item_id: item for item in items}
     prior_by_id = {item.item_id: item for item in prior_items}
     new_items = list(settled_new_items) or [
@@ -1719,14 +1933,14 @@ def carry_over_anchor_round(
             existing = source.get(item.item_id)
             if existing is not None and existing != item:
                 raise AgentLoopError(
-                    "PR board change found conflicting content for carried finding "
+                    f"{surface.lineage_label} board change found conflicting content for carried finding "
                     f"{item.item_id}."
                 )
         seen[item.item_id] = item
         if item.item_id in prior_by_id:
             # Already reconciled from the anchor ledger; never reopened here.
             continue
-        if item.status in {"blocking", "same-pr"} and item.item_id not in by_id:
+        if item.status in active and item.item_id not in by_id:
             by_id[item.item_id] = item
             items.append(item)
     for clearance in reconciled_clearances:
@@ -1764,7 +1978,12 @@ def carry_over_anchor_round(
     )
 
 
-def pre_epoch_panel_items(records: Sequence[object], lineage: BoardLineage) -> frozenset[str]:
+def pre_epoch_panel_items(
+    records: Sequence[object],
+    lineage: BoardLineage,
+    *,
+    derive_evidence: Callable[..., object] | None = None,
+) -> frozenset[str]:
     """Items legitimately created under a panel opening before the primary epoch.
 
     Every primary epoch closes one window of authenticated round history,
@@ -1782,8 +2001,13 @@ def pre_epoch_panel_items(records: Sequence[object], lineage: BoardLineage) -> f
     share one window.  A secondary-owned item that never had a qualified
     opening is not eligible, so it still raises the pre-panel stop (D5a).
     """
-    from .panel_evidence import _derive_pr_panel_evidence
+    from .panel_evidence import _derive_plan_panel_evidence, _derive_pr_panel_evidence
 
+    if derive_evidence is None:
+        derive_evidence = (
+            _derive_pr_panel_evidence if lineage.surface.flow == "pr"
+            else _derive_plan_panel_evidence
+        )
     epochs: dict[int, BoardChangeLink] = {}
     for element in lineage.elements:
         link = element.link
@@ -1811,7 +2035,7 @@ def pre_epoch_panel_items(records: Sequence[object], lineage: BoardLineage) -> f
             key=lambda record: record.index,
         )
         start = epoch_round
-        evidence = _derive_pr_panel_evidence(
+        evidence = derive_evidence(
             history,
             primary_reviewer=judge.old_board.primary,
             required_reviewers=judge.old_board.names,
@@ -1842,6 +2066,7 @@ def carried_secondary_obligations(
     epoch_round: int | None,
     primary: str | None,
     eligible: frozenset[str] = frozenset(),
+    same_status: str = "same-pr",
 ) -> tuple[str, ...]:
     """Active pre-epoch items pending on secondaries that a qualified opening created (D5a)."""
     if epoch_round is None:
@@ -1849,7 +2074,7 @@ def carried_secondary_obligations(
     carried: list[str] = []
     for item in items:
         if (
-            item.status not in {"blocking", "same-pr"}
+            item.status not in {"blocking", same_status}
             or item.source_round >= epoch_round
             or item.item_id not in eligible
         ):

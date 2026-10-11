@@ -13,6 +13,18 @@ effective board, the orchestrator posts one plain-text board-change audit
 record on the PR, identified by a digest so a rerun posts nothing new.  The
 record carries no protocol marker and no signature grammar: it is neither a
 signed human requirement nor a signed reviewer-board amendment.
+
+Recorded plan board changes (#1377): once the plan history carries a plan
+board root anchor or an orchestrator-authored plan board-change link, the
+context is resolved through the plan board lineage (links and signed plan
+amendments in one ordered chain).  The approving board is the board of the
+latest lineage element that took effect, and approvals that the lineage
+retired (a removed seat, an added or rebound seat before its effective round,
+a pre-epoch approval after a primary change) never count.
+
+:func:`classify_plan_approval` decides read-only, from history alone, whether
+the current canonical plan is provably completely approved.  An approved plan
+is never reopened by a later invocation's board or planning flags.
 """
 
 from __future__ import annotations
@@ -21,7 +33,7 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from .errors import AgentLoopError
 from .reviewer_floor import BoardSeat, SignedBoardAuthorization, distinct_providers
@@ -48,6 +60,10 @@ class PlanVerificationContext:
     # Comment positions of approvals bound to a superseded seat model; they
     # never count towards the approving board (#1373 review item-2).
     stale_approval_indices: frozenset[int] = frozenset()
+    # How the approving board was derived: ``lineage`` (plan board root or
+    # link, #1377), ``contract``, ``binding`` or ``posters`` (plain legacy
+    # history, which proves membership but never completion by itself).
+    derivation: str = "contract"
 
     def verification_comments(self, comments: Sequence[object]) -> tuple[object, ...]:
         """``comments`` with superseded-model approvals neutralized in place.
@@ -182,15 +198,21 @@ def _board_seats(
 
 
 def derive_plan_verification_context(
-    comments: Sequence[object], *, issue_number: int | None,
+    comments: Sequence[object],
+    *,
+    issue_number: int | None,
+    trusted_actor: tuple[str, int] | None = None,
 ) -> PlanVerificationContext | None:
     """Derive the approving plan board from the plan's owning issue history.
 
     Returns ``None`` when the issue carries no plan round records (or no plan
     reviewer at all), in which case no plan board can be verified.  Malformed
-    binding or amendment lineage fails closed.
+    binding or amendment lineage fails closed.  History carrying a plan board
+    root anchor or a plan board-change link is resolved through the plan
+    board lineage; its links are admitted only from ``trusted_actor``.
     """
     from .board_amendment import collect_reviewer_board_amendments, resolve_contract_lineage
+    from .board_change import PLAN_SURFACE, comments_bear_board_change_links
     from .reviewer_seats import (
         _persisted_plan_contract,
         validate_backend_outage_amendments_for_binding,
@@ -201,6 +223,12 @@ def derive_plan_verification_context(
     records = _extract_round_metadata_records(comments, flow="plan")
     if not records:
         return None
+    if comments_bear_board_change_links(comments, surface=PLAN_SURFACE) or any(
+        record.metadata.plan_board_root is not None for record in records
+    ):
+        return _lineage_verification_context(
+            comments, records, issue_number=issue_number, trusted_actor=trusted_actor,
+        )
     binding, binding_entries, stale = _validated_plan_binding_history(records)
     contract = next(
         (contract for record in records
@@ -217,6 +245,7 @@ def derive_plan_verification_context(
             "cannot be verified."
         )
     amendment_count = 0
+    derivation = "contract"
     if contract is not None:
         amendments = collect_reviewer_board_amendments(
             comments, flow="plan", issue_number=issue_number,
@@ -238,6 +267,7 @@ def derive_plan_verification_context(
     elif binding is not None:
         original_names = effective_names = tuple(binding_entries)
         policy, primary = "all-reviewers", None
+        derivation = "binding"
     else:
         # Plain all-reviewers planning persists no contract or binding: every
         # reviewer that reviewed the plan is on the approving board.
@@ -249,6 +279,7 @@ def derive_plan_verification_context(
             return None
         original_names = effective_names = tuple(names)
         policy, primary = "all-reviewers", None
+        derivation = "posters"
     return PlanVerificationContext(
         issue_number=issue_number,
         original_reviewers=original_names,
@@ -260,6 +291,101 @@ def derive_plan_verification_context(
         seat_binding=binding,
         signed_amendment_count=amendment_count,
         stale_approval_indices=stale,
+        derivation=derivation,
+    )
+
+
+def _lineage_verification_context(
+    comments: Sequence[object],
+    records: Sequence[object],
+    *,
+    issue_number: int | None,
+    trusted_actor: tuple[str, int] | None,
+) -> PlanVerificationContext:
+    """The approving plan board of history with a plan board lineage (#1377).
+
+    Resolved through the plan surface resolver, never from the invocation's
+    planning configuration.  The approving identity is the board of the
+    latest lineage element any plan round record took effect under (pending
+    elements never governed an approval).  Any lineage defect raises.
+    """
+    import dataclasses
+
+    from .board_change import (
+        PLAN_SURFACE,
+        BoardIdentity,
+        apply_inits,
+        collect_board_change_links,
+    )
+    from .plan_board_state import resolve_plan_lineage
+
+    if issue_number is None:
+        raise AgentLoopError(
+            "Approved plan board lineage cannot be verified without its owning issue."
+        )
+    anchored = next(
+        (record.metadata.plan_board_root for record in records
+         if record.metadata.plan_board_root is not None),
+        None,
+    )
+    if anchored is not None:
+        root = BoardIdentity.from_payload(anchored)
+    else:
+        links = collect_board_change_links(
+            comments, pr_number=issue_number, trusted_actor=trusted_actor, surface=PLAN_SURFACE,
+        )
+        root = links[0].root
+    lineage = resolve_plan_lineage(
+        comments,
+        issue_number=issue_number,
+        configured=root,
+        trusted_actor=trusted_actor,
+        drift_error=lambda _persisted, detail: AgentLoopError(
+            f"Approved plan board history is inconsistent with its lineage: {detail}"
+        ),
+    )
+    # Only elements some plan round record took effect under can have
+    # governed an approval.
+    taken = [element for element in lineage.elements if element.digest in lineage.carried]
+    last = lineage.elements.index(taken[-1]) + 1 if taken else 0
+    view = dataclasses.replace(lineage, elements=lineage.elements[:last])
+    effective = view.current_identity
+    base = apply_inits(view.segment_base, view.inits)
+    segment_amendments = 0
+    for element in reversed(view.elements):
+        if element.kind != "amendment":
+            break
+        segment_amendments += 1
+    fresh = view.fresh_from_rounds
+    epoch = view.primary_epoch_round
+    effective_names = set(effective.names)
+    stale: set[int] = set()
+    for record in records:
+        metadata = record.metadata
+        if epoch is not None and metadata.round_number < epoch and metadata.role != "coder":
+            # A primary change restarts the primary phase: pre-epoch reviews,
+            # panel openings and approvals never count.
+            stale.add(record.index)
+            continue
+        if metadata.role != "reviewer" or metadata.state != "approved":
+            continue
+        if metadata.agent not in effective_names or metadata.round_number < fresh.get(
+            metadata.agent, 0
+        ):
+            stale.add(record.index)
+    binding = base.seat_binding() if base.named else effective.seat_binding()
+    return PlanVerificationContext(
+        issue_number=issue_number,
+        original_reviewers=base.names,
+        effective_reviewers=effective.names,
+        original_seats=base.seats,
+        effective_seats=effective.seats,
+        policy=effective.policy,
+        primary_reviewer=effective.primary,
+        seat_binding=binding,
+        signed_amendment_count=segment_amendments,
+        stale_approval_indices=frozenset(stale),
+        derivation="lineage",
     )
 
 
@@ -343,7 +469,11 @@ def _validated_plan_binding_history(
 
 
 def plan_verification_inputs(
-    config: object, comments: Sequence[object], *, issue_number: int | None,
+    config: object,
+    comments: Sequence[object],
+    *,
+    issue_number: int | None,
+    trusted_actor: tuple[str, int] | None = None,
 ) -> tuple[object, tuple[object, ...]]:
     """The config and comments every plan-approval reader uses.
 
@@ -360,7 +490,9 @@ def plan_verification_inputs(
         for record in _extract_round_metadata_records(comments, flow="plan")
     ):
         return config, comments
-    context = derive_plan_verification_context(comments, issue_number=issue_number)
+    context = derive_plan_verification_context(
+        comments, issue_number=issue_number, trusted_actor=trusted_actor,
+    )
     if context is None:
         return config, comments
     return context.config_for(config), context.verification_comments(comments)
@@ -490,21 +622,370 @@ def signed_lineage_authorization(
     )
 
 
+# --- Plan approval classification (#1377) --------------------------------------
+
+PLAN_APPROVAL_STATES = ("no-plan", "unfinished", "undetermined", "approved")
+
+
+@dataclass(frozen=True)
+class PlanApprovalClassification:
+    """Whether the current canonical plan is provably completely approved.
+
+    ``approved`` exempts a run from plan board-change candidacy, planning
+    policy drift and the planning candidate floor; it never produces an
+    approved outcome by itself.  The live approval boundary still runs, and
+    any input it cannot confirm downgrades the run to normal resolution.
+    """
+
+    state: str
+    reason: str
+    context: PlanVerificationContext | None = None
+    plan_hash: str | None = None
+
+    @property
+    def approved(self) -> bool:
+        return self.state == "approved"
+
+
+def plan_hash_has_issue_handoff(
+    comments: Sequence[object], *, issue_number: int, repo: str | None, plan_hash: str,
+) -> bool:
+    """Whether an issue-side implementation handoff names exactly ``plan_hash``.
+
+    Completion evidence for unanchored plain history, whose posters prove
+    membership only (#1377 step 12a).  Malformed records never count.
+    """
+    from .decomposition import (
+        ONE_SHOT_IMPL_HANDOFF_MARKER_RE,
+        PHASE_IMPLEMENTATION_MARKER_RE,
+        _decode_one_shot_impl_handoff_metadata,
+        _decode_phase_implementation_handoff_metadata,
+    )
+    from .issue_pr_handoff import find_latest_issue_pr_handoff
+
+    if repo is not None:
+        try:
+            handoff = find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=repo)
+        except AgentLoopError:
+            handoff = None
+        if handoff is not None and handoff.plan_hash == plan_hash:
+            return True
+    for comment in comments:
+        body = getattr(comment, "body", None)
+        if not isinstance(body, str):
+            continue
+        for pattern, decode in (
+            (ONE_SHOT_IMPL_HANDOFF_MARKER_RE, _decode_one_shot_impl_handoff_metadata),
+            (PHASE_IMPLEMENTATION_MARKER_RE, _decode_phase_implementation_handoff_metadata),
+        ):
+            for match in pattern.finditer(body):
+                try:
+                    metadata = decode(match.group("payload"))
+                except (AgentLoopError, ValueError, KeyError, TypeError):
+                    continue
+                if (
+                    getattr(metadata, "parent_issue", None) == issue_number
+                    and getattr(metadata, "plan_hash", None) == plan_hash
+                ):
+                    return True
+    return False
+
+
+def plan_open_obligations(plan_round: object, *, board: Sequence[str]) -> tuple[str, ...]:
+    """Active blocking or same-plan items left after the resumed round reconciles.
+
+    The ledger view reassigns removed reviewers' items to the remaining
+    ``board``, so a removed reviewer's unresolved finding stays open.
+    """
+    from .board_amendment import apply_board_amendment_to_ledger
+    from .round_state import _aggregate_record_dispositions
+    from .unresolved_items import _apply_unresolved_item_dispositions
+
+    prior = tuple(getattr(plan_round, "prior_items", ()))
+    new = tuple(getattr(plan_round, "current_round_new_items", ()))
+    if not new:
+        new = tuple(
+            item
+            for record in getattr(plan_round, "completed_reviews", ())
+            for item in record.metadata.new_items
+        )
+    owners = {
+        owner
+        for item in (*prior, *new)
+        for owner in (tuple(item.resolution_owners or ()) or (item.reviewer,))
+    }
+    removed = tuple(sorted(name for name in owners if name and name not in set(board)))
+    view, _ = apply_board_amendment_to_ledger(
+        prior,
+        removed_reviewers=removed,
+        remaining_reviewers=tuple(board),
+        primary_reviewer=None,
+    )
+    items, _future = _apply_unresolved_item_dispositions(
+        view,
+        _aggregate_record_dispositions(tuple(getattr(plan_round, "completed_reviews", ()))),
+        same_status="same-plan",
+        retain_future=False,
+    )
+    open_ids = [item.item_id for item in items if item.status in {"blocking", "same-plan"}]
+    prior_ids = {item.item_id for item in prior}
+    open_ids += [
+        item.item_id for item in new
+        if item.status in {"blocking", "same-plan"} and item.item_id not in prior_ids
+    ]
+    return tuple(dict.fromkeys(open_ids))
+
+
+def _approval_requirement_binding(
+    plan_round: object,
+    *,
+    board: Sequence[str],
+    plan_text: str,
+    surfaced_ids: Sequence[str],
+) -> str:
+    """``bound``, ``stale`` or ``unproven`` for an all-reviewers approval set (step 12c).
+
+    A recorded exact-plan candidate key binds only when it equals the key
+    recomputed against the current requirement set.  A keyless legacy
+    approval binds only through the plan's own dispositions naming exactly
+    the current set, plus the acknowledgement in every approval text when
+    that set is non-empty.
+    """
+    from .panel_evidence import _plan_candidate_key_for, _plan_key_from_payload
+    from .protocol import human_requirements_resolved
+    from .response_validation import _current_plan_has_complete_human_requirement_dispositions
+    from .plan_assembly import decode_assembled_plan_sidecar
+    from .round_state import _plan_subject
+
+    coder_metadata = getattr(plan_round, "coder_metadata", None)
+    sidecar = None
+    if coder_metadata is not None and coder_metadata.assembled_plan_sidecar is not None:
+        try:
+            sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
+        except (AgentLoopError, ValueError, KeyError, TypeError):
+            return "unproven"
+    current_key = _plan_candidate_key_for(
+        plan_subject=_plan_subject(plan_text),
+        sidecar=sidecar,
+        surfaced_requirement_ids=surfaced_ids,
+    )
+    surfaced = {str(item) for item in surfaced_ids}
+    approvals = [
+        record for record in getattr(plan_round, "completed_reviews", ())
+        if record.metadata.agent in set(board) and record.metadata.state == "approved"
+    ]
+    legacy = []
+    for record in approvals:
+        key = _plan_key_from_payload(record.metadata.plan_candidate_key)
+        if key is None:
+            legacy.append(record)
+            continue
+        if not key.matches(current_key) or (
+            surfaced and set(record.metadata.surfaced_reviewer_requirement_ids) != surfaced
+        ):
+            return "stale"
+    if not legacy:
+        return "bound"
+    if not _current_plan_has_complete_human_requirement_dispositions(
+        getattr(plan_round, "coder_output", None), surfaced_requirement_ids=tuple(surfaced_ids),
+    ):
+        return "unproven"
+    if surfaced and not all(human_requirements_resolved(record.body or "") for record in legacy):
+        return "unproven"
+    return "bound"
+
+
+def classify_plan_approval(
+    comments: Sequence[object],
+    *,
+    config: object,
+    issue_number: int,
+    human_requirements: Sequence[object],
+    trusted_actor: tuple[str, int] | None = None,
+    inherited_check: Callable[[str], str | None] | None = None,
+    inherited_derivable: bool = True,
+    supersession_pending: bool = False,
+) -> PlanApprovalClassification:
+    """Read-only plan approval classification from history alone (#1377 step 12).
+
+    Shared by the issue-entry floor preflight and plan startup.  Every input
+    comes from durable history: the approving plan identity (never the
+    invocation's reviewers or planning flags), the reconstructed latest round
+    and its ledger, the current signed requirement set and each counted
+    approval's requirement binding, the inherited-matrix admissibility
+    result, a pending signed supersession, and the plan-growth gate.  Any
+    underivable input means not approved; a malformed lineage raises.
+    """
+    from .config import reviewers
+    from .panel_evidence import _require_complete_canonical_plan_approval
+    from .plan_review_scheduling import plan_policy_capabilities
+    from .response_validation import _surfaced_reviewer_requirement_ids
+    from .round_state import _extract_round_metadata_records, _resume_plan_round
+    from .decomposition import approved_plan_hash
+
+    from .board_change import PLAN_SURFACE, comments_bear_board_change_links
+    from .config import phased_delivery_guard_active
+    from .execution_policy import _current_execution_recommendation
+
+    comments = tuple(comments)
+    records = _extract_round_metadata_records(comments, flow="plan")
+    if not records:
+        return PlanApprovalClassification("no-plan", "no plan round records")
+    lineage_bearing = comments_bear_board_change_links(comments, surface=PLAN_SURFACE) or any(
+        record.metadata.plan_board_root is not None for record in records
+    )
+    try:
+        context = derive_plan_verification_context(
+            comments, issue_number=issue_number, trusted_actor=trusted_actor,
+        )
+    except AgentLoopError as exc:
+        if lineage_bearing:
+            # A malformed plan board lineage fails closed.
+            raise
+        # Degraded legacy history keeps today's handling in the live loop.
+        return PlanApprovalClassification("undetermined", f"legacy plan history: {exc}")
+    if context is None:
+        return PlanApprovalClassification("unfinished", "no plan reviewer has reviewed the plan")
+    plan_config = context.config_for(config)
+    plan_comments = context.verification_comments(comments)
+    try:
+        resumed = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
+    except (AgentLoopError, ValueError, KeyError, TypeError) as exc:
+        return PlanApprovalClassification(
+            "undetermined", f"the latest plan round cannot be reconstructed: {exc}", context,
+        )
+    if resumed is None:
+        return PlanApprovalClassification("unfinished", "no reconstructible plan round", context)
+    plan_text, plan_round = resumed
+    plan_hash = approved_plan_hash(plan_text)
+
+    def result(state: str, reason: str) -> PlanApprovalClassification:
+        return PlanApprovalClassification(state, reason, context, plan_hash)
+
+    if phased_delivery_guard_active(getattr(config, "plan_execution_mode", "")):
+        # The execution-mode guard (#1268): a staged plan under a guard-active
+        # mode is narrowed or stopped by the live loop, never approved here.
+        try:
+            recommendation = _current_execution_recommendation(plan_text, comments)
+        except AgentLoopError:
+            return result("undetermined", "the execution recommendation cannot be read")
+        if recommendation is not None and recommendation.strategy == "staged":
+            return result("unfinished", "a staged plan under a phased-delivery execution mode")
+
+    if supersession_pending:
+        return result("unfinished", "a validated signed plan supersession is pending")
+    if not inherited_derivable:
+        return result("undetermined", "the inherited-matrix admissibility is not derivable")
+    if inherited_check is not None and inherited_check(plan_text) is not None:
+        return result("unfinished", "the plan fails its inherited parent matrix rows")
+    if context.derivation == "posters" and not plan_hash_has_issue_handoff(
+        comments, issue_number=issue_number, repo=getattr(config, "repo", None),
+        plan_hash=plan_hash,
+    ):
+        # Historical posters prove membership, never completion (step 12a).
+        return result(
+            "undetermined",
+            "unanchored plain plan history has no issue-side handoff bound to the plan hash",
+        )
+    try:
+        _require_complete_canonical_plan_approval(
+            plan_comments,
+            config=plan_config,
+            plan_text=plan_text,
+            plan_round=plan_round,
+            human_requirements=human_requirements,
+            error_message="incomplete",
+        )
+    except AgentLoopError:
+        return result("unfinished", "not every approving reviewer approved the exact plan")
+    except (ValueError, KeyError, TypeError) as exc:
+        return result("undetermined", f"the approval state cannot be reconstructed: {exc}")
+    board = context.effective_reviewers
+    open_items = plan_open_obligations(plan_round, board=board)
+    if open_items:
+        return result("unfinished", "open plan obligation(s) " + ", ".join(open_items))
+    if not plan_policy_capabilities(context.policy).scheduler_enabled:
+        binding = _approval_requirement_binding(
+            plan_round,
+            board=board,
+            plan_text=plan_text,
+            surfaced_ids=_surfaced_reviewer_requirement_ids(
+                human_requirements, requirement_scope="planning requirements",
+            ),
+        )
+        if binding == "stale":
+            return result("unfinished", "an approval is bound to a stale requirement set")
+        if binding != "bound":
+            return result("undetermined", "an approval's requirement binding is unproven")
+    return result("approved", "every approving reviewer approved the exact plan")
+
+
 def enforce_issue_board_floor(
-    config: object, comments: Sequence[object], *, issue_number: int,
+    config: object,
+    comments: Sequence[object],
+    *,
+    issue_number: int,
+    runner: object | None = None,
+    human_requirements: Sequence[object] = (),
+    planning: bool = False,
+    inherited_derivable: bool = True,
 ) -> None:
     """Issue-mode floor preflight, before any planning or implementation turn.
 
-    The effective board is the invocation's board after the handoff board rule
-    against the issue's own plan lineage, so a signed plan amendment excuses
-    only the measures its chain lowered.
+    Two branches (#1377 step 9).  When the issue's current plan is provably
+    approved, or there is no plan to resume, the effective board is the
+    invocation's board after the stage 1 handoff board rule against the
+    approving plan context, so a signed plan amendment excuses only the
+    measures its chain lowered; the invocation's planning flags are never
+    compared.  Otherwise a plan-first run resolves its plan board read-only,
+    including any board-change candidate, and refuses a below-floor plan
+    board before any agent invocation or comment post.
     """
     from .reviewer_floor import board_floor_enabled, enforce_configured_board_floor
     from .reviewer_seats import resolve_plan_handoff_board
 
     if not board_floor_enabled(config):
         return
-    plan = derive_plan_verification_context(comments, issue_number=issue_number)
+    trusted_actor = None
+    if runner is not None:
+        from .plan_board_state import admitted_issue_comments
+
+        comments, trusted_actor = admitted_issue_comments(
+            runner, config=config, issue_number=issue_number, comments=comments,
+        )
+    if planning:
+        classification = classify_plan_approval(
+            comments,
+            config=config,
+            issue_number=issue_number,
+            human_requirements=human_requirements,
+            trusted_actor=trusted_actor,
+            inherited_derivable=inherited_derivable,
+        )
+        if classification.state not in {"approved", "no-plan"}:
+            from .plan_board_state import (
+                plan_drift_error,
+                plan_floor_refusal_hint,
+                plan_resume_round,
+                resolve_plan_board_state,
+            )
+
+            resolve_plan_board_state(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                comments=comments,
+                admitted=(comments, trusted_actor),
+                drift_error=plan_drift_error(issue_number),
+                floor_context=f"Issue #{issue_number} plan reviewer board",
+                floor_refusal_hint=plan_floor_refusal_hint(
+                    issue_number, lambda: plan_resume_round(comments, config),
+                ),
+            )
+            return
+    plan = derive_plan_verification_context(
+        comments, issue_number=issue_number, trusted_actor=trusted_actor,
+    )
     authorizations: tuple[SignedBoardAuthorization, ...] = ()
     effective = config
     if plan is not None:

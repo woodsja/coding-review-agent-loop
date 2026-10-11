@@ -96,6 +96,11 @@ from .evidence_stall import stall_snapshot_is_consistent
 logger = logging.getLogger(__name__)
 
 
+_PR_BOARD_FIELDS = ("pr_board_root", "pr_board_identity", "pr_board_binding_init")
+_PLAN_BOARD_FIELDS = ("plan_board_root", "plan_board_identity", "plan_board_binding_init")
+_BOARD_FIELDS = (*_PR_BOARD_FIELDS, *_PLAN_BOARD_FIELDS)
+
+
 @dataclass(frozen=True)
 class PostedRoundMetadata:
     flow: str
@@ -296,6 +301,12 @@ class PostedRoundMetadata:
     pr_board_identity: dict | None = None
     pr_board_binding_init: dict | None = None
     reviewer_board_change_digest: str | None = None
+    # Plan board lineage (#1377): the same fields for issue plan-review runs.
+    # They are flow-scoped: ``plan_board_*`` only on plan-flow records and
+    # ``pr_board_*`` only on PR-flow records.
+    plan_board_root: dict | None = None
+    plan_board_identity: dict | None = None
+    plan_board_binding_init: dict | None = None
     # Coder record round that last rendered the full visible matrix-evidence
     # row list (#959).  Writers set it iff they persist matrix evidence; it is
     # omitted from the encoding when None so legacy records stay byte-stable.
@@ -388,13 +399,24 @@ class PostedRoundMetadata:
             or not re.fullmatch(r"[0-9a-f]{64}", self.reviewer_board_change_digest)
         ):
             raise ValueError("invalid reviewer board change digest")
-        for board_field in ("pr_board_root", "pr_board_identity", "pr_board_binding_init"):
+        for board_field in _BOARD_FIELDS:
             if getattr(self, board_field) is not None and not isinstance(
                 getattr(self, board_field), dict
             ):
                 raise ValueError(f"invalid {board_field}")
         if (self.pr_board_root is None) != (self.pr_board_identity is None):
             raise ValueError("pr_board_root and pr_board_identity must be set together")
+        if (self.plan_board_root is None) != (self.plan_board_identity is None):
+            raise ValueError("plan_board_root and plan_board_identity must be set together")
+        # Board identity fields are flow-scoped (#1377).
+        if self.flow != "pr" and any(
+            getattr(self, name) is not None for name in _PR_BOARD_FIELDS
+        ):
+            raise ValueError("pr_board_* fields are only valid on PR-flow records")
+        if self.flow != "plan" and any(
+            getattr(self, name) is not None for name in _PLAN_BOARD_FIELDS
+        ):
+            raise ValueError("plan_board_* fields are only valid on plan-flow records")
         if self.followup_dispatch_head is not None and not _is_followup_dispatch_head(
             self.followup_dispatch_head
         ):
@@ -2730,7 +2752,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["reviewer_board_amendment_digest"] = metadata.reviewer_board_amendment_digest
     if metadata.reviewer_board_change_digest is not None:
         payload["reviewer_board_change_digest"] = metadata.reviewer_board_change_digest
-    for board_field in ("pr_board_root", "pr_board_identity", "pr_board_binding_init"):
+    for board_field in _BOARD_FIELDS:
         if getattr(metadata, board_field) is not None:
             payload[board_field] = getattr(metadata, board_field)
     if metadata.plan_candidate_key is not None:
@@ -3270,6 +3292,9 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             pr_board_root=_decode_board_object(payload, "pr_board_root"),
             pr_board_identity=_decode_board_object(payload, "pr_board_identity"),
             pr_board_binding_init=_decode_board_object(payload, "pr_board_binding_init"),
+            plan_board_root=_decode_board_object(payload, "plan_board_root"),
+            plan_board_identity=_decode_board_object(payload, "plan_board_identity"),
+            plan_board_binding_init=_decode_board_object(payload, "plan_board_binding_init"),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             evidence_stall=_decode_evidence_stall(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
@@ -3330,10 +3355,28 @@ def reset_pr_board_stamp(token: "contextvars.Token") -> None:
     _PR_BOARD_STAMP.reset(token)
 
 
+# The plan board stamp of the running plan loop (#1377), applied only to
+# plan-flow records at the same single encoder.
+_PLAN_BOARD_STAMP: "contextvars.ContextVar[object | None]" = contextvars.ContextVar(
+    "plan_board_stamp", default=None
+)
+
+
+def set_plan_board_stamp(stamp: object | None) -> "contextvars.Token":
+    return _PLAN_BOARD_STAMP.set(stamp)
+
+
+def reset_plan_board_stamp(token: "contextvars.Token") -> None:
+    _PLAN_BOARD_STAMP.reset(token)
+
+
 def _attach_round_metadata(body: str, metadata: PostedRoundMetadata) -> str:
     stamp = _PR_BOARD_STAMP.get()
     if stamp is not None and metadata.flow == "pr":
         metadata = stamp.apply(metadata)  # type: ignore[attr-defined]
+    plan_stamp = _PLAN_BOARD_STAMP.get()
+    if plan_stamp is not None and metadata.flow == "plan":
+        metadata = plan_stamp.apply(metadata)  # type: ignore[attr-defined]
     marker = f"<!-- AGENT_LOOP_META: {_encode_round_metadata(metadata)} -->"
     degradations = render_parse_degradations_section(metadata.architecture_impact_degradations)
     if degradations is not None and degradations not in str(body):

@@ -744,6 +744,11 @@ class PlanSchedulerSnapshot:
     # They are unqualified artifacts: never approvals, never ownership.
     premature_secondary_reviews: tuple[str, ...] = ()
     transport_error: object | None = None
+    # Pre-epoch secondary obligations carried across a recorded plan primary
+    # change (#1377).  They keep their owners and block approval, but are
+    # exempt from the pre-panel safety stop; the panel reopens for them once
+    # the new primary approves the exact plan.
+    carried_obligations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         source = self.force_full_source
@@ -1060,7 +1065,13 @@ def select_plan_reviewers(
                         f"from configured secondary reviewer(s) {', '.join(premature)}"
                     )
                 )
-            secondary_pending = pending_owner_set & secondaries
+            carried = set(snapshot.carried_obligations)
+            secondary_pending = {
+                owner
+                for obligation in active_obligations
+                if obligation.item_id not in carried
+                for owner in obligation.pending_owners
+            } & secondaries
             if secondary_pending and not degraded:
                 # Secondaries are never plan-finding owners before their first
                 # legitimate panel invocation; do not guess ownership and do not
@@ -1068,7 +1079,8 @@ def select_plan_reviewers(
                 item_ids = sorted(
                     obligation.item_id
                     for obligation in active_obligations
-                    if set(obligation.pending_owners) & secondary_pending
+                    if obligation.item_id not in carried
+                    and set(obligation.pending_owners) & secondary_pending
                 )
                 raise PlanPrePanelSafetyError(
                     plan_pre_panel_safety_message(

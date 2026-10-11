@@ -226,8 +226,18 @@ def run_issue_loop(
         from .reviewer_floor import board_floor_enabled
         if board_floor_enabled(config):
             plan_owner = _issue_floor_plan_owner(runner, config=config, issue_number=issue_number)
+            # A plan-first run on its own plan resolves the plan board when the
+            # plan is not provably approved (#1377); a planning child's
+            # inherited admissibility is not derivable here, so it is never
+            # classified approved at this point.
             enforce_issue_board_floor(
-                config, plan_owner.comments, issue_number=plan_owner.number,
+                config,
+                plan_owner.comments,
+                issue_number=plan_owner.number,
+                runner=runner,
+                human_requirements=plan_owner.human_requirements,
+                planning=plan_first and plan_owner.number == issue_number,
+                inherited_derivable=_infer_staged_parent_issue(plan_owner) is None,
             )
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)

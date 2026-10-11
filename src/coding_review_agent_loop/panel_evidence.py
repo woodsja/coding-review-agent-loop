@@ -1247,6 +1247,14 @@ def _require_complete_canonical_plan_approval(
         error_message=error_message,
     )
     configured_names = {agent_display_name(reviewer) for reviewer in reviewers(config)}
+    # Unanimous approvals with an open carried obligation, including a removed
+    # reviewer's reassigned finding, are not a completed plan (#1377).
+    from .plan_verification import plan_open_obligations
+
+    if plan_open_obligations(
+        plan_round, board=tuple(agent_display_name(reviewer) for reviewer in reviewers(config)),
+    ):
+        raise AgentLoopError(error_message)
     if not plan_policy_capabilities(config.plan_review_policy).scheduler_enabled:
         round_approved = {
             record.metadata.agent

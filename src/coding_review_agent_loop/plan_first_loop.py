@@ -18,15 +18,38 @@ from .config import (
     reviewers,
 )
 from .board_amendment import (
-    ContractLineage,
     amendment_audit_already_posted,
     amendment_summary_line,
     apply_board_amendment_to_ledger,
     collect_reviewer_board_amendments,
     render_amendment_audit_comment,
     require_amendment_activation,
-    resolve_contract_lineage,
 )
+from .board_change import (
+    PLAN_SURFACE,
+    BoardIdentity,
+    board_anchor,
+    board_reentry_round,
+    carried_secondary_obligations,
+    carry_over_anchor_round,
+    identity_agents,
+    link_already_posted,
+    name_agents,
+    plan_identity_from_config,
+    pre_epoch_panel_items,
+    render_board_change_link,
+    stamp_for_lineage,
+)
+from .plan_board_state import (
+    admitted_issue_comments,
+    plan_floor_refusal_hint,
+    plan_resume_round,
+    resolve_plan_board_state,
+    resolve_plan_lineage,
+)
+from .plan_verification import classify_plan_approval
+from .pr_board_state import check_lineage_floor
+from .reviewer_floor import board_floor_enabled
 from .decomposition import (
     CreatedPhaseIssue,
     approved_plan_hash,
@@ -145,6 +168,8 @@ from .followups import (
 )
 from .config import phased_delivery_guard_active
 from .round_state import (
+    reset_plan_board_stamp,
+    set_plan_board_stamp,
     prior_plan_execution_mode,
     ApprovedPlanContext,
     PostedRoundMetadata,
@@ -751,7 +776,55 @@ def _typed_deferred_work_titles(sidecar: object | None) -> tuple[str, ...]:
     return ()
 
 
-def _run_plan_first_loop(
+# Invocation board fields re-pointed at an approved plan's approving board for
+# the planning phase only, and restored before implementation (#1377).
+_PLAN_BOARD_CONFIG_FIELDS = (
+    "reviewer",
+    "reviewer_seats",
+    "active_reviewer_seat_id",
+    "pr_seat_binding_override",
+    "plan_review_policy",
+    "primary_plan_reviewer",
+    "plan_review_force_full",
+    "plan_reset_stall_streak",
+    "plan_primary_stall_rounds",
+    "plan_step_back_rounds",
+    "plan_step_back_escalation_rounds",
+)
+
+
+def _approving_plan_board_config(config: AgentLoopConfig, approving: object) -> AgentLoopConfig:
+    """``config`` with only its planning board fields taken from the approving plan."""
+    approving_config = approving.config_for(config)  # type: ignore[attr-defined]
+    return dataclasses_replace(
+        config,
+        **{name: getattr(approving_config, name) for name in _PLAN_BOARD_CONFIG_FIELDS},
+    )
+
+
+def _restore_invocation_board(
+    config: AgentLoopConfig, invocation: AgentLoopConfig
+) -> AgentLoopConfig:
+    """``config`` with the invocation's own board for implementation (#1377).
+
+    After an approved plan the stage 1 handoff rule alone governs the PR
+    board, against the approving plan context.
+    """
+    return dataclasses_replace(
+        config, **{name: getattr(invocation, name) for name in _PLAN_BOARD_CONFIG_FIELDS}
+    )
+
+
+def _run_plan_first_loop(runner: Runner, **kwargs: object) -> int:
+    """Run one plan-first loop with its plan board stamp scoped to the run (#1377)."""
+    token = set_plan_board_stamp(None)
+    try:
+        return _run_plan_first_loop_body(runner, **kwargs)  # type: ignore[arg-type]
+    finally:
+        reset_plan_board_stamp(token)
+
+
+def _run_plan_first_loop_body(
     runner: Runner,
     *,
     issue_number: int,
@@ -774,11 +847,7 @@ def _run_plan_first_loop(
     )
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
-    from .reviewer_seats import (
-        reviewer_seat_binding,
-        validate_pr_seat_bindings,
-        validate_pr_backend_outage_amendments,
-    )
+    from .reviewer_seats import reviewer_seat_binding
 
     seat_binding = reviewer_seat_binding(config)
 
@@ -1085,6 +1154,18 @@ def _run_plan_first_loop(
             ).comments
         try:
             records = _extract_round_metadata_records(comments, flow="plan")
+            if plan_lineage_links:
+                # Recorded board changes (#1377): approvals are judged by the
+                # lineage (fresh-from rounds), never by one global binding.  A
+                # primary change is a history boundary for panel evidence,
+                # approvals, the stall streak and the step-back counters.
+                if plan_primary_epoch_round is not None:
+                    return tuple(
+                        record for record in records
+                        if record.metadata.round_number >= plan_primary_epoch_round
+                        or record.metadata.role == "coder"
+                    )
+                return records
             if seat_binding is not None:
                 last_changed = max(
                     (record.index for record in records
@@ -1160,8 +1241,7 @@ def _run_plan_first_loop(
 
     # Signed reviewer-board amendments (#943) are read from the same issue
     # comment list the plan round records live in, so comment order is
-    # always comparable.  Without an amendment this is exactly the historical
-    # immutability rule.
+    # always comparable.
     plan_amendment_diagnostics: list[str] = []
     plan_board_amendments = collect_reviewer_board_amendments(
         issue_context.comments,
@@ -1172,44 +1252,175 @@ def _run_plan_first_loop(
     for diagnostic in plan_amendment_diagnostics:
         log(config, f"Planning issue #{issue_number}: {diagnostic}")
     plan_drift_records = planning_contract_drift_records()
-    changed_seat_models = validate_pr_seat_bindings(plan_drift_records, config)
-    if seat_binding is not None and not staged_planning and plan_drift_records:
-        recorded = plan_drift_records[-1].metadata.seat_binding
-        if recorded is not None and {entry["id"] for entry in recorded["seats"]} != set(plan_reviewer_names):
-            raise AgentLoopError(
-                "Named plan reviewer board changed during resume; all required seats must remain configured."
-            )
-    validate_pr_backend_outage_amendments(plan_board_amendments, config)
-    if changed_seat_models:
-        log(config, "Plan reviewer model-chain reconfiguration requires fresh review: "
-            + ", ".join(sorted(changed_seat_models)))
-    plan_contract_lineage: ContractLineage = resolve_contract_lineage(
-        plan_drift_records,
-        plan_board_amendments,
-        plan_scheduler_contract,
-        accept_base_configured=bool(config.reviewer_seats),
-        contract_from_metadata=_plan_contract_or_none,
-        drift_error=plan_contract_drift_error,
+    # --- Plan board lineage (#1377) -------------------------------------
+    # The plan board is a per-invocation choice.  Whether the current plan is
+    # provably completely approved is decided first, read-only and from
+    # history alone; an approved plan is never reopened and posts no plan
+    # board-change link, whatever this invocation's board or planning flags.
+    # Any other plan resolves its unified board lineage (root anchor,
+    # orchestrator-authored links and signed plan amendments); a configured
+    # board that differs from the effective one is recorded as one link,
+    # floor-checked before it is posted and before any agent invocation.
+    plan_admitted_comments, plan_trusted_actor = admitted_issue_comments(
+        runner, config=config, issue_number=issue_number, comments=issue_context.comments,
     )
-    if plan_scheduler_contract is not None:
-        effective_contract = plan_contract_lineage.contracts[-1]
-        if effective_contract != plan_scheduler_contract:
-            effective_names = set(effective_contract.required_reviewers)
-            configured_reviewers = tuple(
-                reviewer for reviewer in configured_reviewers
-                if agent_display_name(reviewer) in effective_names
+    invocation_config = config
+    plan_approval = classify_plan_approval(
+        plan_admitted_comments,
+        config=config,
+        issue_number=issue_number,
+        human_requirements=issue_context.human_requirements,
+        trusted_actor=plan_trusted_actor,
+        inherited_check=(
+            (lambda plan_text: inherited_review_context(plan_text)[1])
+            if inherited_matrix_binding is not None
+            else None
+        ),
+        supersession_pending=plan_supersession is not None,
+    )
+    plan_approved_shortcut = False
+    plan_board_state = None
+    if plan_approval.approved:
+        assert plan_approval.context is not None
+        approving = plan_approval.context
+        plan_contract_lineage = resolve_plan_lineage(
+            plan_admitted_comments,
+            issue_number=issue_number,
+            configured=BoardIdentity(
+                policy=approving.policy,
+                primary=approving.primary_reviewer,
+                broad_rules=(),
+                seats=approving.effective_seats,
+            ),
+            trusted_actor=plan_trusted_actor,
+            drift_error=plan_contract_drift_error,
+        )
+        # A pending element never governed the approval and never reopens it:
+        # the run keeps the lineage prefix that took effect.
+        plan_approved_shortcut = True
+        if plan_contract_lineage.pending_links or plan_contract_lineage.pending_amendments:
+            log(
+                config,
+                f"Planning issue #{issue_number}: a board change recorded after the plan "
+                "was approved does not reopen planning; it is not activated",
+            )
+            taken = [
+                element for element in plan_contract_lineage.elements
+                if element.digest in plan_contract_lineage.carried
+            ]
+            plan_contract_lineage = dataclasses_replace(
+                plan_contract_lineage,
+                elements=plan_contract_lineage.elements[
+                    : plan_contract_lineage.elements.index(taken[-1]) + 1 if taken else 0
+                ],
+                pending_links=(),
+                pending_amendments=(),
+            )
+    if plan_approved_shortcut:
+        log(
+            config,
+            f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} is completely "
+            "approved by its approving board "
+            f"{', '.join(approving.effective_reviewers)}; planning is not reopened and "
+            "no plan board change is recorded",
+        )
+        config = _approving_plan_board_config(config, approving)
+        seat_binding = reviewer_seat_binding(config)
+    else:
+        if plan_approval.state != "no-plan":
+            log(
+                config,
+                f"Planning issue #{issue_number}: plan approval classification "
+                f"{plan_approval.state} ({plan_approval.reason})",
+            )
+
+        def plan_lineage_resume_round(effective_config: object, _lineage: object) -> int:
+            return plan_resume_round(plan_admitted_comments, effective_config)
+
+        plan_board_state = resolve_plan_board_state(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            comments=plan_admitted_comments,
+            admitted=(plan_admitted_comments, plan_trusted_actor),
+            drift_error=plan_contract_drift_error,
+            floor_context=f"Issue #{issue_number} plan reviewer board",
+            resume_round=plan_lineage_resume_round,
+            floor_refusal_hint=plan_floor_refusal_hint(
+                issue_number,
+                lambda: plan_lineage_resume_round(config, None),
+            ),
+        )
+        plan_contract_lineage = plan_board_state.lineage
+        if plan_board_state.rebound:
+            # The operator may keep the original board configured and let the
+            # signed amendment do the removing (#1133).
+            log(
+                config,
+                f"Planning issue #{issue_number}: configured plan reviewer board "
+                f"{', '.join(agent_display_name(r) for r in configured_reviewers)} differs "
+                "from the signed amended board "
+                f"{', '.join(plan_contract_lineage.current_board)}; using the amended board.",
             )
             config = dataclasses_replace(
-                config,
-                reviewer=configured_reviewers,
-                pr_seat_binding_override=seat_binding,
+                plan_board_state.config, pr_seat_binding_override=seat_binding,
             )
-            plan_reviewer_names = tuple(agent_display_name(name) for name in configured_reviewers)
-            plan_scheduler_contract = effective_contract
+    # Every later board read uses the effective plan board.
+    configured_reviewers = reviewers(config)
+    plan_reviewer_names = tuple(agent_display_name(name) for name in configured_reviewers)
+    plan_capabilities = plan_policy_capabilities(config.plan_review_policy)
+    staged_planning = plan_capabilities.scheduler_enabled
+    plan_scheduler_contract = (
+        plan_contract_lineage.current_contract
+        if staged_planning or seat_binding is not None
+        else None
+    )
+    plan_primary_name = (
+        plan_scheduler_contract.primary_reviewer if plan_scheduler_contract is not None else None
+    )
+    plan_operator_force_full = bool(config.plan_review_force_full)
+    plan_lineage_links = any(
+        element.kind == "link" for element in plan_contract_lineage.elements
+    )
+    plan_fresh_from_rounds = {
+        **plan_contract_lineage.restoration_rounds,
+        **plan_contract_lineage.fresh_from_rounds,
+    }
+    plan_primary_epoch_round = plan_contract_lineage.primary_epoch_round
+    plan_pre_epoch_items = (
+        pre_epoch_panel_items(plan_drift_records, plan_contract_lineage)
+        if plan_primary_epoch_round is not None
+        else frozenset()
+    )
+    plan_board_activation = (
+        plan_board_state.activation if plan_board_state is not None else None
+    )
+    if plan_board_state is not None and plan_board_state.candidate is not None:
+        candidate = plan_board_state.candidate
+        log(
+            config,
+            f"Planning issue #{issue_number}: plan reviewer board changed from "
+            f"{candidate.old_board.label()} to {candidate.new_board.label()}; recording the "
+            f"change effective from round {candidate.effective_from_round}.",
+        )
+        if not link_already_posted(
+            plan_board_state.comments, candidate.digest, surface=PLAN_SURFACE
+        ):
+            post_issue_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                body=render_board_change_link(candidate.payload, surface=PLAN_SURFACE),
+            )
+    # Every plan round record this run posts carries the plan root anchor, the
+    # governing board identity and the governing element's digest.
+    set_plan_board_stamp(
+        stamp_for_lineage(plan_contract_lineage, configured=plan_identity_from_config(config))
+    )
     plan_amendment_digest = plan_contract_lineage.active_digest
     for record in plan_drift_records:
         metadata = record.metadata
-        if not staged_planning:
+        if not staged_planning or plan_approved_shortcut:
             continue
         if (
             metadata.scheduler_force_full
@@ -1246,36 +1457,82 @@ def _run_plan_first_loop(
     # run does for every item the resumed round carried.
     plan_accounted_item_ids: set[str] = set()
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
-    if changed_seat_models and resume_state is not None:
-        current_text, old_round = resume_state
-        carried_by_id = {item.item_id: item for item in old_round.prior_items}
-        for record in old_round.completed_reviews:
-            for item in record.metadata.new_items:
-                if item.reviewer != record.metadata.agent:
-                    raise AgentLoopError(
-                        "Plan seat reconfiguration cannot verify the owner of a carried finding."
-                    )
-                existing = carried_by_id.get(item.item_id)
-                if existing is not None and existing != item:
-                    raise AgentLoopError(
-                        "Plan seat reconfiguration found conflicting finding provenance."
-                    )
-                carried_by_id[item.item_id] = item
-        for item in old_round.current_round_new_items:
-            existing = carried_by_id.get(item.item_id)
-            if existing is not None and existing != item:
-                raise AgentLoopError(
-                    "Plan seat reconfiguration found conflicting reconciliation provenance."
-                )
-            carried_by_id[item.item_id] = item
-        resume_state = (current_text, dataclasses_replace(
-            old_round,
-            round_number=old_round.round_number + 1,
-            prior_items=tuple(carried_by_id.values()),
+    plan_board_reentry: int | None = None
+    plan_board_anchor_state = None
+    if (
+        plan_board_activation is not None
+        and plan_board_activation.link is not None
+        and plan_board_activation.link.advance
+    ):
+        # Collect the anchor round under the predecessor board, never the
+        # invocation board, so an outgoing reviewer's findings are kept.  A
+        # resume that no longer re-enters the link's anchor round fails closed
+        # before any agent invocation (#1377 step 6).
+        anchor_round = plan_board_activation.link.anchor_round
+        predecessor = plan_board_state.predecessor_board
+        assert predecessor is not None
+        plan_board_anchor_state = _resume_plan_round(
+            issue_context.comments, configured_reviewers=identity_agents(predecessor)
+        )
+        anchor_number = (
+            plan_board_anchor_state[1].round_number
+            if plan_board_anchor_state is not None
+            else board_anchor(plan_drift_records).round_number
+        )
+        if plan_board_anchor_state is None or anchor_number != anchor_round:
+            raise AgentLoopError(
+                f"Planning issue #{issue_number}: the plan reviewer-board change is anchored "
+                f"at round {anchor_round}, but the durable resume re-enters round "
+                f"{anchor_number}; refusing to activate it. No agent was invoked."
+            )
+        plan_board_reentry = plan_board_activation.effective_from_round
+    elif (
+        not plan_approved_shortcut
+        and plan_contract_lineage.pending_amendments
+        and plan_lineage_links
+        and plan_drift_records
+    ):
+        # With link history a pending signed amendment takes effect after the
+        # highest recorded round, every element following the one before it.
+        plan_board_anchor_state = _resume_plan_round(
+            issue_context.comments,
+            configured_reviewers=name_agents(tuple(plan_contract_lineage.last_seen)),
+        )
+        if plan_board_anchor_state is not None:
+            plan_board_reentry = board_anchor(plan_drift_records).round_number + 1
+    if plan_board_anchor_state is not None and plan_board_reentry is not None:
+        # Board-change carry-over: reconcile the anchor round's persisted
+        # dispositions and merge its new findings, then re-enter the effective
+        # round once as a reviewer-only round on the byte-identical plan.  The
+        # new board's ownership is applied by the derived ledger view.
+        anchor_text, anchor_resumed = plan_board_anchor_state
+        carry = carry_over_anchor_round(
+            prior_items=anchor_resumed.prior_items,
+            completed_reviews=anchor_resumed.completed_reviews,
+            settled_new_items=anchor_resumed.current_round_new_items,
+            records=plan_drift_records,
+            round_number=anchor_resumed.round_number,
+            reconciliation_mode="aggregate",
+            evidence_clearances=(),
+            next_item_number=anchor_resumed.next_unresolved_item_number,
+            same_status="same-plan",
+            surface=PLAN_SURFACE,
+        )
+        resume_state = (anchor_text, dataclasses_replace(
+            anchor_resumed,
+            round_number=plan_board_reentry,
+            prior_items=tuple(carry.items),
             completed_reviews=(),
             current_round_new_items=(),
+            next_unresolved_item_number=carry.next_item_number,
             reconciled=False,
+            ledger_may_be_incomplete=False,
         ))
+        log(
+            config,
+            f"Planning issue #{issue_number}: plan reviewer-board change carried round "
+            f"{anchor_resumed.round_number} findings into round {plan_board_reentry}",
+        )
     # Amendment activation (#943) runs right after resume reconstruction and
     # before any agent invocation or comment post: an amendment no
     # digest-bound record has used must start at the round this resume
@@ -1288,9 +1545,7 @@ def _run_plan_first_loop(
             flow="plan",
             issue_number=issue_number,
             pr_number=None,
-            persisted=plan_contract_lineage.contracts[
-                plan_contract_lineage.amendments.index(amendment)
-            ],
+            persisted=plan_contract_lineage.contract_before(amendment),
             removed=amendment.removed_reviewers,
             restored=amendment.restored_reviewers,
             start_round_number=round_number,
@@ -1298,8 +1553,7 @@ def _run_plan_first_loop(
     )
     plan_amendment_reassignments = ()
     plan_amendment_note: str | None = None
-    if plan_contract_lineage.active_amendment is not None:
-        plan_amended_contract = plan_contract_lineage.contracts[-1]
+    if plan_contract_lineage.removed_reviewers or plan_lineage_links:
         _view, plan_amendment_reassignments = apply_board_amendment_to_ledger(
             (
                 (*resume_state[1].prior_items, *resume_state[1].current_round_new_items)
@@ -1307,14 +1561,15 @@ def _run_plan_first_loop(
                 else ()
             ),
             removed_reviewers=plan_contract_lineage.removed_reviewers,
-            remaining_reviewers=plan_amended_contract.required_reviewers,
-            primary_reviewer=plan_amended_contract.primary_reviewer,
+            remaining_reviewers=plan_contract_lineage.current_board,
+            primary_reviewer=plan_contract_lineage.current_identity.primary,
         )
+    if plan_contract_lineage.active_amendment is not None:
         plan_amendment_note = amendment_summary_line(
             plan_contract_lineage, plan_amendment_reassignments
         )
         log(config, f"Planning issue #{issue_number}: {plan_amendment_note}")
-        if not amendment_audit_already_posted(
+        if not plan_approved_shortcut and not amendment_audit_already_posted(
             issue_context.comments, plan_contract_lineage.active_amendment.digest
         ):
             post_issue_comment(
@@ -1327,25 +1582,48 @@ def _run_plan_first_loop(
                     reassignments=plan_amendment_reassignments,
                 ),
             )
+    elif plan_lineage_links:
+        # One-line board-change note beside the amendment note (#1377 step 7).
+        plan_amendment_note = (
+            "Plan reviewer board changed by recorded board-change link(s); required board "
+            f"now {', '.join(plan_contract_lineage.current_board)}"
+            + (
+                f"; removed {', '.join(plan_contract_lineage.removed_reviewers)}"
+                if plan_contract_lineage.removed_reviewers
+                else ""
+            )
+            + "."
+        )
+        log(config, f"Planning issue #{issue_number}: {plan_amendment_note}")
 
     def plan_ledger_view(
         items: Sequence[UnresolvedReviewItem],
     ) -> tuple[UnresolvedReviewItem, ...]:
-        """Derived ledger with removed reviewers' ownership reassigned (#943).
+        """Derived ledger with removed reviewers' ownership reassigned (#943, #1377).
 
         Persisted ``prior_items`` inside a round are never rewritten; this
         view feeds scheduler obligations, dispositions, and completion.
         """
-        if plan_contract_lineage.active_amendment is None:
+        if not plan_contract_lineage.removed_reviewers:
             return tuple(items)
-        amended = plan_contract_lineage.contracts[-1]
         view, _reassignments = apply_board_amendment_to_ledger(
             items,
             removed_reviewers=plan_contract_lineage.removed_reviewers,
-            remaining_reviewers=amended.required_reviewers,
-            primary_reviewer=amended.primary_reviewer,
+            remaining_reviewers=plan_contract_lineage.current_board,
+            primary_reviewer=plan_contract_lineage.current_identity.primary,
         )
         return view
+
+    def plan_carried_obligations(
+        items: Sequence[UnresolvedReviewItem],
+    ) -> tuple[str, ...]:
+        """Pre-epoch secondary obligations carried across a primary change (#1377)."""
+        return carried_secondary_obligations(
+            items,
+            epoch_round=plan_primary_epoch_round,
+            primary=plan_primary_name,
+            eligible=plan_pre_epoch_items,
+        )
 
     if plan_supersession is not None:
         # Classify the latest reconstructable plan round before any agent
@@ -1752,6 +2030,22 @@ def _run_plan_first_loop(
         )
 
     for round_number in range(start_round_number, config.max_rounds + 1):
+        if plan_approved_shortcut and round_number != start_round_number:
+            # The approval classification and the live approval boundary
+            # disagree; never revise an approved plan under its old board.
+            raise AgentLoopError(
+                f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} was classified "
+                "completely approved, but the approval boundary did not approve it. Rerun "
+                "after resolving the reported condition; no planner turn was started."
+            )
+        if not plan_approved_shortcut and board_floor_enabled(config):
+            # The floor is checked at every planning round on the effective
+            # plan board (#1377 step 9).
+            check_lineage_floor(
+                config,
+                plan_contract_lineage,
+                context=f"Issue #{issue_number} plan reviewer board (round {round_number})",
+            )
         current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
         prior_unresolved_items = current_resume.prior_items if current_resume is not None else tuple(unresolved_items)
         plan_finding_history.note_carried_ledger(prior_unresolved_items)
@@ -1959,6 +2253,7 @@ def _run_plan_first_loop(
                     required_reviewers=plan_reviewer_names,
                 ),
                 primary_reviewer=plan_primary_name,
+                restoration_rounds=plan_fresh_from_rounds,
             )
         if growth_skip_panel:
             round_reviewers = ()
@@ -1998,7 +2293,7 @@ def _run_plan_first_loop(
                 surfaced_requirement_ids=plan_hr_ids,
                 panel_evidence=plan_panel_evidence,
                 primary_reviewer=plan_primary_name,
-                restoration_rounds=plan_contract_lineage.restoration_rounds,
+                restoration_rounds=plan_fresh_from_rounds,
             )
             plan_history = _classify_staged_plan_history(
                 plan_records, current_key=current_plan_key
@@ -2006,11 +2301,6 @@ def _run_plan_first_loop(
             latest_scheduler_record = plan_history.latest_scheduler_record
             plan_previous_key = plan_history.previous_key
             plan_history_class = plan_history.history_class
-            if changed_seat_models and round_number == start_round_number:
-                plan_panel_evidence = PlanPanelEvidence()
-                plan_qualifying_approvals = ()
-                latest_scheduler_record = None
-                plan_previous_key = None
             step_back_history_intact = plan_history_class == PLAN_HISTORY_INTACT
             step_back_history_class = str(plan_history_class)
             if config.plan_step_back_rounds > 0 and plan_primary_name is not None:
@@ -2193,6 +2483,9 @@ def _run_plan_first_loop(
                 premature_secondary_reviews=(
                     () if plan_panel_evidence.opened
                     else plan_panel_evidence.premature_secondary_reviews
+                ),
+                carried_obligations=plan_carried_obligations(
+                    plan_ledger_view(prior_unresolved_items)
                 ),
             )
             try:
@@ -2480,6 +2773,16 @@ def _run_plan_first_loop(
                 execution_mode_history_present=execution_mode_history_present,
             )
 
+        if plan_approved_shortcut and any(
+            resumed_by_name.get(agent_display_name(reviewer)) is None
+            for reviewer in round_reviewers
+        ):
+            raise AgentLoopError(
+                f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} was classified "
+                "completely approved, but round "
+                f"{round_number} would invoke a plan reviewer; refusing to reopen an approved "
+                "plan. No agent was invoked."
+            )
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
         plan_turn_results: dict[AgentName, _ReviewerTurnResult] = {}
         early_published_plan_reviewers: set[AgentName] = {
@@ -2532,12 +2835,19 @@ def _run_plan_first_loop(
                         # review actually carried HUMAN_REQUIREMENTS_RESOLVED,
                         # so a later round cannot satisfy the signed-requirement
                         # gate vacuously through a carried approval.
+                        # Generation-1 plans persist the exact-plan key under
+                        # every planning policy (#1377): under all-reviewers it
+                        # is requirement-binding evidence only, never read by
+                        # full-board scheduling or approval.
                         plan_candidate_key=(
-                            current_plan_key.as_dict() if staged_planning else None
+                            current_plan_key.as_dict()
+                            if staged_planning or current_plan_key.complete
+                            else None
                         ),
                         surfaced_reviewer_requirement_ids=(
                             tuple(plan_hr_ids)
-                            if staged_planning and human_requirements_resolved(review_output)
+                            if (staged_planning or current_plan_key.complete)
+                            and human_requirements_resolved(review_output)
                             else ()
                         ),
                         compact_prior_summaries=tuple(compact_prior_summaries),
@@ -3453,6 +3763,12 @@ def _run_plan_first_loop(
                 f"plan-growth gate ({plan_growth_violation}); starting a planner revision",
             )
         elif all_approved and not must_fix_items and not plan_missing_approvals:
+            plan_approving_reviewers = tuple(configured_reviewers)
+            if plan_approved_shortcut:
+                # The approving board judged the plan; implementation uses the
+                # invocation's board under the stage 1 handoff rule.
+                config = _restore_invocation_board(config, invocation_config)
+                configured_reviewers = reviewers(config)
             if plan_amendment_note:
                 log(
                     config,
@@ -3747,7 +4063,8 @@ def _run_plan_first_loop(
                 issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
             if mode == "plan-only":
                 print(
-                    f"Issue #{issue_number} plan approved by {format_agent_list(configured_reviewers)}."
+                    f"Issue #{issue_number} plan approved by "
+                    f"{format_agent_list(plan_approving_reviewers)}."
                     + (f" {plan_amendment_note}" if plan_amendment_note else "")
                 )
                 deferred_titles = _typed_deferred_work_titles(current_plan_sidecar)
