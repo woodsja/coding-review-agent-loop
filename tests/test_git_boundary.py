@@ -1202,3 +1202,24 @@ def test_symlink_loop_is_refused_without_hanging(ssh_home):
     loop_b.symlink_to(loop_a)
     with pytest.raises(_UntrustedPath):
         _trusted_operator_file(loop_a, forbidden_roots=())
+
+
+@pytest.mark.parametrize("value", ["/", "~/rootlink"])
+@pytest.mark.parametrize("selection", ["config-identity", "known-hosts", "identity-override"])
+def test_filesystem_root_is_refused_as_non_regular(ssh_home, capsys, selection, value):
+    """`/` (directly or through a link) traverses no file component; it must be
+    refused with the fixed warning or error, never crash."""
+    from coding_review_agent_loop import git_transport
+
+    (ssh_home / "rootlink").symlink_to("/")
+    if selection == "identity-override":
+        override = Path(str(ssh_home) + value[1:]) if value.startswith("~") else Path(value)
+        with pytest.raises(AgentLoopError) as raised:
+            _ssh_argv(ssh_identity=override)
+        assert str(raised.value) == git_transport._SSH_IDENTITY_REFUSED
+        return
+    key = "IdentityFile" if selection == "config-identity" else "UserKnownHostsFile"
+    _write_ssh_config(ssh_home, f"Host github.com\n  {key} {value}\n")
+    argv = _ssh_argv()
+    assert argv[len(_SSH_PREFIX):] == []
+    assert f"{key} for trusted Git transport" in capsys.readouterr().err

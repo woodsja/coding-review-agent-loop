@@ -215,7 +215,9 @@ def _trusted_resolve(path: Path, *, uid: int, roots: tuple[str, ...],
                 pending = list(target.parts) + pending
             continue
         current = candidate
-    return current, info
+    # Describe the resolved final component itself, even when no component
+    # was traversed (``/``) or the last hop resolved to a directory such as ``/``.
+    return current, current.lstat()
 
 
 def _trusted_operator_file(path: Path, *, forbidden_roots: tuple[Path, ...],
