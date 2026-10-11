@@ -3502,6 +3502,17 @@ def _run_plan_first_loop_body(
                         reviewer_name=metadata.agent,
                     )
 
+        # The round's reviews are in.  Before its outcome creates the next
+        # round (a planner revision or a reviewer-only phase advance) or
+        # reaches approval, re-validate the durable board history (#1377).
+        round_outcome_issue_context = get_issue_context(
+            runner, config=config, issue_number=issue_number
+        )
+        revalidate_plan_lineage(
+            round_outcome_issue_context.comments,
+            round_number=round_number,
+            boundary="before the next round's planner turn or record",
+        )
         unresolved_items, _ = _apply_unresolved_item_dispositions(
             plan_ledger_view(prior_unresolved_items),
             prior_dispositions,
@@ -3950,17 +3961,13 @@ def _run_plan_first_loop_body(
             # a human instruction posted during planning cannot be hidden by
             # the original snapshot. New signed IDs require a fresh planning
             # acknowledgement rather than being silently folded into the plan.
-            refreshed_issue_context = get_issue_context(
-                runner, config=config, issue_number=issue_number
-            )
+            # The re-read taken once this round's reviews were in is that
+            # boundary read: no agent turn has run since, and its board history
+            # was re-validated then (#1377).
+            refreshed_issue_context = round_outcome_issue_context
             # The shared completion predicate's ledger rule (#1377): an
             # obligation history published but neither carried nor provably
             # cleared fails closed instead of being approved over.
-            revalidate_plan_lineage(
-                refreshed_issue_context.comments,
-                round_number=round_number,
-                boundary="before approval",
-            )
             # The complete history: the epoch and binding filters of
             # plan_history_records select approval evidence, never obligations.
             lost_obligations = plan_ledger_unreconstructible_items(

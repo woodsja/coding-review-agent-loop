@@ -4928,11 +4928,10 @@ def test_issue_loop_plan_revision_proof_covers_items_resolved_in_the_same_round(
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
-    # The first revision saw only the empty pre-loop fetch.  The second also
-    # follows round 2's board-history revalidation read (#1377), which only
-    # validates the lineage and never feeds the revision proof.
-    assert revision_snapshot_sizes[0] == (0,)
-    assert revision_snapshot_sizes[1][0] == 0 and len(revision_snapshot_sizes[1]) == 2
+    # The pre-loop fetch was empty.  Later reads are the board-history
+    # revalidation reads (#1377), taken once each round's reviews are in and at
+    # each later round; they validate the lineage and never feed the proof.
+    assert all(sizes[0] == 0 for sizes in revision_snapshot_sizes)
     assert revision_history_ids[0] == ()
     assert revision_history_ids[1] == ("item-2",)
 

@@ -135,6 +135,8 @@ def test_named_plan_model_change_keeps_blocker_and_requires_fresh_review(tmp_pat
             state="blocking", reviewer="opus (Google Antigravity: Model B)",
             blocking_plan_issues=["Name the rollout owner."],
         )],
+        # Round outcomes re-admit the posted plan board-change record (#1377).
+        serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
     )
     config = make_config(
         tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),

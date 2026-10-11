@@ -2311,11 +2311,14 @@ startup.
   before any agent invocation or comment post, with the filled-in signed plan
   amendment template. Plan startup repeats the resolution, and the floor is
   checked again at every planning round. Floor authorizations come only from
-  signed plan segments. Each later round, and the approval boundary, re-reads
-  the issue, re-admits link records through the authenticated actor and
-  re-resolves the plan lineage. Inconsistent history, or any board change
-  recorded while the run was active, refuses before another agent turn, post
-  or approval; a rerun resolves and applies it.
+  signed plan segments. Once a round's reviews are in, before its outcome
+  creates the next round (a planner revision or a reviewer-only phase-advance
+  record) or reaches approval, and again at each later round and at the
+  approval boundary, the run re-reads the issue, re-admits link records
+  through the authenticated actor and re-resolves the plan lineage.
+  Inconsistent history, or any board change recorded while the run was
+  active, refuses before another agent turn, next-round record or approval; a
+  rerun resolves and applies it.
 - **Plan verification.** `derive_plan_verification_context` resolves plan
   history that carries a root anchor or a link through the plan lineage,
   never from the invocation's planning configuration. The approving identity

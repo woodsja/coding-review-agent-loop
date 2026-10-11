@@ -3919,6 +3919,22 @@ def _inject_during_first(runner, agent, body):
     return injected
 
 
+def _inject_after_record(runner, predicate, body):
+    """Append an operator comment right after a plan record matching ``predicate`` posts."""
+    real = runner._run_locked
+    injected = []
+
+    def run_locked(args, **kwargs):
+        result = real(args, **kwargs)
+        if not injected and any(predicate(r.metadata) for r in _plan_records(runner)):
+            injected.append(True)
+            _append_issue_comment(runner, body)
+        return result
+
+    runner._run_locked = run_locked
+    return injected
+
+
 def test_forged_link_arriving_mid_plan_refuses_approval(tmp_path):
     """Item-16: a forged plan link posted while reviewers run never lets the
     approval boundary report approval."""
@@ -3932,7 +3948,9 @@ def test_forged_link_arriving_mid_plan_refuses_approval(tmp_path):
         f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->",
     )
     config = _plan_cfg(tmp_path, ("codex", "gemini"), review_parallel=False)
-    with pytest.raises(AgentLoopError, match="history is inconsistent before approval"):
+    # Refused once the round's reviews are in, before any next-round record or
+    # approval.
+    with pytest.raises(AgentLoopError, match="history is inconsistent before the next round"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert injected
     from coding_review_agent_loop.plan_verification import classify_plan_approval
@@ -3944,43 +3962,48 @@ def test_forged_link_arriving_mid_plan_refuses_approval(tmp_path):
 
 
 def test_signed_amendment_arriving_mid_plan_stops_before_the_next_round(tmp_path):
-    """Item-16: a signed amendment recorded while the plan runs would govern the
-    next round, so the refreshed lineage stops the run before that round's agent
-    turns (round 2's planner record followed the unread amendment, which the
-    existing rule never reinterprets)."""
+    """Item-16: a signed amendment recorded during round 1 stops the run before the
+    next round's planner turn or record; a clean rerun applies it."""
     runner = _plan_runner(
         claude_outputs=[structured_v1_plan_state()],
-        codex_outputs=[structured_plan_review(state="approved")],
-        gemini_outputs=[structured_plan_review(
-            state="blocking", reviewer="Google Gemini", summary="x",
-            blocking_plan_issues=["Name the owner."],
+        codex_outputs=[structured_plan_review(
+            state="blocking", summary="x", blocking_plan_issues=["Name the owner."],
         )],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
     )
-    runner.claude_outputs.append(
-        _semantic_patch(runner, round_number=1, summary="Name the owner.", item_id="item-1")
-    )
-    injected = _inject_during_first(runner, "codex", format_reviewer_board_amendment_comment(
+    # Posted right after round 1's last review record: nothing the run writes
+    # later can be published under the old board.
+    injected = _inject_after_record(
+        runner, lambda m: m.role == "reviewer" and m.agent == "Gemini",
+        format_reviewer_board_amendment_comment(
         flow="plan", issue=56, pr_number=None,
         original_required_reviewers=("Codex", "Gemini"),
         policy="all-reviewers", primary_reviewer=None,
-        removed_reviewers=("Gemini",), effective_from_round=2,
+        removed_reviewers=("Gemini",), effective_from_round=1,
         rationale="Gemini quota exhausted.",
     ))
     config = _plan_cfg(tmp_path, ("codex", "gemini"), review_parallel=False)
     with pytest.raises(
         AgentLoopError,
-        match="history is inconsistent before this round's agent turns.*stale-unread-amendment",
+        match="board change was recorded while this run was active .*before the next round",
     ):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     assert injected
-    # Round 1 finished (both reviews and the revision); round 2 never started.
-    assert _plan_agents(runner) == ["claude", "codex", "gemini", "claude"]
-    assert max(r.metadata.round_number for r in _plan_records(runner)) == 2
-    assert not any(
-        r.metadata.round_number == 2 and r.metadata.role == "reviewer"
-        for r in _plan_records(runner)
+    # Round 1's reviews ran; no planner turn and no round-2 record followed.
+    assert _plan_agents(runner) == ["claude", "codex", "gemini"]
+    assert max(r.metadata.round_number for r in _plan_records(runner)) == 1
+    # A clean rerun resolves and activates the amendment: the approving Gemini
+    # is removed, and Codex's finding is revised and resolved by Codex alone.
+    runner.claude_outputs.append(
+        _semantic_patch(runner, round_number=1, summary="Name the owner.", item_id="item-1")
     )
-
+    runner.codex_outputs.append(_review("codex"))
+    start = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert _plan_agents(runner, start) == ["claude", "codex"]
+    round_two = [r.metadata for r in _plan_records(runner) if r.metadata.round_number == 2]
+    assert round_two and all(m.reviewer_board_amendment_digest is not None for m in round_two)
+    assert not any(m.agent == "Gemini" for m in round_two)
 
 
 def _epoch_plan_losing_a_pre_epoch_finding(tmp_path):
@@ -4129,3 +4152,35 @@ def test_unanimous_approvals_with_an_open_same_plan_item_refuse_managed_recovery
         run_pr_loop(pr_runner, pr_number=77, config=pr_config)
     assert merges == []
     assert _agent_commands(pr_runner) == []
+
+
+def test_signed_amendment_after_the_primary_approval_stops_before_the_phase_advance(tmp_path):
+    """Item-16 (phase-advance branch): an amendment recorded after the primary's
+    approval stops the run before the reviewer-only phase-advance record."""
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    injected = _inject_after_record(
+        runner, lambda m: m.role == "reviewer" and m.agent == "Codex",
+        format_reviewer_board_amendment_comment(
+            flow="plan", issue=56, pr_number=None,
+            original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+            policy="primary-then-panel", primary_reviewer="Codex",
+            removed_reviewers=("Antigravity",), effective_from_round=2,
+            rationale="Antigravity quota exhausted.",
+        ),
+    )
+    staged = _plan_cfg(
+        tmp_path, ("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex", review_parallel=False,
+    )
+    with pytest.raises(
+        AgentLoopError,
+        match="board change was recorded while this run was active .*before the next round",
+    ):
+        run_issue_loop(runner, issue_number=56, config=staged, plan_first=True)
+    assert injected
+    assert _plan_agents(runner) == ["claude", "codex"]
+    assert not any(r.metadata.phase == "plan-phase-advance" for r in _plan_records(runner))
+    assert max(r.metadata.round_number for r in _plan_records(runner)) == 1
