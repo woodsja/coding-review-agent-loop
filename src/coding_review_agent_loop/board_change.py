@@ -1033,7 +1033,7 @@ def derive_legacy_root(
     On the plan surface (#1377) contract-neutral history only ever happened
     under all-reviewers planning, so its root policy is all-reviewers with no
     primary whatever the invocation's planning flags; the configured policy
-    and primary seed the root only when no reviewer has reviewed the plan yet.
+    and primary seed the root only for a plan with no round records at all.
     """
     plain = _plain_backends()
     contract = next(
@@ -1088,11 +1088,16 @@ def derive_legacy_root(
             broad_rules=tuple(getattr(contract, "broad_rules", ())),
             seats=tuple(seat_for(name) for name in contract.required_reviewers),
         )
-    # Plan history without a persisted contract was all-reviewers planning.
-    neutral_policy = configured.policy if surface.flow == "pr" else "all-reviewers"
+    # Plan history without a persisted contract was all-reviewers planning,
+    # unless an unreadable scheduler record hides the staged contract (a
+    # degraded history the live loop recovers under the configured policy).
+    contract_neutral = surface.flow == "plan" and not any(
+        record.metadata.scheduler_metadata_status == "invalid" for record in records
+    )
+    neutral_policy = "all-reviewers" if contract_neutral else configured.policy
 
     def neutral_primary(names: Sequence[str]) -> str | None:
-        if surface.flow != "pr":
+        if contract_neutral:
             return None
         return configured.primary if configured.primary in names else None
 
@@ -1121,9 +1126,11 @@ def derive_legacy_root(
                 f"original board {list(original)}"
             )
         names = original
-    elif not posters:
+    elif not posters and (not contract_neutral or not records):
         return configured
     else:
+        # On the plan surface even coder-only history was all-reviewers
+        # planning: only a plan with no round records at all is fresh.
         names = tuple(dict.fromkeys((*configured.names, *posters)))
     return BoardIdentity(
         policy=neutral_policy,

@@ -3004,6 +3004,15 @@ def _verify_strict_managed_plan_binding(
         human_requirements=issue_context.human_requirements,
         error_message=str(fail("the canonical plan is not completely approved")),
     )
+    from .plan_verification import require_recoverable_plan_approval
+
+    try:
+        require_recoverable_plan_approval(
+            runner, config=config, issue_context=issue_context, comments=issue_comments,
+            trusted_actor=trusted_actor, error_message="the canonical plan is not completely approved",
+        )
+    except AgentLoopError as exc:
+        raise fail(str(exc)) from exc
     if approved_plan_hash(plan_text) != expected_plan_hash:
         raise fail("the issue's canonical approved plan changed")
 

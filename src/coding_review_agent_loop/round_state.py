@@ -171,6 +171,11 @@ class PostedRoundMetadata:
     # the current signed requirements from one made before new requirements
     # were surfaced for the same immutable PR head.
     surfaced_reviewer_requirement_ids: tuple[str, ...] = ()
+    # Authoritative staged-parent signed requirement IDs current when a child
+    # plan reviewer record was written (#1377).  Requirement-binding evidence
+    # only; ``None`` on records written without a staged parent and on every
+    # historical record, and omitted from the encoding when ``None``.
+    parent_requirement_ids: tuple[str, ...] | None = None
     # Parallel reviewers publish a durable provisional checkpoint before the
     # configured-order settlement barrier.  Legacy records are authoritative.
     phase: str = "authoritative"
@@ -2666,6 +2671,11 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         "result_mode": metadata.result_mode,
         "evidence_reconciliation": metadata.evidence_reconciliation,
         "surfaced_reviewer_requirement_ids": list(metadata.surfaced_reviewer_requirement_ids),
+        **(
+            {"parent_requirement_ids": list(metadata.parent_requirement_ids)}
+            if metadata.parent_requirement_ids is not None
+            else {}
+        ),
         "phase": metadata.phase,
         "canonical_reviewer_response": metadata.canonical_reviewer_response,
         "local_test_evidence": (
@@ -2993,6 +3003,16 @@ def _decode_plan_supersession_field(payload: Mapping[str, object], key: str) -> 
     return value
 
 
+def _decode_parent_requirement_ids(payload: Mapping[str, object]) -> tuple[str, ...] | None:
+    # A present-but-malformed evidence list must not decode as legacy absence.
+    if "parent_requirement_ids" not in payload:
+        return None
+    value = payload["parent_requirement_ids"]
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("parent_requirement_ids must be a list of strings")
+    return tuple(value)
+
+
 def _decode_board_object(payload: Mapping[str, object], key: str) -> dict | None:
     # A present-but-malformed board field must not decode as legacy absence.
     if key not in payload:
@@ -3233,6 +3253,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             surfaced_reviewer_requirement_ids=tuple(
                 str(item) for item in payload.get("surfaced_reviewer_requirement_ids", [])
             ),
+            parent_requirement_ids=_decode_parent_requirement_ids(payload),
             phase=str(payload.get("phase", "authoritative")),
             canonical_reviewer_response=(
                 str(payload["canonical_reviewer_response"])

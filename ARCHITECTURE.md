@@ -2231,8 +2231,9 @@ startup.
   history only ever happened under `all-reviewers`, so its root policy is
   `all-reviewers` with no primary, whatever the invocation's planning flags.
   Resuming it as `primary-then-panel` is refused as drift before any post or
-  agent invocation. The configured policy and primary seed the root only when
-  no plan reviewer has reviewed yet. Persisted rounds are never rewritten.
+  agent invocation. The configured policy and primary seed the root only for a
+  plan with no round records at all, so even coder-only legacy history keeps
+  the all-reviewers root. Persisted rounds are never rewritten.
 - **Plan board-change links.** For a plan that is not approved, a configured
   plan board that differs from the effective one is posted as one
   orchestrator-authored link on the issue. That covers membership, primary,

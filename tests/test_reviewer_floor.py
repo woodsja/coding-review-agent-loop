@@ -963,10 +963,16 @@ def test_approved_plan_preflight_keeps_the_stage_one_handoff_floor(tmp_path):
         primary_plan_reviewer="gemini", min_reviewers=2,
     )
     enforce_issue_board_floor(staged, comments, issue_number=56, runner=runner, planning=True)
-    # A below-floor invocation board meets the stage 1 handoff floor, not a plan floor.
+    below = make_config(tmp_path, reviewer=("codex",), min_reviewers=2)
+    # A plan-only resume of the approved plan selects no board: no floor applies.
+    enforce_issue_board_floor(
+        replace(below, plan_execution_mode="plan-only"), comments,
+        issue_number=56, runner=runner, planning=True,
+    )
+    # An implementation run meets the stage 1 handoff floor, never a plan floor.
     with pytest.raises(AgentLoopError, match="Issue #56 reviewer board") as refusal:
         enforce_issue_board_floor(
-            make_config(tmp_path, reviewer=("codex",), min_reviewers=2), comments,
+            replace(below, plan_execution_mode="implement-one-shot"), comments,
             issue_number=56, runner=runner, planning=True,
         )
     assert "plan reviewer board" not in str(refusal.value)

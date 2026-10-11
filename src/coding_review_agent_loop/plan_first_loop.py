@@ -47,7 +47,7 @@ from .plan_board_state import (
     resolve_plan_board_state,
     resolve_plan_lineage,
 )
-from .plan_verification import classify_plan_approval
+from .plan_verification import approval_record_binding, classify_plan_approval
 from .pr_board_state import check_lineage_floor
 from .reviewer_floor import board_floor_enabled
 from .decomposition import (
@@ -1265,6 +1265,16 @@ def _run_plan_first_loop_body(
         runner, config=config, issue_number=issue_number, comments=issue_context.comments,
     )
     invocation_config = config
+    # The same live inputs the issue preflight and recovery derive: the issue
+    # and authoritative-parent requirement sets, the inherited admissibility
+    # check and the signed supersession state.
+    plan_parent_requirement_ids: tuple[str, ...] | None = (
+        tuple(sorted(
+            requirement.requirement_id for requirement in parent_issue_context.human_requirements
+        ))
+        if parent_issue_context is not None
+        else None
+    )
     plan_approval = classify_plan_approval(
         plan_admitted_comments,
         config=config,
@@ -1277,6 +1287,7 @@ def _run_plan_first_loop_body(
             else None
         ),
         supersession_pending=plan_supersession is not None,
+        parent_requirement_ids=plan_parent_requirement_ids,
     )
     plan_approved_shortcut = False
     plan_board_state = None
@@ -1623,6 +1634,7 @@ def _run_plan_first_loop_body(
             epoch_round=plan_primary_epoch_round,
             primary=plan_primary_name,
             eligible=plan_pre_epoch_items,
+            same_status="same-plan",
         )
 
     if plan_supersession is not None:
@@ -2254,6 +2266,7 @@ def _run_plan_first_loop_body(
                 ),
                 primary_reviewer=plan_primary_name,
                 restoration_rounds=plan_fresh_from_rounds,
+                parent_requirement_ids=plan_parent_requirement_ids,
             )
         if growth_skip_panel:
             round_reviewers = ()
@@ -2294,6 +2307,7 @@ def _run_plan_first_loop_body(
                 panel_evidence=plan_panel_evidence,
                 primary_reviewer=plan_primary_name,
                 restoration_rounds=plan_fresh_from_rounds,
+                parent_requirement_ids=plan_parent_requirement_ids,
             )
             plan_history = _classify_staged_plan_history(
                 plan_records, current_key=current_plan_key
@@ -2638,6 +2652,27 @@ def _run_plan_first_loop_body(
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
         }
+        # A resumed approval bound to a stale requirement set (issue or
+        # authoritative parent) is never reused: its reviewer reviews the plan
+        # again under the current requirements (#1377).
+        for stale_name in [
+            name
+            for name, record in resumed_by_name.items()
+            if record.metadata.state == "approved"
+            and approval_record_binding(
+                record,
+                current_key=current_plan_key,
+                surfaced_ids=plan_hr_ids,
+                parent_ids=plan_parent_requirement_ids,
+                check_acknowledgement=False,
+            ) == "stale"
+        ]:
+            log(
+                config,
+                f"Planning round {round_number}: {stale_name}'s resumed approval is bound to "
+                "a stale requirement set; it reviews the current plan again",
+            )
+            resumed_by_name.pop(stale_name)
         # Superseded pre-panel plan reviews, replayed to their own author only
         # as non-authoritative context under the operator planning override.
         superseded_plan_prepanel: dict[str, PostedRoundRecord] = {}
@@ -2850,6 +2885,7 @@ def _run_plan_first_loop_body(
                             and human_requirements_resolved(review_output)
                             else ()
                         ),
+                        parent_requirement_ids=plan_parent_requirement_ids,
                         compact_prior_summaries=tuple(compact_prior_summaries),
                         model_used=model_used, phase=phase,
                         **(_metadata_identity_fields(identity) if identity is not None else {}),

@@ -608,6 +608,15 @@ def _canonical_plan_without_handoff(
         human_requirements=issue_context.human_requirements,
         error_message=error_message,
     )
+    # The shared approval classification: requirement binding (issue and
+    # authoritative parent), a reconstructible ledger, inherited
+    # admissibility and signed supersession (#1377).
+    from .plan_verification import require_recoverable_plan_approval
+
+    require_recoverable_plan_approval(
+        runner, config=config, issue_context=issue_context, comments=comments,
+        trusted_actor=trusted_actor, error_message=error_message,
+    )
     return make_approved_plan_context(
         plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
     )

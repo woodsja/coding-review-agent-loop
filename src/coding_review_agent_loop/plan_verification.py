@@ -736,24 +736,9 @@ def plan_open_obligations(plan_round: object, *, board: Sequence[str]) -> tuple[
     return tuple(dict.fromkeys(open_ids))
 
 
-def _approval_requirement_binding(
-    plan_round: object,
-    *,
-    board: Sequence[str],
-    plan_text: str,
-    surfaced_ids: Sequence[str],
-) -> str:
-    """``bound``, ``stale`` or ``unproven`` for an all-reviewers approval set (step 12c).
-
-    A recorded exact-plan candidate key binds only when it equals the key
-    recomputed against the current requirement set.  A keyless legacy
-    approval binds only through the plan's own dispositions naming exactly
-    the current set, plus the acknowledgement in every approval text when
-    that set is non-empty.
-    """
-    from .panel_evidence import _plan_candidate_key_for, _plan_key_from_payload
-    from .protocol import human_requirements_resolved
-    from .response_validation import _current_plan_has_complete_human_requirement_dispositions
+def plan_round_candidate_key(plan_round: object, *, plan_text: str, surfaced_ids: Sequence[str]):
+    """The exact-plan candidate key of the resumed round under ``surfaced_ids``, or ``None``."""
+    from .panel_evidence import _plan_candidate_key_for
     from .plan_assembly import decode_assembled_plan_sidecar
     from .round_state import _plan_subject
 
@@ -763,36 +748,215 @@ def _approval_requirement_binding(
         try:
             sidecar = decode_assembled_plan_sidecar(coder_metadata.assembled_plan_sidecar)
         except (AgentLoopError, ValueError, KeyError, TypeError):
-            return "unproven"
-    current_key = _plan_candidate_key_for(
+            return None
+    return _plan_candidate_key_for(
         plan_subject=_plan_subject(plan_text),
         sidecar=sidecar,
         surfaced_requirement_ids=surfaced_ids,
     )
+
+
+def approval_record_binding(
+    record: object,
+    *,
+    current_key: object | None,
+    surfaced_ids: Sequence[str],
+    parent_ids: Sequence[str] | None,
+    legacy_fallback: Callable[[object], str] | None = None,
+    check_acknowledgement: bool = True,
+) -> str:
+    """``bound``, ``stale`` or ``unproven`` for one counted plan approval (step 12c).
+
+    A recorded exact-plan candidate key binds only when it equals the key
+    recomputed against the current requirement set and its recorded
+    requirement IDs equal the current surfaced set (``check_acknowledgement``;
+    the live loop leaves an unacknowledged approval to its acknowledgement
+    repair).  A keyless legacy approval is judged by ``legacy_fallback``.  For a staged child, the recorded authoritative-parent
+    requirement IDs must equal the current parent set; a record without them
+    binds only while that set is empty.
+    """
+    from .panel_evidence import _plan_key_from_payload
+
+    metadata = record.metadata  # type: ignore[attr-defined]
     surfaced = {str(item) for item in surfaced_ids}
-    approvals = [
-        record for record in getattr(plan_round, "completed_reviews", ())
-        if record.metadata.agent in set(board) and record.metadata.state == "approved"
-    ]
-    legacy = []
-    for record in approvals:
-        key = _plan_key_from_payload(record.metadata.plan_candidate_key)
-        if key is None:
-            legacy.append(record)
-            continue
-        if not key.matches(current_key) or (
-            surfaced and set(record.metadata.surfaced_reviewer_requirement_ids) != surfaced
-        ):
+    if parent_ids is not None:
+        recorded_parent = metadata.parent_requirement_ids
+        if recorded_parent is None:
+            if parent_ids:
+                return "unproven"
+        elif set(recorded_parent) != set(parent_ids):
             return "stale"
-    if not legacy:
-        return "bound"
-    if not _current_plan_has_complete_human_requirement_dispositions(
-        getattr(plan_round, "coder_output", None), surfaced_requirement_ids=tuple(surfaced_ids),
+    key = _plan_key_from_payload(metadata.plan_candidate_key)
+    if key is None:
+        return legacy_fallback(record) if legacy_fallback is not None else "unproven"
+    if current_key is None or not key.matches(current_key):
+        return "stale"
+    if (
+        check_acknowledgement
+        and surfaced
+        and set(metadata.surfaced_reviewer_requirement_ids) != surfaced
     ):
-        return "unproven"
-    if surfaced and not all(human_requirements_resolved(record.body or "") for record in legacy):
-        return "unproven"
+        return "stale"
     return "bound"
+
+
+def _legacy_requirement_fallback(plan_round: object, surfaced_ids: Sequence[str]) -> Callable[[object], str]:
+    """The authenticated fallback for a keyless legacy approval (step 12c2).
+
+    With signed requirements surfaced now, the plan's own dispositions must
+    name exactly that set and the approval text must carry the
+    acknowledgement.  With none surfaced now, an approval text carrying the
+    acknowledgement was given under requirements since withdrawn (the marker
+    is prohibited when none are surfaced), so it is stale; one without it
+    was given with none surfaced and still binds.
+    """
+    from .protocol import human_requirements_resolved
+    from .response_validation import _current_plan_has_complete_human_requirement_dispositions
+
+    dispositions_ok = bool(surfaced_ids) and _current_plan_has_complete_human_requirement_dispositions(
+        getattr(plan_round, "coder_output", None), surfaced_requirement_ids=tuple(surfaced_ids),
+    )
+
+    def fallback(record: object) -> str:
+        acknowledged = human_requirements_resolved(getattr(record, "body", "") or "")
+        if not surfaced_ids:
+            return "stale" if acknowledged else "bound"
+        return "bound" if dispositions_ok and acknowledged else "unproven"
+
+    return fallback
+
+
+def plan_ledger_unreconstructible_items(records: Sequence[object], plan_round: object) -> tuple[str, ...]:
+    """Blocking or same-plan items published in history that the resumed ledger lost.
+
+    Every such item must still be in the resumed round's ledger or provably
+    cleared by the recorded reconciliation history; anything else means the
+    obligations cannot be recovered, so completion fails closed.
+    """
+    from .round_state import _canonically_resolved_history_item_ids
+
+    ledger_ids = {
+        item.item_id
+        for item in (
+            *getattr(plan_round, "prior_items", ()),
+            *getattr(plan_round, "current_round_new_items", ()),
+        )
+    }
+    published = {
+        item.item_id: item
+        for record in records
+        for item in record.metadata.new_items  # type: ignore[attr-defined]
+        if item.status in {"blocking", "same-plan"}
+    }
+    resolved = _canonically_resolved_history_item_ids(
+        records, reconciliation_mode="aggregate", same_status="same-plan",
+        current_carried_ids=tuple(sorted(ledger_ids)),
+    )
+    return tuple(sorted(
+        item_id for item_id in published if item_id not in ledger_ids and item_id not in resolved
+    ))
+
+
+@dataclass(frozen=True)
+class PlanApprovalInputs:
+    """The live, read-only inputs of the plan approval classification (#1377 step 12).
+
+    Built once by :func:`build_plan_approval_inputs` for the issue-entry
+    preflight, managed-CI no-handoff recovery and strict qualification; plan
+    startup supplies the same fields from its own live state.  ``derivable``
+    is false when any input could not be read; the classification is then
+    never approved.
+    """
+
+    human_requirements: tuple[object, ...] = ()
+    # Authoritative staged-parent signed requirement IDs; ``None`` without a
+    # staged parent.
+    parent_requirement_ids: tuple[str, ...] | None = None
+    inherited_check: Callable[[str], str | None] | None = None
+    supersession_check: Callable[[str], bool] | None = None
+    derivable: bool = True
+    underivable_reason: str = ""
+
+
+def build_plan_approval_inputs(
+    runner: object | None,
+    *,
+    config: object,
+    issue_context: object,
+    parent_issue_context: object | None = None,
+) -> PlanApprovalInputs:
+    """Derive every live classification input read-only from the issue and its parent.
+
+    A staged child's authoritative parent is read for its current signed
+    requirement IDs; a fresh planning child additionally gets its
+    inherited-matrix admissibility check and its signed supersession check,
+    exactly as the issue router and the plan loop judge them.  Any read that
+    cannot be completed makes the inputs underivable.
+    """
+    from .execution_policy import _infer_staged_parent_issue, _resolve_fresh_child_provenance
+    from .github import get_issue_context
+
+    requirements = tuple(getattr(issue_context, "human_requirements", ()) or ())
+    try:
+        parent_number = _infer_staged_parent_issue(issue_context)  # type: ignore[arg-type]
+    except AgentLoopError as exc:
+        return PlanApprovalInputs(requirements, derivable=False, underivable_reason=str(exc))
+    if parent_number is None or parent_number == getattr(issue_context, "number", None):
+        return PlanApprovalInputs(requirements)
+    parent = parent_issue_context
+    if parent is None or getattr(parent, "number", None) != parent_number:
+        if runner is None:
+            return PlanApprovalInputs(
+                requirements, derivable=False,
+                underivable_reason=f"parent issue #{parent_number} cannot be read",
+            )
+        try:
+            parent = get_issue_context(runner, config=config, issue_number=parent_number)  # type: ignore[arg-type]
+        except AgentLoopError as exc:
+            return PlanApprovalInputs(requirements, derivable=False, underivable_reason=str(exc))
+    parent_ids = tuple(sorted(
+        requirement.requirement_id for requirement in getattr(parent, "human_requirements", ())
+    ))
+    try:
+        fresh_child = _resolve_fresh_child_provenance(
+            issue_context=issue_context, parent_issue_context=parent,  # type: ignore[arg-type]
+        )
+    except AgentLoopError as exc:
+        return PlanApprovalInputs(
+            requirements, parent_ids, derivable=False, underivable_reason=str(exc),
+        )
+    if fresh_child is None or not fresh_child.route.is_planning:
+        return PlanApprovalInputs(requirements, parent_ids)
+
+    from .child_plan_binding import _child_plan_admissibility_failure
+    from .decomposition import collect_child_plan_supersessions
+    from .round_state import make_approved_plan_context
+
+    child_number = getattr(issue_context, "number", None)
+
+    def inherited_check(plan_text: str) -> str | None:
+        return _child_plan_admissibility_failure(
+            fresh_child.parent_plan_context,
+            make_approved_plan_context(plan_text, source_locator=f"issue #{child_number} plan"),
+            stage_id=fresh_child.stage_id,
+        )
+
+    def supersession_check(plan_hash: str) -> bool:
+        return any(
+            record.superseded_plan_hash == plan_hash
+            for record in collect_child_plan_supersessions(
+                getattr(issue_context, "comments", ()),
+                child_issue=child_number,  # type: ignore[arg-type]
+                parent_issue=fresh_child.parent_issue,
+                stage_id=fresh_child.stage_id,
+                ignored_sink=[],
+            )
+        )
+
+    return PlanApprovalInputs(
+        requirements, parent_ids, inherited_check=inherited_check,
+        supersession_check=supersession_check,
+    )
 
 
 def classify_plan_approval(
@@ -800,21 +964,33 @@ def classify_plan_approval(
     *,
     config: object,
     issue_number: int,
-    human_requirements: Sequence[object],
+    human_requirements: Sequence[object] = (),
     trusted_actor: tuple[str, int] | None = None,
     inherited_check: Callable[[str], str | None] | None = None,
     inherited_derivable: bool = True,
     supersession_pending: bool = False,
+    supersession_check: Callable[[str], bool] | None = None,
+    parent_requirement_ids: Sequence[str] | None = None,
+    inputs: PlanApprovalInputs | None = None,
+    poster_completion_proven: bool = False,
+    execution_mode_guard: bool = True,
 ) -> PlanApprovalClassification:
     """Read-only plan approval classification from history alone (#1377 step 12).
 
-    Shared by the issue-entry floor preflight and plan startup.  Every input
-    comes from durable history: the approving plan identity (never the
-    invocation's reviewers or planning flags), the reconstructed latest round
-    and its ledger, the current signed requirement set and each counted
-    approval's requirement binding, the inherited-matrix admissibility
-    result, a pending signed supersession, and the plan-growth gate.  Any
+    Shared by the issue-entry floor preflight, plan startup, managed-CI
+    no-handoff recovery and strict qualification.  Every input comes from
+    durable history: the approving plan identity (never the invocation's
+    reviewers or planning flags), the reconstructed latest round and a
+    reconstructible ledger, the current signed requirement set (issue plus
+    authoritative parent) against each counted approval's requirement
+    binding, the inherited-matrix admissibility, a pending signed
+    supersession, the execution-mode guard and the plan-growth gate.  Any
     underivable input means not approved; a malformed lineage raises.
+
+    ``poster_completion_proven`` is set only by managed-CI recovery and
+    qualification, whose own complete-approval check over the plan board
+    proves completion of unanchored plain history (as before #1377);
+    ``execution_mode_guard`` is off there because no planning turn follows.
     """
     from .config import reviewers
     from .panel_evidence import _require_complete_canonical_plan_approval
@@ -827,6 +1003,15 @@ def classify_plan_approval(
     from .config import phased_delivery_guard_active
     from .execution_policy import _current_execution_recommendation
 
+    if inputs is not None:
+        if not inputs.derivable:
+            return PlanApprovalClassification(
+                "undetermined", f"an approval input is not derivable: {inputs.underivable_reason}",
+            )
+        human_requirements = inputs.human_requirements
+        parent_requirement_ids = inputs.parent_requirement_ids
+        inherited_check = inputs.inherited_check
+        supersession_check = inputs.supersession_check
     comments = tuple(comments)
     records = _extract_round_metadata_records(comments, flow="plan")
     if not records:
@@ -862,7 +1047,9 @@ def classify_plan_approval(
     def result(state: str, reason: str) -> PlanApprovalClassification:
         return PlanApprovalClassification(state, reason, context, plan_hash)
 
-    if phased_delivery_guard_active(getattr(config, "plan_execution_mode", "")):
+    if execution_mode_guard and phased_delivery_guard_active(
+        getattr(config, "plan_execution_mode", "")
+    ):
         # The execution-mode guard (#1268): a staged plan under a guard-active
         # mode is narrowed or stopped by the live loop, never approved here.
         try:
@@ -872,13 +1059,19 @@ def classify_plan_approval(
         if recommendation is not None and recommendation.strategy == "staged":
             return result("unfinished", "a staged plan under a phased-delivery execution mode")
 
-    if supersession_pending:
+    try:
+        superseded = supersession_pending or (
+            supersession_check is not None and supersession_check(plan_hash)
+        )
+    except AgentLoopError as exc:
+        return result("undetermined", f"the signed supersession state cannot be read: {exc}")
+    if superseded:
         return result("unfinished", "a validated signed plan supersession is pending")
     if not inherited_derivable:
         return result("undetermined", "the inherited-matrix admissibility is not derivable")
     if inherited_check is not None and inherited_check(plan_text) is not None:
         return result("unfinished", "the plan fails its inherited parent matrix rows")
-    if context.derivation == "posters" and not plan_hash_has_issue_handoff(
+    if context.derivation == "posters" and not poster_completion_proven and not plan_hash_has_issue_handoff(
         comments, issue_number=issue_number, repo=getattr(config, "repo", None),
         plan_hash=plan_hash,
     ):
@@ -901,22 +1094,48 @@ def classify_plan_approval(
     except (ValueError, KeyError, TypeError) as exc:
         return result("undetermined", f"the approval state cannot be reconstructed: {exc}")
     board = context.effective_reviewers
+    # A reconstructible ledger: nothing published in history may be lost.
+    verification_records = _extract_round_metadata_records(plan_comments, flow="plan")
+    if getattr(plan_round, "ledger_may_be_incomplete", False):
+        return result("undetermined", "the plan ledger may be incomplete")
+    lost = plan_ledger_unreconstructible_items(verification_records, plan_round)
+    if lost:
+        return result("undetermined", "unreconstructible plan obligation(s) " + ", ".join(lost))
     open_items = plan_open_obligations(plan_round, board=board)
     if open_items:
         return result("unfinished", "open plan obligation(s) " + ", ".join(open_items))
-    if not plan_policy_capabilities(context.policy).scheduler_enabled:
-        binding = _approval_requirement_binding(
-            plan_round,
-            board=board,
-            plan_text=plan_text,
-            surfaced_ids=_surfaced_reviewer_requirement_ids(
-                human_requirements, requirement_scope="planning requirements",
-            ),
+    surfaced_ids = _surfaced_reviewer_requirement_ids(
+        human_requirements, requirement_scope="planning requirements",
+    )
+    current_key = plan_round_candidate_key(plan_round, plan_text=plan_text, surfaced_ids=surfaced_ids)
+    staged = plan_policy_capabilities(context.policy).scheduler_enabled
+    counted: list[object] = []
+    if staged:
+        latest: dict[str, object] = {}
+        for record in verification_records:
+            if record.metadata.role == "reviewer" and record.metadata.agent in board:
+                latest[record.metadata.agent] = record
+        counted = list(latest.values())
+    else:
+        counted = [
+            record for record in plan_round.completed_reviews
+            if record.metadata.agent in board and record.metadata.state == "approved"
+        ]
+    fallback = _legacy_requirement_fallback(plan_round, surfaced_ids)
+    bindings = {
+        approval_record_binding(
+            record,
+            current_key=current_key,
+            surfaced_ids=surfaced_ids,
+            parent_ids=parent_requirement_ids,
+            legacy_fallback=None if staged else fallback,
         )
-        if binding == "stale":
-            return result("unfinished", "an approval is bound to a stale requirement set")
-        if binding != "bound":
-            return result("undetermined", "an approval's requirement binding is unproven")
+        for record in counted
+    }
+    if "stale" in bindings:
+        return result("unfinished", "an approval is bound to a stale requirement set")
+    if "unproven" in bindings:
+        return result("undetermined", "an approval's requirement binding is unproven")
     return result("approved", "every approving reviewer approved the exact plan")
 
 
@@ -928,7 +1147,7 @@ def enforce_issue_board_floor(
     runner: object | None = None,
     human_requirements: Sequence[object] = (),
     planning: bool = False,
-    inherited_derivable: bool = True,
+    inputs: PlanApprovalInputs | None = None,
 ) -> None:
     """Issue-mode floor preflight, before any planning or implementation turn.
 
@@ -937,9 +1156,10 @@ def enforce_issue_board_floor(
     invocation's board after the stage 1 handoff board rule against the
     approving plan context, so a signed plan amendment excuses only the
     measures its chain lowered; the invocation's planning flags are never
-    compared.  Otherwise a plan-first run resolves its plan board read-only,
-    including any board-change candidate, and refuses a below-floor plan
-    board before any agent invocation or comment post.
+    compared.  An approved plan resumed plan-only selects no board at all,
+    so neither floor applies.  Otherwise a plan-first run resolves its plan
+    board read-only, including any board-change candidate, and refuses a
+    below-floor plan board before any agent invocation or comment post.
     """
     from .reviewer_floor import board_floor_enabled, enforce_configured_board_floor
     from .reviewer_seats import resolve_plan_handoff_board
@@ -960,8 +1180,12 @@ def enforce_issue_board_floor(
             issue_number=issue_number,
             human_requirements=human_requirements,
             trusted_actor=trusted_actor,
-            inherited_derivable=inherited_derivable,
+            inputs=inputs,
         )
+        if classification.approved and getattr(config, "plan_execution_mode", None) == "plan-only":
+            # Nothing is implemented and planning is not reopened: no board
+            # is chosen by this invocation, so there is nothing to floor.
+            return
         if classification.state not in {"approved", "no-plan"}:
             from .plan_board_state import (
                 plan_drift_error,
@@ -997,3 +1221,34 @@ def enforce_issue_board_floor(
         authorizations=authorizations,
         context=f"Issue #{issue_number} reviewer board",
     )
+
+
+def require_recoverable_plan_approval(
+    runner: object | None,
+    *,
+    config: object,
+    issue_context: object,
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+    error_message: str,
+) -> None:
+    """Managed-CI no-handoff recovery and strict qualification refuse to bind
+    a plan the shared approval classification does not approve (#1377).
+
+    Uses the same read-only inputs as the issue preflight and plan startup:
+    current issue and authoritative-parent requirements against each counted
+    approval's binding, a reconstructible clear ledger, inherited
+    admissibility and any pending signed supersession.
+    """
+    inputs = build_plan_approval_inputs(runner, config=config, issue_context=issue_context)
+    classification = classify_plan_approval(
+        comments,
+        config=config,
+        issue_number=getattr(issue_context, "number"),
+        trusted_actor=trusted_actor,
+        inputs=inputs,
+        poster_completion_proven=True,
+        execution_mode_guard=False,
+    )
+    if not classification.approved:
+        raise AgentLoopError(f"{error_message} ({classification.reason})")
