@@ -1499,9 +1499,43 @@ including their parent directories, must be root-owned so an unrestricted
 same-user agent cannot replace them before launch.
 The `--trusted-origin-protocol` setting selects HTTPS or SSH when creating a
 new default checkout; the pinned SSH client is validated before transport.
-Its command ignores user SSH configuration and executable proxy options while
-retaining default keys and `SSH_AUTH_SOCK`; a trusted host with a port uses an
-`ssh://` origin.
+Its command keeps `-F /dev/null` and executable-option hardening, retains
+default keys and `SSH_AUTH_SOCK`, and pins `StrictHostKeyChecking=yes` before
+any other option, so an unknown or changed host key fails closed without a
+prompt (`BatchMode` stays unset for passphrase prompts). A trusted host with a
+port uses an `ssh://` origin.
+SSH identity selection (#1380): on POSIX, `git_transport` reads a non-executing
+subset of `~/.ssh/config` for the literal URL host (`Host` blocks only; never
+`ssh -G`). It honours `IdentityFile`, `HostName`, `IdentitiesOnly`, a single
+`UserKnownHostsFile`, and `Port` only when the URL has no port. `User`,
+`Match`, `Include`, `ProxyCommand`, `ProxyJump`, `LocalCommand`,
+`KnownHostsCommand` and all other keys are ignored. Values are emitted as
+explicit `-o`/`-i` options only when their final form (after `~/` expansion and
+realpath) matches `[A-Za-z0-9._/+,:@-]+` without a leading `-`; anything else is
+refused rather than escaped, so neither the shell nor ssh's option grammar or
+`%`/`${}`/`~` expansion can reinterpret it. The config file, identity files and
+the known-hosts file pass one trust walk (`_trusted_operator_file`). It
+resolves the path component by component, expanding each symlink in place
+(bounded hops), so every component traversed, including intermediate links
+and the directories their targets pass through, is owned by the current uid
+or root and, unless it is a symlink, not group- or world-writable. Root-owned
+sticky directories are exempt, but never the final file or the parent of an
+accepted missing file. The supplied path and every traversed component must
+lie outside `transport_forbidden_roots`, which covers every agent checkout,
+named-seat workdir, store, run-worktree root and import destination, so an
+agent-controlled link cannot select an otherwise trusted file. The target must
+be a regular file. The config
+is opened `O_NOFOLLOW|O_NONBLOCK`, inode-checked against the walk and read with
+a 256 KiB bound. An explicit `--git-ssh-identity` / `AGENT_LOOP_GIT_SSH_IDENTITY`
+replaces config identities with exactly one `-i` and `IdentitiesOnly=yes`, and
+an untrusted override is a fixed error. Windows does not read the config, keeps
+the previous command byte-for-byte and refuses the override. Transport failures
+report a fixed class chosen by evidence precedence (`remote not found`,
+`host-key failure`, `network or timeout`, then `authentication failure` from
+specific evidence before Git's generic access-rights footer, else
+`unclassified`) with no stderr or argv; SSH authentication and host-key
+failures add a fixed hint. No HTTPS fallback is attempted after SSH failure. Same-UID live races against `~/.ssh` remain out of
+scope (#1371).
 The complete reachable pack for a pinned commit
 is streamed to confined `index-pack --stdin`; the destination verifies the
 commit, then compare-and-swaps the tracking ref while its checkout or store

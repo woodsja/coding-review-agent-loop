@@ -748,3 +748,88 @@ def test_worktree_links_are_per_run_and_removal_keeps_store_target(tmp_path, mon
     finally:
         if proc_a.poll() is None:
             stop(proc_a)
+
+
+def _record_imports(monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    calls = []
+    real_import = git_transport.import_ref
+
+    def recording_import(destination, source_ref, tracking_ref, **kwargs):
+        calls.append((source_ref, kwargs["ssh_identity"], kwargs["forbidden_roots"]))
+        return real_import(destination, source_ref, tracking_ref, **kwargs)
+
+    monkeypatch.setattr(git_transport, "import_ref", recording_import)
+    return calls
+
+
+def test_transport_forbidden_roots_cover_every_agent_location(tmp_path, monkeypatch):
+    """#1380: SSH config, identities and known-hosts are refused in any agent-controlled root."""
+    from coding_review_agent_loop.config import default_run_worktree
+
+    env = Env(tmp_path, monkeypatch)
+    explicit = tmp_path / "explicit-codex"
+    seat_dir = tmp_path / "seat-checkout"
+    config = env.config(extra=(
+        "--codex-dir", str(explicit),
+        "--reviewer-seat", "audit=gemini", "--seat-model", "audit=gemini-test",
+        "--seat-dir", f"audit={seat_dir}",
+        "--reviewer-seat", "second=claude", "--seat-model", "second=claude-test",
+    ))
+    roots = set(config.transport_forbidden_roots)
+    expected = {
+        config.claude_dir, explicit.resolve(), config.gemini_dir, config.antigravity_dir,
+        seat_dir.resolve(),
+        default_run_worktree("OWNER/REPO", "second", config.run_token).resolve(),
+        env.bare.resolve(),
+    }
+    for agent in ("claude", "gemini", "antigravity", "second"):
+        expected.add(default_agent_workdir("OWNER/REPO", agent).resolve())
+        expected.add(default_run_worktree_root("OWNER/REPO", agent).resolve())
+    assert expected <= roots
+    assert default_agent_workdir("OWNER/REPO", "codex").resolve() not in roots
+    assert len(roots) == len(config.transport_forbidden_roots)
+
+
+def test_every_import_call_site_forwards_identity_and_shared_roots(tmp_path, monkeypatch):
+    """Both run_worktrees.py and all three config.py import_ref sites forward both values."""
+    from dataclasses import replace
+
+    from coding_review_agent_loop.config import sync_coder_base_before_implementation
+
+    env = Env(tmp_path, monkeypatch)
+    explicit = tmp_path / "explicit-claude"
+    subprocess.run(["git", "clone", "-q", str(env.bare), str(explicit)], check=True)
+    identity = Path("/keys/operator_key")
+    store_config = replace(env.config(), git_ssh_identity=identity)
+    explicit_config = replace(env.config(extra=("--claude-dir", str(explicit))),
+                              git_ssh_identity=identity)
+    sha = env.commit("b.txt", "two")
+    env.set_pr_head(7, sha)
+    calls = _record_imports(monkeypatch)
+
+    # run_worktrees.py: _fetch_and_pin and pin_pr_head.
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    assert run_worktrees.prepare_store(store, config=store_config, runner=Runner()) == sha
+    assert run_worktrees.pin_pr_head(store, 7, config=store_config, runner=Runner()) == sha
+    assert [ref for ref, *_ in calls] == ["refs/heads/main", "refs/heads/main", "refs/pull/7/head"]
+    assert all(call[1:] == (identity, store_config.transport_forbidden_roots) for call in calls)
+
+    # config.py: _sync_base_branch and both sync_checkout_to_pr imports.
+    calls.clear()
+    sync_coder_base_before_implementation(explicit_config, Runner())
+    sync_checkout_to_pr(
+        explicit_config, Runner(), path=explicit, label="--claude-dir", default_owned=False,
+        pr_number=7, pr_metadata=SimpleNamespace(head_sha=sha),
+    )
+    assert [ref for ref, *_ in calls] == ["refs/heads/main", "refs/heads/main", "refs/pull/7/head"]
+    assert explicit.resolve() in explicit_config.transport_forbidden_roots
+    assert all(call[1:] == (identity, explicit_config.transport_forbidden_roots) for call in calls)
+
+    # Test doubles without the new fields keep working with empty defaults.
+    calls.clear()
+    doubles = SimpleNamespace(repo="OWNER/REPO", gh_cmd=str(env.gh), base="main",
+                              trusted_local_origin=env.bare)
+    run_worktrees._fetch_and_pin(store, "main", config=doubles, runner=Runner(), free=False)
+    assert calls == [("refs/heads/main", None, ())]

@@ -1143,3 +1143,22 @@ def test_long_suite_attainability_is_documented():
         for parser in subparsers.choices.values()
         for action in parser._actions
     )
+
+
+def test_ssh_transport_identity_contract_is_documented():
+    """#1380: the honoured ~/.ssh/config subset replaces the 'ignored entirely' claim."""
+    for path in (README, LOCAL_AGENT_LOOP_DOC, ARCHITECTURE):
+        text = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+        assert "ignores the user's SSH config" not in text
+        assert "ignores user SSH configuration" not in text
+        for phrase in (
+            "IdentityFile", "HostName", "IdentitiesOnly", "UserKnownHostsFile",
+            "`User`", "`Match`", "`Include`", "`ProxyCommand`", "`KnownHostsCommand`",
+            "--git-ssh-identity", "AGENT_LOOP_GIT_SSH_IDENTITY", "StrictHostKeyChecking=yes",
+            "ssh -G", "Windows", "#1371", "authentication failure", "host-key",
+        ):
+            assert phrase in text, (path.name, phrase)
+        assert "HTTPS fallback is attempted" not in text.replace("No HTTPS fallback is attempted", "")
+    readme = re.sub(r"\s+", " ", README.read_text(encoding="utf-8"))
+    assert "single `UserKnownHostsFile`" in readme
+    assert "`A-Z a-z 0-9 . _ / + , : @ -`" in readme

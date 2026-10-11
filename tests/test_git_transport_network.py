@@ -1,4 +1,4 @@
-"""Real Git transport regressions against a local TLS Git HTTP backend."""
+"""Real Git transport regressions against local TLS Git HTTP and OpenSSH backends."""
 
 from __future__ import annotations
 
@@ -6,11 +6,14 @@ import base64
 import getpass
 import os
 import socket
+import shlex
 import ssl
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -121,8 +124,8 @@ def https_git(tmp_path, monkeypatch):
     monkeypatch.setenv("SSL_CERT_FILE", str(cert))
     original_env = git_transport._transport_env
 
-    def fixture_env(endpoint, gh_cmd):
-        env = original_env(endpoint, gh_cmd)
+    def fixture_env(endpoint, gh_cmd, **kwargs):
+        env = original_env(endpoint, gh_cmd, **kwargs)
         env["GIT_SSL_CAINFO"] = str(cert)
         return env
 
@@ -171,9 +174,38 @@ def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
     assert not marker.exists()
 
 
-@pytest.mark.skipif(os.name != "posix" or not Path("/usr/sbin/sshd").exists(),
-                    reason="local OpenSSH server is unavailable")
-def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
+_SSHD = Path("/usr/sbin/sshd")
+_SSH = Path("/usr/bin/ssh")
+requires_ssh = pytest.mark.skipif(os.name != "posix" or not _SSH.exists(),
+                                  reason="OpenSSH client is unavailable")
+requires_sshd = pytest.mark.skipif(os.name != "posix" or not _SSHD.exists() or not _SSH.exists(),
+                                   reason="local OpenSSH server is unavailable")
+
+
+def _private_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+def _ssh_home(tmp_path: Path, monkeypatch) -> Path:
+    """A trusted 0700 HOME with no agent socket and no default-named key."""
+    tmp_path.chmod(0o700)
+    home = _private_dir(tmp_path / "home")
+    _private_dir(home / ".ssh")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr(git_transport, "_EMITTED_WARNINGS", set())
+    return home
+
+
+def _write_private(path: Path, text: str) -> Path:
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
+def _seed_origin(tmp_path: Path) -> tuple[Path, Path]:
     bare = tmp_path / "OWNER" / "REPO.git"
     bare.parent.mkdir()
     seed = tmp_path / "seed"
@@ -185,9 +217,22 @@ def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
     _git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture")
     _git(seed, "push", "-q", str(bare), "main")
     subprocess.run(("git", "clone", "-q", str(bare), str(checkout)), check=True)
-    key = tmp_path / "client_key"
+    return bare, checkout
+
+
+@pytest.fixture
+def ssh_origin(tmp_path, monkeypatch):
+    """A local sshd serving one bare repository, plus a trusted operator HOME.
+
+    The client key has a non-default name and is reachable only through
+    ~/.ssh/config or the explicit override; there is no agent socket.
+    """
+    bare, checkout = _seed_origin(tmp_path)
+    home = _ssh_home(tmp_path, monkeypatch)
+    key = home / ".ssh" / "github_key"
+    unauthorized = home / ".ssh" / "unauthorized_key"
     host_key = tmp_path / "host_key"
-    for path in (key, host_key):
+    for path in (key, unauthorized, host_key):
         subprocess.run(("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)), check=True)
     forced_command = tmp_path / "serve_git.sh"
     forced_command.write_text(f"#!/bin/sh\nexec /usr/bin/git-upload-pack {bare}\n")
@@ -202,10 +247,14 @@ def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
                              f"AuthorizedKeysFile {authorized}\nStrictModes no\nUsePAM no\n"
                              "PasswordAuthentication no\nPubkeyAuthentication yes\n"
                              "PermitRootLogin no\nLogLevel QUIET\n")
-    server = subprocess.Popen(("/usr/sbin/sshd", "-D", "-e", "-f", str(server_config)),
+    host_public = host_key.with_suffix(".pub").read_text().split()[:2]
+    known_hosts = _write_private(
+        home / ".ssh" / "known_hosts_test",
+        f"[localhost]:{port},[127.0.0.1]:{port} {' '.join(host_public)}\n",
+    )
+    server = subprocess.Popen((str(_SSHD), "-D", "-e", "-f", str(server_config)),
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        import time
         for _ in range(50):
             if server.poll() is not None:
                 pytest.skip("local sshd could not start")
@@ -217,50 +266,174 @@ def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
         else:
             pytest.skip("local sshd did not accept connections")
         repo = f"localhost:{port}/OWNER/REPO"
-        from coding_review_agent_loop.git_transport import default_origin
-        from coding_review_agent_loop.config import ensure_temp_checkout
-        from agent_loop_helpers import make_config
-
-        url = default_origin(repo, protocol="ssh")
-        config = make_config(tmp_path, create_dirs=False, repo=repo, claude_dir=checkout,
-                             trusted_origin_protocol="ssh")
-        # A hostile user config must not be consulted by the pinned client.
-        home = tmp_path / "home"
-        (home / ".ssh").mkdir(parents=True)
-        marker = tmp_path / "proxy-ran"
-        (home / ".ssh" / "config").write_text(f"Host *\n  ProxyCommand touch {marker}\n")
-        monkeypatch.setenv("HOME", str(home))
+        url = git_transport.default_origin(repo, protocol="ssh")
+        _git(checkout, "config", "remote.origin.url", url)
+        commands: list[str] = []
         original_env = git_transport._transport_env
 
-        def fixture_env(endpoint, gh_cmd):
-            env = original_env(endpoint, gh_cmd)
-            assert env["GIT_SSH_COMMAND"].startswith("/usr/bin/ssh -F /dev/null ")
-            env["GIT_SSH_COMMAND"] += (
-                f" -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
-                f" -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -l {getpass.getuser()}"
-            )
+        def fixture_env(endpoint, gh_cmd, **kwargs):
+            env = original_env(endpoint, gh_cmd, **kwargs)
+            commands.append(env["GIT_SSH_COMMAND"])
+            # Labelled test convenience only: the local sshd authenticates the
+            # current OS user rather than GitHub's pinned ``git`` user.  No
+            # identity, host-key or known-hosts option is injected here.
+            env["GIT_SSH_COMMAND"] += f" -l {getpass.getuser()}"
             return env
 
         monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
-        checkout.rename(tmp_path / "fixture-clone")
-        checkout_marker = tmp_path / "checkout-helper-ran"
-
-        class PlantCheckoutConfig(Runner):
-            def run(self, args, *, cwd, **kwargs):
-                result = super().run(args, cwd=cwd, **kwargs)
-                if tuple(args[:4]) == ("git", "remote", "add", "origin"):
-                    _git(checkout, "config", "core.sshCommand", f"touch {checkout_marker}")
-                    _git(checkout, "config", "url.ssh://evil.example/.insteadOf", url)
-                return result
-
-        ensure_temp_checkout(checkout, agent="claude", config=config,
-                             runner=PlantCheckoutConfig())
-        sha = _git(checkout, "rev-parse", "HEAD")
-        assert _git(checkout, "config", "--local", "--get", "remote.origin.url") == url
-        assert sha == _git(bare, "rev-parse", "refs/heads/main")
-        assert _git(checkout, "cat-file", "-t", sha) == "commit"
-        assert (checkout / "file.txt").read_text() == "ssh fixture\n"
-        assert not marker.exists() and not checkout_marker.exists()
+        yield SimpleNamespace(bare=bare, checkout=checkout, home=home, key=key,
+                              unauthorized=unauthorized, known_hosts=known_hosts,
+                              port=port, repo=repo, url=url, commands=commands,
+                              marker=tmp_path / "proxy-ran")
     finally:
         server.terminate()
         server.communicate(timeout=5)
+
+
+def _hostile_lines(marker: Path) -> str:
+    return (f"Host *\n  ProxyCommand touch {marker}\n  LocalCommand touch {marker}\n"
+            f'Match exec "touch {marker}"\n  IdentityFile /dev/null\n')
+
+
+def _assert_no_test_injection(command: str) -> None:
+    assert "StrictHostKeyChecking=no" not in command
+    assert "UserKnownHostsFile=/dev/null" not in command
+    argv = shlex.split(command)
+    assert argv[:3] == ["/usr/bin/ssh", "-F", os.devnull]
+    strict = argv.index("StrictHostKeyChecking=yes")
+    assert all(index > strict for index, token in enumerate(argv) if token == "-i")
+
+
+@requires_sshd
+def test_real_ssh_fetch_uses_config_selected_identity(ssh_origin, tmp_path):
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.config import ensure_temp_checkout
+
+    origin = ssh_origin
+    _write_private(origin.home / ".ssh" / "config", (
+        "Host localhost\n"
+        "  IdentityFile ~/.ssh/github_key\n"
+        "  IdentitiesOnly yes\n"
+        "  UserKnownHostsFile ~/.ssh/known_hosts_test\n"
+        + _hostile_lines(origin.marker)
+    ))
+    checkout = origin.checkout
+    config = make_config(tmp_path, create_dirs=False, repo=origin.repo, claude_dir=checkout,
+                         trusted_origin_protocol="ssh")
+    checkout.rename(tmp_path / "fixture-clone")
+    checkout_marker = tmp_path / "checkout-helper-ran"
+
+    class PlantCheckoutConfig(Runner):
+        def run(self, args, *, cwd, **kwargs):
+            result = super().run(args, cwd=cwd, **kwargs)
+            if tuple(args[:4]) == ("git", "remote", "add", "origin"):
+                _git(checkout, "config", "core.sshCommand", f"touch {checkout_marker}")
+                _git(checkout, "config", "url.ssh://evil.example/.insteadOf", origin.url)
+            return result
+
+    ensure_temp_checkout(checkout, agent="claude", config=config, runner=PlantCheckoutConfig())
+    sha = _git(checkout, "rev-parse", "HEAD")
+    assert _git(checkout, "config", "--local", "--get", "remote.origin.url") == origin.url
+    assert sha == _git(origin.bare, "rev-parse", "refs/heads/main")
+    assert (checkout / "file.txt").read_text() == "ssh fixture\n"
+    assert origin.commands
+    for command in origin.commands:
+        _assert_no_test_injection(command)
+        assert f"-i {origin.key}" in command
+        assert f"UserKnownHostsFile={origin.known_hosts}" in command
+    assert not origin.marker.exists() and not checkout_marker.exists()
+
+
+@requires_sshd
+def test_real_ssh_fetch_uses_explicit_identity_override(ssh_origin):
+    origin = ssh_origin
+    _write_private(origin.home / ".ssh" / "config", (
+        "Host localhost\n  UserKnownHostsFile ~/.ssh/known_hosts_test\n" + _hostile_lines(origin.marker)
+    ))
+    sha = git_transport.import_ref(origin.checkout, "refs/heads/main", "refs/remotes/origin/main",
+                                   repo=origin.repo, runner=Runner(), ssh_identity=origin.key)
+    assert sha == _git(origin.bare, "rev-parse", "refs/heads/main")
+    _assert_no_test_injection(origin.commands[-1])
+    assert shlex.split(origin.commands[-1]).count("-i") == 1
+    assert "IdentitiesOnly=yes" in origin.commands[-1]
+    assert not origin.marker.exists()
+
+
+@requires_sshd
+def test_real_ssh_without_usable_key_reports_authentication_class(ssh_origin):
+    origin = ssh_origin
+    _write_private(origin.home / ".ssh" / "config", (
+        "Host localhost\n  IdentityFile ~/.ssh/unauthorized_key\n  IdentitiesOnly yes\n"
+        "  UserKnownHostsFile ~/.ssh/known_hosts_test\n"
+    ))
+    with pytest.raises(AgentLoopError) as raised:
+        git_transport.import_ref(origin.checkout, "refs/heads/main", "refs/remotes/origin/main",
+                                 repo=origin.repo, runner=Runner())
+    message = str(raised.value)
+    assert "(authentication failure)." in message
+    assert "--git-ssh-identity" in message
+    assert "Permission denied" not in message and str(origin.unauthorized) not in message
+
+
+@requires_sshd
+def test_real_ssh_unknown_host_fails_closed_without_prompt(ssh_origin):
+    origin = ssh_origin
+    missing = origin.home / ".ssh" / "known_hosts_missing"
+    _write_private(origin.home / ".ssh" / "config", (
+        "Host localhost\n  IdentityFile ~/.ssh/github_key\n  IdentitiesOnly yes\n"
+        "  UserKnownHostsFile ~/.ssh/known_hosts_missing\n"
+    ))
+    assert not (origin.home / ".ssh" / "known_hosts").exists()
+    started = time.monotonic()
+    with pytest.raises(AgentLoopError) as raised:
+        git_transport.import_ref(origin.checkout, "refs/heads/main", "refs/remotes/origin/main",
+                                 repo=origin.repo, runner=Runner())
+    assert time.monotonic() - started < 60
+    message = str(raised.value)
+    assert "(host-key failure)." in message and "known_hosts" in message
+    assert "--git-ssh-identity" not in message
+    assert not missing.exists()
+    assert not (origin.home / ".ssh" / "known_hosts").exists()
+    command = origin.commands[-1]
+    assert "StrictHostKeyChecking=yes" in command and "BatchMode" not in command
+
+
+@requires_ssh
+def test_real_ssh_connection_refused_reports_network_class(tmp_path, monkeypatch):
+    _, checkout = _seed_origin(tmp_path)
+    _ssh_home(tmp_path, monkeypatch)
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    repo = f"127.0.0.1:{port}/OWNER/REPO"
+    _git(checkout, "config", "remote.origin.url", git_transport.default_origin(repo, protocol="ssh"))
+    with pytest.raises(AgentLoopError) as raised:
+        git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main",
+                                 repo=repo, runner=Runner())
+    message = str(raised.value)
+    assert "(network or timeout)." in message
+    assert "--git-ssh-identity" not in message and "refused" not in message
+
+
+@requires_ssh
+def test_pinned_ssh_consumes_exactly_the_validated_paths(tmp_path, monkeypatch):
+    home = _ssh_home(tmp_path, monkeypatch)
+    key = _write_private(home / ".ssh" / "github_key", "placeholder\n")
+    known_hosts = _write_private(home / ".ssh" / "known_hosts_github", "")
+    _write_private(home / ".ssh" / "config", (
+        "Host localhost\n  IdentityFile ~/.ssh/github_key\n"
+        "  UserKnownHostsFile ~/.ssh/known_hosts_github\n"
+    ))
+    command = git_transport._transport_env("ssh://git@localhost:2222/OWNER/REPO.git", None)["GIT_SSH_COMMAND"]
+    # Test-only option dump; production code never runs ssh -G.  The
+    # generated command carries -F /dev/null, so no user config is evaluated.
+    result = subprocess.run((*shlex.split(command), "-G", "localhost"), capture_output=True,
+                            text=True, check=True, stdin=subprocess.DEVNULL, timeout=30)
+    values: dict[str, list[str]] = {}
+    for line in result.stdout.splitlines():
+        name, _, value = line.partition(" ")
+        values.setdefault(name, []).append(value)
+    assert values["identityfile"] == [str(key)]
+    assert values["userknownhostsfile"] == [str(known_hosts)]
+    assert values["stricthostkeychecking"] == ["true"]
+    assert values.get("proxycommand", ["none"]) == ["none"]
