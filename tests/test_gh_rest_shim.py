@@ -331,7 +331,7 @@ def test_issue_view_matches_gh_graphql_shape():
     comments = [rest_comment(11, "hi"), rest_comment(12, "bot says", login="helper[bot]", uid=2, bot=True)]
     api = FakeApi(issue_routes(comments))
     result = run_shim(
-        ["issue", "view", "1", "--repo", REPO, "--comments", "--json", "number,title,body,url,author,createdAt,comments,state"],
+        ["issue", "view", "1", "--repo", REPO, "--json", "number,title,body,url,author,createdAt,comments,state"],
         api,
     )
     data = json.loads(result.out)
@@ -344,6 +344,18 @@ def test_issue_view_matches_gh_graphql_shape():
     }
     # GraphQL spells app logins without `[bot]`.
     assert data["comments"][1]["author"] == {"login": "helper"}
+
+
+def test_issue_view_still_tolerates_legacy_comments_flag():
+    # Callers no longer send ``--comments`` with ``--json`` (gh >= 2.102
+    # refuses it, #1351), but the shim keeps accepting it for older wrappers.
+    api = FakeApi(issue_routes([rest_comment(11, "hi")]))
+    result = run_shim(
+        ["issue", "view", "1", "--repo", REPO, "--comments", "--json", "number,comments"],
+        api,
+    )
+    data = json.loads(result.out)
+    assert [c["body"] for c in data["comments"]] == ["hi"]
 
 
 def test_bot_suffix_is_only_stripped_for_bot_accounts():

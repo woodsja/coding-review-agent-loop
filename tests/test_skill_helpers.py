@@ -7482,3 +7482,43 @@ class TestRunExternalCodexErrorChannel:
         stderr = "timeout " + "n" * 7000 + " 401 Unauthorized " + "n" * 7000 + " timeout"
         raw = json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n" + stderr
         assert self._run(monkeypatch, raw)[0] == 1
+
+
+def test_fetch_issue_context_omits_comments_flag_rejected_by_gh_2_102(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1351: gh >= 2.102 refuses ``--comments`` combined with ``--json``."""
+    import helpers.skill_runner as sr
+
+    calls: list[list[str]] = []
+    payload = {
+        "number": 7,
+        "title": "Issue title",
+        "body": "Issue body",
+        "url": "https://github.com/o/r/issues/7",
+        "author": {"login": "alice"},
+        "createdAt": "2026-10-01T00:00:00Z",
+        "comments": [
+            {"author": {"login": "bob"}, "createdAt": "2026-10-02T00:00:00Z", "body": "first"},
+        ],
+    }
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "--comments" in argv and "--json" in argv:
+            return subprocess.CompletedProcess(
+                argv, 1, "", "specify only one of --comments or --json\n"
+            )
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(sr.subprocess, "run", fake_run)
+    context = sr._fetch_issue_context("o/r", 7, gh_cmd="gh")
+
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[:4] == ["gh", "issue", "view", "7"]
+    assert "--comments" not in argv
+    assert "comments" in argv[argv.index("--json") + 1].split(",")
+    assert context.title == "Issue title"
+    assert context.body == "Issue body"
+    assert [(c.author, c.body) for c in context.comments] == [("bob", "first")]

@@ -1144,7 +1144,11 @@ class FakeRunner(Runner):
 
     @staticmethod
     def _gh_argv_error(cmd):
-        """Model the pinned gh 2.45 parser so tests catch unsupported flags."""
+        """Model the pinned gh 2.45 parser so tests catch unsupported flags.
+
+        It also models the gh 2.102 rule that ``view`` refuses ``--comments``
+        combined with ``--json``.
+        """
         if len(cmd) < 2 or cmd[0] != "gh":
             return None
         if cmd[1] == "api":
@@ -1190,6 +1194,8 @@ class FakeRunner(Runner):
         for token in cmd[3:]:
             if token.startswith("-") and token not in accepted and not token.startswith("--inputs"):
                 return f"unknown flag: {token}"
+        if cmd[2] == "view" and "--comments" in cmd[3:] and "--json" in cmd[3:]:
+            return "specify only one of --comments or --json"
         return None
 
     def _run_locked(self, args, *, cwd, check, input_text=None):
