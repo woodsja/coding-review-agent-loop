@@ -32,7 +32,6 @@ from .config import (
 from .board_amendment import (
     collect_reviewer_board_amendments,
     reject_misplaced_pr_amendments,
-    resolve_contract_lineage,
 )
 from .decomposition import approved_plan_hash
 from .errors import (
@@ -2856,7 +2855,11 @@ def _pr_amendment_start_round(
     except AgentLoopError:
         # Only filling an error template; the real resume reports the refusal.
         return 1
-    return resumed.round_number if resumed is not None else 1
+    from .board_change import board_reentry_round
+
+    return board_reentry_round(
+        pr_context.comments, resumed.round_number if resumed is not None else None
+    )
 
 
 def _is_completed_full_board_scheduler_record(

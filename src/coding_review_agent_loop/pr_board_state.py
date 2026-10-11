@@ -118,6 +118,9 @@ def _rebind_signed_segment(config: object, lineage: BoardLineage, configured: Bo
 
     if not binding_compatible(apply_inits(base, lineage.inits), configured):
         return None
+    if lineage.current_board == configured.names:
+        # A restoration back to the configured board: nothing to rebind.
+        return None
     names = set(lineage.current_board)
     return dataclasses_replace(
         config,
@@ -283,15 +286,17 @@ def qualification_board_check(
                 floor_context=f"PR #{pr_number} qualification reviewer board",
                 diagnostics=diagnostics,
             )
-            if state.candidate is not None or state.lineage.pending_links:
+            # The run's config already reflects every element it activated, so
+            # any difference is a change made after the run read the board: a
+            # new board, a signed segment that rebinds the run's board, or a
+            # signed amendment still waiting to take effect.  A pending link
+            # whose board is the run's own board (a removal that needed no new
+            # record) is the board the run reviewed with.
+            if state.candidate is not None or state.rebound or state.lineage.pending_amendments:
                 raise AgentLoopError(
                     "PR reviewer board changed during qualification: the effective board "
                     f"is {state.lineage.describe()}, but this run reviewed "
-                    + "; ".join(seat.seat_id for seat in expected.seats)
-                )
-            if state.configured.names != expected.names:
-                raise AgentLoopError(
-                    "PR reviewer board changed during qualification."
+                    + ", ".join(expected.names)
                 )
         except AgentLoopError as exc:
             if "no qualification or merge is permitted" in str(exc):

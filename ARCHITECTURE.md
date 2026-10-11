@@ -542,9 +542,12 @@ availability failure; it is never repaired into a verdict.
 The default policy invokes all reviewers. Opt-in selective intermediate review
 can pause already-approved reviewers for bounded fixes, but their old approvals
 remain head-bound. Changed scope, incomplete state, and final qualification can
-require a full review. The scheduler contract is immutable across a resume,
-with one audited exception (#943). A signed human `reviewer-board-amendment`
-record may remove unavailable non-primary reviewers. It is read from the same
+require a full review. The review policy and broad-path rules are immutable
+across a resume. The planning scheduler contract is immutable apart from signed
+amendments; the PR board changes only through the recorded board lineage
+described under "Recorded PR board changes" below (#1376). A signed human
+`reviewer-board-amendment` record (#943) may remove unavailable non-primary
+reviewers. It is read from the same
 comment surface as the round records it amends: the issue for planning, the PR
 for PR review. Named PR seat-local removal of one or more independently failed seats uses the signed `seat-unavailable` reason;
 shared `backend-unavailable` removal must cover every active seat on that
@@ -554,8 +557,10 @@ independent seat failures remain local. Evidence freeze, release, and qualificat
 same seat binding as review records so startup can authenticate their board.
 Named `all-reviewers` plan rounds persist a bound board contract without
 scheduler selection state, so signed removals and later restorations use the
-same lineage. `board_amendment.resolve_contract_lineage` is the single resolver used at plan
-resume, PR startup, and the PR qualification gate. Only
+same lineage. `board_amendment.resolve_contract_lineage` is the resolver used at plan
+resume. PR startup and the PR qualification gate use the unified PR resolver
+(`board_change.resolve_board_lineage`), which builds each signed segment with the
+same chain builder and resolves signed-amendment-only history exactly as before. Only
 contract-bearing scheduler records take part. The base contract comes from the
 earliest persisted record, and each record is judged by exactly one
 amendment-chain link. Every post-amendment scheduler record must carry the
@@ -1971,12 +1976,97 @@ not hide it. It is verified by the same helper
 those recovery paths use, and that issue's board is used. An ordinary PR whose
 linked issue has no handoff record naming it binds no plan, so unfinished
 planning on that issue is never consulted. The read-only PR preflight also validates persisted PR seat bindings
-before it grants a signed floor exception, so a backend change on a remaining
-seat fails before any write. This is the
+against the lineage segment that governs each record before it grants a signed
+floor exception. This is the
 same selection the handoff seam applies, and the seam repeats the check. The
 exception covers only the measures the chain
 lowered from C0 to Cn, and never goes below the signed board's own counts with
 its recorded bindings. A binding swap therefore cannot inherit a provider
-exception. Recording unsigned in-run PR and plan board changes is later work
-(stages 2 and 3 of #1373). Until then, a persisted PR or plan scheduler contract
-is still immutable apart from signed amendments.
+exception. In-run PR board changes are recorded as described next (#1376).
+Recording unsigned plan board changes is later work (stage 3 of #1373), so a
+persisted plan scheduler contract is still immutable apart from signed
+amendments.
+
+### Recorded PR board changes (#1376)
+
+The PR reviewer board is a per-invocation choice under every review policy,
+including the default `all-reviewers` policy, which persists no scheduler
+contract. `board_change.py` keeps the guarantee that every reviewer on the
+board in force approved the exact final artifact through a durable, auditable
+board lineage instead of a frozen roster. `pr_board_state.resolve_pr_board_state`
+resolves it read-only at PR entry, at startup and at the qualification gate.
+
+- **Board identity and root anchor.** A board identity is the policy, primary,
+  broad-path rules and ordered seats (ID, backend, model chain, effort). Every
+  PR round record written by the PR loop carries `pr_board_root` (the immutable
+  root identity C0) and `pr_board_identity` (the identity of the lineage
+  element that governs it). They are stamped in the single round-metadata
+  encoder, so every writer is covered. The root is the root carried by the
+  earliest identity-bearing record or link, and every later one must carry the
+  same root. It is never re-derived from the effective board.
+- **Legacy migration.** With no anchor, the root is derived once, read-only:
+  the earliest persisted scheduler contract (with the latest legacy seat
+  binding when one exists), else the recorded named seat binding, else for
+  plain `all-reviewers` history the earliest signed amendment's original board,
+  or the configured board plus every historical reviewer poster. Plain
+  membership is never inferred from round completeness, so an unchanged board
+  resumes with no record whether a reviewer crashed, was unavailable or hit a
+  fatal stop. Plain history records no models: an unknown binding is
+  initialized from configuration by the first durable artifact
+  (`pr_board_binding_init`) and compared exactly afterwards. Before that, it
+  is compared compatibly (seat ID, order, primary and backend only).
+- **Board-change links.** A configured board that differs from the effective
+  board in membership, primary, backend, model chain or effort becomes one
+  orchestrator-authored link comment: an audit text plus the reserved
+  `AGENT_PR_BOARD_CHANGE` record. It carries the root, the predecessor digest,
+  the old and new boards and seat bindings, the added, removed and rebound
+  seats, `anchor_round`, `advance` and `effective_from_round`, and the reason
+  `operator-reconfigured`. Only a comment by the authenticated orchestrator
+  actor (the REST identity path used for PR recovery records) is admitted. A
+  marker-bearing comment by anyone else, a malformed payload, a digest, root or
+  predecessor mismatch, or an old board that differs from the derived one fails
+  closed at startup and at qualification. Agent text naming the marker is
+  neutralized by the reserved-marker registry. Policy and broad-rule changes
+  stay contract drift.
+- **One ordered chain.** Links and signed amendments are ordered by comment
+  position with strictly increasing effective rounds. The only exception is a
+  link that supersedes a never-activated pending link: it copies that link's
+  anchor round, advance flag and effective round. A signed amendment after a
+  link amends the link's new board. A signed restoration can only re-add a seat
+  a signed amendment removed since the latest link. Each round record is
+  governed by the latest element whose comment precedes it and whose effective
+  round is at or before its round. It must carry that element's digest in the
+  matching field (`reviewer_board_amendment_digest` or
+  `reviewer_board_change_digest`), and its identity and contract.
+- **Floor authorization.** `lineage_floor_authorizations` is the only source of
+  floor authorizations, at preflight, link candidacy, every round and
+  qualification. Each signed segment is frozen from the identity immediately
+  before it, plus its signed membership changes. A link never creates or
+  enlarges an exception. A candidate link is floor-checked against the lineage
+  that would exist after posting it, so a refused change posts nothing. A
+  removal refusal prints the filled-in signed amendment.
+- **Re-entry and carry-over.** The anchor round is the highest recorded PR round
+  of any role or phase (a scheduler-prelaunch-only round included), and
+  `advance` is set when it holds any record. The anchor round's records are
+  collected under the predecessor board, so an outgoing reviewer's findings are
+  kept. Its persisted dispositions are reconciled with the existing rules,
+  its new findings merged, and its evidence requests rebuilt with the
+  accumulated head-scoped clearances. The run then re-enters the effective
+  round once, with the anchor round's coder output as the artifact. A link
+  posted before a crash is recovered from durable history alone. A resume whose
+  anchor no longer matches fails closed before any agent invocation or post.
+- **Approval and ledger rules.** Required reviewers are the effective board
+  only, so removed reviewers' approvals never count. Added, rebound, restored
+  and role-changed seats must approve from the link's effective round
+  (`fresh_from_rounds`). Removed reviewers' unresolved items are reassigned to
+  the remaining board by the ledger view; settled items stay settled.
+- **Primary restart.** A change of the primary seat, its binding, or a seat's
+  role under `primary-then-panel` sets a primary epoch. Panel openings and
+  approvals before it never count. Active secondary-owned items from before the
+  epoch are carried obligations. They are exempt only from the pre-panel safety
+  stop, keep their owners, and block qualification. When the restarted primary
+  approves, the panel reopens at the same head so their owners disposition them.
+- **Managed CI.** Historical rejected-recovery reviews are checked against the
+  seat binding of the board that governed their round, which the link records
+  carry. Current-head checks use the current board.
+

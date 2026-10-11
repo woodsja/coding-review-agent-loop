@@ -14634,6 +14634,85 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
         _plan_binding_1367(published, config)
 
 
+def _board_link_comment_1376(comment_id, old_binding, new_binding, *, effective_round=2,
+                             login="agent-loop", user_id=1):
+    """An orchestrator board-change link rebinding seat ``sol`` (#1376)."""
+    from coding_review_agent_loop.board_change import (
+        BoardIdentity,
+        board_change_link_payload,
+        render_board_change_link,
+    )
+    from coding_review_agent_loop.reviewer_floor import BoardSeat
+
+    def identity(binding):
+        (entry,) = binding["seats"]
+        return BoardIdentity(
+            policy="all-reviewers", primary=None, broad_rules=(),
+            seats=(BoardSeat("sol", entry["backend"], tuple(entry["model_chain"]), None),),
+        )
+
+    old, new = identity(old_binding), identity(new_binding)
+    payload = board_change_link_payload(
+        pr_number=7, root=old, predecessor=old.digest, old_board=old, new_board=new,
+        old_seat_binding=old_binding, binding_init={},
+        anchor_round=effective_round - 1, advance=True,
+    )
+    assert payload["new_seat_binding"] == new_binding
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": user_id},
+        "body": str(render_board_change_link(payload)),
+    }
+
+
+@pytest.mark.parametrize("history", ["governing-board", "tampered", "foreign-link"])
+def test_m1376_historical_recovery_review_uses_the_board_that_governed_it(tmp_path, history):
+    """Row pr-managed-ci-historical-binding: board A history, a link to board B.
+
+    The blocking review of the rejected-coder recovery was bound to board A;
+    a later board-change link rebound the seat to board B.  Historical records
+    are validated against the binding of the lineage element that governed
+    their round, never the current board; current-board checks use B.  A
+    tampered historical binding, or a link no orchestrator wrote, fails closed.
+    """
+    board_a = {"version": 1, "seats": [
+        {"id": "sol", "backend": "codex", "model_chain": ["gpt-a"], "effort": None},
+    ]}
+    board_b = {"version": 1, "seats": [
+        {"id": "sol", "backend": "codex", "model_chain": ["gpt-b"], "effort": None},
+    ]}
+    tampered = {"version": 1, "seats": [
+        {"id": "sol", "backend": "codex", "model_chain": ["gpt-z"], "effort": None},
+    ]}
+    chain, _round = _recovery_chain_1367(
+        seat_binding=tampered if history == "tampered" else board_a
+    )
+    chain["link"] = _board_link_comment_1376(
+        45, board_a, board_b,
+        **({"login": "mallory", "user_id": 9} if history == "foreign-link" else {}),
+    )
+    config = _config_1367(tmp_path, pr_seat_binding_override=board_b)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain)
+    published = _runner_1367(_published_chain_1367(chain))
+    if history == "governing-board":
+        assert _correlate_1367(runner, config, handoff) == _RECOVERY_IDS_1367
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+        assert _authorization_posts_1367(runner) == 1
+        audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+        assert audit is not None and audit[0] == 70
+        _plan_binding_1367(published, config)
+        return
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff)
+    assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config)
+
+
 def test_m1367_earlier_dispatch_records_are_not_recovery_candidates(tmp_path):
     """Row recovery-link-mismatch: only this dispatch's records are counted.
 

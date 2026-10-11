@@ -182,6 +182,10 @@ class BoardIdentity:
     def digest(self) -> str:
         return _digest(self.payload())
 
+    def label(self) -> str:
+        """Seat IDs, with the primary when there is one, for log lines."""
+        return ", ".join(self.names) + (f" (primary {self.primary})" if self.primary else "")
+
     @property
     def named(self) -> bool:
         return any(is_named_seat(seat) for seat in self.seats)
@@ -265,6 +269,39 @@ def identity_agents(identity: BoardIdentity) -> tuple[object, ...]:
                 )
             )
     return tuple(agents)
+
+
+def name_agents(names: Sequence[str]) -> tuple[object, ...]:
+    """Reviewer keys for display names alone, for history readers that match by name."""
+    from pathlib import Path
+
+    from .reviewer_seats import ReviewerSeat, SeatAgent
+
+    plain = _plain_backends()
+    return tuple(
+        plain[name] if name in plain
+        else SeatAgent(ReviewerSeat(name, "codex", (), None), Path("."))
+        for name in names
+    )
+
+
+def board_reentry_round(comments: Sequence[object], resumed_round: int | None) -> int:
+    """The round a PR resume re-enters (#1376).
+
+    The resume reader matches the latest round's records by the configured
+    board.  When a recorded board change has left that round with no record by
+    a current seat, the reader finds nothing; with link history the run then
+    re-enters after the highest recorded round instead of restarting at round 1.
+    """
+    if resumed_round is not None:
+        return resumed_round
+    if comments_bear_board_change_links(comments):
+        from .round_state import _extract_round_metadata_records
+
+        records = _extract_round_metadata_records(comments, flow="pr")
+        if records:
+            return board_anchor(records).round_number + 1
+    return 1
 
 
 def seats_compatible(old: BoardSeat, new: BoardSeat) -> bool:

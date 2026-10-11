@@ -27,7 +27,6 @@ from .config import (
     sync_reviewer_pr_before_review,
 )
 from .board_amendment import (
-    ContractLineage,
     amendment_audit_already_posted,
     amendment_summary_line,
     apply_board_amendment_to_ledger,
@@ -36,7 +35,6 @@ from .board_amendment import (
     reject_misplaced_pr_amendments,
     render_amendment_audit_comment,
     require_amendment_activation,
-    resolve_contract_lineage,
 )
 from .plan_verification import (
     board_change_audit_already_posted,
@@ -48,6 +46,8 @@ from .plan_verification import (
 )
 from .reviewer_floor import board_floor_enabled
 from .board_change import (
+    board_reentry_round,
+    name_agents,
     identity_agents,
     carried_secondary_obligations,
     carry_over_anchor_round,
@@ -452,7 +452,6 @@ from .pr_loop_support import (
     _reviewer_history_is_reconstructible,
     _returning_reviewer_context,
     _observe_pr_transition,
-    _scheduler_contract_from_metadata,
     _pr_contract_drift_error,
     _post_reduced_board_completion_note,
     _pr_amendment_start_round,
@@ -529,7 +528,9 @@ def _enforce_pr_board_floor(
                 "owner-scoped" if capabilities.owner_scoped_reconciliation else "aggregate"
             ),
         )
-        return resumed.round_number if resumed is not None else 1
+        return board_reentry_round(
+            pr_context.comments, resumed.round_number if resumed is not None else None
+        )
 
     resolve_pr_board_state(
         runner,
@@ -2387,9 +2388,9 @@ def run_pr_loop(
             candidate = pr_board_state.candidate
             log(
                 config,
-                f"PR #{pr_number}: reviewer board changed from "
-                f"{', '.join(candidate.old_board.names)} to {', '.join(candidate.new_board.names)}; "
-                f"recording the change effective from round {candidate.effective_from_round}.",
+                f"PR #{pr_number}: reviewer board changed from {candidate.old_board.label()} "
+                f"to {candidate.new_board.label()}; recording the change effective from round "
+                f"{candidate.effective_from_round}.",
             )
             if not link_already_posted(pr_board_state.comments, candidate.digest):
                 post_pr_comment(
@@ -2483,13 +2484,59 @@ def run_pr_loop(
         conflict_dispatch_head_sha: str | None = None
         latest_mergeability: PullRequestMergeability | None = None
         pr_board_carried = False
+        pr_board_reentry = (
+            pr_board_activation.effective_from_round
+            if pr_board_anchor_round is not None and pr_board_activation is not None
+            else None
+        )
+        if pr_board_anchor_round is None:
+            resumed_round = _resume_pr_round_admitted(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                comments=initial_pr_context.comments,
+                head_sha=initial_pr_context.metadata.head_sha,
+                configured_reviewers=configured_reviewers,
+                reconciliation_mode=pr_reconciliation_mode,
+            )
+            if (
+                resumed_round is None
+                and startup_records
+                and comments_bear_board_change_links(initial_pr_context.comments)
+            ):
+                # The highest recorded round holds no record by a current seat
+                # (a recorded board change removed them): re-enter after it with
+                # its records collected under every seat the lineage has known,
+                # instead of restarting at round 1.
+                anchor = board_anchor(startup_records)
+                pr_board_anchor_round = _resume_pr_round_admitted(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    comments=initial_pr_context.comments,
+                    head_sha=initial_pr_context.metadata.head_sha,
+                    configured_reviewers=name_agents(tuple(pr_contract_lineage.last_seen)),
+                    reconciliation_mode=pr_reconciliation_mode,
+                )
+                if (
+                    pr_board_anchor_round is None
+                    or pr_board_anchor_round.round_number != anchor.round_number
+                ):
+                    pr_board_anchor_round = ResumedReviewRound(
+                        round_number=anchor.round_number,
+                        prior_items=tuple(anchor.ledger),
+                        coder_output=None,
+                        completed_reviews=(),
+                        next_unresolved_item_number=1,
+                    )
+                pr_board_reentry = anchor.round_number + 1
         if pr_board_anchor_round is not None:
             # Board-change carry-over (D4b): reconcile the anchor round's
             # persisted dispositions, merge its new findings and rebuild its
             # evidence requests, then re-enter the link's effective round once
             # with the anchor round's coder output as the artifact.  New-board
             # ownership is applied by the ledger view.
-            assert pr_board_activation is not None
+            assert pr_board_reentry is not None
             carry = carry_over_anchor_round(
                 prior_items=pr_board_anchor_round.prior_items,
                 completed_reviews=pr_board_anchor_round.completed_reviews,
@@ -2503,7 +2550,7 @@ def run_pr_loop(
             )
             resumed_round = dataclasses_replace(
                 pr_board_anchor_round,
-                round_number=pr_board_activation.effective_from_round,
+                round_number=pr_board_reentry,
                 prior_items=tuple(carry.items),
                 completed_reviews=(),
                 current_round_new_items=(),
@@ -2522,18 +2569,7 @@ def run_pr_loop(
             log(
                 config,
                 f"PR #{pr_number}: reviewer-board change carried round "
-                f"{pr_board_anchor_round.round_number} findings into round "
-                f"{pr_board_activation.effective_from_round}",
-            )
-        else:
-            resumed_round = _resume_pr_round_admitted(
-                runner,
-                config=config,
-                pr_number=pr_number,
-                comments=initial_pr_context.comments,
-                head_sha=initial_pr_context.metadata.head_sha,
-                configured_reviewers=configured_reviewers,
-                reconciliation_mode=pr_reconciliation_mode,
+                f"{pr_board_anchor_round.round_number} findings into round {pr_board_reentry}",
             )
         pr_amendment_start_round = (
             resumed_round.round_number if resumed_round is not None else 1
@@ -5493,6 +5529,43 @@ def run_pr_loop(
             # repair go to the coder.  A current, fully reviewed CI candidate
             # proceeds to source-authoritative qualification instead.
             must_fix_items = list(item_partitions["coder_blockers"])
+            carried_panel_ids = (
+                set(carried_secondary_obligations(
+                    pr_ledger_view(unresolved_items),
+                    epoch_round=pr_primary_epoch_round,
+                    primary=scheduler_contract.primary_reviewer,
+                ))
+                if scheduler_capabilities.requires_primary else set()
+            )
+            if (
+                carried_panel_ids
+                and must_fix_items
+                and not unavailable_reviewer_failures
+                and evidence_pass is None
+                and all(item.item_id in carried_panel_ids for item in must_fix_items)
+                and scheduler_decision is not None
+                and scheduler_decision.phase == "primary"
+                and scheduler_contract.primary_reviewer in {
+                    *unchanged_head_approvals,
+                    *(name for name, _output in approved_review_outputs),
+                }
+            ):
+                # A board change restarted the primary phase (#1376) and the new
+                # primary approved this head.  The only open items are carried
+                # secondary obligations: their owners recheck them when the panel
+                # reopens at this head, so no coder turn is dispatched.
+                log(
+                    config,
+                    f"Round {round_number}: restarted primary approved; reopening the panel for "
+                    f"carried obligation(s) {', '.join(sorted(carried_panel_ids))}; no coder dispatch",
+                )
+                if round_number == allowed_rounds:
+                    raise AgentLoopError(
+                        f"PR #{pr_number} carried panel obligation(s) "
+                        f"{', '.join(sorted(carried_panel_ids))} still need their owners after the "
+                        "restarted primary approved. No coder follow-up or merge was attempted."
+                    )
+                continue
             if unavailable_reviewer_failures:
                 # Decide at the point of detection (#1129): a required reviewer
                 # that cannot be reached can never be satisfied by continuing.
