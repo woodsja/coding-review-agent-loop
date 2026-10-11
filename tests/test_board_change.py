@@ -3189,3 +3189,32 @@ def test_plan_primary_change_restarts_the_primary_phase_and_carries_the_panel_it
     assert prelaunch[0].scheduler_primary_reviewer == "Antigravity"
     assert [item.item_id for item in prelaunch[0].prior_items] == ["item-1"]
     assert not any("Plan review scheduling diagnostic" in c["body"] for c in runner.issue_comments)
+
+
+def test_supersession_inherited_failure_and_mode_guard_are_never_approved(tmp_path):
+    """Rows plan-supersession-not-shortcut / plan-approval-gate-live-inputs (unit)."""
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _plan_cfg(tmp_path, ("codex", "gemini"))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    comments = _plan_comments(runner)
+
+    def classify(**kwargs):
+        return classify_plan_approval(
+            comments, config=kwargs.pop("config", config), issue_number=56,
+            human_requirements=(), trusted_actor=_PLAN_ACTOR, **kwargs,
+        )
+
+    assert classify().state == "approved"
+    # A pending validated signed supersession is never shortcut as approved.
+    assert classify(supersession_pending=True).state == "unfinished"
+    # An inadmissible inherited matrix routes to the revision path, never approval.
+    assert classify(inherited_check=lambda _text: "inherited row weakened").state == "unfinished"
+    assert classify(inherited_check=lambda _text: None).state == "approved"
+    # An underivable inherited input is not approved.
+    assert classify(inherited_derivable=False).state == "undetermined"
