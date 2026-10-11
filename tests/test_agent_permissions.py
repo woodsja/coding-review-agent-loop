@@ -825,37 +825,44 @@ def _checkout_isolated_python(root: Path) -> str:
     site-packages holds a ``.pth`` naming this checkout's ``src`` has a known
     isolated resolution, since site-packages ``.pth`` files still apply under ``-I``.
     """
-    venv = root / "venv"
+    stage = "venv creation"
     try:
+        venv = root / "venv"
         created = subprocess.run(
             [sys.executable, "-m", "venv", "--without-pip", str(venv)],
             capture_output=True, text=True, timeout=120,
         )
+        if created.returncode != 0:
+            pytest.skip(
+                "cannot build an isolated interpreter bound to the checkout under test: "
+                f"{created.stderr.strip() or f'venv exited {created.returncode}'}"
+            )
+        python = str(venv / "bin" / "python")
+        stage = "neutral cwd setup"
+        neutral = root / "neutral-cwd"
+        neutral.mkdir()
+        stage = "purelib discovery"
+        purelib = subprocess.run(
+            [python, "-I", "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
+            cwd=neutral, capture_output=True, text=True, timeout=60,
+        )
+        if purelib.returncode != 0 or not purelib.stdout.strip():
+            pytest.skip(
+                "cannot build an isolated interpreter bound to the checkout under test: "
+                f"no purelib reported: {purelib.stderr.strip() or 'no output'}"
+            )
+        stage = ".pth setup"
+        site_packages = Path(purelib.stdout.strip())
+        site_packages.mkdir(parents=True, exist_ok=True)
+        (site_packages / "agent_loop_checkout.pth").write_text(f"{CHECKOUT_SRC}\n", encoding="utf-8")
+        stage = "resolution verification"
+        resolved = subprocess.run(
+            [python, "-I", "-c", _FIND_PACKAGE], cwd=neutral, capture_output=True, text=True, timeout=60,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
-        pytest.skip(f"cannot build an isolated interpreter bound to the checkout under test: {exc}")
-    if created.returncode != 0:
         pytest.skip(
-            "cannot build an isolated interpreter bound to the checkout under test: "
-            f"{created.stderr.strip() or f'venv exited {created.returncode}'}"
+            f"cannot build an isolated interpreter bound to the checkout under test: {stage} failed: {exc!r}"
         )
-    python = str(venv / "bin" / "python")
-    neutral = root / "neutral-cwd"
-    neutral.mkdir()
-    purelib = subprocess.run(
-        [python, "-I", "-c", "import sysconfig;print(sysconfig.get_paths()['purelib'])"],
-        cwd=neutral, capture_output=True, text=True, timeout=60,
-    )
-    if purelib.returncode != 0 or not purelib.stdout.strip():
-        pytest.skip(
-            "cannot build an isolated interpreter bound to the checkout under test: "
-            f"no purelib reported: {purelib.stderr.strip() or 'no output'}"
-        )
-    site_packages = Path(purelib.stdout.strip())
-    site_packages.mkdir(parents=True, exist_ok=True)
-    (site_packages / "agent_loop_checkout.pth").write_text(f"{CHECKOUT_SRC}\n", encoding="utf-8")
-    resolved = subprocess.run(
-        [python, "-I", "-c", _FIND_PACKAGE], cwd=neutral, capture_output=True, text=True, timeout=60,
-    )
     found = os.path.realpath(resolved.stdout.strip()) if resolved.returncode == 0 else None
     if found != PACKAGE_DIR:
         pytest.skip(
@@ -902,7 +909,11 @@ def test_real_package_locator_ignores_cwd_shadow_package(tmp_path, monkeypatch, 
     assert located == PACKAGE_DIR
 
 
-@pytest.mark.parametrize("failure", ["venv-raises", "venv-exit", "no-purelib", "foreign-resolution"])
+@pytest.mark.parametrize("failure", [
+    "venv-raises", "venv-exit", "no-purelib", "purelib-raises", "purelib-timeout",
+    "neutral-mkdir-raises", "pth-write-raises", "resolution-raises", "resolution-timeout",
+    "foreign-resolution",
+])
 def test_checkout_isolated_python_skips_when_it_cannot_be_built_or_verified(tmp_path, monkeypatch, failure):
     calls = []
     foreign = "/elsewhere/src/coding_review_agent_loop"
@@ -916,10 +927,23 @@ def test_checkout_isolated_python_skips_when_it_cannot_be_built_or_verified(tmp_
         if "sysconfig" in argv[-1]:
             if failure == "no-purelib":
                 return subprocess.CompletedProcess(argv, 1, "", "no sysconfig")
+            if failure == "purelib-raises":
+                raise OSError("purelib probe exec failed")
+            if failure == "purelib-timeout":
+                raise subprocess.TimeoutExpired(argv, 60)
             return subprocess.CompletedProcess(argv, 0, str(tmp_path / "site") + "\n", "")
+        if failure == "resolution-raises":
+            raise OSError("resolution probe exec failed")
+        if failure == "resolution-timeout":
+            raise subprocess.TimeoutExpired(argv, 60)
         return subprocess.CompletedProcess(argv, 0, foreign + "\n", "")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    if failure == "neutral-mkdir-raises":
+        (tmp_path / "neutral-cwd").write_text("not a directory", encoding="utf-8")
+    if failure == "pth-write-raises":
+        (tmp_path / "site").mkdir()
+        (tmp_path / "site" / "agent_loop_checkout.pth").mkdir()
     with pytest.raises(pytest.skip.Exception) as skipped:
         _checkout_isolated_python(tmp_path)
     reason = str(skipped.value)
@@ -927,6 +951,12 @@ def test_checkout_isolated_python_skips_when_it_cannot_be_built_or_verified(tmp_
         "venv-raises": "venv module unavailable",
         "venv-exit": "ensurepip broke",
         "no-purelib": "no sysconfig",
+        "purelib-raises": "purelib discovery failed",
+        "purelib-timeout": "purelib discovery failed",
+        "neutral-mkdir-raises": "neutral cwd setup failed",
+        "pth-write-raises": ".pth setup failed",
+        "resolution-raises": "resolution verification failed",
+        "resolution-timeout": "resolution verification failed",
         "foreign-resolution": foreign,
     }[failure]
     assert expected in reason
