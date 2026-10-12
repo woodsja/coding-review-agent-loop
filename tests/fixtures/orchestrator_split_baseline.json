@@ -27,6 +27,8 @@
   "evidence_reconciliation",
   "expected_closure",
   "finding_history",
+  "fixture_runtime",
+  "fixture_supervisor",
   "followups",
   "gh_rest_shim",
   "github",
