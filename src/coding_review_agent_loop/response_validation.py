@@ -595,7 +595,7 @@ def _derive_authenticated_risk_evidence_for_coder(
             diagnostics=actionable,
             execution_catalog=_safe_execution_handle_catalog(catalog),
             include_coverage_map=coverage_map_applies(approved_plan_context),
-            managed_ci_dispatch_guard=config.coder_ci_dispatch_guard,
+            managed_ci_dispatch_guard=getattr(config, "coder_ci_dispatch_guard", False),
         )
         try:
             correction_result = run_agent_result(
