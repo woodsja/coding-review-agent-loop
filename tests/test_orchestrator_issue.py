@@ -19878,3 +19878,32 @@ def test_m1390_lookalike_boundary_is_ignored_and_the_plan_resumes(tmp_path):
     assert len(_m1390_boundaries(runner)) == 1  # only the forged one
     assert any("resuming round 3" in message for message in messages)
     assert "item-3" in _m1251_prompts(runner, "claude")[0]
+
+
+def test_m1390_fresh_scope_prompt_keeps_human_discussion_and_signed_requirements(tmp_path):
+    """`prompt-excludes-archived-plan`: archived planning text is dropped, while
+    human comments, a signed requirement and the boundary audit text remain."""
+    history = _m1390_history(tmp_path)
+    human = {
+        "author": {"login": "maintainer"},
+        "createdAt": "2026-05-24T00:00:00Z",
+        "body": "Please keep the CLI output stable for scripts.",
+    }
+    signed = {
+        "author": {"login": "maintainer"},
+        "createdAt": "2026-05-24T00:01:00Z",
+        "body": "Also preserve the audit trail.\n\n-- Human Reviewer",
+    }
+    runner, _result, _messages = _m1390_rerun(
+        tmp_path, [*history, human, signed], issue_payload=_M1390_EDIT,
+        claude_outputs=[structured_v1_plan_state()],
+    )
+
+    assert len(_m1390_boundaries(runner)) == 1
+    prompt = _m1251_prompts(runner, "claude")[0]
+    for archived in ("Close gap 2.", "Gap 3 remains.", "Gap 1 remains."):
+        assert any(archived in comment["body"] for comment in history)
+        assert archived not in prompt
+    assert "Please keep the CLI output stable for scripts." in prompt
+    assert "Also preserve the audit trail." in prompt
+    assert "Planning scope restarted." in prompt
