@@ -44,6 +44,13 @@ from .panel_evidence import (
 from .plan_first_loop import PLAN_SCHEDULING_DIAGNOSTIC_TEMPLATE
 from .pr_loop import PR_SCHEDULING_DIAGNOSTIC_TEMPLATE
 from .protocol import parse_agent_unavailable
+from .review_rounds import (
+    INCOMPLETE_PR_REVIEW_DETECTION_PREFIX,
+    INCOMPLETE_PR_REVIEW_DETECTION_ROUND,
+    INCOMPLETE_PR_REVIEW_HEADLINE,
+    INCOMPLETE_PR_REVIEW_MISSING_HEADING,
+    INCOMPLETE_PR_REVIEW_MISSING_LINE,
+)
 from .review_step_back import PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
 from .round_state import PostedRoundRecord, _extract_round_metadata_records
 from .round_transport import ROUND_RESUME_MARKER_RE
@@ -77,6 +84,14 @@ KIND_INFRASTRUCTURE = "infrastructure"
 STOP_KINDS = frozenset({KIND_HUMAN_DECISION_STOP, KIND_PLANNING_STOP, KIND_PR_STOP})
 
 CAUSE_UNKNOWN = "unknown"
+# A seat missing from the newest round of a history no terminal state bounds:
+# the round may still be running, and nothing explains the absence yet.
+CAUSE_PENDING = "pending"
+UNEXPLAINED_CAUSES = frozenset({CAUSE_UNKNOWN, CAUSE_PENDING})
+
+# Reviewer records that settle a reviewer's verdict for a round: ordinary
+# records and early-published parallel reviews, which settlement never reposts.
+_VERDICT_PHASES = frozenset({"authoritative", "publication"})
 
 # Records carrying any of these fields were written after plan step-back
 # entries (#1251) existed, so a plan history without entries is a verified
@@ -95,15 +110,26 @@ _REVIEW_ROLES = frozenset({"coder", "reviewer"})
 
 @dataclass(frozen=True)
 class RecognizedDiagnostic:
-    """One authenticated plain diagnostic that carries no round metadata."""
+    """One authenticated plain diagnostic that carries no round metadata.
+
+    ``terminal`` marks a diagnostic that ends its invocation (every stop, an
+    agent-unavailable envelope, an incomplete-review stop, the CI stall stop);
+    the advisory CI stall comment is not terminal.  ``seat_failures`` holds
+    ``(reviewer, category)`` pairs a diagnostic names explicitly, and
+    ``seat_signature`` the signature of an agent-unavailable envelope.
+    """
 
     kind: str
     reason: str
     round_number: int | None = None
     seat_signature: str | None = None
+    terminal: bool = False
+    seat_failures: tuple[tuple[str, str], ...] = ()
 
 
-def _template_regex(template: str, groups: Mapping[str, str]) -> re.Pattern[str]:
+def _template_regex(
+    template: str, groups: Mapping[str, str], *, anchored_end: bool = True
+) -> re.Pattern[str]:
     """Compile a ``str.format`` template into an anchored regex.
 
     Literal text is escaped; each ``{name}`` becomes the named group given in
@@ -116,7 +142,7 @@ def _template_regex(template: str, groups: Mapping[str, str]) -> re.Pattern[str]
         pattern += f"(?P<{match.group(1)}>{groups[match.group(1)]})"
         position = match.end()
     pattern += re.escape(template[position:])
-    return re.compile(r"\A" + pattern + r"\Z", re.DOTALL)
+    return re.compile(r"\A" + pattern + (r"\Z" if anchored_end else ""), re.DOTALL)
 
 
 _LABEL_GROUP = r"startup|round [1-9][0-9]*"
@@ -126,12 +152,33 @@ _PLAN_SCHEDULING_RE = _template_regex(
 _PR_SCHEDULING_RE = _template_regex(
     PR_SCHEDULING_DIAGNOSTIC_TEMPLATE, {"label": _LABEL_GROUP, "message": r".*"}
 )
-_CI_HEADLINE_RES = tuple(
-    _template_regex(template, {"pr_number": r"[1-9][0-9]*"})
-    for template in (CI_INFRASTRUCTURE_COMMENT_HEADLINE, CI_INFRASTRUCTURE_STOP_HEADLINE)
+_CI_COMMENT_RE = _template_regex(CI_INFRASTRUCTURE_COMMENT_HEADLINE, {"pr_number": r"[1-9][0-9]*"})
+_CI_STOP_RE = _template_regex(CI_INFRASTRUCTURE_STOP_HEADLINE, {"pr_number": r"[1-9][0-9]*"})
+_INCOMPLETE_ROUND_RE = _template_regex(
+    INCOMPLETE_PR_REVIEW_DETECTION_ROUND, {"round_number": r"[1-9][0-9]*"}, anchored_end=False
+)
+_INCOMPLETE_LINE_RE = _template_regex(
+    INCOMPLETE_PR_REVIEW_MISSING_LINE, {"reviewer": r"[^\n]+?", "category": r"[^\n:]+"}
 )
 _SETTINGS_LOCK_RE = re.compile(r"settings[ _-]lock", re.I)
 _AUTH_TOKEN_RE = re.compile(r"auth|unauthorized|forbidden|invalid api key", re.I)
+
+# Recorded agent-failure categories (``AgentInvocationError.failure_category``
+# and discuss ``failed_debaters``) mapped onto infrastructure categories.
+_FAILURE_CATEGORY_MAP = {
+    "non-retryable": "auth-or-billing",
+    "transient": "backend-outage",
+    "resource-exhausted": "quota",
+    "settings_lock_contention": "settings-lock",
+    "settings-lock": "settings-lock",
+    "agent-unavailable": "agent-unavailable",
+}
+
+
+def classify_failure_category(category: str | None) -> str:
+    """Infrastructure category for a recorded agent-failure category."""
+    value = (category or "unknown").strip() or "unknown"
+    return _FAILURE_CATEGORY_MAP.get(value, f"agent-failure-{value}")
 
 
 def _label_round(label: str) -> int | None:
@@ -169,6 +216,35 @@ def _signature_line(text: str) -> str | None:
     return None
 
 
+def _recognize_incomplete_review(body: str) -> RecognizedDiagnostic | None:
+    lines = body.split("\n")
+    if len(lines) < 5 or lines[0] != INCOMPLETE_PR_REVIEW_HEADLINE or lines[1] != "":
+        return None
+    detection = lines[2]
+    if not detection.startswith(INCOMPLETE_PR_REVIEW_DETECTION_PREFIX):
+        return None
+    round_match = _INCOMPLETE_ROUND_RE.match(detection[len(INCOMPLETE_PR_REVIEW_DETECTION_PREFIX):])
+    try:
+        start = lines.index(INCOMPLETE_PR_REVIEW_MISSING_HEADING) + 1
+    except ValueError:
+        return None
+    failures: list[tuple[str, str]] = []
+    for line in lines[start:]:
+        match = _INCOMPLETE_LINE_RE.match(line)
+        if match is None:
+            break
+        failures.append((match.group("reviewer"), classify_failure_category(match.group("category"))))
+    if not failures:
+        return None
+    return RecognizedDiagnostic(
+        KIND_INFRASTRUCTURE,
+        "incomplete-review",
+        int(round_match.group("round_number")) if round_match else None,
+        terminal=True,
+        seat_failures=tuple(failures),
+    )
+
+
 def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
     """Recognize a plain stop or infrastructure diagnostic, else ``None``.
 
@@ -183,13 +259,22 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
         message = match.group("message")
         round_number = _label_round(match.group("label"))
         if message.startswith(PLAN_STEP_BACK_HUMAN_DECISION_PREFIX):
-            return RecognizedDiagnostic(KIND_HUMAN_DECISION_STOP, "plan-step-back", round_number)
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "plan-step-back", round_number, terminal=True
+            )
         if message.startswith(PLAN_PRIMARY_STALL_PREFIX):
-            return RecognizedDiagnostic(KIND_HUMAN_DECISION_STOP, "plan-primary-stall", round_number)
-        return RecognizedDiagnostic(kind, "scheduling-stop", round_number)
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "plan-primary-stall", round_number, terminal=True
+            )
+        return RecognizedDiagnostic(kind, "scheduling-stop", round_number, terminal=True)
     first_line = body.split("\n", 1)[0]
-    if any(regex.match(first_line) for regex in _CI_HEADLINE_RES):
+    if _CI_STOP_RE.match(first_line):
+        return RecognizedDiagnostic(KIND_INFRASTRUCTURE, "ci-infrastructure-stall", terminal=True)
+    if _CI_COMMENT_RE.match(first_line):
         return RecognizedDiagnostic(KIND_INFRASTRUCTURE, "ci-infrastructure-stall")
+    incomplete = _recognize_incomplete_review(body)
+    if incomplete is not None:
+        return incomplete
     try:
         unavailable = parse_agent_unavailable(body)
     except AgentLoopError:
@@ -200,6 +285,7 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
         KIND_INFRASTRUCTURE,
         classify_infrastructure_failure(unavailable.summary, category=unavailable.category),
         seat_signature=_signature_line(body),
+        terminal=True,
     )
 
 
@@ -214,6 +300,16 @@ def _signature_names_seat(signature: str | None, seat: str) -> bool:
         ):
             return True
     return False
+
+
+def _explained_cause(diagnostic: RecognizedDiagnostic, seat: str) -> str | None:
+    """The failure category ``diagnostic`` records for ``seat``, else ``None``."""
+    for reviewer, category in diagnostic.seat_failures:
+        if reviewer == seat:
+            return category
+    if _signature_names_seat(diagnostic.seat_signature, seat):
+        return diagnostic.reason
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +468,9 @@ class _FlowLedger:
     missing: tuple[dict[str, object], ...]
 
 
-def _seats(records: Sequence[PostedRoundRecord]) -> tuple[str, ...]:
+def _seats(records: Sequence[PostedRoundRecord], role: str = "reviewer") -> tuple[str, ...]:
     return tuple(dict.fromkeys(
-        record.metadata.agent for record in records if record.metadata.role == "reviewer"
+        record.metadata.agent for record in records if record.metadata.role == role
     ))
 
 
@@ -393,29 +489,36 @@ def _expected_seats(
 
 
 def _present_seats(
-    records: Sequence[PostedRoundRecord], round_number: int, *, before: int | None = None
+    records: Sequence[PostedRoundRecord],
+    round_number: int,
+    *,
+    role: str = "reviewer",
+    before: int | None = None,
 ) -> set[str]:
     return {
         record.metadata.agent
         for record in records
         if record.metadata.round_number == round_number
-        and record.metadata.role == "reviewer"
+        and record.metadata.role == role
         and (before is None or record.index < before)
     }
 
 
 def _attach_infrastructure(
     thread: _Thread, flow: str
-) -> dict[int, list[tuple[int, RecognizedDiagnostic]]]:
+) -> dict[int, list[tuple[int, RecognizedDiagnostic, frozenset[str]]]]:
     """Attach each infrastructure diagnostic to the round it interrupted.
 
-    A diagnostic belongs to the newest round started before it only while
-    that round still lacks an expected reviewer record; one posted after a
-    fully reviewed round (for example during implementation) ends no round.
+    A diagnostic naming its round (the incomplete-review stop) attaches there.
+    Otherwise it belongs to the newest round started before it, but only while
+    that round still lacks an expected reviewer record; one posted after a fully
+    reviewed round (for example during implementation) ends no round.  Each
+    attachment carries its obligations: the seats it names, or else the seats
+    still missing when it was posted.
     """
     records = thread.records.get(flow, ())
     seats = _seats(records)
-    attached: dict[int, list[tuple[int, RecognizedDiagnostic]]] = {}
+    attached: dict[int, list[tuple[int, RecognizedDiagnostic, frozenset[str]]]] = {}
     for index, diagnostic in thread.diagnostics:
         if diagnostic.kind != KIND_INFRASTRUCTURE:
             continue
@@ -423,13 +526,21 @@ def _attach_infrastructure(
             record for record in records
             if record.index < index and record.metadata.role in _REVIEW_ROLES
         ]
-        if not prior:
+        if diagnostic.round_number is not None:
+            round_number = diagnostic.round_number
+        elif prior:
+            round_number = max(record.metadata.round_number for record in prior)
+        else:
             continue
-        round_number = max(record.metadata.round_number for record in prior)
         expected = set(_expected_seats(records, round_number, seats))
-        if expected and expected <= _present_seats(records, round_number, before=index):
+        missing_then = expected - _present_seats(records, round_number, before=index)
+        if diagnostic.round_number is None and expected and not missing_then:
             continue
-        attached.setdefault(round_number, []).append((index, diagnostic))
+        named = {seat for seat in expected if _explained_cause(diagnostic, seat) is not None}
+        named |= {reviewer for reviewer, _category in diagnostic.seat_failures}
+        attached.setdefault(round_number, []).append(
+            (index, diagnostic, frozenset(named or missing_then))
+        )
     return attached
 
 
@@ -438,13 +549,16 @@ def _flow_ledger(thread: _Thread, flow: str, *, bounded: bool) -> _FlowLedger:
     review_records = [record for record in records if record.metadata.role in _REVIEW_ROLES]
     rounds = tuple(sorted({record.metadata.round_number for record in review_records}))
     attached = _attach_infrastructure(thread, flow)
+    # A round ended in infrastructure failure unless every obligation the
+    # failure left (the failed or missing seats) was fulfilled afterwards; a
+    # later record from a healthy peer fulfils nothing.
     infra_rounds = frozenset(
         round_number
         for round_number, diagnostics in attached.items()
-        if not any(
-            record.metadata.round_number == round_number
-            and record.index > max(index for index, _ in diagnostics)
-            for record in review_records
+        if any(
+            not obligations <= _present_seats(records, round_number)
+            or (not obligations and not _present_seats(records, round_number))
+            for _index, _diagnostic, obligations in diagnostics
         )
     )
     stop_rounds = {
@@ -458,18 +572,16 @@ def _flow_ledger(thread: _Thread, flow: str, *, bounded: bool) -> _FlowLedger:
         present = _present_seats(records, round_number)
         if not present and round_number in stop_rounds:
             continue
-        if round_number == rounds[-1] and not bounded:
-            continue  # the newest round may still be in progress
         for seat in _expected_seats(records, round_number, seats):
             if seat in present:
                 continue
             cause = next(
                 (
-                    diagnostic.reason
-                    for _index, diagnostic in attached.get(round_number, ())
-                    if _signature_names_seat(diagnostic.seat_signature, seat)
+                    explained
+                    for _index, diagnostic, _obligations in attached.get(round_number, ())
+                    if (explained := _explained_cause(diagnostic, seat)) is not None
                 ),
-                CAUSE_UNKNOWN,
+                CAUSE_PENDING if round_number == rounds[-1] and not bounded else CAUSE_UNKNOWN,
             )
             missing.append({
                 "surface": thread.surface, "flow": flow, "round": round_number,
@@ -478,38 +590,116 @@ def _flow_ledger(thread: _Thread, flow: str, *, bounded: bool) -> _FlowLedger:
     return _FlowLedger(flow, thread, rounds, infra_rounds, tuple(missing))
 
 
-def _latest_round_approved(records: Sequence[PostedRoundRecord]) -> bool:
+def _discuss_ledger(thread: _Thread, *, bounded: bool) -> tuple[list[dict], list[dict]]:
+    """Recorded debater failures and missing debater records of a discussion.
+
+    Round summaries persist ``failed_debaters`` as authenticated
+    ``(debater, failure-category)`` pairs; those explain a debater's missing
+    record.  Any other missing debater stays ``unknown`` (``pending`` in the
+    newest round of an unbounded history).
+    """
+    records = thread.records.get("discuss", ())
+    failures: list[dict[str, object]] = []
+    explained: dict[tuple[int, str], str] = {}
+    for record in records:
+        for debater, category in record.metadata.failed_debaters:
+            mapped = classify_failure_category(category)
+            key = (record.metadata.round_number, debater)
+            if key in explained:
+                continue
+            explained[key] = mapped
+            failures.append({
+                "surface": thread.surface,
+                "comment_id": thread.comments[record.index].comment_id,
+                "created_at": _iso(thread.created(record.index)),
+                "category": mapped,
+                "seat": debater,
+                "source": "discuss-failed-debater",
+                "terminal": False,
+            })
+    debaters = _seats(records, "debater")
+    rounds = sorted({record.metadata.round_number for record in records if record.metadata.role == "debater"})
+    missing: list[dict[str, object]] = []
+    for round_number in rounds:
+        present = _present_seats(records, round_number, role="debater")
+        for debater in debaters:
+            if debater in present:
+                continue
+            cause = explained.get(
+                (round_number, debater),
+                CAUSE_PENDING if round_number == rounds[-1] and not bounded else CAUSE_UNKNOWN,
+            )
+            missing.append({
+                "surface": thread.surface, "flow": "discuss", "round": round_number,
+                "reviewer": debater, "cause": cause,
+            })
+    return failures, missing
+
+
+def _plan_board_approved(records: Sequence[PostedRoundRecord]) -> bool:
+    """Whether the whole plan board approved the exact final candidate.
+
+    The board is the scheduler contract's required reviewers when recorded,
+    otherwise every reviewer seat seen in the history.  Each board seat's
+    newest verdict on the newest planner candidate (``subject``) must be an
+    approval, carried approvals included, and no review in the newest round may
+    block.  A primary-only approval in primary-then-panel planning, or a peer
+    that never reviewed the candidate, is therefore not a plan approval.
+    """
+    coders = [record for record in records if record.metadata.role == "coder"]
     reviews = [
         record for record in records
-        if record.metadata.role == "reviewer" and record.metadata.phase == "authoritative"
+        if record.metadata.role == "reviewer" and record.metadata.phase in _VERDICT_PHASES
     ]
-    if not reviews:
+    if not coders or not reviews:
+        return False
+    candidate = coders[-1].metadata.subject
+    board: tuple[str, ...] = ()
+    for record in records:
+        contract = record.metadata.scheduler_contract
+        if record.metadata.scheduler_metadata_status == "valid" and isinstance(contract, Mapping):
+            required = contract.get("required_reviewers")
+            if isinstance(required, list) and all(isinstance(name, str) for name in required):
+                board = tuple(required)
+    board = board or _seats(reviews)
+    verdicts: dict[str, str | None] = {}
+    for record in reviews:
+        if record.metadata.subject == candidate:
+            verdicts[record.metadata.agent] = record.metadata.state
+    if any(verdicts.get(seat) != "approved" for seat in board):
         return False
     latest = max(record.metadata.round_number for record in records if record.metadata.role in _REVIEW_ROLES)
-    current = [record for record in reviews if record.metadata.round_number == latest]
-    if not current:
-        return False
-    newest: dict[str, str | None] = {}
-    for record in current:
-        newest[record.metadata.agent] = record.metadata.state
-    selected = {
-        reviewer
-        for record in records
+    return all(
+        record.metadata.state == "approved"
+        for record in reviews
         if record.metadata.round_number == latest
-        and record.metadata.scheduler_metadata_status == "valid"
-        for reviewer in record.metadata.scheduler_selected_reviewers
-    }
-    if selected - set(newest):
-        return False
-    return all(state == "approved" for state in newest.values())
-
-
-def _era_known(records: Iterable[PostedRoundRecord], fields: Sequence[str]) -> bool:
-    return any(
-        record.metadata.step_back_status != "absent"
-        or any(getattr(record.metadata, name) is not None for name in fields)
-        for record in records
     )
+
+
+_ERA_FIELDS = {"plan": _PLAN_STEP_BACK_ERA_FIELDS, "pr": _PR_STEP_BACK_ERA_FIELDS}
+
+
+def _era_covers(ledger: _FlowLedger) -> bool:
+    """Every counted round carries a record written in the step-back era.
+
+    A newer record never vouches for older rounds, so one legacy round leaves
+    the whole step-back count unavailable.
+    """
+    fields = _ERA_FIELDS[ledger.flow]
+    records = ledger.thread.records.get(ledger.flow, ())
+    for round_number in ledger.rounds:
+        if round_number in ledger.infra_rounds:
+            continue
+        if not any(
+            record.metadata.round_number == round_number
+            and (
+                record.metadata.step_back_status != "absent"
+                or any(getattr(record.metadata, name) is not None for name in fields)
+            )
+            for record in records
+        ):
+            return False
+    return True
 
 
 def _step_back_keys(records: Iterable[PostedRoundRecord], excluded_rounds: frozenset[int]) -> set:
@@ -586,15 +776,17 @@ def derive_history_row(
             | {index for index, _diagnostic in thread.diagnostics}
         )
     ]
+    # Terminal infrastructure diagnostics end a workflow like any stop; they
+    # bound the history but are never counted as human difficulty.
     stop_indices = {
         (thread.surface, index)
         for thread in threads
         for index, diagnostic in thread.diagnostics
-        if diagnostic.kind in STOP_KINDS
+        if diagnostic.terminal
     }
     latest_is_stop = bool(events) and (max(events)[2], max(events)[3]) in stop_indices
     linked_open = [pr.number for pr in history.linked_prs if (pr.state or "").upper() == "OPEN"]
-    plan_approved = bool(plan_records) and _latest_round_approved(plan_records)
+    plan_approved = bool(plan_records) and _plan_board_approved(plan_records)
     discuss_final = any(record.metadata.is_final for record in discuss_records)
     merged_any = any(pr.merged_at is not None or pr.state.upper() == "MERGED" for pr in history.linked_prs)
     prs_settled = bool(history.linked_prs) and not linked_open
@@ -614,29 +806,46 @@ def derive_history_row(
     ]
     plan_ledger = ledgers[0]
     pr_ledgers = ledgers[1:]
-    infrastructure_failures = [
-        {
-            "surface": thread.surface,
-            "comment_id": thread.comments[index].comment_id,
-            "created_at": _iso(thread.created(index)),
-            "category": diagnostic.reason,
-            "seat": diagnostic.seat_signature,
-        }
-        for thread in threads
-        for index, diagnostic in thread.diagnostics
-        if diagnostic.kind == KIND_INFRASTRUCTURE
-    ]
+    discuss_failures, discuss_missing = _discuss_ledger(issue, bounded=bounded)
+    infrastructure_failures: list[dict[str, object]] = []
+    for thread in threads:
+        for index, diagnostic in thread.diagnostics:
+            if diagnostic.kind != KIND_INFRASTRUCTURE:
+                continue
+            base = {
+                "surface": thread.surface,
+                "comment_id": thread.comments[index].comment_id,
+                "created_at": _iso(thread.created(index)),
+                "source": diagnostic.reason if diagnostic.seat_failures else (
+                    "ci-infrastructure-stall"
+                    if diagnostic.reason == "ci-infrastructure-stall"
+                    else "agent-unavailable"
+                ),
+                "terminal": diagnostic.terminal,
+            }
+            if diagnostic.seat_failures:
+                infrastructure_failures.extend(
+                    {**base, "category": category, "seat": seat}
+                    for seat, category in diagnostic.seat_failures
+                )
+            else:
+                infrastructure_failures.append(
+                    {**base, "category": diagnostic.reason, "seat": diagnostic.seat_signature}
+                )
+    infrastructure_failures.extend(discuss_failures)
     infrastructure_rounds = [
         {"surface": ledger.thread.surface, "flow": ledger.flow, "round": round_number}
         for ledger in ledgers
         for round_number in sorted(ledger.infra_rounds)
     ]
-    missing_reviewer_records = [entry for ledger in ledgers for entry in ledger.missing]
+    missing_reviewer_records = [
+        *discuss_missing, *(entry for ledger in ledgers for entry in ledger.missing)
+    ]
     coverage = (
         COVERAGE_PARTIAL
         if decode_errors
         or missing_pr_views
-        or any(entry["cause"] == CAUSE_UNKNOWN for entry in missing_reviewer_records)
+        or any(entry["cause"] in UNEXPLAINED_CAUSES for entry in missing_reviewer_records)
         else COVERAGE_COMPLETE
     )
 
@@ -646,10 +855,7 @@ def derive_history_row(
     )
 
     # Step-backs: era-gated so legacy histories stay unavailable, not zero.
-    all_pr_records = [record for records in pr_records.values() for record in records]
-    step_back_era = (not plan_records or _era_known(plan_records, _PLAN_STEP_BACK_ERA_FIELDS)) and (
-        not all_pr_records or _era_known(all_pr_records, _PR_STEP_BACK_ERA_FIELDS)
-    )
+    step_back_era = all(_era_covers(ledger) for ledger in ledgers)
     step_backs = len(_step_back_keys(plan_records, plan_ledger.infra_rounds)) + sum(
         len(_step_back_keys(ledger.thread.records.get("pr", ()), ledger.infra_rounds))
         for ledger in pr_ledgers
@@ -683,10 +889,10 @@ def derive_history_row(
         for record in records
     ]
     run_started_at = min(record_times) if record_times else None
-    first_digest = next(
-        (record.metadata.plan_issue_digest for record in plan_records if record.metadata.plan_issue_digest),
-        None,
-    )
+    # Only the run's first planner record identifies the text it received; a
+    # digest on a later run's record describes later text, never this run's.
+    first_planner = next((record for record in plan_records if record.metadata.role == "coder"), None)
+    first_digest = first_planner.metadata.plan_issue_digest if first_planner is not None else None
     commits = sorted(set(tool_commits or ()))
 
     terminal_states = [

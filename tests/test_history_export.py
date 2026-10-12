@@ -652,3 +652,268 @@ def test_history_export_is_documented():
     root = Path(__file__).resolve().parents[1]
     for path in ("README.md", "docs/local_agent_loop.md", "ARCHITECTURE.md"):
         assert "history export" in (root / path).read_text(encoding="utf-8"), path
+
+
+# --- review round 1: real publication and failure paths -----------------------
+
+
+from coding_review_agent_loop.errors import AgentInvocationError  # noqa: E402
+from coding_review_agent_loop.plan_review_scheduling import make_plan_contract  # noqa: E402
+from coding_review_agent_loop.review_rounds import _format_incomplete_pr_review_comment  # noqa: E402
+
+
+def _plan_subject_review(agent: str, round_number: int, state: str, subject: str, **fields) -> str:
+    return plan_review(agent, round_number, state, subject=subject, **fields)
+
+
+def _primary_scheduler(round_number: int, subject: str) -> str:
+    return record(
+        "plan", "summary", "Orchestrator", round_number, subject=subject,
+        phase="scheduler-prelaunch",
+        scheduler_contract=make_plan_contract((CODEX, CLAUDE), "primary-then-panel", CODEX).as_dict(),
+        scheduler_obligation_digest="0" * 16,
+        scheduler_selected_reviewers=(CODEX,),
+        scheduler_paused_reviewers=((CLAUDE, "primary phase"),),
+        scheduler_reasons=("primary phase",),
+        scheduler_final_sweep=False, scheduler_force_full=False, scheduler_calls_avoided=1,
+        scheduler_phase="primary", scheduler_primary_reviewer=CODEX,
+        plan_candidate_key={
+            "subject": subject, "aggregate_plan_identity": "aggregate",
+            "execution_strategy_identity": "strategy", "risk_test_matrix_identity": "matrix",
+            "surfaced_requirement_id_digest": "requirements",
+            "execution_strategy_contract_version": 1,
+        },
+    )
+
+
+def test_parallel_publication_reviews_settle_plan_approval():
+    subject = "plan-subject-1"
+    row = derive(
+        history(),
+        issue_view(
+            comment(1, plan_coder(1, subject=subject)),
+            comment(2, _plan_subject_review(CODEX, 1, "approved", subject, phase="publication")),
+            comment(3, _plan_subject_review(CLAUDE, 1, "approved", subject, phase="publication")),
+            comment(4, record("plan", "summary", "Orchestrator", 1, subject=subject, phase="reconciliation")),
+        ),
+    )
+    assert "plan-approved" in row["terminal_states"]
+    assert row["plan_rounds"] == {"value": 1, "evidence": "verified"}
+    assert row["human_decision_stops"] == {"value": 0, "evidence": "verified"}
+    assert row["outcome_complete"] is False
+
+
+def test_primary_or_partial_approval_is_not_plan_approval():
+    subject = "plan-subject-1"
+    primary_only = derive(
+        history(),
+        issue_view(
+            comment(1, _primary_scheduler(1, subject)),
+            comment(2, plan_coder(1, subject=subject)),
+            comment(3, _plan_subject_review(CODEX, 1, "approved", subject)),
+        ),
+    )
+    assert "plan-approved" not in primary_only["terminal_states"]
+    assert primary_only["plan_rounds"] == {"value": None, "evidence": "unavailable"}
+    assert primary_only["human_decision_stops"]["evidence"] == "unavailable"
+
+    missing_peer = derive(
+        history(),
+        issue_view(
+            comment(1, plan_coder(1, subject="s1")),
+            comment(2, _plan_subject_review(CODEX, 1, "blocking", "s1")),
+            comment(3, _plan_subject_review(CLAUDE, 1, "blocking", "s1")),
+            comment(4, plan_coder(2, subject="s2")),
+            comment(5, _plan_subject_review(CODEX, 2, "approved", "s2")),
+        ),
+    )
+    assert "plan-approved" not in missing_peer["terminal_states"]
+
+    full_board = derive(
+        history(),
+        issue_view(
+            comment(1, _primary_scheduler(1, subject)),
+            comment(2, plan_coder(1, subject=subject)),
+            comment(3, _plan_subject_review(CODEX, 1, "approved", subject)),
+            comment(4, _plan_subject_review(CLAUDE, 2, "approved", subject)),
+        ),
+    )
+    assert "plan-approved" in full_board["terminal_states"]
+
+
+def _incomplete_review(round_number: int, failures: dict) -> str:
+    return _format_incomplete_pr_review_comment(
+        pr_number=PR,
+        unavailable_reviewers={
+            agent: AgentInvocationError("down", failure_category=category)
+            for agent, category in failures.items()
+        },
+        approved_reviewer_names=[CODEX],
+        detection_round=round_number,
+    )
+
+
+def test_incomplete_pr_review_stop_is_recognized_and_explains_seats():
+    body = _incomplete_review(2, {"claude": "non-retryable", "gemini": "transient"})
+    diagnostic = recognize_diagnostic(body)
+    assert diagnostic.kind == KIND_INFRASTRUCTURE and diagnostic.terminal
+    assert diagnostic.round_number == 2
+    assert diagnostic.seat_failures == (("Claude", "auth-or-billing"), ("Gemini", "backend-outage"))
+
+    row = derive(
+        history(state="CLOSED", closed=at(50, 12), linked=[merged_pr()]),
+        issue_view(),
+        {PR: pr_view(
+            pr_comment(20, pr_record("coder", "Claude", 1)),
+            pr_comment(21, pr_record("reviewer", CODEX, 1, "blocking")),
+            pr_comment(22, pr_record("reviewer", CLAUDE, 1, "blocking")),
+            pr_comment(23, pr_record("coder", "Claude", 2)),
+            pr_comment(24, pr_record("reviewer", CODEX, 2, "approved")),
+            pr_comment(25, _incomplete_review(2, {"claude": "non-retryable"})),
+            pr_comment(26, pr_record("coder", "Claude", 3)),
+            pr_comment(27, pr_record("reviewer", CODEX, 3, "approved")),
+            pr_comment(28, pr_record("reviewer", CLAUDE, 3, "approved")),
+        )},
+    )
+    assert {"surface": f"pr#{PR}", "flow": "pr", "round": 2} in row["infrastructure_rounds"]
+    assert row["pr_rounds"] == {"value": 2, "evidence": "verified"}
+    failure = next(entry for entry in row["infrastructure_failures"] if entry["source"] == "incomplete-review")
+    assert (failure["seat"], failure["category"], failure["terminal"]) == (CLAUDE, "auth-or-billing", True)
+    assert {"surface": f"pr#{PR}", "flow": "pr", "round": 2, "reviewer": CLAUDE,
+            "cause": "auth-or-billing"} in row["missing_reviewer_records"]
+    assert row["infrastructure_coverage"] == "complete"
+
+
+def test_round_ends_in_infrastructure_unless_the_failed_seat_recovers():
+    base = (
+        comment(1, plan_coder(1)),
+        comment(2, plan_review(CODEX, 1, "blocking")),
+        comment(3, plan_review(CLAUDE, 1, "blocking")),
+        comment(4, plan_coder(2)),
+        comment(5, _unavailable("Claude authentication expired.", "permissions")),
+        comment(6, plan_review(CODEX, 2, "blocking")),
+    )
+    later_peer = derive(history(state="CLOSED", closed=at(30, 11)), issue_view(*base))
+    assert later_peer["infrastructure_rounds"] == [{"surface": f"issue#{ISSUE}", "flow": "plan", "round": 2}]
+    assert later_peer["plan_rounds"] == {"value": 1, "evidence": "verified"}
+
+    recovered = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(*base, comment(7, plan_review(CLAUDE, 2, "blocking"))),
+    )
+    assert recovered["infrastructure_rounds"] == []
+    assert recovered["plan_rounds"] == {"value": 2, "evidence": "verified"}
+
+
+def test_terminal_infrastructure_diagnostic_bounds_an_open_issue():
+    row = derive(
+        history(),
+        issue_view(
+            comment(1, plan_coder(1)),
+            comment(2, plan_review(CODEX, 1, "blocking")),
+            comment(3, _unavailable("Completion recovery exhausted its bounded pass.", "tooling")),
+        ),
+    )
+    assert "recognized-stop" in row["terminal_states"]
+    assert row["outcome_complete"] is True
+    assert row["human_decision_stops"] == {"value": 0, "evidence": "verified"}
+    assert row["plan_rounds"] == {"value": 1, "evidence": "verified"}
+
+    stall = CiInfrastructureStall(checks=(StalledCheck(name="test", kind="check_run", reason="queued_too_long", check_id=7, run_id="9", url=None, age_seconds=9000.0),))
+    advisory = recognize_diagnostic(_format_ci_infrastructure_comment(PR, stall))
+    stop = recognize_diagnostic(_ci_infrastructure_stop_message(PR, stall, []))
+    assert (advisory.terminal, stop.terminal) == (False, True)
+
+
+def test_unexplained_seat_in_the_latest_unbounded_round_is_pending():
+    row = derive(
+        history(),
+        issue_view(
+            comment(1, plan_coder(1)),
+            comment(2, plan_review(CODEX, 1, "blocking")),
+            comment(3, plan_review(CLAUDE, 1, "blocking")),
+            comment(4, plan_coder(2)),
+            comment(5, plan_review(CODEX, 2, "blocking")),
+        ),
+    )
+    assert row["missing_reviewer_records"] == [
+        {"surface": f"issue#{ISSUE}", "flow": "plan", "round": 2, "reviewer": CLAUDE, "cause": "pending"},
+    ]
+    assert row["infrastructure_coverage"] == "partial"
+
+
+def _debater(comment_id: int, agent: str, round_number: int):
+    return comment(comment_id, record("discuss", "debater", agent, round_number))
+
+
+def _discuss_summary(comment_id: int, round_number: int, *, failed=(), final=False):
+    return comment(comment_id, record(
+        "discuss", "summary", "Orchestrator", round_number, failed_debaters=failed, is_final=final,
+    ))
+
+
+def test_discussion_failed_debaters_are_infrastructure_failures():
+    explained = derive(
+        history(),
+        issue_view(
+            _debater(1, CODEX, 1), _debater(2, CLAUDE, 1), _discuss_summary(3, 1),
+            _debater(4, CODEX, 2), _discuss_summary(5, 2, failed=((CLAUDE, "transient"),), final=True),
+        ),
+    )
+    assert explained["route_taken"] == ["discuss"]
+    failure = explained["infrastructure_failures"][0]
+    assert (failure["seat"], failure["category"], failure["source"]) == (
+        CLAUDE, "backend-outage", "discuss-failed-debater",
+    )
+    assert explained["missing_reviewer_records"] == [
+        {"surface": f"issue#{ISSUE}", "flow": "discuss", "round": 2, "reviewer": CLAUDE,
+         "cause": "backend-outage"},
+    ]
+    assert explained["infrastructure_coverage"] == "complete"
+
+    unexplained = derive(
+        history(),
+        issue_view(
+            _debater(1, CODEX, 1), _debater(2, CLAUDE, 1), _discuss_summary(3, 1),
+            _debater(4, CODEX, 2), _discuss_summary(5, 2, final=True),
+        ),
+    )
+    assert unexplained["infrastructure_failures"] == []
+    assert unexplained["missing_reviewer_records"][0]["cause"] == "unknown"
+    assert unexplained["infrastructure_coverage"] == "partial"
+
+
+def test_snapshot_uses_only_the_first_planner_record_digest():
+    v1, v2 = "Body v1", "Body v2"
+    row = derive(
+        history(body=v2, body_revisions=((at(0, 9), v1), (at(30, 10), v2))),
+        issue_view(
+            comment(1, plan_coder(1)),
+            comment(2, plan_review(CODEX, 1, "blocking")),
+            comment(45, plan_coder(2, plan_issue_digest=plan_issue_text_digest_for("Issue title", v2))),
+        ),
+    )
+    snapshot = row["snapshot"]
+    assert snapshot["plan_issue_digest"] is None
+    assert snapshot["status"] == "time-inferred"
+    assert snapshot["body"] == v1
+
+
+def test_mixed_era_step_backs_stay_unavailable():
+    legacy = (
+        comment(1, record("plan", "coder", "Claude", 1, canonical_plan="Old plan.")),
+        comment(2, record("plan", "reviewer", CODEX, 1, state="blocking")),
+    )
+    mixed = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(*legacy, comment(3, plan_coder(2)), comment(4, plan_review(CODEX, 2, "approved"))),
+    )
+    assert mixed["step_backs"] == {"value": None, "evidence": "unavailable"}
+    modern = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(
+            comment(1, plan_coder(1)), comment(2, plan_review(CODEX, 1, "blocking")),
+            comment(3, plan_coder(2)), comment(4, plan_review(CODEX, 2, "approved")),
+        ),
+    )
+    assert modern["step_backs"] == {"value": 0, "evidence": "verified"}

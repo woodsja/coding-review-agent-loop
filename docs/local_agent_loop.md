@@ -4735,29 +4735,41 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   (characters of the newest canonical plan), `pr_rounds`, `merged` and
   `tool_commit` as `{"value": ..., "evidence": "verified"|"unavailable"}`
   pairs. `verified` needs a recognized terminal state that bounds the history:
-  an approved latest plan round, settled (merged or closed) linked PRs, a
+  a plan approval by the whole board, settled (merged or closed) linked PRs, a
   closed issue, or a recognized stop as the newest workflow event (operator
   comments from the same account are not workflow events). Without one, the
-  value is `null`, never a zero. Step-backs are also `unavailable` for records
-  that predate step-back recording.
+  value is `null`, never a zero. Step-backs are also `unavailable` unless
+  every counted round has a record written after step-back recording existed.
+- A plan approval needs every board seat (the scheduler contract's required
+  reviewers, otherwise every seat seen) to approve the newest planner
+  candidate, counting early-published parallel reviews and carried approvals,
+  with no blocking review in the newest round. A primary-only approval in
+  primary-then-panel planning is not a plan approval.
 - Human-decision stops are the planning scheduling diagnostics that carry the
   step-back or primary-stall human-decision text; step-back entries alone
   never count as stops.
 - `infrastructure_failures` lists recognized agent-unavailable comments
   (classified as `auth-expiry`, `quota`, `settings-lock`, `backend-outage`,
   `billing`, `environment` or `agent-unavailable-<category>`, including
-  completion-recovery terminal comments) and CI infrastructure-stall stops. A
-  round interrupted by one and never completed is listed in
-  `infrastructure_rounds` and excluded from the round counts.
-  `missing_reviewer_records` names reviewer seats missing from a round whose
-  peers posted, with the explaining failure category or `unknown`;
-  `infrastructure_coverage` is `partial` when anything is unexplained.
+  completion-recovery terminal comments), the incomplete-PR-review stop (one
+  entry per missing reviewer with its recorded failure category), discussion
+  debaters recorded as failed on a round summary, and CI infrastructure-stall
+  comments and stops. Each entry carries its `source` and whether it was
+  `terminal`. Terminal ones end a workflow like a stop but never count as
+  human-decision stops. A round is listed in `infrastructure_rounds` and
+  excluded from the round counts when a failure interrupted it and the failed
+  or missing seats never posted afterwards; a later healthy peer does not
+  complete it. `missing_reviewer_records` names reviewer (and debater) seats
+  missing from a round, with the explaining failure category, `unknown`, or
+  `pending` for the newest round of an unbounded history;
+  `infrastructure_coverage` is `partial` when any entry is `unknown` or
+  `pending`.
 - `outcome_complete` is true only when the issue is closed, or the newest
   workflow event is a recognized stop, and no linked PR is open.
   `outcome_available_at` is the latest of every authenticated comment's
   creation and edit time, linked PR merge/close times and the issue close time.
-- `snapshot` is the title and body the run received. When the first plan
-  record carries the issue-text digest, the versions rebuilt from GitHub edit
+- `snapshot` is the title and body the run received. When the first planner
+  record carries the issue-text digest (a later run's digest never applies), the versions rebuilt from GitHub edit
   history are matched against it: one distinct match is `digest-verified` (raw
   text); several normalization-equivalent matches are `digest-normalized`
   (normalized text only). Otherwise the status is `never-edited`,
