@@ -15090,6 +15090,7 @@ def test_external_push_breaks_the_freeze_and_the_new_head_is_reviewed_in_full(tm
         run_pr_loop(runner, pr_number=77, config=config)
 
     runner.pr_payload["headRefOid"] = "def456"
+    runner.git_head = "def456"
     runner.simulate_new_process()  # the rerun is a fresh agent-loop process
     runner.codex_outputs.append(
         _evidence_review(
