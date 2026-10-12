@@ -2006,7 +2006,9 @@ raises `AgentSettingsLockWaitTimeout`, a transient `AgentInvocationError`,
 before settings.json is touched; `run_validated_agent` and the direct
 Antigravity repair path each retry it once in place without spending retries
 or model fallback. A second expiry stays seat-local (repair records
-`settings_lock_contention`) and is never treated as a backend outage. PR round metadata, including scheduler and
+`settings_lock_contention`) and is never treated as a backend outage; a
+parallel PR round treats it as retry-bound, withholding healthy peers in the
+round spool so a rerun completes the round independently. PR round metadata, including scheduler and
 coder recovery records, stores a versioned board binding. Recovery verifies
 the binding before using any recorded checkpoint; a changed
 model chain starts a fresh round, retaining reconciled open findings but

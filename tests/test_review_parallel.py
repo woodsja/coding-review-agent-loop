@@ -353,7 +353,7 @@ def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkey
     assert not any(command[0] == "agy" for command, _ in runner.commands)
 
 
-def test_named_pr_lock_wait_is_seat_local_and_parallel_rerun_is_guarded(tmp_path, monkeypatch):
+def test_named_pr_parallel_lock_wait_withholds_peers_and_rerun_completes(tmp_path, monkeypatch):
     import fcntl
     import importlib
 
@@ -393,22 +393,19 @@ def test_named_pr_lock_wait_is_seat_local_and_parallel_rerun_is_guarded(tmp_path
         return original_flock(handle, operation)
 
     monkeypatch.setattr(fcntl, "flock", block_second_seat)
-    with pytest.raises(AgentLoopError, match="review incomplete") as caught:
+    # The wait and its one in-place retry expire. The failure stays transient
+    # and seat-local (no backend-outage expansion), and the healthy peer's
+    # review is withheld privately so the round remains resumable (#1400).
+    with pytest.raises(AgentSettingsLockWaitTimeout) as caught:
         run_pr_loop(runner, pr_number=77, config=config)
-    # The exhausted wait (and its one in-place retry) is a transient,
-    # seat-local failure: only the waiting seat is unavailable, never every
-    # Antigravity seat as a backend outage (#1400).
-    missing = str(caught.value).split("missing required input from ", 1)[1].split(" (", 1)[0]
-    assert missing in {"flash", "opus"}
-    assert ": transient)" in str(caught.value)
-    incomplete = [
-        c["body"] for c in runner.pr_payload["comments"]
-        if "shared_outage_backends=antigravity" in c["body"]
-    ]
-    assert incomplete == []
-    assert "shared_outage_backends=antigravity" not in str(caught.value)
+    assert caught.value.failure_category == "transient"
+    assert not any(
+        "shared_outage_backends" in c["body"] or "**Review status: Incomplete**" in c["body"]
+        for c in runner.pr_payload["comments"]
+    )
     assert lock_state["acquires"] == 1
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
+    assert _spool_files(config)
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
     from types import SimpleNamespace
     records = _extract_round_metadata_records(
@@ -416,18 +413,19 @@ def test_named_pr_lock_wait_is_seat_local_and_parallel_rerun_is_guarded(tmp_path
         flow="pr",
     )
     assert any(record.metadata.phase == "scheduler-prelaunch" for record in records)
-    # The healthy seat's review is recorded; the waiting seat has none yet.
-    reviewer_records = [record for record in records if record.metadata.role == "reviewer"]
-    assert len(reviewer_records) == 1
-    assert reviewer_records[0].metadata.agent != missing
+    assert not any(record.metadata.role == "reviewer" for record in records)
+    assert not any("**Review verdict:**" in c["body"] for c in runner.pr_payload["comments"])
+
+    # With the lock free, a plain rerun replays the withheld review and runs
+    # only the contended seat, completing both reviews.
     lock_state["blocked"] = False
-    # The healthy peer is already public, so the parallel round's independence
-    # guard refuses to launch the missing seat against its findings; the
-    # operator gets the existing actionable recovery instead of a silent rerun.
-    from coding_review_agent_loop.review_rounds import PartialReviewRoundError
-    with pytest.raises(PartialReviewRoundError, match="partially published"):
-        run_pr_loop(runner, pr_number=77, config=config)
-    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 2
+    reviews = [c["body"] for c in runner.pr_payload["comments"] if "**Review verdict:**" in c["body"]]
+    assert len(reviews) == 2
+    assert any(body.endswith("-- flash (Google Antigravity: Model A)") for body in reviews)
+    assert any(body.endswith("-- opus (Google Antigravity: Model B)") for body in reviews)
+    assert _spool_files(config) == []
 
 
 def test_named_pr_sequential_lock_wait_is_seat_local_and_rerun_completes(tmp_path, monkeypatch):

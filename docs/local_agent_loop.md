@@ -646,8 +646,11 @@ The window restarts for each new holder, under an overall cap of three times
 the largest allowance seen. An expired wait is a transient, seat-local failure:
 the validated turn retries the wait once in place (without spending
 `--agent-max-retries` or advancing the model chain), and if that also expires
-only the waiting seat is reported unavailable, never every Antigravity seat as
-a backend outage. Direct Antigravity format repair gets the same one re-wait
+only the waiting seat is affected, never every Antigravity seat as a backend
+outage. In a parallel PR round the other seats' reviews stay withheld in the
+private round spool, so rerunning once the lock is free replays them and runs
+only the contended seat; a sequential round reports just that seat unavailable
+and a rerun completes it. Direct Antigravity format repair gets the same one re-wait
 and records an exhausted wait as `settings_lock_contention`, without trying
 another repair model.
 

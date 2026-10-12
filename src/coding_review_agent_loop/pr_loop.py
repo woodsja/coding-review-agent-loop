@@ -94,6 +94,7 @@ from .evidence_stall import approved_matrix_row_ids
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
+    AgentSettingsLockWaitTimeout,
     HumanDecisionRequiredError,
     QuotaResetExceededError,
 )
@@ -4805,7 +4806,15 @@ def run_pr_loop(
 
                         def _pr_retry_bound(reviewer: AgentName, turn: _ReviewerTurnResult) -> AgentLoopError | None:
                             if turn.error is not None:
-                                return turn.error if _pr_failure_is_fatal(turn.error) else None
+                                # Settings-lock contention is transient and seat-local,
+                                # but the seat only needs the lock to clear: keep the
+                                # healthy peers' outcomes withheld in the spool so a
+                                # rerun completes the round independently (#1400).
+                                if _pr_failure_is_fatal(turn.error) or isinstance(
+                                    turn.error, AgentSettingsLockWaitTimeout
+                                ):
+                                    return turn.error
+                                return None
                             parsed = _pr_publication_parsed(turn)
                             if (
                                 parsed is not None

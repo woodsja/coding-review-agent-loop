@@ -149,6 +149,9 @@ def _settings_lock_holder_path(settings_lock_path: Path) -> Path:
 def _valid_holder_bound(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
+    # Range-check before converting: a huge JSON integer overflows float().
+    if isinstance(value, int) and not 0 < value <= SETTINGS_LOCK_HOLDER_BOUND_CEILING_SECONDS:
+        return None
     bound = float(value)
     if not math.isfinite(bound) or bound <= 0 or bound > SETTINGS_LOCK_HOLDER_BOUND_CEILING_SECONDS:
         return None

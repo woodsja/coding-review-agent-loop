@@ -1454,7 +1454,9 @@ def test_settings_lock_waiter_honors_a_longer_advertised_holder_bound(
     [None, "{not json", '{"token": "t", "turn_bound_seconds": -5}',
      '{"token": "t", "turn_bound_seconds": "Infinity"}',
      '{"token": "t", "turn_bound_seconds": 1e9}',
-     '{"token": "t", "turn_bound_seconds": true}'],
+     '{"token": "t", "turn_bound_seconds": true}',
+     # A huge JSON integer must not overflow float() and abort the wait.
+     '{"token": "t", "turn_bound_seconds": 1' + "0" * 400 + '}'],
 )
 def test_settings_lock_waiter_falls_back_to_own_budget_for_unknown_or_untrusted_holder(
     tmp_path, monkeypatch, capsys, record
@@ -1689,3 +1691,21 @@ def test_settings_lock_crashed_holder_record_does_not_delay_the_waiter(tmp_path,
     assert harness.now == harness.start
     assert seen[0]["token"] != "dead"  # overwritten by the new holder
     assert not harness.holder_path.exists()
+
+
+def test_settings_lock_owner_cleanup_tolerates_an_oversized_integer_bound(tmp_path, monkeypatch):
+    harness = _SettingsLockHarness(tmp_path, monkeypatch)
+
+    class Overwriting(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            harness.holder_path.write_text(
+                '{"token": "x", "turn_bound_seconds": 1' + "0" * 400 + "}", encoding="utf-8"
+            )
+            return super().run_with_log(args, **kwargs)
+
+    result = harness.mod.AntigravityBackend().run(
+        Overwriting(antigravity_outputs=[("ok", 0)]), harness.config(tmp_path), "Review.", role="reviewer"
+    )
+    assert result.text == "ok"
+    assert harness.mod.read_settings_lock_holder(harness.holder_path).turn_bound_seconds is None
+    assert harness.holder_path.exists()  # foreign token: left alone
