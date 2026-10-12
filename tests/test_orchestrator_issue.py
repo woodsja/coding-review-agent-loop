@@ -9759,6 +9759,113 @@ def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
     assert after == [*calls_before, "gemini"]
 
 
+def _named_repaired_acknowledgement_run_1363(tmp_path, monkeypatch, *, interrupt_repost):
+    """A named Antigravity primary approves on fallback Model B without the ack."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
+    dispositions = [{
+        "requirement_id": requirement.requirement_id,
+        "disposition": "addressed",
+        "evidence": "The plan preserves the public API.",
+    }]
+    flash = SeatAgent(
+        ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash",
+    )
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus")
+    for seat in (flash, opus):
+        seat.workdir.mkdir()
+
+    def review(seat_signature, *, resolved):
+        return structured_plan_review(
+            state="approved", reviewer=seat_signature,
+            human_requirements_resolved=resolved,
+            human_requirement_dispositions=dispositions,
+        )
+
+    repaired = review("flash (Google Antigravity: Model B)", resolved=True)
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        antigravity_outputs=[
+            ("quota exceeded", 1),
+            review("flash (Google Antigravity: Model B)", resolved=False),
+            review("opus (Google Antigravity: Model C)", resolved=True),
+        ],
+    )
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=flash,
+        review_parallel=True, agent_max_retries=0, max_rounds=6,
+    )
+    real_post = orchestrator_module.post_issue_comment
+    state = {"interrupted": False}
+
+    def interrupt_before_the_repost(*args, **kwargs):
+        body = kwargs["body"]
+        if (
+            interrupt_repost and not state["interrupted"]
+            and "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in body
+            and "\n-- flash (" in body
+        ):
+            state["interrupted"] = True
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+        with patch.object(
+            orchestrator_module, "post_issue_comment", side_effect=interrupt_before_the_repost,
+        ):
+            if interrupt_repost:
+                with pytest.raises(KeyboardInterrupt):
+                    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+                assert state["interrupted"]
+                restored = [r for r in _plan_round_records(runner) if r.agent == "flash"]
+                assert [(r.model_used, r.surfaced_reviewer_requirement_ids) for r in restored] == [
+                    ("Model B", ()),
+                ]
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    return runner
+
+
+@pytest.mark.parametrize("interrupt_repost", [False, True])
+def test_named_seat_repaired_plan_approval_keeps_the_fallback_model(
+    tmp_path, monkeypatch, interrupt_repost
+):
+    """Row repaired-approval-model-preserved (#1363), live and on resume.
+
+    The repaired repost re-renders a completed review, so it keeps the model
+    that produced it rather than the chain head or no model at all.
+    """
+    runner = _named_repaired_acknowledgement_run_1363(
+        tmp_path, monkeypatch, interrupt_repost=interrupt_repost,
+    )
+
+    flash_records = [r for r in _plan_round_records(runner) if r.agent == "flash"]
+    assert flash_records[-1].round_number == 1
+    assert flash_records[-1].surfaced_reviewer_requirement_ids != ()
+    assert {r.model_used for r in flash_records} == {"Model B"}
+    flash_bodies = [
+        c["body"] for c in runner.issue_comments
+        if "<!-- AGENT_PLAN_STATE: approved -->" in c["body"] and "\n-- flash (" in c["body"]
+    ]
+    assert len(flash_bodies) == 2
+    reposted = flash_bodies[-1]
+    assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in reposted
+    assert reposted.rstrip().endswith("-- flash (Google Antigravity: Model B)")
+    assert "Model A" not in reposted.rstrip().splitlines()[-1]
+    # The repair never re-invokes the reviewer: one failed Model A attempt,
+    # one Model B review, and the panel's Model C review.
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"]
+    assert models == ["Model A", "Model B", "Model C"]
+
+
 def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):
     """`round-budget-diagnostic`: exhaustion during a pending phase advance."""
     runner = _FakeRunner(
@@ -20497,6 +20604,26 @@ def test_named_plan_first_issue_handoff_reaches_pr_review_with_legacy_coder_reco
     assert "repos/OWNER/REPO/issues/56/comments?per_page=100&page=1" in [
         cmd[2] for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"] and len(cmd) > 2
     ]
+    # Public seat footers name the backend and model (#1363); the plan
+    # reviewer records still carry the bare seat IDs.
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    seat_footers = [
+        "-- sol (OpenAI Codex: gpt-6.1-sol (medium))",
+        "-- flash (Google Antigravity: Gemini 3.8 Flash (High))",
+        "-- opus-low (Google Antigravity: Claude Opus 5.5 (Low))",
+    ]
+    for comments in (runner.issue_comments, runner.pr_payload.get("comments", [])):
+        footers = [c["body"].rstrip().splitlines()[-1] for c in comments]
+        assert [f for f in footers if f in seat_footers] == seat_footers
+        assert not {"-- sol", "-- flash", "-- opus-low"} & set(footers)
+    plan_reviews = [
+        record for record in _extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan",
+        )
+        if record.metadata.role == "reviewer"
+    ]
+    assert sorted(r.metadata.agent for r in plan_reviews) == ["flash", "opus-low", "sol"]
 
 
 def test_named_direct_issue_reaches_pr_review_with_anchored_board(tmp_path):

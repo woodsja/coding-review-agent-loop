@@ -3356,3 +3356,87 @@ def test_every_accepted_reference_key_flattens_1230():
     for name, label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS:
         text = _flatten_plan_review_finding({"finding": "F.", name: ["x-1"]}, item_context="ctx")
         assert text == f"F. {label}: x-1"
+
+
+# --- Named reviewer-seat footers (#1363) -------------------------------------
+
+
+def _seat_config_1363(tmp_path):
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    sol = SeatAgent(ReviewerSeat("sol", "codex", ("gpt-6-sol",), "medium"), tmp_path / "sol")
+    opus = SeatAgent(
+        ReviewerSeat(
+            "opus-low", "antigravity", ("Claude Opus 5.5 (Low)", "Gemini 3.8 Flash (High)"),
+        ),
+        tmp_path / "opus-low",
+    )
+    return make_config(tmp_path, reviewer=(sol, opus), reviewer_seats=(sol, opus))
+
+
+def _render_seat_footer_1363(kind, agent, config, model_used):
+    if kind == "plan_review":
+        parsed = parse_structured_plan_review(
+            structured_plan_review(reviewer=str(agent)), reviewer=str(agent),
+        )
+    else:
+        parsed = parse_pr_review(structured_pr_review(reviewer=str(agent)), reviewer=str(agent))
+    rendered = render_public_agent_comment(
+        kind=kind, parsed=parsed, agent=agent, config=config, model_used=model_used,
+    )
+    return rendered.rstrip().splitlines()[-1]
+
+
+@pytest.mark.parametrize("kind", ["plan_review", "pr_review"])
+def test_plain_string_seat_id_renders_seat_backend_model_and_effort(tmp_path, kind):
+    config = _seat_config_1363(tmp_path)
+
+    footer = _render_seat_footer_1363(kind, "sol", config, "gpt-6-sol (medium)")
+
+    assert type("sol") is str
+    assert footer == "-- sol (OpenAI Codex: gpt-6-sol (medium))"
+
+
+@pytest.mark.parametrize("kind", ["plan_review", "pr_review"])
+def test_antigravity_seat_footer_names_the_fallback_model_that_ran(tmp_path, kind):
+    config = _seat_config_1363(tmp_path)
+
+    footer = _render_seat_footer_1363(kind, "opus-low", config, "Gemini 3.8 Flash (High)")
+
+    assert footer == "-- opus-low (Google Antigravity: Gemini 3.8 Flash (High))"
+    assert "Claude Opus 5.5 (Low)" not in footer
+
+
+@pytest.mark.parametrize("kind", ["plan_review", "pr_review"])
+def test_seat_footer_without_model_used_falls_back_to_chain_head(tmp_path, kind):
+    config = _seat_config_1363(tmp_path)
+
+    assert _render_seat_footer_1363(kind, "sol", config, None) == (
+        "-- sol (OpenAI Codex: gpt-6-sol (medium))"
+    )
+    assert _render_seat_footer_1363(kind, "opus-low", config, None) == (
+        "-- opus-low (Google Antigravity: Claude Opus 5.5 (Low))"
+    )
+
+
+@pytest.mark.parametrize("kind", ["plan_review", "pr_review"])
+def test_legacy_provider_and_unconfigured_seat_footers_are_unchanged(tmp_path, kind):
+    from agent_loop_helpers import make_config
+
+    seat_config = _seat_config_1363(tmp_path)
+    legacy_config = make_config(tmp_path / "legacy")
+
+    legacy_footers = {
+        "codex": "-- OpenAI Codex: gpt-6-sol (medium)",
+        "Codex": "-- OpenAI Codex: gpt-6-sol (medium)",
+        # A provider signature is not a lookup key and keeps passing through.
+        "OpenAI Codex": "-- OpenAI Codex",
+    }
+    for agent, expected in legacy_footers.items():
+        assert _render_seat_footer_1363(kind, agent, legacy_config, "gpt-6-sol (medium)") == expected
+        assert _render_seat_footer_1363(kind, agent, seat_config, "gpt-6-sol (medium)") == expected
+    assert _render_seat_footer_1363(kind, "codex", None, None) == "-- OpenAI Codex"
+    # A seat removed from the board is not guessed: the bare ID remains.
+    assert _render_seat_footer_1363(kind, "flash", seat_config, "Model A") == "-- flash"
+    assert _render_seat_footer_1363(kind, "sol", None, "gpt-6-sol (medium)") == "-- sol"

@@ -344,6 +344,28 @@ def _item_label_status(item: UnresolvedReviewItem) -> str:
     return item.source_status or item.status
 
 
+def _configured_seat_agent(name: str, config: AgentLoopConfig | None):
+    """The configured named seat whose durable seat ID is exactly ``name``.
+
+    Callers often pass ``agent_display_name(seat)``, a plain ``str`` that has
+    lost the seat's backend and model chain.  Seat IDs are validated so they
+    never collide with a provider identity or display name.  A seat absent
+    from the current config (for example one removed by a board change) is
+    not guessed: the caller keeps today's bare-ID rendering.
+    """
+    from .reviewer_seats import SeatAgent
+
+    if config is None or isinstance(name, SeatAgent):
+        return None
+    candidates = [*getattr(config, "reviewer", ())]
+    for attr in ("primary_reviewer", "primary_plan_reviewer"):
+        candidates.append(getattr(config, attr, None))
+    for candidate in candidates:
+        if isinstance(candidate, SeatAgent) and str(candidate) == name:
+            return candidate
+    return None
+
+
 def _public_reviewer_name(
     name: str,
     config: AgentLoopConfig | None = None,
@@ -355,6 +377,9 @@ def _public_reviewer_name(
 
     if isinstance(name, SeatAgent):
         return agent_signature(name, config, model_used, role=role)
+    seat = _configured_seat_agent(name, config)
+    if seat is not None:
+        return agent_signature(seat, config, model_used, role=role)
     agent = _AGENT_BY_DISPLAY_NAME.get(name)
     if agent is None and name in {"claude", "codex", "gemini", "antigravity"}:
         agent = name  # type: ignore[assignment]
