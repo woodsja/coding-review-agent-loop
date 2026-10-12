@@ -1436,7 +1436,11 @@ def _run_foreground_test_body(
             # and the lock is released only after termination is confirmed.
             # Issue #1326: a fixture run keeps this cleanup inside its
             # absolute deadline (None leaves fixture-less runs unchanged).
-            termination = terminate_process_group_descendants(proc.pid, deadline=absolute_deadline)
+            termination = (
+                terminate_process_group_descendants(proc.pid)
+                if absolute_deadline is None
+                else terminate_process_group_descendants(proc.pid, deadline=absolute_deadline)
+            )
             descendants_terminated = termination.count
             descendants_unconfirmed = not termination.confirmed
             if descendants_unconfirmed:
