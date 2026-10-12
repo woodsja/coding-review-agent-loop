@@ -1863,11 +1863,16 @@ class DescendantTermination:
     confirmed: bool
 
 
+# Kill confirmation kept inside an absolute deadline (#1326).
+DEADLINE_KILL_CONFIRM_RESERVE_SECONDS = 0.5
+
+
 def terminate_process_group_descendants(
     pgid: int,
     *,
     grace_seconds: float = DESCENDANT_TERMINATION_GRACE_SECONDS,
     kill_wait_seconds: float = DESCENDANT_KILL_CONFIRM_SECONDS,
+    deadline: float | None = None,
 ) -> DescendantTermination:
     """Terminate whatever is left in the target's process group.
 
@@ -1877,7 +1882,16 @@ def terminate_process_group_descendants(
     remains.  ``confirmed`` is False when a member was still alive at the end
     of the wait; the caller must then keep the worker-budget lock held until
     the group is gone (WorkerBudgetLock.hold_until_group_exits).
+
+    ``deadline`` (issue #1326) is an absolute monotonic bound: the SIGTERM
+    grace shrinks (to nothing, escalating straight to SIGKILL) so that the
+    kill confirmation still ends by it.  An unconfirmed survivor keeps the
+    usual retained-lock handling.
     """
+    if deadline is not None:
+        remaining = max(0.0, deadline - time.monotonic())
+        grace_seconds = max(0.0, min(grace_seconds, remaining - DEADLINE_KILL_CONFIRM_RESERVE_SECONDS))
+        kill_wait_seconds = max(0.05, min(kill_wait_seconds, remaining - grace_seconds))
     members = process_group_members(pgid)
     try:
         os.killpg(pgid, signal.SIGTERM)

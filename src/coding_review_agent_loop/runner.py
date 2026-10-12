@@ -1434,7 +1434,9 @@ def _run_foreground_test_body(
             # Processes that escaped into a new session are outside it.
             # The group is signalled even where /proc cannot enumerate it,
             # and the lock is released only after termination is confirmed.
-            termination = terminate_process_group_descendants(proc.pid)
+            # Issue #1326: a fixture run keeps this cleanup inside its
+            # absolute deadline (None leaves fixture-less runs unchanged).
+            termination = terminate_process_group_descendants(proc.pid, deadline=absolute_deadline)
             descendants_terminated = termination.count
             descendants_unconfirmed = not termination.confirmed
             if descendants_unconfirmed:

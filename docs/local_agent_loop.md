@@ -1749,7 +1749,9 @@ their process-tree cleanup, a held managed-scope child is released only while
 its termination allowance still fits and after the launcher identity is
 re-checked once more, a directly spawned target is never launched once its
 termination allowance no longer fits, the optional pytest import check used
-for pre-collection classification is skipped when it cannot fit, and forwarding output to a client that
+for pre-collection classification is skipped when it cannot fit, worker-budget
+cleanup of the target's process group shortens its SIGTERM grace (escalating
+straight to SIGKILL when needed) so its kill confirmation ends by the cutoff, and forwarding output to a client that
 stopped reading never blocks past the cutoff.
 Teardown is bounded so that the sweep allowance still fits before the request
 deadline, but it always keeps a positive bound. The broker waits for cleanup

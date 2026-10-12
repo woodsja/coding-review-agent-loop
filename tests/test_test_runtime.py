@@ -7081,3 +7081,96 @@ def test_fixture_deadline_reaches_both_import_check_classification_paths(monkeyp
             scan=SimpleNamespace(no_module_pytest=True), analysis=None, cwd=tmp_path, deadline=deadline,
         )
     assert seen == [deadline]
+
+
+@_FX_LINUX
+@pytest.mark.parametrize("remaining", [0.6, 1.5], ids=["escalates-at-once", "short-grace"])
+def test_fixture_descendant_cleanup_ends_by_the_absolute_deadline(tmp_path, remaining):
+    from coding_review_agent_loop.test_workers import terminate_process_group_descendants
+
+    pid_file = tmp_path / "resistant.pid"
+    leader = subprocess.Popen(
+        [sys.executable, "-c", _FX_TERM_RESISTANT % str(pid_file)], start_new_session=True,
+    )
+    try:
+        deadline_wait = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < deadline_wait:
+            time.sleep(0.02)
+        deadline = time.monotonic() + remaining
+        result = terminate_process_group_descendants(leader.pid, deadline=deadline)
+        assert time.monotonic() <= deadline + 0.15
+        assert result.confirmed
+    finally:
+        _kill_if_active(leader.pid)
+        leader.wait(timeout=10)
+    _fx_assert_gone([leader.pid])
+
+
+_FX_WORKER_RESISTANT_TEST = '''import os, pathlib, signal, subprocess, sys, time
+
+HERE = pathlib.Path(__file__).resolve().parent
+MARKERS = pathlib.Path((HERE / "fx_markers").read_text().strip())
+
+
+def test_parent_slow_on_term_with_resistant_child():
+    child = subprocess.Popen([sys.executable, "-c", (
+        "import os, pathlib, signal, time\\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
+        "pathlib.Path(%r).write_text(str(os.getpid()))\\n"
+        "time.sleep(600)\\n" % str(MARKERS / "resistant-child")
+    )])
+
+    def slow_exit(*_args):
+        time.sleep(1.8)
+        os._exit(1)
+
+    signal.signal(signal.SIGTERM, slow_exit)
+    (MARKERS / "inner-blocking").write_text("1")
+    time.sleep(600)
+'''
+
+
+@_FX_HOST
+def test_fixture_worker_descendant_cleanup_keeps_the_teardown_reserve(tmp_path, monkeypatch):
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "", **{"test_worker_resistant.py": _FX_WORKER_RESISTANT_TEST})
+    server = _fx_server(root)
+    gib = 1024 ** 3
+    budget = WorkerBudget(2, "inherited", "clamp", "cpu", {"cpu_available": 2, "host_usable_bytes": 64 * gib, "per_worker_bytes": gib, "reserve_bytes": gib}, False)
+    assert budget.enforcing
+    server._worker_lock_root = tmp_path / "locks"
+    server.set_execution_context(containment_handle=None, process_started=None, process_finished=None, worker_budget=budget)
+    inner_deadlines: list[float] = []
+    returned_at: list[float] = []
+    original_init = fx_evidence._FixtureRun.__init__
+    original_run = runner_module.run_foreground_test
+
+    def recording_init(self, **kwargs):
+        original_init(self, **kwargs)
+        inner_deadlines.append(self.inner_deadline)
+
+    def recording_run(*args, **kwargs):
+        try:
+            return original_run(*args, **kwargs)
+        finally:
+            returned_at.append(time.monotonic())
+
+    monkeypatch.setattr(fx_evidence._FixtureRun, "__init__", recording_init)
+    monkeypatch.setattr(runner_module, "run_foreground_test", recording_run)
+    inner = (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "0", "test_worker_resistant.py")
+    try:
+        result = fx_evidence.TestBrokerClient(_fx_env(server)).run(
+            list(inner), timeout_seconds=30, cwd=root, fixture="fixture.py",
+        )
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    child = int((markers / "resistant-child").read_text())
+    _fx_assert_gone([*_fx_pids(markers), child])
+    assert (markers / "inner-blocking").exists() and (markers / "teardown-done").exists()
+    # The runner, including worker-descendant cleanup, returned by the inner deadline.
+    assert returned_at and returned_at[-1] <= inner_deadlines[0] + 0.05
+    assert row.outcome == "timed_out" and result.outcome == "timed_out"
+    assert row.fixture.teardown_status == 0
