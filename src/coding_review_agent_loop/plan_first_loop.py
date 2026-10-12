@@ -383,6 +383,15 @@ from .issue_implementation import (
 )
 
 
+# Plain planning stop diagnostic; history_export recognizes posted stops by it.
+PLAN_SCHEDULING_DIAGNOSTIC_TEMPLATE = "Plan review scheduling diagnostic ({label}): {message}"
+
+
+def render_plan_scheduling_diagnostic(label: str, message: str) -> str:
+    """The exact body ``stop_plan_pre_panel`` posts."""
+    return PLAN_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
+
+
 def _run_child_planning_cycle(
     runner: Runner,
     *,
@@ -958,7 +967,7 @@ def _run_plan_first_loop_body(
             runner,
             config=config,
             issue_number=issue_number,
-            body=f"Plan review scheduling diagnostic ({label}): {message}",
+            body=render_plan_scheduling_diagnostic(label, message),
         )
         raise PlanPrePanelSafetyError(message)
 

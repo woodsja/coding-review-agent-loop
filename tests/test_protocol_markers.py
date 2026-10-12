@@ -494,6 +494,15 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
     # The named-board legacy PR entry check (#1365) reads the actor-bound
     # comment view, and only the reader itself; it consumes no v2 record.
     allowed = {("pr_board_state.py", "read_authenticated_protocol_comments")}
+    # The read-only history export (#1433) derives rows from the actor-bound
+    # comment views and the reader itself; it consumes no v2 record either.
+    allowed |= {
+        ("history_export.py", name)
+        for name in (
+            "read_authenticated_protocol_comments", "AuthenticatedComment",
+            "AuthenticatedCommentView",
+        )
+    }
     offenders: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
         if path.name == "workflow_transaction.py":

@@ -4701,6 +4701,95 @@ agent-loop pr 123 \
   --reviewer claude
 ```
 
+### Outcome history export
+
+`agent-loop history export` builds one outcome row per issue from the round
+records and plain stop diagnostics that the authenticated GitHub actor posted on
+the issue and on the PRs GitHub links to it as closing PRs. It is read-only: it
+reads comments, edit history and PR state, posts nothing, starts no agent and
+makes no model call.
+
+```bash
+agent-loop history export --repo OWNER/REPO --output history.json
+agent-loop history export --repo OWNER/REPO --issue 1337 --format csv
+agent-loop history export --repo OWNER/REPO --since 2026-10-01 \
+  --usage-summaries ~/.agent-loop/logs
+```
+
+Options: `--repo` (required), `--output PATH` (stdout when omitted),
+`--format json|csv` (default `json`), `--issue N` (repeatable; explicit issues
+always produce a row, otherwise issues with no agent-loop history are skipped),
+`--since YYYY-MM-DD` (issues created on or after that UTC date),
+`--usage-summaries DIR` with optional `--run-attribution-log PATH`, and
+`--gh-cmd`.
+
+Rows use `schema_version` 1. Only comments whose author user ID equals the
+authenticated actor contribute; a byte-identical record from anyone else is
+ignored and only counted in `ignored_foreign_records`. Each row reports:
+
+- `route_taken` / `route`: `plan-first` when plan-flow records exist, `discuss`
+  when discuss records exist, `direct` when a linked PR has PR-flow records and
+  the issue has no plan records; combinations are ordered by first record, for
+  example `discuss then plan-first`. Labels and prose never select a route.
+- `plan_rounds`, `step_backs`, `human_decision_stops`, `final_plan_size`
+  (characters of the newest canonical plan), `pr_rounds`, `merged` and
+  `tool_commit` as `{"value": ..., "evidence": "verified"|"unavailable"}`
+  pairs. `verified` needs a recognized terminal state that bounds the history:
+  an accepted plan, settled (merged or closed) linked PRs, a
+  closed issue, or a recognized stop as the newest workflow event (operator
+  comments from the same account are not workflow events). Without one, the
+  value is `null`, never a zero. Step-backs are also `unavailable` unless
+  every counted round has a record written after step-back recording existed.
+- A plan counts as accepted only when the orchestrator recorded its own
+  post-approval record for the newest planner candidate: the plan-approval
+  announcement every approved plan-first round posts (including `plan-only`
+  runs), the issue-to-PR implementation handoff, a staged decomposition
+  summary or a phase implementation handoff whose plan hash matches. Reviewer
+  votes alone never settle a plan, because the planning loop can still reject
+  a unanimous board (no panel opening, a stale carried approval, the
+  plan-growth gate, an unsettled reconciliation).
+- Expected reviewer seats for a round are the seats a valid scheduler
+  checkpoint selected, otherwise the recorded plan or PR board identity (or
+  the scheduler contract's required reviewers), otherwise every seat seen; a
+  seat that never posted is still expected.
+- Human-decision stops are the planning scheduling diagnostics that carry the
+  step-back or primary-stall human-decision text; step-back entries alone
+  never count as stops.
+- `infrastructure_failures` lists recognized agent-unavailable comments
+  (classified as `auth-expiry`, `quota`, `settings-lock`, `backend-outage`,
+  `billing`, `environment` or `agent-unavailable-<category>`, including
+  completion-recovery terminal comments), the incomplete-PR-review stop (one
+  entry per missing reviewer with its recorded failure category), discussion
+  debaters recorded as failed on a round summary, and CI infrastructure-stall
+  comments and stops. Each entry carries its `source` and whether it was
+  `terminal`. Terminal ones end a workflow like a stop but never count as
+  human-decision stops. A round is listed in `infrastructure_rounds` and
+  excluded from the round counts when a failure interrupted it and the failed
+  or missing seats never posted afterwards; a later healthy peer does not
+  complete it. `missing_reviewer_records` names reviewer (and debater) seats
+  missing from a round, with the explaining failure category, `unknown`, or
+  `pending` for the newest round of an unbounded history;
+  `infrastructure_coverage` is `partial` when any entry is `unknown` or
+  `pending`.
+- `outcome_complete` is true only when the issue is closed, or the newest
+  workflow event is a recognized stop, and no linked PR is open.
+  `outcome_available_at` is the latest of every authenticated comment's
+  creation and edit time, linked PR merge/close times and the issue close time.
+- `snapshot` is the title and body the run received. When the first planner
+  record carries the issue-text digest (a later run's digest never applies), the versions rebuilt from GitHub edit
+  history are matched against it: one distinct match is `digest-verified` (raw
+  text); several normalization-equivalent matches are `digest-normalized`
+  (normalized text only). Otherwise the status is `never-edited`,
+  `time-inferred` (the version in effect at the earliest record; not exact) or
+  `unavailable` (no text) when edit history is missing or nothing matches.
+  `run_started_at` is the earliest authenticated record.
+
+Tool commits are not stored on GitHub. With `--usage-summaries DIR`, a row's
+tool commit comes from local `*-usage-summary.json` files whose run ID has a
+`run-start` attribution record for the same repository and the issue or one of
+its linked PRs (the worker telemetry log by default). Anything else is
+`unavailable`.
+
 ## Workdirs
 
 ### Checkout claims

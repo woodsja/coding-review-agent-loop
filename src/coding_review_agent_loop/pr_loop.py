@@ -489,6 +489,15 @@ from .pr_loop_support import (
 )
 
 
+# Plain PR pre-panel stop diagnostic; history_export recognizes posted stops by it.
+PR_SCHEDULING_DIAGNOSTIC_TEMPLATE = "PR review scheduling diagnostic ({label}): {message}"
+
+
+def render_pr_scheduling_diagnostic(label: str, message: str) -> str:
+    """The exact body ``stop_pre_panel`` posts."""
+    return PR_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
+
+
 def unchanged_head_stop_message(
     *, pr, coder_name, previous_head, turns, round_number, evidence, route
 ) -> str:
@@ -2339,7 +2348,7 @@ def run_pr_loop(
                 runner,
                 config=config,
                 pr_number=pr_number,
-                body=f"PR review scheduling diagnostic ({label}): {message}",
+                body=render_pr_scheduling_diagnostic(label, message),
             )
             raise PrePanelSafetyError(message)
 

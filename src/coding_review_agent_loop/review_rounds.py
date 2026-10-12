@@ -265,6 +265,15 @@ def _describe_pr_review_outcome(parsed_review: ParsedReview, *, has_blocking_sum
     return "blocking with blocking findings"
 
 
+# Render-side pieces of the incomplete-PR-review stop; history_export
+# recognizes the posted stop, its round and each missing seat through them.
+INCOMPLETE_PR_REVIEW_HEADLINE = "**Review status: Incomplete**"
+INCOMPLETE_PR_REVIEW_DETECTION_PREFIX = "After the unavailable reviewer(s) were detected"
+INCOMPLETE_PR_REVIEW_DETECTION_ROUND = " in round {round_number}"
+INCOMPLETE_PR_REVIEW_MISSING_HEADING = "### Missing required reviewer input"
+INCOMPLETE_PR_REVIEW_MISSING_LINE = "- {reviewer}: {category}"
+
+
 def _format_incomplete_pr_review_comment(
     *,
     pr_number: int,
@@ -276,18 +285,26 @@ def _format_incomplete_pr_review_comment(
     remedy_lines: Sequence[str] = (),
 ) -> str:
     lines = [
-        "**Review status: Incomplete**",
+        INCOMPLETE_PR_REVIEW_HEADLINE,
         "",
-        "After the unavailable reviewer(s) were detected"
-        + (f" in round {detection_round}" if detection_round is not None else "")
+        INCOMPLETE_PR_REVIEW_DETECTION_PREFIX
+        + (
+            INCOMPLETE_PR_REVIEW_DETECTION_ROUND.format(round_number=detection_round)
+            if detection_round is not None
+            else ""
+        )
         + ", no coder follow-up, CI wait, qualification, or merge was started. "
         "Their failure is not a code finding and does not count as approval.",
         "",
-        "### Missing required reviewer input",
+        INCOMPLETE_PR_REVIEW_MISSING_HEADING,
     ]
     for reviewer, failure in unavailable_reviewers.items():
         category = failure.failure_category or "unknown"
-        lines.append(f"- {agent_display_name(reviewer)}: {category}")
+        lines.append(
+            INCOMPLETE_PR_REVIEW_MISSING_LINE.format(
+                reviewer=agent_display_name(reviewer), category=category
+            )
+        )
     if approved_reviewer_names:
         lines.extend(
             [

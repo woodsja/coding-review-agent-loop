@@ -576,6 +576,11 @@ def render_plan_step_back_review_notice() -> str:
     )
 
 
+# Leading bytes of the plan step-back human-decision stop; history_export
+# recognizes the posted diagnostic through this constant.
+PLAN_STEP_BACK_HUMAN_DECISION_PREFIX = "human decision required: the planner stepped back at round "
+
+
 def render_step_back_human_decision(
     *,
     phase: str,
@@ -611,8 +616,8 @@ def render_step_back_human_decision(
             )
         anchor_report = _render_anchor_report(dissolved, reintroduced) + " "
     return (
-        "human decision required: the planner stepped back at round "
-        f"{step_back_round} (a simplify-or-re-scope revision), and the primary plan "
+        PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
+        + f"{step_back_round} (a simplify-or-re-scope revision), and the primary plan "
         f"reviewer has since blocked {blocks} round(s), reaching "
         f"--plan-step-back-escalation-rounds {threshold} (the stall stop is deferred "
         "while a step-back is pending or in progress). "

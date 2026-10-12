@@ -566,6 +566,7 @@ agent-loop task "Add a health-check endpoint" \
 | `agent-loop discuss` | You want agents to evaluate an open question without writing code. |
 | `agent-loop managed-pr` | Code is pushed but no PR exists, and the repository uses managed exact-head CI. |
 | `agent-loop managed-ci preflight` | You want a read-only readiness report for managed CI. |
+| `agent-loop history export` | You want a read-only per-issue outcome table (route taken, plan/PR rounds, step-backs, human-decision stops, merge state, infrastructure failures, run-start snapshot). See [outcome history export](docs/local_agent_loop.md#outcome-history-export). |
 
 Run `agent-loop <command> --help` for the complete options for one workflow.
 The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
