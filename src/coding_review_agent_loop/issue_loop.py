@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+import datetime
 import sys
 from dataclasses import replace as dataclasses_replace
 from .agents.registry import agent_display_name
@@ -31,6 +32,7 @@ from .expected_closure import (
     resolve_issue_contract,
 )
 from .github import (
+    coder_turn_dispatch_audit_note,
     deduplicate_human_requirements,
     get_issue_context,
     get_pr_review_context,
@@ -818,6 +820,11 @@ def run_issue_loop(
             )
             if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
                 _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
+        # The creation intent is this turn's managed decision: it drives the
+        # coder prompt guidance and the gh CI-dispatch guard together (#1366).
+        coder_config = dataclasses_replace(
+            config, coder_ci_dispatch_guard=managed_ci_creation_intent is not None
+        )
         assigned_head_before = _read_assigned_workdir_head(runner, config)
         salvage_summary = latest_salvage_context(
             config.log_dir,
@@ -826,13 +833,14 @@ def run_issue_loop(
             issue_number=issue_number,
             scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
         )
+        coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
         coder_response = _run_validated_agent(
             runner,
             agent=config.coder,
-            config=config,
+            config=coder_config,
             prompt=build_issue_prompt(
                 issue_number,
-                config,
+                coder_config,
                 memory,
                 issue_context=issue_context,
                 salvage_summary=salvage_summary,
@@ -941,6 +949,7 @@ def run_issue_loop(
         validate_open_pr(runner, config=config, pr_number=pr_number)
         initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
         managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
+        coder_dispatch_audit_note = ""
         if managed_ci_creation_intent is not None:
             managed_ci_handoff = authenticate_issue_created_handoff(
                 runner,
@@ -961,6 +970,15 @@ def run_issue_loop(
                 handoff=managed_ci_handoff,
                 metadata=initial_pr_context.metadata,
                 issue_number=issue_number,
+            )
+            # Audit only after the created PR is authenticated: the reserved
+            # branch and turn start bound discovery (#1366).
+            coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
+                runner,
+                config,
+                branch=managed_ci_creation_intent.branch,
+                head_shas=(initial_pr_context.metadata.head_sha,),
+                turn_started_at=coder_turn_started_at,
             )
         else:
             reject_forged_protocol_markers(
@@ -1054,16 +1072,19 @@ def run_issue_loop(
             legacy_tests_run=implementation_result.tests_run,
             cwd=active_workdir(config),
         )
+        initial_coder_public = render_public_agent_comment(
+            kind="issue_implementation",
+            parsed=implementation_result,
+            agent=config.coder,
+            config=config,
+            model_used=coder_response.model_used,
+            local_test_evidence=initial_local_test_evidence,
+            current_test_turn_id=coder_response.acquisition_test_turn_id,
+        )
+        if coder_dispatch_audit_note:
+            initial_coder_public = f"{coder_dispatch_audit_note}\n\n{initial_coder_public}"
         initial_coder_body = _attach_round_metadata(
-            render_public_agent_comment(
-                kind="issue_implementation",
-                parsed=implementation_result,
-                agent=config.coder,
-                config=config,
-                model_used=coder_response.model_used,
-                local_test_evidence=initial_local_test_evidence,
-                current_test_turn_id=coder_response.acquisition_test_turn_id,
-            ),
+            initial_coder_public,
             PostedRoundMetadata(
                 flow="pr",
                 role="coder",

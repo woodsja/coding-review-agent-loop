@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import replace as dataclasses_replace
 from .agents.registry import agent_display_name
 from .config import (
@@ -40,6 +41,7 @@ from .expected_closure import (
     resolve_issue_contract,
 )
 from .github import (
+    coder_turn_dispatch_audit_note,
     IssueContext,
     PullRequestMetadata,
     deduplicate_human_requirements,
@@ -486,11 +488,15 @@ def _implement_approved_issue(
     if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
         _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
+    # The creation intent is this invocation's managed decision: it drives the
+    # coder prompt guidance and the gh CI-dispatch guard together, and only
+    # coder calls receive it (#1366).
+    coder_ci_guarded = managed_ci_creation_intent is not None
     assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
     implementation_prompt = build_issue_implementation_prompt(
         issue_number,
         approved_plan,
-        implementation_config,
+        dataclasses_replace(implementation_config, coder_ci_dispatch_guard=coder_ci_guarded),
         memory,
         issue_context=issue_context,
         salvage_summary=salvage_summary,
@@ -505,7 +511,7 @@ def _implement_approved_issue(
         return _run_validated_agent(
             runner,
             agent=invoke_config.coder,
-            config=invoke_config,
+            config=dataclasses_replace(invoke_config, coder_ci_dispatch_guard=coder_ci_guarded),
             prompt=prompt,
             session_id=session_id,
             marker_description="structured issue_implementation result, blocking, or clarification",
@@ -563,6 +569,7 @@ def _implement_approved_issue(
                 if managed_ci_creation_intent is not None else None
             ),
         )
+    coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
     coder_response = _invoke_implementation_coder(
         implementation_prompt,
         session_id=implementation_session_id,
@@ -876,19 +883,32 @@ def _implement_approved_issue(
         legacy_tests_run=implementation_result.tests_run,
         cwd=active_workdir(implementation_config),
     )
+    initial_coder_public = render_public_agent_comment(
+        kind="issue_implementation",
+        parsed=implementation_result,
+        agent=implementation_config.coder,
+        config=implementation_config,
+        model_used=coder_response.model_used,
+        local_test_evidence=initial_local_test_evidence,
+        current_test_turn_id=coder_response.acquisition_test_turn_id,
+        coverage_assessment=final_coverage_assessment,
+        coverage_reask_used=coverage_reask_used,
+        coverage_discard_note=coverage_discard_note,
+    )
+    if managed_ci_creation_intent is not None:
+        # Post-turn backstop over the reserved branch since the first coder
+        # turn started, after the created PR is authenticated (#1366).
+        coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
+            runner,
+            implementation_config,
+            branch=managed_ci_creation_intent.branch,
+            head_shas=(initial_pr_context.metadata.head_sha, bound_round_head),
+            turn_started_at=coder_turn_started_at,
+        )
+        if coder_dispatch_audit_note:
+            initial_coder_public = f"{coder_dispatch_audit_note}\n\n{initial_coder_public}"
     initial_coder_body = _attach_round_metadata(
-        render_public_agent_comment(
-            kind="issue_implementation",
-            parsed=implementation_result,
-            agent=implementation_config.coder,
-            config=implementation_config,
-            model_used=coder_response.model_used,
-            local_test_evidence=initial_local_test_evidence,
-            current_test_turn_id=coder_response.acquisition_test_turn_id,
-            coverage_assessment=final_coverage_assessment,
-            coverage_reask_used=coverage_reask_used,
-            coverage_discard_note=coverage_discard_note,
-        ),
+        initial_coder_public,
         PostedRoundMetadata(
             flow="pr",
             role="coder",

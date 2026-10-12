@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import re
 import shlex
@@ -104,6 +105,7 @@ from .expected_closure import (
     resolve_issue_contract,
 )
 from .github import (
+    coder_turn_dispatch_audit_note,
     IssueContext,
     PullRequestMetadata,
     PullRequestChecks,
@@ -7971,6 +7973,12 @@ def run_pr_loop(
             step_back_entries = (
                 step_back_decision.entry_payloads() if step_back_guidance else ()
             )
+            # One invocation-scoped decision drives this turn's coder prompt
+            # guidance and its gh CI-dispatch guard (#1366).  Only the coder
+            # call receives this config, so retries and format repair inherit
+            # it and reviewer launches stay unguarded.
+            coder_ci_guarded = managed_ci_active(pr_metadata)
+            coder_config = dataclasses_replace(config, coder_ci_dispatch_guard=coder_ci_guarded)
             if has_merge_conflict_item:
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
@@ -7999,7 +8007,7 @@ def run_pr_loop(
                     pr_number,
                     round_number,
                     combined_review,
-                    config,
+                    coder_config,
                     memory,
                     issue_context=issue_context,
                     human_requirements=human_requirements,
@@ -8025,7 +8033,7 @@ def run_pr_loop(
                     pr_number,
                     round_number,
                     combined_review,
-                    config,
+                    coder_config,
                     memory,
                     issue_context=issue_context,
                     human_requirements=human_requirements,
@@ -8050,7 +8058,7 @@ def run_pr_loop(
                     pr_number,
                     round_number,
                     combined_review,
-                    config,
+                    coder_config,
                     memory,
                     issue_context=issue_context,
                     human_requirements=human_requirements,
@@ -8204,11 +8212,13 @@ def run_pr_loop(
                 attempt=dispatch_attempt,
                 carried_reasons=dispatch_carried_reasons,
             )
+            coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
+            coder_dispatch_audit_note = ""
             try:
                 coder_response = _run_validated_agent(
                     runner,
                     agent=config.coder,
-                    config=config,
+                    config=coder_config,
                     prompt=followup_prompt,
                     session_id=coder_session_id,
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
@@ -8323,6 +8333,17 @@ def run_pr_loop(
                     source_round=round_number,
                 )
                 updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                if coder_ci_guarded:
+                    # Backstop for a dispatch that bypassed the gh guard: a
+                    # visible, non-authoritative diagnostic, never
+                    # qualification, and never a round blocker (#1366).
+                    coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
+                        runner,
+                        config,
+                        branch=updated_pr_context.metadata.head_branch or pr_metadata.head_branch,
+                        head_shas=(pre_turn_head, updated_pr_context.metadata.head_sha),
+                        turn_started_at=coder_turn_started_at,
+                    )
                 unresolved_items = _advance_machine_obligations_for_head(
                     unresolved_items,
                     current_head_sha=updated_pr_context.metadata.head_sha,
@@ -8595,7 +8616,11 @@ def run_pr_loop(
                 config=config,
                 pr_number=pr_number,
                 body=_attach_round_metadata(
-                    public_comment,
+                    (
+                        f"{coder_dispatch_audit_note}\n\n{public_comment}"
+                        if coder_dispatch_audit_note
+                        else public_comment
+                    ),
                     latest_coder_metadata,
                 ),
             )

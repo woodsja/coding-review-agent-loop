@@ -18,6 +18,7 @@
   "child_topology",
   "ci_health",
   "cli",
+  "coder_ci_guard",
   "comment_rendering",
   "config",
   "containment",

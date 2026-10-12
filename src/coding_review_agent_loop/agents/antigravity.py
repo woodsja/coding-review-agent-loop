@@ -52,6 +52,7 @@ from ..errors import AgentLoopError, AgentSettingsLockWaitTimeout, CheckoutVerif
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
+from ..coder_ci_guard import coder_ci_guard_environment
 from ..test_runtime import agent_shell_environment
 from .. import workdir_claims
 from ..scratch import make_private_dirs, scratch_root
@@ -1336,6 +1337,9 @@ class AntigravityBackend:
                                 config.coder_test_command_timeout_seconds
                             ),
                             **agent_shell_environment(config, "antigravity", role),
+                            # Managed-CI coder/repair turns, including
+                            # run_repair: refuse CI-triggering gh (#1366).
+                            **coder_ci_guard_environment(config, "antigravity", role),
                         },
                         use_pty=True,
                         timeout_seconds=(

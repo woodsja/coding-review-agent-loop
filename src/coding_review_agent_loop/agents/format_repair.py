@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from ..coder_ci_guard import coder_ci_guard_environment
 from ..config import DEFAULT_REASONING_EFFORT
 from ..scratch import make_private_dirs, scratch_root
 from .base import AgentName, AgentResult
@@ -59,7 +60,7 @@ def run_cli_repair(
             containment_role="repair",
             env={"AGENT_LOOP_WORKDIR": str(cwd), **(
                 {"CLAUDE_CODE_EFFORT_LEVEL": effort} if backend == "claude" else {}
-            )},
+            ), **coder_ci_guard_environment(config, backend, "repair")},
         )
         observed_model = None
         if backend == "codex":

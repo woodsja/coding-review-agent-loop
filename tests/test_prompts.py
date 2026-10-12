@@ -6266,3 +6266,42 @@ def test_1388_non_empty_or_omitted_item_ids_keep_the_existing_example(tmp_path, 
     assert '[\\"item-2.s1\\"]' in omitted or '["item-2.s1"]' in omitted
     assert "classify every unresolved reviewer item ID shown in this prompt" in omitted
     assert "No reviewer items are unresolved in this round" not in omitted
+
+
+def _coder_prompt_set(config):
+    return {
+        "issue": build_issue_prompt(56, config),
+        "implementation": build_issue_implementation_prompt(56, "1. Fix it.", config),
+        "recovery": build_completion_recovery_prompt(config),
+        "task": build_task_prompt("Fix the bug.", config),
+        "followup": build_followup_prompt(77, 1, "Needs tests.", config),
+        "same_pr": build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+        "merge_conflict": build_merge_conflict_prompt(
+            77, 1, "", config, base_branch="main", head_sha=None,
+            merge_state_detail="mergeable=unknown, mergeStateStatus=unknown",
+        ),
+    }
+
+
+def test_managed_ci_dispatch_guidance_only_when_turn_is_guarded(tmp_path):
+    """#1366: the per-turn guard flag, never managed_ci alone, drives the text."""
+    from dataclasses import replace
+
+    unmanaged = make_config(tmp_path)
+    managed_unguarded = replace(unmanaged, managed_ci=True)
+    guarded = replace(unmanaged, coder_ci_dispatch_guard=True)
+    baseline = _coder_prompt_set(unmanaged)
+    for name, prompt in _coder_prompt_set(guarded).items():
+        assert "This pull request uses managed CI." in prompt, name
+        assert "expected approval-gated state, not a failure" in prompt
+        assert "Never trigger GitHub Actions yourself" in prompt
+        assert "`gh workflow run`, `gh run rerun`" in prompt
+        assert "do not remove the managed label" in prompt
+        assert "orchestrator dispatches the correlated exact-head qualification" in prompt
+        assert "so a human operator can decide" in prompt
+        # Removing exactly the guidance yields the unguarded prompt.
+        guidance = prompts_module._coder_managed_ci_dispatch_guidance(True)
+        assert prompt.replace(guidance, "", 1) == baseline[name], name
+    for name, prompt in _coder_prompt_set(managed_unguarded).items():
+        assert "This pull request uses managed CI." not in prompt, name
+    assert prompts_module._coder_managed_ci_dispatch_guidance(False) == ""

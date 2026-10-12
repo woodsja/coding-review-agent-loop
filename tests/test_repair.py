@@ -5255,3 +5255,127 @@ def test_antigravity_repair_exhausted_settings_lock_contention_is_distinct_and_s
     assert invocations == []
     assert [r.outcome for r in usage.records] == ["settings_lock_contention"]
     assert [r.fallback_planned for r in usage.records] == [False]
+
+
+# ---- coder CI-dispatch guard on format-repair launches (#1366) ----
+
+from dataclasses import replace  # noqa: E402
+
+_GUARD_VARS = ("AGENT_LOOP_CODER_CI_DISPATCH_GUARD", "AGENT_LOOP_CODER_GUARD_TARGET_GH", "AGENT_LOOP_CODER_GUARD_DIR")
+
+
+def _guard_fake_gh(tmp_path, monkeypatch):
+    from coding_review_agent_loop import scratch
+
+    bin_dir = tmp_path / "gh-bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("AGENT_LOOP_REPAIR_AMBIENT_MARKER", "kept")
+    monkeypatch.setattr(scratch, "scratch_root", lambda: tmp_path / "scratch")
+    return gh
+
+
+def _assert_guarded_env(env, gh):
+    assert env["AGENT_LOOP_CODER_CI_DISPATCH_GUARD"] == "managed"
+    assert env["AGENT_LOOP_CODER_GUARD_TARGET_GH"] == str(gh)
+    guard_dir = env["AGENT_LOOP_CODER_GUARD_DIR"]
+    assert env["PATH"].split(os.pathsep)[0] == guard_dir
+    assert (Path(guard_dir) / "gh").is_file()
+    assert str(gh.parent) in env["PATH"].split(os.pathsep)
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+@pytest.mark.parametrize("guarded", [True, False])
+def test_cli_format_repair_launch_carries_guard_only_when_guarded(tmp_path, monkeypatch, backend, guarded):
+    from coding_review_agent_loop.agents.format_repair import run_cli_repair
+    from coding_review_agent_loop.runner import CommandResult
+
+    gh = _guard_fake_gh(tmp_path, monkeypatch)
+    captured = {}
+
+    class LaunchRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            captured["args"] = list(args)
+            captured["env"] = kwargs["env"]
+            return CommandResult(list(args), Path(cwd), "", "", 0)
+
+    config = replace(
+        make_config(tmp_path, repair_backend=backend, repair_models=("m",)), coder_ci_dispatch_guard=guarded
+    )
+    run_cli_repair(LaunchRunner(), config, "fix it", model="m", log_path=tmp_path / "repair.log")
+    env = captured["env"]
+    if guarded:
+        _assert_guarded_env(env, gh)
+    else:
+        assert not any(name in env for name in _GUARD_VARS) and "PATH" not in env
+    # Existing no-tools restrictions are unchanged by the guard.
+    if backend == "codex":
+        assert "features.shell_tool=false" in captured["args"]
+        assert captured["args"][captured["args"].index("--sandbox") + 1] == "read-only"
+    else:
+        assert captured["args"][captured["args"].index("--tools") + 1] == ""
+        assert "--safe-mode" in captured["args"]
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_gemini_format_repair_subprocess_carries_guard_only_when_guarded(tmp_path, monkeypatch, guarded):
+    gh = _guard_fake_gh(tmp_path, monkeypatch)
+    valid = structured_pr_review(state="approved", reviewer="Google Gemini")
+    proc = MagicMock(returncode=0, stdout=valid, stderr="")
+    config = replace(make_config(tmp_path, repair_backend="gemini"), coder_ci_dispatch_guard=guarded)
+    with patch("coding_review_agent_loop.repair.subprocess.run", return_value=proc) as run:
+        repaired, _, _ = execute_repair(
+            malformed_pr_review_source(state="approved"),
+            runner=FakeRunner(),
+            config=config,
+            run_id="run-guard",
+            usage_context=None,
+            validate=lambda text: parse_structured_pr_review(text, reviewer="Google Gemini"),
+            expected_kind="pr_review",
+        )
+    assert repaired == valid
+    env = run.call_args.kwargs["env"]
+    if guarded:
+        _assert_guarded_env(env, gh)
+        # The ambient environment is preserved, not replaced.
+        assert env["AGENT_LOOP_REPAIR_AMBIENT_MARKER"] == "kept"
+    else:
+        assert env is None
+
+
+@pytest.mark.parametrize("guarded", [True, False])
+def test_antigravity_format_repair_launch_carries_guard_only_when_guarded(tmp_path, monkeypatch, guarded):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    gh = _guard_fake_gh(tmp_path, monkeypatch)
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    valid = structured_pr_review(state="approved", reviewer="Google Antigravity")
+    envs = []
+
+    class RepairRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            if "models" not in args:
+                envs.append(kwargs["env"])
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    config = replace(
+        make_config(tmp_path, repair_models=("Gemini 3 Flash",)), coder_ci_dispatch_guard=guarded
+    )
+    repaired, _, _ = execute_repair(
+        malformed_pr_review_source(state="approved"),
+        runner=RepairRunner(antigravity_outputs=[(valid, 0)]),
+        config=config,
+        run_id="run-agy-guard",
+        usage_context=None,
+        validate=lambda text: parse_structured_pr_review(text, reviewer="Google Antigravity"),
+        expected_kind="pr_review",
+    )
+    assert repaired == valid and envs
+    for env in envs:
+        if guarded:
+            _assert_guarded_env(env, gh)
+        else:
+            assert not any(name in env for name in _GUARD_VARS)
