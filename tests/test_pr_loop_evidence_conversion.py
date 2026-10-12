@@ -624,12 +624,30 @@ def test_the_finalization_gate_reopens_a_stale_tombstone_and_freezes(tmp_path, m
     """`convert-head-change-no-dispatch`: the gate's own reconciliation is defense in depth."""
     from coding_review_agent_loop.pr_loop_support import _evidence_freeze_gate
 
+    from coding_review_agent_loop.evidence_conversion import ConversionAuditRow, EvidenceConversionAudit
+
     context = _plan_context("row-a")
-    runner = FakeRunner()
     config = _config(tmp_path)
     _ledger, obligation, _ = _upsert_converted_evidence_obligation(
         [], item_number=2, row_id="row-a", matrix_identity=context.risk_test_matrix_identity,
         head_sha="old-head", owners=("Codex",), source_round=2, explanation="",
+    )
+    # The orchestrator's admitted conversion audit backs the obligation.
+    audit = EvidenceConversionAudit(
+        source="operator", matrix_identity=context.risk_test_matrix_identity, head="old-head",
+        rows=(ConversionAuditRow(
+            row_id="row-a", obligation_identity=obligation.obligation_identity,
+            obligation_item_id="item-2", owners=("Codex",), converted_item_ids=(),
+            attempt_record_rounds=(),
+        ),),
+    )
+    conversion = PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject="old-head",
+        prior_items=(obligation,), state="blocking", phase="evidence-conversion",
+        evidence_conversion=audit,
+    )
+    runner = FakeRunner(
+        pr_payload={"comments": [_comment(_attach_round_metadata("Converted.", conversion))]}
     )
     stale = dataclasses.replace(obligation, status="resolved", lifecycle="cleared", candidate_head_sha="old-head")
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
@@ -1067,3 +1085,143 @@ def test_a_partly_converted_finding_keeps_its_residual_row_until_that_row_conver
     assert final["item-1"].status == "converted"
     assert final["item-1"].converted_row_ids == ("row-a", "row-b")
     assert _agent_count(runner, "claude") == 2
+
+
+# --- review round 1 regressions -------------------------------------------------
+
+
+def test_a_conversion_record_with_a_rejected_audit_is_not_resumed_as_converted(tmp_path, monkeypatch):
+    """item-3: an invalid audit is treated as unconverted through the actual resume."""
+    from coding_review_agent_loop.evidence_conversion import EvidenceConversionAudit
+
+    context = _plan_context("row-a", "row-b")
+    runner = _auto_converted_runner(tmp_path, monkeypatch, context)
+    runner.codex_outputs.pop()  # stop before the repeat's review
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path), approved_plan_context=context)
+    records = _records(runner)
+    conversion = records[-1]
+    assert conversion.metadata.phase == "evidence-conversion"
+    # Rewrite the audit so it no longer binds to the record head: it decodes as rejected.
+    bad_audit = dataclasses.replace(conversion.metadata.evidence_conversion, head="feedface")
+    comment = next(c for c in runner.pr_payload["comments"] if "risk-matrix evidence converted" in c["body"].lower())
+    comment["body"] = _attach_round_metadata(
+        "Converted.", dataclasses.replace(conversion.metadata, evidence_conversion=bad_audit)
+    )
+    assert _records(runner)[-1].metadata.evidence_conversion is None
+    runner.simulate_new_process()
+    # The pre-conversion review round resumes; conversion is decided afresh from
+    # the attempt history, and the fresh repeat runs.
+    runner.codex_outputs.append(_review(kept=["item-2"], state="blocking"))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path), approved_plan_context=context)
+    valid = [
+        r for r in _records(runner)
+        if r.metadata.phase == "evidence-conversion" and r.metadata.evidence_conversion is not None
+    ]
+    assert len(valid) == 1 and valid[0].metadata.evidence_conversion.row_ids == ("row-a",)
+    assert _agent_count(runner, "claude") == 1
+
+
+def test_an_invalid_operator_list_posts_nothing_even_with_a_pending_board_change(tmp_path, monkeypatch):
+    """item-5: validation runs read-only before any startup write."""
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_two_reviewer_runner(tmp_path, monkeypatch, context)
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    swapped = dataclasses.replace(
+        _config(tmp_path, reviewer=("codex", "antigravity")),
+        pr_convert_evidence_rows=("row-a", "row-z"),
+    )
+    with pytest.raises(AgentLoopError, match="rejected: row-z"):
+        run_pr_loop(runner, pr_number=77, config=swapped, approved_plan_context=context)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert not any(
+        cmd[:3] == ["gh", "pr", "comment"] or cmd[:1] in (["codex"], ["antigravity"], ["agy"], ["claude"])
+        for cmd, _cwd in runner.commands[commands_before:]
+    )
+    # Control: without the entry preflight the same invocation writes the
+    # board-change link before the round-start validation rejects the list.
+    monkeypatch.setattr(pr_loop_module, "preflight_operator_evidence_conversion", lambda *a, **k: None)
+    with pytest.raises(AgentLoopError, match="rejected: row-z"):
+        run_pr_loop(runner, pr_number=77, config=swapped, approved_plan_context=context)
+    assert len(runner.pr_payload["comments"]) > comments_before
+
+
+@pytest.mark.parametrize("rows", [("row-a",), ("row-a", "row-c")])
+def test_a_satisfied_converted_row_is_rejected_alone_or_in_a_mixed_list(tmp_path, monkeypatch, rows):
+    """item-6: only currently unsatisfied, not-yet-converted rows are accepted."""
+    context = _plan_context("row-a", "row-b", "row-c")
+    plan = {"row-a": "limited", "row-b": "verified", "row-c": "missing"}
+    runner = _auto_converted_runner(tmp_path, monkeypatch, context, plan=plan)
+    config = _config(tmp_path)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    runner.pr_payload["comments"].append(_signed("Live run at abc123-coder-1 passed.", 1))
+    runner.codex_outputs.append(_review(resolved=["item-2"], hr=True))
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    comments_before = len(runner.pr_payload["comments"])
+    with pytest.raises(AgentLoopError, match="rejected: row-a"):
+        run_pr_loop(
+            runner, pr_number=77, approved_plan_context=context,
+            config=dataclasses.replace(config, pr_convert_evidence_rows=rows),
+        )
+    assert len(runner.pr_payload["comments"]) == comments_before
+
+
+def test_after_the_owner_leaves_the_board_every_current_reviewer_must_clear(tmp_path, monkeypatch):
+    """item-1 / `convert-owner-removed` through a PR-loop board-change resume.
+
+    Gemini alone owns the converted row; the rerun's board swaps Gemini for
+    Antigravity, so the ledger runs through the board-change view.  One
+    current reviewer's clearance keeps the freeze; both clear it.
+    """
+    context = _plan_context("row-a", "row-b")
+    plan = {"row-a": "limited", "row-b": "verified"}
+    runner = FakeRunner(
+        claude_outputs=[_coder(1)],
+        codex_outputs=[
+            _review(),
+            _review(resolved=["item-1"]),
+            _review(kept=["item-2"], state="blocking"),
+        ],
+        gemini_outputs=[
+            _review([_tagged("row-a")], reviewer="Google Gemini"),
+            _review(carried=["item-1"], reviewer="Google Gemini"),
+            _review(kept=["item-2"], state="blocking", reviewer="Google Gemini"),
+        ],
+        pr_payload={"comments": [_implementation_record(context, plan)]},
+    )
+    _install_derivation(monkeypatch, context, [plan])
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+        run_pr_loop(
+            runner, pr_number=77, approved_plan_context=context,
+            config=_config(tmp_path, reviewer=("codex", "gemini")),
+        )
+    [obligation] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-a")
+    assert obligation.resolution_owners == ("Gemini",)
+    runner.pr_payload["comments"].append(_signed("Live run at abc123-coder-1 passed.", 1))
+    swapped = _config(tmp_path, reviewer=("codex", "antigravity"))
+    runner.codex_outputs.append(_review(resolved=["item-2"], hr=True))
+    runner.antigravity_outputs.append(_review(kept=["item-2"], state="blocking", hr=True, reviewer="Antigravity"))
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+        run_pr_loop(runner, pr_number=77, config=swapped, approved_plan_context=context)
+    from coding_review_agent_loop.board_change import BOARD_CHANGE_LINK_HEADING
+
+    assert any(c["body"].startswith(BOARD_CHANGE_LINK_HEADING) for c in runner.pr_payload["comments"])
+    latest = _records(runner)[-1].metadata
+    [still] = _evidence_items(latest.prior_items, "row-a")
+    assert still.lifecycle == "evidence_frozen"
+    assert still.resolution_owners == ("Gemini",)  # never reassigned to the new board
+    assert not latest.signed_evidence_references
+    # Both current reviewers resolve it after further signed input.
+    runner.pr_payload["comments"].append(_signed("Added the deploy log for abc123-coder-1.", 2))
+    runner.codex_outputs.append(_review(resolved=["item-2"], hr=True))
+    runner.antigravity_outputs.append(_review(resolved=["item-2"], hr=True, reviewer="Antigravity"))
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=swapped, approved_plan_context=context) == 0
+    [release] = [r for r in _records(runner) if r.metadata.phase == "evidence-release"]
+    assert [ref.clearing_reviewers for ref in release.metadata.signed_evidence_references] == [
+        ("Antigravity", "Codex")
+    ]

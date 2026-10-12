@@ -496,10 +496,12 @@ def test_operator_rows_must_all_be_currently_unsatisfied():
         validate_operator_conversion_rows(["row-a", "row-a"], unsatisfied_row_ids=["row-a"])
     with pytest.raises(AgentLoopError, match="cannot be applied"):
         validate_operator_conversion_rows(["row-a"], unsatisfied_row_ids=None)
-    # An already-converted row is an idempotent no-op, never an error.
-    assert validate_operator_conversion_rows(
-        ["row-a"], unsatisfied_row_ids=[], already_converted=["row-a"]
-    ) == ()
+    # An already-converted row (pending or cleared) is rejected, alone or mixed.
+    for requested in (["row-a"], ["row-a", "row-b"]):
+        with pytest.raises(AgentLoopError, match="rejected: row-a"):
+            validate_operator_conversion_rows(
+                requested, unsatisfied_row_ids=["row-a", "row-b"], already_converted=["row-a"]
+            )
 
 
 # --- audit record and reconciliation ------------------------------------------
@@ -560,14 +562,14 @@ def test_reconciliation_reopens_a_tombstone_at_a_new_head_with_the_same_identity
     tombstone = _obligation(status="resolved", lifecycle="cleared", candidate_head_sha=HEAD)
     # Kept at its head while its admitted reference stands.
     same = reconcile_converted_obligations(
-        [tombstone], live_head=HEAD, matrix_identity=IDENTITY, admitted_references=[_reference()]
+        [tombstone], live_head=HEAD, matrix_identity=IDENTITY, admitted_audits=[_audit()], admitted_references=[_reference()]
     )
     assert same == [tombstone]
     # Without the reference a tombstone alone never satisfies the row.
-    reopened = reconcile_converted_obligations([tombstone], live_head=HEAD, matrix_identity=IDENTITY)
+    reopened = reconcile_converted_obligations([tombstone], live_head=HEAD, matrix_identity=IDENTITY, admitted_audits=[_audit()])
     assert reopened[0].lifecycle == "evidence_deferred" and reopened[0].status == "blocking"
     moved = reconcile_converted_obligations(
-        [tombstone], live_head="ffff0001", matrix_identity=IDENTITY, admitted_references=[_reference()]
+        [tombstone], live_head="ffff0001", matrix_identity=IDENTITY, admitted_audits=[_audit()], admitted_references=[_reference()]
     )
     assert moved[0].item_id == "item-4"
     assert moved[0].obligation_identity == tombstone.obligation_identity
@@ -576,14 +578,14 @@ def test_reconciliation_reopens_a_tombstone_at_a_new_head_with_the_same_identity
     )
     # Idempotent.
     assert reconcile_converted_obligations(
-        moved, live_head="ffff0001", matrix_identity=IDENTITY, admitted_references=[_reference()]
+        moved, live_head="ffff0001", matrix_identity=IDENTITY, admitted_audits=[_audit()], admitted_references=[_reference()]
     ) == moved
 
 
 def test_reconciliation_supersedes_by_tool_evidence_and_reopens_at_the_next_head():
     pending = _obligation()
     superseded = reconcile_converted_obligations(
-        [pending], live_head="ffff0002", matrix_identity=IDENTITY,
+        [pending], live_head="ffff0002", matrix_identity=IDENTITY, admitted_audits=[_audit()],
         tool_verified_rows_at_live_head=["row-a"],
     )[0]
     assert (superseded.status, superseded.lifecycle, superseded.candidate_head_sha) == (
@@ -591,7 +593,7 @@ def test_reconciliation_supersedes_by_tool_evidence_and_reopens_at_the_next_head
     )
     assert any("tool-captured" in note for note in superseded.notes)
     reopened = reconcile_converted_obligations(
-        [superseded], live_head="ffff0003", matrix_identity=IDENTITY
+        [superseded], live_head="ffff0003", matrix_identity=IDENTITY, admitted_audits=[_audit()]
     )[0]
     assert (reopened.item_id, reopened.lifecycle) == ("item-4", "evidence_deferred")
 
@@ -599,9 +601,9 @@ def test_reconciliation_supersedes_by_tool_evidence_and_reopens_at_the_next_head
 def test_reconciliation_releases_a_freeze_at_another_head_and_restores_from_an_audit():
     frozen = _obligation(lifecycle="evidence_frozen", candidate_head_sha=HEAD)
     assert reconcile_converted_obligations(
-        [frozen], live_head=HEAD, matrix_identity=IDENTITY
+        [frozen], live_head=HEAD, matrix_identity=IDENTITY, admitted_audits=[_audit()]
     ) == [frozen]
-    released = reconcile_converted_obligations([frozen], live_head="ffff0004", matrix_identity=IDENTITY)
+    released = reconcile_converted_obligations([frozen], live_head="ffff0004", matrix_identity=IDENTITY, admitted_audits=[_audit()])
     assert released[0].lifecycle == "evidence_deferred"
     restored = reconcile_converted_obligations(
         [], live_head=HEAD, matrix_identity=IDENTITY, admitted_audits=[_audit()]
@@ -613,3 +615,127 @@ def test_reconciliation_releases_a_freeze_at_another_head_and_restores_from_an_a
     assert reconcile_converted_obligations(
         [], live_head=HEAD, matrix_identity="b" * 64, admitted_audits=[_audit()]
     ) == []
+
+
+# --- review round 1 regressions -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "derive_kwargs,disqualifier",
+    [
+        ({"checkout_head": "elsewhere"}, "checkout-head-mismatch"),
+        ({"tree_clean": False}, "checkout-tree-unavailable"),
+    ],
+)
+@pytest.mark.parametrize("selector", ["unknown", "dropped"])
+def test_checkout_disqualifiers_apply_even_without_a_resolved_selector(derive_kwargs, disqualifier, selector):
+    """item-2: a claim selecting only unknown or dropped refs from a wrong or
+    unauthenticated checkout is never capture-limited."""
+    matrix = _matrix("row-a")
+    claim = (
+        _claim("row-a", "ref-missing")
+        if selector == "unknown"
+        else _claim("row-a", dropped_execution_refs=("ref-dropped",))
+    )
+    result = _derive(matrix, [claim], [], **derive_kwargs)
+    classification = result.row_capture_classifications["row-a"]
+    assert classification["class"] == NOT_CAPTURE_LIMITED
+    assert disqualifier in classification["disqualifiers"]
+    assert classification["observation_classes"] == ["unknown-ref"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: {**p, "rows": {"row-a": {**p["rows"]["row-a"], "class": []}}},
+        lambda p: {**p, "rows": {"row-a": {**p["rows"]["row-a"], "observation_classes": [{}]}}},
+        lambda p: {**p, "rows": {"row-a": {**p["rows"]["row-a"], "disqualifiers": [[]]}}},
+        lambda p: {**p, "rows": {"row-a": []}},
+        lambda p: {**p, "head": ["x"]},
+    ],
+)
+def test_ill_typed_classification_values_decode_as_none_without_raising(mutate):
+    """item-4: tolerant decoders never raise on ill-typed JSON values."""
+    matrix = _matrix("row-a")
+    result = _derive(matrix, [_claim("row-a", "ref-1")], [_observation("ref-1")])
+    payload = mutate(capture_classification_payload(result, head_sha=HEAD))
+    assert decode_capture_classification(
+        payload, subject=HEAD, evidence_identity=risk_test_matrix_identity(matrix)
+    ) is None
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject=HEAD,
+        risk_test_matrix_evidence=result.evidence.to_payload(),
+        risk_test_matrix_capture_classification=payload,
+    )
+    assert _decode_round_metadata(_encode_round_metadata(metadata)).risk_test_matrix_capture_classification is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: {**p, "source": []},
+        lambda p: {**p, "matrix_identity": {}},
+        lambda p: {**p, "rows": [{**p["rows"][0], "owners": [[]]}]},
+        lambda p: {**p, "rows": [{**p["rows"][0], "row_id": []}]},
+    ],
+)
+def test_ill_typed_audits_decode_as_unconverted_without_raising(mutate):
+    from coding_review_agent_loop.round_state import _decode_round_metadata as decode, _encode_round_metadata as encode
+
+    payload = mutate(_audit().to_payload())
+    assert EvidenceConversionAudit.from_payload(payload) is None
+    from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
+
+    stored = decode_mapping(encode(PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject=HEAD,
+        phase="evidence-conversion", evidence_conversion=_audit(),
+    )))
+    stored["evidence_conversion"] = payload
+    assert decode(encode_mapping(stored)).evidence_conversion is None
+
+
+def test_conversion_state_without_an_admitted_audit_is_dropped_and_the_finding_reopens():
+    """item-3: a ledger adopted from a record whose audit was rejected grants no conversion."""
+    obligation = _obligation()
+    finding = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Codex", source_round=1, text="Capture evidence",
+        status="converted", evidence_row_ids=("row-a",), converted_row_ids=("row-a",),
+    )
+    unbacked = reconcile_converted_obligations(
+        [finding, obligation], live_head=HEAD, matrix_identity=IDENTITY, admitted_audits=[],
+    )
+    assert [item.item_id for item in unbacked] == ["item-1"]
+    assert unbacked[0].status == "blocking" and unbacked[0].converted_row_ids == ()
+    backed = reconcile_converted_obligations(
+        [finding, obligation], live_head=HEAD, matrix_identity=IDENTITY, admitted_audits=[_audit()],
+    )
+    assert [item.item_id for item in backed] == ["item-1", "item-4"]
+    assert backed[0].status == "converted"
+
+
+def test_a_board_change_never_reassigns_converted_owners_to_a_primary_alone():
+    """item-1: the board-amendment ledger view keeps stored owners, so the
+    departed-owner rule (every current reviewer) applies, not primary-only."""
+    from coding_review_agent_loop.board_amendment import apply_board_amendment_to_ledger
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+    from coding_review_agent_loop.unresolved_items import _apply_unresolved_item_dispositions
+
+    frozen = _obligation(lifecycle="evidence_frozen", candidate_head_sha=HEAD)  # owned by Codex
+    view, reassignments = apply_board_amendment_to_ledger(
+        [frozen], removed_reviewers=("Codex",), remaining_reviewers=("Gemini", "Claude"),
+        primary_reviewer="Gemini",
+    )
+    assert view[0].resolution_owners == ("Codex",) and reassignments == ()
+
+    def clears(resolvers):
+        clearances: list = []
+        kept, _ = _apply_unresolved_item_dispositions(
+            list(view),
+            {"item-4": [ReviewItemDisposition("item-4", name, "resolved") for name in resolvers]},
+            evidence_response_head=HEAD, configured_reviewers=("Gemini", "Claude"),
+            evidence_clearances=clearances,
+        )
+        return bool(clearances) and kept[0].lifecycle == "cleared"
+
+    assert not clears(["Gemini"])  # the new primary alone cannot clear it
+    assert clears(["Gemini", "Claude"])

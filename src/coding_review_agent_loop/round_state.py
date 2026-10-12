@@ -3009,6 +3009,23 @@ def _decode_evidence_stall(payload: Mapping[str, object]) -> Mapping[str, object
 
 
 def _decode_conversion_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode the #1325 fields; an ill-typed value is absent, never fatal."""
+    try:
+        return _decode_conversion_fields_strict(payload)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        logger.warning("Ignoring ill-typed evidence-conversion fields on a round record")
+        return {
+            key: (() if key == "signed_evidence_references" else None)
+            for key in (
+                "risk_test_matrix_capture_classification", "evidence_conversion",
+                "conversion_stall_snapshot", "conversion_review_round",
+                "signed_evidence_references",
+            )
+            if key in payload
+        }
+
+
+def _decode_conversion_fields_strict(payload: Mapping[str, object]) -> dict[str, object]:
     """Decode the #1325 conversion fields; malformed values never raise.
 
     A malformed classification, audit, or snapshot decodes as absent (a
@@ -4715,7 +4732,15 @@ def _admit_recovery_records(
                 record.metadata.phase not in RECOVERY_RECORD_PHASES
                 and record.metadata.phase != EVIDENCE_CONVERSION_PHASE
             )
-            or _recovery_record_admitted(record, comments, trusted_actor)
+            or (
+                _recovery_record_admitted(record, comments, trusted_actor)
+                # A conversion handoff whose audit was rejected is not a
+                # conversion: recovery reconstructs the preceding ledger.
+                and (
+                    record.metadata.phase != EVIDENCE_CONVERSION_PHASE
+                    or record.metadata.evidence_conversion is not None
+                )
+            )
         ),
         comments,
         trusted_actor,
@@ -5045,7 +5070,10 @@ def _recover_unrecorded_pr_head_advance(
         return None
     latest_prior_subject = prior_records[-1].metadata.subject
     latest_prior_record = prior_records[-1]
-    if latest_prior_record.metadata.phase == EVIDENCE_CONVERSION_PHASE:
+    if (
+        latest_prior_record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+        and latest_prior_record.metadata.evidence_conversion is not None
+    ):
         # A push after a conversion record (#1325): its post-conversion ledger
         # is the handoff, and live-head reconciliation rebinds the converted
         # obligations to the new head.
@@ -5802,7 +5830,11 @@ def _resume_pr_round_from_records(
             evidence_boundary=boundary,
             evidence_clearances=boundary.evidence_clearances,
         )
-    if current_head_records and current_head_records[-1].metadata.phase == EVIDENCE_CONVERSION_PHASE:
+    if (
+        current_head_records
+        and current_head_records[-1].metadata.phase == EVIDENCE_CONVERSION_PHASE
+        and current_head_records[-1].metadata.evidence_conversion is not None
+    ):
         # The conversion record (#1325) was posted before the same-head repeat
         # started any reviewer: it is the handoff boundary carrying the
         # post-conversion ledger and round.  Its repeat re-runs every reviewer.

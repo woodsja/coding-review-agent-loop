@@ -116,19 +116,11 @@ def decode_capture_classification(
         row_class = entry.get("class")
         classes = entry.get("observation_classes")
         disqualifiers = entry.get("disqualifiers")
-        if row_class not in {CAPTURE_LIMITED, NOT_CAPTURE_LIMITED}:
+        if not isinstance(row_class, str) or row_class not in {CAPTURE_LIMITED, NOT_CAPTURE_LIMITED}:
             return None
-        if (
-            not isinstance(classes, list)
-            or any(value not in CAPTURE_OBSERVATION_CLASSES for value in classes)
-            or classes != sorted(set(classes))
-        ):
+        if not _closed_string_list(classes, CAPTURE_OBSERVATION_CLASSES):
             return None
-        if (
-            not isinstance(disqualifiers, list)
-            or any(value not in CAPTURE_DISQUALIFIERS for value in disqualifiers)
-            or disqualifiers != sorted(set(disqualifiers))
-        ):
+        if not _closed_string_list(disqualifiers, CAPTURE_DISQUALIFIERS):
             return None
         # Capture-limited holds exactly when no disqualifier applies.
         if (row_class == CAPTURE_LIMITED) != (not disqualifiers):
@@ -139,6 +131,15 @@ def decode_capture_classification(
             "disqualifiers": list(disqualifiers),
         }
     return {"version": 1, "matrix_identity": identity, "head": head, "rows": decoded}
+
+
+def _closed_string_list(value: object, vocabulary: frozenset[str]) -> bool:
+    """A sorted, duplicate-free list of strings from ``vocabulary``; never raises."""
+    return (
+        isinstance(value, list)
+        and all(isinstance(entry, str) and entry in vocabulary for entry in value)
+        and value == sorted(set(value))
+    )
 
 
 def attempt_counts_for_row(
@@ -253,11 +254,10 @@ def validate_operator_conversion_rows(
 ) -> tuple[str, ...]:
     """All-or-nothing validation of ``--pr-convert-evidence-rows`` (#1325).
 
-    Every named row must be in the current unsatisfied set or already
-    converted under the same matrix identity (an idempotent rerun after a
-    crash); only the not-yet-converted rows are returned.  Any other ID, a
-    duplicate, or an unavailable set raises before any agent runs, naming the
-    rejected IDs.
+    Every named row must be in the current unsatisfied set minus rows
+    already converted under the same matrix identity (pending or cleared).
+    Any other ID, a duplicate, or an unavailable set raises before any agent
+    runs, naming the rejected IDs, and nothing is converted.
     """
     names = [str(row).strip() for row in requested]
     if not names or any(not name for name in names):
@@ -274,17 +274,17 @@ def validate_operator_conversion_rows(
             + (reason or "no unsatisfied risk-matrix row set is bound to the current PR head")
             + f". Rejected row(s): {', '.join(names)}. Nothing was converted and no agent was run."
         )
-    converted = set(already_converted)
-    allowed = set(unsatisfied_row_ids) - converted
-    rejected = [name for name in names if name not in allowed and name not in converted]
+    allowed = set(unsatisfied_row_ids) - set(already_converted)
+    rejected = [name for name in names if name not in allowed]
     if rejected:
         raise AgentLoopError(
             "--pr-convert-evidence-rows accepts only rows that are currently unsatisfied at the "
-            f"live head; rejected: {', '.join(rejected)}. Currently convertible: "
+            f"live head and not already converted; rejected: {', '.join(rejected)}. Currently "
+            "convertible: "
             + (", ".join(sorted(allowed)) or "(none)")
             + ". Nothing was converted and no agent was run."
         )
-    return tuple(name for name in names if name not in converted)
+    return tuple(names)
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +345,8 @@ class EvidenceConversionAudit:
         head = value.get("head")
         raw_rows = value.get("rows")
         if (
-            source not in EVIDENCE_CONVERSION_SOURCES
+            not isinstance(source, str)
+            or source not in EVIDENCE_CONVERSION_SOURCES
             or not isinstance(identity, str)
             or not _IDENTITY_RE.fullmatch(identity)
             or not isinstance(head, str)
@@ -442,6 +443,48 @@ def tool_superseded_note(head_sha: str) -> str:
     return f"Superseded by tool-captured evidence verified at head {head_sha}."
 
 
+def _drop_unbacked_conversions(
+    ledger: Sequence[UnresolvedReviewItem],
+    admitted_audits: Sequence[EvidenceConversionAudit],
+    *,
+    matrix_identity: str,
+) -> list[UnresolvedReviewItem]:
+    """Conversion state counts only when an admitted audit records it (#1325).
+
+    A converted obligation whose (identity, item ID) no admitted audit names
+    is dropped, and a finding's converted rows not named by an admitted audit
+    for the current matrix return to its residual demand (a `converted`
+    finding with residual rows reopens as blocking).  So a ledger adopted from
+    a record with a rejected or foreign audit grants no conversion.
+    """
+    backed_obligations = {
+        (row.obligation_identity, row.obligation_item_id)
+        for audit in admitted_audits
+        for row in audit.rows
+    }
+    backed_rows = {
+        row.row_id
+        for audit in admitted_audits
+        if audit.matrix_identity == matrix_identity
+        for row in audit.rows
+    }
+    result: list[UnresolvedReviewItem] = []
+    for item in ledger:
+        if item.converted_row_id is not None:
+            if (item.obligation_identity, item.item_id) in backed_obligations:
+                result.append(item)
+            continue
+        if item.converted_row_ids:
+            kept = tuple(row for row in item.converted_row_ids if row in backed_rows)
+            if kept != item.converted_row_ids:
+                status = item.status
+                if status == "converted" and set(kept) != set(item.evidence_row_ids):
+                    status = "blocking"
+                item = replace(item, converted_row_ids=kept, status=status)
+        result.append(item)
+    return result
+
+
 def reconcile_converted_obligations(
     ledger: Sequence[UnresolvedReviewItem],
     *,
@@ -453,6 +496,7 @@ def reconcile_converted_obligations(
 ) -> list[UnresolvedReviewItem]:
     """Bind every row-converted obligation to the live head (#1325).
 
+    0. Drop conversion state no admitted audit backs.
     1. Restore an obligation recorded in an admitted audit but missing from
        the ledger, with the audit's item ID and owners.
     2. A converted obligation is satisfied at the live head only by an
@@ -467,7 +511,7 @@ def reconcile_converted_obligations(
     """
     if not live_head or not matrix_identity:
         return list(ledger)
-    result = list(ledger)
+    result = _drop_unbacked_conversions(ledger, admitted_audits, matrix_identity=matrix_identity)
     present_identities = {
         item.obligation_identity for item in result if item.obligation_identity
     }

@@ -446,6 +446,7 @@ from .pr_loop_support import (
     _cumulative_references,
     _evidence_gate_needed,
     admitted_pr_records,
+    preflight_operator_evidence_conversion,
     round_evidence_authority_records,
     conversion_repeat_round,
     evidence_authority_from_records,
@@ -900,6 +901,16 @@ def run_pr_loop(
                     entry_board.signed_authorizations if entry_board is not None else ()
                 ),
             )
+        # Operator evidence conversion (#1325) is validated read-only here,
+        # before the first PR write, so an invalid row list posts nothing.
+        preflight_operator_evidence_conversion(
+            runner,
+            config,
+            pr_number=pr_number,
+            comments=initial_pr_context.comments,
+            head_sha=initial_pr_context.metadata.head_sha,
+            approved_plan_context=approved_plan_context,
+        )
         # A successful manual qualification retains the managed label on the
         # ready PR.  Release it before any managed-CI authentication so every
         # downstream path sees the ready/unlabeled state it already handles.

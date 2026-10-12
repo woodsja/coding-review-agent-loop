@@ -4564,6 +4564,73 @@ def _pr_evidence_stall_decision(
     return EvidenceStallOutcome(snapshot.to_payload())
 
 
+def preflight_operator_evidence_conversion(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object],
+    head_sha: str | None,
+    approved_plan_context: ApprovedPlanContext | None,
+) -> None:
+    """Read-only ``--pr-convert-evidence-rows`` validation before any PR write (#1325).
+
+    Runs at entry, before board-change links, plan-handoff audits, recovery
+    handoffs or any other startup write, from admitted history alone: the
+    unsatisfied set bound to the live head (with admitted signed references
+    overlaid), minus every row an admitted conversion audit already converted,
+    and refusal while the latest record at the head is an evidence freeze.
+    The round-start conversion re-validates against the reconciled ledger.
+    """
+    requested = tuple(config.pr_convert_evidence_rows)
+    if not requested:
+        return
+    if not _matrix_applies(approved_plan_context):
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None,
+            reason="the approved plan has no applicable risk-test matrix",
+        )
+    assert approved_plan_context is not None
+    if not head_sha:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None, reason="the live PR head is unknown"
+        )
+    assert head_sha is not None
+    records = admitted_pr_records(runner, config, pr_number=pr_number, comments=comments, resume=True)
+    identity = approved_plan_context.risk_test_matrix_identity
+    at_head = [record for record in records if record.metadata.subject == head_sha]
+    if at_head and at_head[-1].metadata.phase == EVIDENCE_FREEZE_PHASE:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None,
+            reason="an exact-head evidence freeze is active; answer or release it first",
+        )
+    references, audits = evidence_authority_from_records(records)
+    already = {
+        row_id
+        for audit in audits
+        if audit.matrix_identity == identity
+        for row_id in audit.row_ids
+    }
+    unsatisfied = _head_bound_unsatisfied_rows(
+        records, head_sha, approved_plan_context,
+        excluded_row_ids=already, signed_references=references,
+    )
+    if unsatisfied is None or unsatisfied.reason is not None:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested,
+            unsatisfied_row_ids=None,
+            reason=(
+                "no coder record is bound to the live head"
+                if unsatisfied is None
+                else f"the head-bound evidence is unusable ({unsatisfied.reason})"
+            ),
+        )
+    assert unsatisfied is not None
+    _evidence_conversion.validate_operator_conversion_rows(
+        requested, unsatisfied_row_ids=unsatisfied.row_ids, already_converted=already
+    )
+
+
 def _pr_operator_evidence_conversion(
     runner: Runner,
     config: AgentLoopConfig,
@@ -4576,7 +4643,7 @@ def _pr_operator_evidence_conversion(
     next_item_number: int,
     configured_reviewers: Sequence[str],
     signed_evidence_references: Sequence[SignedEvidenceReference] = (),
-) -> EvidenceConversionOutcome | None:
+) -> EvidenceConversionOutcome:
     """Apply ``--pr-convert-evidence-rows`` before any reviewer or coder (#1325).
 
     The named rows must all be in the unsatisfied set derived from the coder
@@ -4629,13 +4696,6 @@ def _pr_operator_evidence_conversion(
     rows = _evidence_conversion.validate_operator_conversion_rows(
         requested, unsatisfied_row_ids=unsatisfied.row_ids, already_converted=already
     )
-    if not rows:
-        log(
-            config,
-            f"PR #{pr_number}: every row named by --pr-convert-evidence-rows is already "
-            "converted; nothing to do",
-        )
-        return None
     return _apply_evidence_conversion(
         runner,
         config,

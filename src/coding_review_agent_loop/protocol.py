@@ -3035,6 +3035,13 @@ def derive_risk_test_matrix_evidence(
             caveats.append("No semantic coverage claim was supplied for this enforceable row.")
             diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "missing-claim", "No semantic row claim was supplied."))
         else:
+            # Checkout authentication disqualifies the attempt independently of
+            # any selector (#1325): a claim selecting only unknown or dropped
+            # refs from a wrong or unauthenticated checkout never converts.
+            if checkout_head_mismatch or predecessor_head_unmoved:
+                capture_disqualifiers.add("checkout-head-mismatch")
+            if checkout_tree_unavailable:
+                capture_disqualifiers.add("checkout-tree-unavailable")
             candidate_citations: list[TestObservationCitation] = []
             missing_semantic_facts = [
                 field_name

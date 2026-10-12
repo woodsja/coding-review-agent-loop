@@ -959,7 +959,11 @@ tombstone, or a freeze at another head, reopens in place as deferred, so the
 answer for one head never satisfies another, and an approving review at the new
 head reaches a new freeze there with no coder turn. A converted obligation
 missing from the ledger but recorded in an admitted conversion audit is
-restored with its audit item ID and owners.
+restored with its audit item ID and owners; conversion state that no admitted
+audit backs (for example a ledger adopted from a record whose audit was
+rejected) is dropped, so the row is treated as unconverted. A reviewer-board
+change never reassigns a converted obligation's stored owners; the clearance
+rule above already falls back to the whole current board.
 
 Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)` → `Claude Opus 5.5 (Medium)`; see [Quota groups and fallback](#quota-groups-and-fallback)). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
@@ -3932,11 +3936,13 @@ naming a converted row is an ordinary finding.
 **Operator conversion.** `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]`
 converts the named rows before any reviewer or coder runs in that invocation. Every
 named row must be in the unsatisfied set derived from the coder record bound to the
-live head; any other ID, a duplicate, a missing applicable matrix, an unbound head or
-an active freeze fails the whole list before any agent runs, and nothing is posted.
-A row already converted is a no-op. The conversion is persisted in the same audit
-record (`source: operator`), and every reviewer then reviews fresh. The flag is
-one-shot: rendered rerun commands never replay it.
+live head and not already converted (pending or cleared); any other ID, a duplicate, a
+missing applicable matrix, an unbound head or an active freeze fails the whole list.
+This validation is read-only and runs at entry, before any startup write (board-change
+link, plan-handoff audit, recovery handoff) and before any agent runs, so nothing is
+posted for an invalid list. The conversion is persisted in the same audit record
+(`source: operator`), and every reviewer then reviews fresh. The flag is one-shot:
+rendered rerun commands never replay it.
 
 **Authority.** Conversion audits, signed-evidence references, capture classifications
 and `bound_attempt_round` are admitted only from comments authored by the authenticated
