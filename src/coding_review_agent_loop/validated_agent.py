@@ -20,6 +20,7 @@ from .errors import (
     CITATION_REASKABLE_REASONS,
     AgentInvocationError,
     AgentLoopError,
+    AgentSettingsLockWaitTimeout,
     DeterministicPlanValidationExhaustion,
     FreshContractIntegrityError,
     PreservedUnsatisfiedResponse,
@@ -1151,6 +1152,7 @@ def _run_validated_agent(
     latest_replay_refusal_detail: str | None = None
     next_timeout_seconds = timeout_seconds
     marker_safety_repair_attempted = False
+    settings_lock_retry_used = False
     # A field-naming diagnostic for the next attempt's prompt, set only by an
     # unsatisfied architecture-impact contract and consumed by one attempt.
     pending_contract_reprompt: str | None = None
@@ -1310,18 +1312,34 @@ def _run_validated_agent(
             pending_evidence_reask_session = None
         if usage_context is not None:
             usage_context.note_agent_dispatch()
-        result = run_agent_result(
-            runner,
-            agent=agent,
-            config=attempt_config,
-            prompt=attempt_prompt,
-            session_id=attempt_session_id,
-            run_id=usage_context.run_id if usage_context is not None else None,
-            role=role,
-            label=label,
-            timeout_seconds=next_timeout_seconds,
-            **invocation_kwargs,
-        )
+        while True:
+            try:
+                result = run_agent_result(
+                    runner,
+                    agent=agent,
+                    config=attempt_config,
+                    prompt=attempt_prompt,
+                    session_id=attempt_session_id,
+                    run_id=usage_context.run_id if usage_context is not None else None,
+                    role=role,
+                    label=label,
+                    timeout_seconds=next_timeout_seconds,
+                    **invocation_kwargs,
+                )
+                break
+            except AgentSettingsLockWaitTimeout as exc:
+                # Host-wide lock contention, not a model or turn failure: one
+                # dedicated in-place re-wait that consumes no agent_max_retries,
+                # fallback or quota state, and runs no repair (#1400). A second
+                # expiry propagates as a transient AgentInvocationError.
+                if settings_lock_retry_used:
+                    raise
+                settings_lock_retry_used = True
+                log(
+                    config,
+                    f"{agent_name}: shared agy settings lock wait expired ({exc}); "
+                    "retrying the lock wait once",
+                )
         # Keep this acquisition result fixed through every validation and
         # repair callback for the current response. Repair itself may replace
         # runner.latest_test_turn_id, but it cannot replace this snapshot.

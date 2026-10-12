@@ -3448,6 +3448,10 @@ def _run_plan_first_loop_body(
             elif plan_round_parallel:
                 turn = plan_turn_results[reviewer]
                 if turn.error is not None:
+                    # Any reviewer error stays fatal for the round. Shared agy
+                    # settings-lock waits are absorbed earlier: the adapter
+                    # waits out the holder's turn and run_validated_agent
+                    # retries an expired wait once (#1400).
                     category = getattr(turn.error, "failure_category", None) or "error"
                     log(
                         config,

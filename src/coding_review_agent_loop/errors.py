@@ -259,6 +259,35 @@ class AgentInvocationError(AgentLoopError):
         self.bounded_replan_rejection = bounded_replan_rejection
 
 
+
+class AgentSettingsLockWaitTimeout(AgentInvocationError):
+    """The host-wide agy settings lock stayed held past its wait allowance (#1400).
+
+    Lock contention is transient and local to the waiting seat: the holder is
+    another agent-loop turn on this host, not a provider or account outage.
+    Raised before settings.json is read or written and before any holder
+    record is published, so nothing needs restoring.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        holder_pid: int | None = None,
+        holder_run_id: str | None = None,
+        holder_seat: str | None = None,
+        holder_role: str | None = None,
+        holder_turn_bound_seconds: float | None = None,
+        waited_seconds: float = 0.0,
+    ) -> None:
+        super().__init__(message, failure_category="transient")
+        self.holder_pid = holder_pid
+        self.holder_run_id = holder_run_id
+        self.holder_seat = holder_seat
+        self.holder_role = holder_role
+        self.holder_turn_bound_seconds = holder_turn_bound_seconds
+        self.waited_seconds = waited_seconds
+
 class QuotaResetExceededError(AgentLoopError):
     """Raised when a rate-limit reset time exceeds the auto-retry threshold.
 

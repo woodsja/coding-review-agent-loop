@@ -1998,7 +1998,15 @@ seat role key carrying backend, model chain, effort, and checkout. Common
 review scheduling and ledger code stores that seat ID in reviewer and agent
 fields. Backend adapters receive an immutable seat-specific invocation view;
 response files and logs use the seat ID while Antigravity quota state and the
-host settings lock remain shared. PR round metadata, including scheduler and
+host settings lock remain shared. The settings lock is held for a whole agy
+turn, so the adapter publishes a token-owned holder record (PID, run ID, seat,
+role, turn bound) after acquiring it, and a waiter allows each observed holder
+its advertised turn bound plus a margin under an overall cap. An expired wait
+raises `AgentSettingsLockWaitTimeout`, a transient `AgentInvocationError`,
+before settings.json is touched; `run_validated_agent` and the direct
+Antigravity repair path each retry it once in place without spending retries
+or model fallback. A second expiry stays seat-local (repair records
+`settings_lock_contention`) and is never treated as a backend outage. PR round metadata, including scheduler and
 coder recovery records, stores a versioned board binding. Recovery verifies
 the binding before using any recorded checkpoint; a changed
 model chain starts a fresh round, retaining reconciled open findings but

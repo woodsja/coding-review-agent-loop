@@ -11,7 +11,11 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, build_parser, run_issue_loop, run_pr_loop
-from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
+from coding_review_agent_loop.errors import (
+    AgentInvocationError,
+    AgentSettingsLockWaitTimeout,
+    QuotaResetExceededError,
+)
 from coding_review_agent_loop.round_state import (
     PlanValidationDiagnosticPayload,
     encode_plan_validation_diagnostic_body,
@@ -332,7 +336,7 @@ def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkey
     assert peak == 1
 
     lock_path = settings.with_suffix(".json.lock")
-    monkeypatch.setattr(agy_backend, "SETTINGS_LOCK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(agy_backend, "settings_lock_wait_budget_seconds", lambda _bound: 0.05)
     runner = DelayedRunner(antigravity_outputs=[("review", 0)])
     config = dataclasses.replace(
         base, antigravity_dir=flash.workdir, antigravity_model="Model A",
@@ -341,14 +345,15 @@ def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkey
     with lock_path.open("a+") as held:
         fcntl.flock(held, fcntl.LOCK_EX)
         try:
-            with pytest.raises(AgentLoopError, match="review is incomplete"):
+            with pytest.raises(AgentSettingsLockWaitTimeout, match="for the shared agy settings lock") as caught:
                 agy_backend.AntigravityBackend().run(runner, config, "Review PR.", role="reviewer")
+            assert caught.value.failure_category == "transient"
         finally:
             fcntl.flock(held, fcntl.LOCK_UN)
     assert not any(command[0] == "agy" for command, _ in runner.commands)
 
 
-def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch):
+def test_named_pr_lock_wait_is_seat_local_and_parallel_rerun_is_guarded(tmp_path, monkeypatch):
     import fcntl
     import importlib
 
@@ -358,7 +363,7 @@ def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch)
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(agy_backend, "_antigravity_settings_path", lambda: settings)
-    monkeypatch.setattr(agy_backend, "SETTINGS_LOCK_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(agy_backend, "settings_lock_wait_budget_seconds", lambda _bound: 0.05)
     seats = tuple(
         SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
         for name, model in (("flash", "Model A"), ("opus", "Model B"))
@@ -388,11 +393,22 @@ def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch)
         return original_flock(handle, operation)
 
     monkeypatch.setattr(fcntl, "flock", block_second_seat)
-    with pytest.raises(AgentLoopError, match="review is incomplete"):
+    with pytest.raises(AgentLoopError, match="review incomplete") as caught:
         run_pr_loop(runner, pr_number=77, config=config)
+    # The exhausted wait (and its one in-place retry) is a transient,
+    # seat-local failure: only the waiting seat is unavailable, never every
+    # Antigravity seat as a backend outage (#1400).
+    missing = str(caught.value).split("missing required input from ", 1)[1].split(" (", 1)[0]
+    assert missing in {"flash", "opus"}
+    assert ": transient)" in str(caught.value)
+    incomplete = [
+        c["body"] for c in runner.pr_payload["comments"]
+        if "shared_outage_backends=antigravity" in c["body"]
+    ]
+    assert incomplete == []
+    assert "shared_outage_backends=antigravity" not in str(caught.value)
     assert lock_state["acquires"] == 1
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
-    assert _spool_files(config)
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
     from types import SimpleNamespace
     records = _extract_round_metadata_records(
@@ -400,14 +416,161 @@ def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch)
         flow="pr",
     )
     assert any(record.metadata.phase == "scheduler-prelaunch" for record in records)
-    assert not any(record.metadata.role == "reviewer" for record in records)
+    # The healthy seat's review is recorded; the waiting seat has none yet.
+    reviewer_records = [record for record in records if record.metadata.role == "reviewer"]
+    assert len(reviewer_records) == 1
+    assert reviewer_records[0].metadata.agent != missing
+    lock_state["blocked"] = False
+    # The healthy peer is already public, so the parallel round's independence
+    # guard refuses to launch the missing seat against its findings; the
+    # operator gets the existing actionable recovery instead of a silent rerun.
+    from coding_review_agent_loop.review_rounds import PartialReviewRoundError
+    with pytest.raises(PartialReviewRoundError, match="partially published"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
+
+
+def test_named_pr_sequential_lock_wait_is_seat_local_and_rerun_completes(tmp_path, monkeypatch):
+    import fcntl
+    import importlib
+
+    agy = importlib.import_module("coding_review_agent_loop.agents.antigravity")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(agy, "_antigravity_settings_path", lambda: settings)
+    monkeypatch.setattr(agy, "settings_lock_wait_budget_seconds", lambda _bound: 0.0)
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    for seat in seats:
+        seat.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats, review_parallel=False,
+        pr_review_policy="selective-intermediate", pre_review_tests=False, agent_max_retries=0,
+    )
+    lock_state = {"acquires": 0, "blocked": True, "expired": 0}
+    real_flock = fcntl.flock
+
+    def block_second_seat(handle, operation):
+        if (
+            getattr(handle, "name", None) == str(settings.with_suffix(".json.lock"))
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+        ):
+            if lock_state["acquires"] and lock_state["blocked"]:
+                lock_state["expired"] += 1
+                raise BlockingIOError
+            lock_state["acquires"] += 1
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", block_second_seat)
+    with pytest.raises(AgentLoopError, match="review incomplete") as caught:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(caught.value)
+    # The wait and its one in-place retry both expired; only opus is missing.
+    assert lock_state["expired"] == 2
+    assert "missing required input from opus (opus: transient)" in message
+    assert "Healthy reviewers approved: flash" in message
+    assert "shared_outage_backends" not in message
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
+
     lock_state["blocked"] = False
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 2
     reviews = [c["body"] for c in runner.pr_payload["comments"] if "**Review verdict:**" in c["body"]]
-    assert len(reviews) == 2
     assert any(body.endswith("-- flash (Google Antigravity: Model A)") for body in reviews)
     assert any(body.endswith("-- opus (Google Antigravity: Model B)") for body in reviews)
+
+
+def _lock_contention_seat(tmp_path, monkeypatch, *, blocked_waits):
+    """An Antigravity seat whose next *blocked_waits* settings-lock waits expire."""
+    import fcntl
+    import importlib
+
+    backend = importlib.import_module("coding_review_agent_loop.agents.antigravity")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(backend, "_antigravity_settings_path", lambda: settings)
+    # Each blocked poll exhausts the allowance immediately.
+    monkeypatch.setattr(backend, "settings_lock_wait_budget_seconds", lambda _bound: 0.0)
+    lock_name = str(settings.with_suffix(".json.lock"))
+    state = {"remaining": blocked_waits, "expired": 0}
+    real_flock = fcntl.flock
+
+    def interposed(handle, operation):
+        if (
+            getattr(handle, "name", None) == lock_name
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+            and state["remaining"]
+        ):
+            state["remaining"] -= 1
+            state["expired"] += 1
+            raise BlockingIOError
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", interposed)
+    seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash")
+    seat.workdir.mkdir()
+    return seat, state
+
+
+def test_validated_agent_retries_an_expired_settings_lock_wait_once_in_place(
+    tmp_path, monkeypatch
+):
+    from coding_review_agent_loop import validated_agent, workdir_claims
+
+    seat, state = _lock_contention_seat(tmp_path, monkeypatch, blocked_waits=1)
+    runner = FakeRunner(antigravity_outputs=[("approved review", 0)])
+    config = make_config(tmp_path, reviewer=(seat,), reviewer_seats=(seat,), agent_max_retries=0)
+    logs: list[str] = []
+    repairs: list[object] = []
+    monkeypatch.setattr(validated_agent, "log", lambda _c, message: logs.append(message))
+    monkeypatch.setattr(
+        validated_agent, "execute_repair",
+        lambda *args, **kwargs: repairs.append(args) or (None, None, []),
+    )
+    with workdir_claims.workdir_claim_scope():
+        response = validated_agent._run_validated_agent(
+            runner, agent=seat, config=config, prompt="Review", marker_description="none",
+            validate=lambda text: text, role="reviewer",
+        )
+    assert response.text == "approved review"
+    # Same model: no fallback advance, and agent_max_retries=0 was not needed.
+    assert response.model_used == "Model A"
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[:1] == ["agy"]]
+    assert models == ["Model A"]
+    assert state["expired"] == 1
+    assert repairs == []
+    assert any("retrying the lock wait once" in message for message in logs)
+
+
+def test_validated_agent_second_settings_lock_expiry_raises_transient(tmp_path, monkeypatch):
+    from coding_review_agent_loop import validated_agent, workdir_claims
+
+    seat, state = _lock_contention_seat(tmp_path, monkeypatch, blocked_waits=2)
+    runner = FakeRunner(antigravity_outputs=[("approved review", 0)])
+    config = make_config(tmp_path, reviewer=(seat,), reviewer_seats=(seat,), agent_max_retries=3)
+    repairs: list[object] = []
+    monkeypatch.setattr(
+        validated_agent, "execute_repair",
+        lambda *args, **kwargs: repairs.append(args) or (None, None, []),
+    )
+    with workdir_claims.workdir_claim_scope():
+        with pytest.raises(AgentInvocationError) as caught:
+            validated_agent._run_validated_agent(
+                runner, agent=seat, config=config, prompt="Review", marker_description="none",
+                validate=lambda text: text, role="reviewer",
+            )
+    assert isinstance(caught.value, AgentSettingsLockWaitTimeout)
+    assert caught.value.failure_category == "transient"
+    assert state["expired"] == 2
+    # Neither ordinary retries nor the Model B fallback were spent on contention.
+    assert [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"]] == []
+    assert repairs == []
 
 
 def _initial_plan() -> str:

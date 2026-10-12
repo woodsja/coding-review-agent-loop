@@ -1303,3 +1303,389 @@ def test_gemini_success_does_not_append_migration_guidance(tmp_path, monkeypatch
     result = gm.BACKEND.run(runner, config, "Review", run_id="r")
     assert "2026-06-18" not in result.raw_output  # no guidance on a clean success
     assert "2026-06-18" not in result.text
+
+
+# --- Shared agy settings-lock wait (#1400) ---------------------------------
+
+
+class _SettingsLockHarness:
+    """Fake monotonic clock plus a flock interposer simulating another holder.
+
+    The settings lock reports busy while ``now < release_at``.  ``events`` are
+    ``(time, callback)`` pairs fired as the fake clock passes them.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, *, release_at=0.0):
+        import fcntl
+        import importlib
+
+        # Another test reloads the adapter after collection; patch the active module.
+        self.mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
+        self.settings = tmp_path / "settings.json"
+        self.original_settings = '{"k": "v"}'
+        self.settings.write_text(self.original_settings, encoding="utf-8")
+        self.lock_path = self.settings.with_suffix(".json.lock")
+        self.holder_path = self.lock_path.with_name(self.lock_path.name + ".holder")
+        self.start = 1000.0
+        self.now = self.start
+        self.release_at = self.start + release_at
+        self.events: list[tuple[float, object]] = []
+        self.blocked_polls = 0
+        self.acquired_at: float | None = None
+        monkeypatch.setattr(self.mod, "_antigravity_settings_path", lambda: self.settings)
+        monkeypatch.setattr(self.mod, "_settings_lock_monotonic", lambda: self.now)
+        monkeypatch.setattr(self.mod, "_settings_lock_sleep", self.sleep)
+        real_flock = fcntl.flock
+        lock_name = str(self.lock_path)
+
+        def interposed(handle, operation):
+            if (
+                getattr(handle, "name", None) == lock_name
+                and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+            ):
+                if self.now < self.release_at:
+                    self.blocked_polls += 1
+                    raise BlockingIOError
+                self.acquired_at = self.now
+            return real_flock(handle, operation)
+
+        monkeypatch.setattr(fcntl, "flock", interposed)
+
+    def sleep(self, seconds):
+        assert seconds >= 0
+        self.now += seconds
+        for when, callback in list(self.events):
+            if self.now >= self.start + when:
+                self.events.remove((when, callback))
+                callback()
+
+    def write_holder(self, *, token="tok-a", pid=4242, run_id="run-other",
+                     seat="flash", role="reviewer", turn_bound_seconds=600):
+        import json
+
+        self.holder_path.write_text(json.dumps({
+            "token": token, "pid": pid, "run_id": run_id, "seat": seat,
+            "role": role, "turn_bound_seconds": turn_bound_seconds,
+        }), encoding="utf-8")
+
+    def config(self, tmp_path, **overrides):
+        agy_dir = tmp_path / "agy"
+        agy_dir.mkdir(parents=True, exist_ok=True)
+        return make_config(tmp_path, antigravity_dir=agy_dir, quiet=False, **overrides)
+
+
+def _agy_commands(runner):
+    return [command for command, _ in runner.commands if command[:1] == ["agy"]]
+
+
+def test_settings_lock_budget_helpers_cover_reviewer_repair_and_explicit_timeouts(
+    tmp_path, monkeypatch
+):
+    import importlib
+
+    agy_mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
+
+    reviewer = make_config(tmp_path, antigravity_print_timeout_seconds=600, repair_timeout_seconds=120)
+    repair = make_config(tmp_path, antigravity_print_timeout_seconds=60, repair_timeout_seconds=900)
+    tiny = make_config(tmp_path, antigravity_print_timeout_seconds=1, repair_timeout_seconds=1)
+    assert agy_mod.settings_lock_turn_bound_seconds(reviewer) == 600
+    assert agy_mod.settings_lock_turn_bound_seconds(repair) == 900
+    # An explicit coder/reviewer turn timeout above the print timeout wins.
+    assert agy_mod.settings_lock_turn_bound_seconds(reviewer, 1500) == 1500
+    assert agy_mod.settings_lock_turn_bound_seconds(reviewer, None) == 600
+    assert agy_mod.settings_lock_wait_budget_seconds(600) == 600 + agy_mod.SETTINGS_LOCK_WAIT_MARGIN_SECONDS
+    assert agy_mod.settings_lock_wait_budget_seconds(1500) == 1680
+    assert agy_mod.settings_lock_wait_budget_seconds(
+        agy_mod.settings_lock_turn_bound_seconds(tiny)
+    ) == 181
+    # Never below the floor, even with a smaller margin.
+    assert agy_mod.SETTINGS_LOCK_WAIT_FLOOR_SECONDS == 120
+    monkeypatch.setattr(agy_mod, "SETTINGS_LOCK_WAIT_MARGIN_SECONDS", 0)
+    assert agy_mod.settings_lock_wait_budget_seconds(
+        agy_mod.settings_lock_turn_bound_seconds(tiny)
+    ) == 120
+    assert agy_mod.settings_lock_wait_budget_seconds(600) == 600
+    # The legacy constant remains importable as an alias of the floor.
+    assert agy_mod.SETTINGS_LOCK_WAIT_SECONDS == agy_mod.SETTINGS_LOCK_WAIT_FLOOR_SECONDS
+
+
+def test_settings_lock_waiter_outlasts_a_300s_holder_within_its_turn_bound(
+    tmp_path, monkeypatch, capsys
+):
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=300)
+    harness.write_holder(turn_bound_seconds=600)
+    seen_settings: list[str] = []
+
+    class Runner(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            seen_settings.append(harness.settings.read_text(encoding="utf-8"))
+            assert harness.acquired_at is not None  # agy never starts before the lock
+            return super().run_with_log(args, **kwargs)
+
+    runner = Runner(antigravity_outputs=[("the review", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    result = harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer")
+
+    assert result.text == "the review"
+    assert len(_agy_commands(runner)) == 1
+    assert harness.acquired_at == pytest.approx(harness.start + 300, abs=0.5)
+    assert '"k": "v"' in seen_settings[0] and seen_settings[0] != harness.original_settings
+    assert harness.settings.read_text(encoding="utf-8") == harness.original_settings
+    err = capsys.readouterr().err
+    assert "waiting for shared agy settings lock (holder pid 4242, run run-other" in err
+    assert "acquired shared agy settings lock after 300." in err
+
+
+def test_settings_lock_waiter_honors_a_longer_advertised_holder_bound(
+    tmp_path, monkeypatch, capsys
+):
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=2000)
+    harness.write_holder(turn_bound_seconds=2400)
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    result = harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer")
+    assert result.text == "ok"
+    assert harness.acquired_at == pytest.approx(harness.start + 2000, abs=0.5)
+    assert "turn bound 2400s; allowing 2580s" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "record",
+    [None, "{not json", '{"token": "t", "turn_bound_seconds": -5}',
+     '{"token": "t", "turn_bound_seconds": "Infinity"}',
+     '{"token": "t", "turn_bound_seconds": 1e9}',
+     '{"token": "t", "turn_bound_seconds": true}'],
+)
+def test_settings_lock_waiter_falls_back_to_own_budget_for_unknown_or_untrusted_holder(
+    tmp_path, monkeypatch, capsys, record
+):
+    from coding_review_agent_loop.errors import AgentSettingsLockWaitTimeout
+
+    # Own budget: 600 + 180 = 780s.  The holder never releases in time.
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=5000)
+    if record is not None:
+        harness.holder_path.write_text(record, encoding="utf-8")
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    with pytest.raises(AgentSettingsLockWaitTimeout) as caught:
+        harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer")
+    assert caught.value.waited_seconds == pytest.approx(780, abs=0.5)
+    assert caught.value.holder_turn_bound_seconds is None
+    err = capsys.readouterr().err
+    if record is None or record == "{not json":
+        assert "unknown holder; allowing 780s" in err
+    else:
+        assert "turn bound unknown; allowing 780s" in err
+    assert _agy_commands(runner) == []
+
+
+def test_settings_lock_window_restarts_per_holder_and_overall_cap_fires(
+    tmp_path, monkeypatch, capsys
+):
+    from coding_review_agent_loop.errors import AgentSettingsLockWaitTimeout
+
+    # Each holder stays inside its own 780s allowance; the queue does not.
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=1400)
+    harness.write_holder(token="tok-a", pid=1, run_id="run-a")
+    harness.events.append((700, lambda: harness.write_holder(token="tok-b", pid=2, run_id="run-b")))
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    assert harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer").text == "ok"
+    assert harness.acquired_at == pytest.approx(harness.start + 1400, abs=0.5)
+    err = capsys.readouterr().err
+    assert "passed to a new holder (holder pid 2, run run-b" in err
+
+    # A queue of holders that each stay inside 780s still hits 3 x 780s.
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=10_000)
+    harness.write_holder(token="tok-0", pid=10)
+    for index in range(1, 6):
+        harness.events.append(
+            (700 * index, lambda index=index: harness.write_holder(token=f"tok-{index}", pid=10 + index))
+        )
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    with pytest.raises(AgentSettingsLockWaitTimeout, match="overall contention cap") as caught:
+        harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer")
+    assert caught.value.waited_seconds == pytest.approx(3 * 780, abs=0.5)
+    assert _agy_commands(runner) == []
+
+
+def test_settings_lock_overall_cap_is_never_shorter_than_a_long_holder_allowance(
+    tmp_path, monkeypatch
+):
+    # A short first holder, then a 2400s holder: the cap follows the largest
+    # allowance seen (3 x 2580s), so the long holder is waited out.
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=100 + 2500)
+    harness.write_holder(token="short", turn_bound_seconds=60)
+    harness.events.append((100, lambda: harness.write_holder(token="long", turn_bound_seconds=2400)))
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    assert harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer").text == "ok"
+    assert harness.acquired_at == pytest.approx(harness.start + 2600, abs=0.5)
+
+
+def test_settings_lock_timeout_is_typed_transient_and_leaves_holder_state_untouched(
+    tmp_path, monkeypatch
+):
+    import os
+    from coding_review_agent_loop.errors import AgentInvocationError, AgentSettingsLockWaitTimeout
+
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=10_000)
+    harness.write_holder(token="active", pid=777, run_id="run-active", seat="opus",
+                         role="coder", turn_bound_seconds=600)
+    holder_before = harness.holder_path.read_text(encoding="utf-8")
+    opened: list[object] = []
+    real_open = type(harness.lock_path).open
+
+    def tracking_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if str(path) == str(harness.lock_path):
+            opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(type(harness.lock_path), "open", tracking_open)
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600,
+                            active_reviewer_seat_id="flash")
+    with pytest.raises(AgentSettingsLockWaitTimeout) as caught:
+        harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer")
+    error = caught.value
+    assert isinstance(error, AgentInvocationError)
+    assert error.failure_category == "transient"
+    assert (error.holder_pid, error.holder_run_id, error.holder_seat, error.holder_role) == (
+        777, "run-active", "opus", "coder"
+    )
+    assert error.holder_turn_bound_seconds == 600
+    message = str(error)
+    assert message.startswith("flash waited 780s for the shared agy settings lock")
+    assert "holder pid 777, run run-active" in message
+    assert "settings lock" in message and "outage" not in message
+    # No agy command, settings byte-identical, the active holder's record kept,
+    # the lock descriptor closed and no stray temp records.
+    assert _agy_commands(runner) == []
+    assert harness.settings.read_text(encoding="utf-8") == harness.original_settings
+    assert harness.holder_path.read_text(encoding="utf-8") == holder_before
+    assert opened and all(handle.closed for handle in opened)
+    assert not [name for name in os.listdir(tmp_path) if name.endswith(".tmp")]
+
+
+def test_settings_lock_holder_record_lifecycle(tmp_path, monkeypatch):
+    import fcntl
+    import json
+    import os
+
+    harness = _SettingsLockHarness(tmp_path, monkeypatch)
+    order: list[str] = []
+    real_flock = fcntl.flock
+
+    def ordered_flock(handle, operation):
+        if getattr(handle, "name", None) == str(harness.lock_path) and operation == fcntl.LOCK_UN:
+            order.append(
+                "unlock:"
+                + ("record" if harness.holder_path.exists() else "no-record")
+                + ":" + ("restored" if harness.settings.read_text(encoding="utf-8") == harness.original_settings else "injected")
+            )
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", ordered_flock)
+    published: list[dict] = []
+
+    class Runner(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            published.append(json.loads(harness.holder_path.read_text(encoding="utf-8")))
+            return super().run_with_log(args, **kwargs)
+
+    config = harness.config(tmp_path, active_reviewer_seat_id="flash")
+    harness.mod.AntigravityBackend().run(
+        Runner(antigravity_outputs=[("ok", 0)]), config, "Review.", run_id="run-me", role="reviewer"
+    )
+    assert published[0]["pid"] == os.getpid()
+    assert published[0]["run_id"] == "run-me"
+    assert published[0]["seat"] == "flash"
+    assert published[0]["role"] == "reviewer"
+    assert published[0]["turn_bound_seconds"] == 600
+    assert published[0]["token"]
+    # Removed by its owner after the settings restore and before unlock.
+    assert order == ["unlock:no-record:restored"]
+    assert not harness.holder_path.exists()
+
+    # The runner raising still removes the owner's record before unlock.
+    order.clear()
+
+    class Raising(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            raise RuntimeError("agy crashed")
+
+    with pytest.raises(RuntimeError, match="agy crashed"):
+        harness.mod.AntigravityBackend().run(Raising(), config, "Review.", role="reviewer")
+    assert order == ["unlock:no-record:restored"]
+
+    # A record that no longer carries this invocation's token is left alone.
+    order.clear()
+
+    class Replacing(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            harness.write_holder(token="someone-else")
+            return super().run_with_log(args, **kwargs)
+
+    harness.mod.AntigravityBackend().run(
+        Replacing(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer"
+    )
+    assert json.loads(harness.holder_path.read_text(encoding="utf-8"))["token"] == "someone-else"
+    harness.holder_path.unlink()
+
+
+def test_settings_lock_holder_record_io_failures_are_only_logged(tmp_path, monkeypatch, capsys):
+    harness = _SettingsLockHarness(tmp_path, monkeypatch)
+
+    def failing_publish(path, holder):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(harness.mod, "_publish_settings_lock_holder", failing_publish)
+    harness.write_holder(token="foreign")  # stale record owned by someone else
+    config = harness.config(tmp_path)
+    result = harness.mod.AntigravityBackend().run(
+        FakeRunner(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer"
+    )
+    assert result.text == "ok"
+    assert "could not publish the shared agy settings lock holder record: disk full" in capsys.readouterr().err
+    # A failed publish never removes a record it does not own.
+    assert harness.holder_path.exists()
+    assert harness.settings.read_text(encoding="utf-8") == harness.original_settings
+    harness.holder_path.unlink()
+
+    monkeypatch.undo()
+    harness = _SettingsLockHarness(tmp_path, monkeypatch)
+
+    def failing_remove(path, token):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(harness.mod, "_remove_own_settings_lock_holder", failing_remove)
+    result = harness.mod.AntigravityBackend().run(
+        FakeRunner(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer"
+    )
+    assert result.text == "ok"
+    assert "could not remove its shared agy settings lock holder record: read-only" in capsys.readouterr().err
+    assert harness.settings.read_text(encoding="utf-8") == harness.original_settings
+
+
+def test_settings_lock_crashed_holder_record_does_not_delay_the_waiter(tmp_path, monkeypatch):
+    import json
+
+    # The holder died: its record remains but the kernel released the flock.
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=0)
+    harness.write_holder(token="dead", pid=99999, turn_bound_seconds=2400)
+    seen: list[dict] = []
+
+    class Runner(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            seen.append(json.loads(harness.holder_path.read_text(encoding="utf-8")))
+            return super().run_with_log(args, **kwargs)
+
+    config = harness.config(tmp_path)
+    assert harness.mod.AntigravityBackend().run(
+        Runner(antigravity_outputs=[("ok", 0)]), config, "Review.", role="reviewer"
+    ).text == "ok"
+    assert harness.blocked_polls == 0
+    assert harness.now == harness.start
+    assert seen[0]["token"] != "dead"  # overwritten by the new holder
+    assert not harness.holder_path.exists()

@@ -5700,12 +5700,13 @@ def run_pr_loop(
                     agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
                 ]
                 # A host/account outage affects every seat of that backend.
-                # Model access and one seat's fallback exhaustion remain local.
+                # Model access, one seat's fallback exhaustion and shared agy
+                # settings-lock contention (#1400) remain local to the seat.
                 outage_backends = {
                     seat_backend(reviewer)
                     for reviewer, failure in unavailable_reviewer_failures.items()
                     if any(phrase in str(failure).lower() for phrase in (
-                        "backend outage", "provider outage", "settings lock", "cli not found"
+                        "backend outage", "provider outage", "cli not found"
                     ))
                 }
                 if outage_backends:

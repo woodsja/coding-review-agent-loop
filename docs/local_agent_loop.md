@@ -636,8 +636,20 @@ reconfigured board, or a backend swap on an inherited seat set gets no
 exception. Without these flags nothing changes.
 Legacy `--reviewer agy` and `--antigravity-models` still describe one fallback
 reviewer. Same-account Antigravity seats share quota state and take turns under
-the host settings lock; lock waits are visible and bounded separately from the
-agent turn timeout.
+the host settings lock, which every agy turn on the host (any repository) holds
+for its whole turn. A waiting turn logs who holds the lock (PID, run ID, seat,
+role and advertised turn bound, or `unknown holder`) and waits that holder's
+advertised turn bound plus a 180s margin, falling back to its own turn bound
+(the larger of `--antigravity-print-timeout-seconds`, the repair timeout and the
+turn timeout) plus the margin for an unknown holder, and never less than 120s.
+The window restarts for each new holder, under an overall cap of three times
+the largest allowance seen. An expired wait is a transient, seat-local failure:
+the validated turn retries the wait once in place (without spending
+`--agent-max-retries` or advancing the model chain), and if that also expires
+only the waiting seat is reported unavailable, never every Antigravity seat as
+a backend outage. Direct Antigravity format repair gets the same one re-wait
+and records an exhausted wait as `settings_lock_contention`, without trying
+another repair model.
 
 ### Changing the PR reviewer board mid-run
 
@@ -981,7 +993,10 @@ Gemini takes a read-only `HEAD` and exact `git status --porcelain` snapshot
 immediately before `run_with_log`, then lazily takes the after snapshot only for
 an otherwise eligible candidate. Antigravity takes the before snapshot after
 acquiring both the settings lock and the exclusive `GEMINI.md` lock, before
-tool-owned injection. It invokes the backend, removes the injected prefix in a
+tool-owned injection. The settings-lock holder publishes a best-effort holder
+record beside the lock (`settings.json.lock.holder`) right after acquiring it
+and removes it, only if the record still carries its own token, after settings
+restoration and before unlocking. It invokes the backend, removes the injected prefix in a
 `finally` path, parses the candidate, and takes the after snapshot before
 releasing either lock. Reviewer and coder paths therefore cannot observe a peer's
 injected prompt as worktree activity. Isolated `role=repair` / `run_repair`
