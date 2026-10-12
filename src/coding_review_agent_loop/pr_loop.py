@@ -61,6 +61,7 @@ from .board_change import (
     identity_from_config,
 )
 from .pr_board_state import (
+    authenticate_named_legacy_pr_entry,
     check_lineage_floor,
     qualification_board_check,
     resolve_pr_board_state,
@@ -837,6 +838,20 @@ def run_pr_loop(
             runner,
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
+        )
+        # A named board adopting unanchored legacy history (an issue-created
+        # PR's initial coder record, #1365) admits only records written by the
+        # authenticated actor.  This runs on every entry, independent of the
+        # floor and amendment block below, and before any PR write.
+        authenticate_named_legacy_pr_entry(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            comments=initial_pr_context.comments,
+            owning_issue_number=(
+                issue_context.number if issue_context is not None else None
+            ),
+            pr_body=initial_pr_context.metadata.body,
         )
         # The first PR write (the retained-label release, managed-CI fresh
         # authorization, activation, or any post) follows this point.  Whenever

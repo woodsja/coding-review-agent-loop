@@ -20387,3 +20387,160 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     assert "non-authoritative diagnostic, not qualification" in noted[0]
     # Never qualification: the orchestrator's exact-head dispatch still runs once.
     assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
+
+
+# --- Named reviewer seats on issue/task-created PRs (#1365) ------------------
+
+
+def _named_1352_seats(tmp_path):
+    """The #1352 board: sol=codex, flash=antigravity, opus-low=antigravity."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    seats = []
+    for name, backend, model in (
+        ("sol", "codex", "gpt-6.1-sol"),
+        ("flash", "antigravity", "Gemini 3.8 Flash (High)"),
+        ("opus-low", "antigravity", "Claude Opus 5.5 (Low)"),
+    ):
+        workdir = tmp_path / name
+        workdir.mkdir(exist_ok=True)
+        seats.append(SeatAgent(ReviewerSeat(name, backend, (model,)), workdir))
+    return tuple(seats)
+
+
+def _queue_named_reviews(outputs, seats, review):
+    from coding_review_agent_loop.agents.registry import agent_signature
+
+    for seat in seats:
+        key = "codex_outputs" if seat.backend == "codex" else "antigravity_outputs"
+        outputs.setdefault(key, []).append(review(state="approved", reviewer=agent_signature(seat)))
+
+
+def _serve_named_pr_rest(runner):
+    """Serve PR #77's REST history from the PR's own comments, not issue #56's."""
+    runner.issue_comments_by_number[77] = runner.pr_payload.setdefault("comments", [])
+    return runner
+
+
+def _named_pr_records(runner):
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    return _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload.get("comments", [])],
+        flow="pr",
+    )
+
+
+def _assert_named_issue_created_pr(runner, config, expected_root, *, phase="authoritative"):
+    """The initial coder record keeps its legacy shape; later records are anchored."""
+    from coding_review_agent_loop.board_change import BoardIdentity
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+
+    records = _named_pr_records(runner)
+    initial, *later = records
+    assert (initial.metadata.flow, initial.metadata.role, initial.metadata.round_number) == (
+        "pr", "coder", 1,
+    )
+    assert initial.metadata.phase == phase
+    assert initial.metadata.seat_binding is None
+    assert initial.metadata.pr_board_root is None
+    assert initial.metadata.pr_board_identity is None
+    assert initial.metadata.pr_board_binding_init is None
+    reviews = [record for record in later if record.metadata.role == "reviewer"]
+    assert sorted(record.metadata.agent for record in reviews) == ["flash", "opus-low", "sol"]
+    assert all(record.metadata.pr_board_root is not None for record in later)
+    assert {BoardIdentity.from_payload(r.metadata.pr_board_root) for r in later} == {expected_root}
+    assert all(r.metadata.seat_binding == reviewer_seat_binding(config) for r in reviews)
+    assert reviewer_seat_binding(config)["version"] == 1
+    # The authenticated entry check read the PR and the owning issue's REST
+    # history before any review was posted.
+    rest_reads = [
+        cmd[2] for cmd, _cwd in runner.commands
+        if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and "/comments?per_page=100&page=1" in cmd[2]
+    ]
+    assert "repos/OWNER/REPO/issues/77/comments?per_page=100&page=1" in rest_reads
+
+
+def test_named_plan_first_issue_handoff_reaches_pr_review_with_legacy_coder_record(tmp_path):
+    """Rows plan-first-handoff-named: the #1352 board hands off to PR review."""
+    from coding_review_agent_loop.board_change import identity_from_config
+    from coding_review_agent_loop.plan_verification import derive_plan_verification_context
+    from coding_review_agent_loop.reviewer_seats import resolve_plan_handoff_board
+
+    seats = _named_1352_seats(tmp_path)
+    outputs = {
+        "claude_outputs": [
+            "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    }
+    _queue_named_reviews(outputs, seats, structured_plan_review)
+    _queue_named_reviews(outputs, seats, structured_pr_review)
+    runner = _serve_named_pr_rest(FakeRunner(
+        **outputs, authenticated_actor=("agent-loop", 4242), serve_rest_issue_comments=True,
+    ))
+    config = make_config(tmp_path, reviewer=seats, reviewer_seats=seats, pre_review_tests=False)
+
+    assert run_issue_loop(
+        runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True,
+    ) == 0
+
+    plan = derive_plan_verification_context(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments],
+        issue_number=56,
+    )
+    handoff_board = resolve_plan_handoff_board(config, plan)
+    assert handoff_board.inherited and not handoff_board.changed
+    assert tuple(handoff_board.config.reviewer) == seats
+    _assert_named_issue_created_pr(runner, config, identity_from_config(handoff_board.config))
+    assert "repos/OWNER/REPO/issues/56/comments?per_page=100&page=1" in [
+        cmd[2] for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"] and len(cmd) > 2
+    ]
+
+
+def test_named_direct_issue_reaches_pr_review_with_anchored_board(tmp_path):
+    """Row direct-issue-named: the structured initial coder record."""
+    from coding_review_agent_loop.board_change import identity_from_config
+
+    seats = _named_1352_seats(tmp_path)
+    outputs = {"claude_outputs": [structured_issue_implementation(pr_number=77)]}
+    _queue_named_reviews(outputs, seats, structured_pr_review)
+    runner = _serve_named_pr_rest(FakeRunner(
+        **outputs, authenticated_actor=("agent-loop", 4242), serve_rest_issue_comments=True,
+    ))
+    config = make_config(tmp_path, reviewer=seats, reviewer_seats=seats, pre_review_tests=False)
+
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    _assert_named_issue_created_pr(runner, config, identity_from_config(config))
+    (initial, *_rest) = _named_pr_records(runner)
+    assert initial.metadata.raw_structured_coder_response is not None
+    assert "repos/OWNER/REPO/issues/56/comments?per_page=100&page=1" in [
+        cmd[2] for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"] and len(cmd) > 2
+    ]
+
+
+def test_named_task_reaches_pr_review_with_anchored_board(tmp_path):
+    """Row task-named: the freeform initial coder record of task mode."""
+    from coding_review_agent_loop.board_change import identity_from_config
+    from coding_review_agent_loop.cli import run_task_loop
+
+    seats = _named_1352_seats(tmp_path)
+    outputs = {
+        "claude_outputs": ["Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+    }
+    _queue_named_reviews(outputs, seats, structured_pr_review)
+    # A task-origin PR links no issue, so only the PR side is authenticated.
+    runner = _serve_named_pr_rest(FakeRunner(
+        **outputs, authenticated_actor=("agent-loop", 4242), pr_payload={"body": "Task PR."},
+    ))
+    config = make_config(tmp_path, reviewer=seats, reviewer_seats=seats, pre_review_tests=False)
+
+    assert run_task_loop(runner, task_text="Add a /healthz endpoint.", config=config) == 0
+
+    _assert_named_issue_created_pr(runner, config, identity_from_config(config))
+    assert not any(
+        "issues/56/comments?per_page" in cmd[2]
+        for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"] and len(cmd) > 2
+    )

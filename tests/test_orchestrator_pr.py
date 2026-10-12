@@ -21975,3 +21975,333 @@ def test_rejection_after_semantic_correction_still_publishes_the_audit_note(tmp_
     assert "run 4712 on `bypass-head`" in notes[0]
     assert "coder response for this turn was rejected" in notes[0]
     assert runner.orchestrator_dispatches == []
+
+
+# --- Named reviewer seats on issue-created PRs (#1365) -----------------------
+
+_ACTOR_1365 = ("agent-loop", 4242)
+_FOREIGN_1365 = 999
+_WRITE_PREFIXES_1365 = (
+    ["gh", "pr", "comment"], ["gh", "pr", "edit"], ["gh", "pr", "ready"], ["gh", "pr", "merge"],
+    ["gh", "issue", "comment"], ["gh", "issue", "edit"], ["gh", "label"], ["gh", "workflow"],
+)
+
+
+class _PrLoopStopped1365(Exception):
+    pass
+
+
+def _seats_1365(tmp_path, *names):
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    known = {
+        "sol": ("codex", "gpt-6.1-sol"),
+        "flash": ("antigravity", "Gemini 3.8 Flash (High)"),
+        "opus-low": ("antigravity", "Claude Opus 5.5 (Low)"),
+        "opus-high": ("antigravity", "Claude Opus 5.5 (High)"),
+    }
+    seats = []
+    for name in names:
+        workdir = tmp_path / name
+        workdir.mkdir(exist_ok=True)
+        backend, model = known[name]
+        seats.append(SeatAgent(ReviewerSeat(name, backend, (model,)), workdir))
+    return tuple(seats)
+
+
+def _named_config_1365(tmp_path, seats, **overrides):
+    return make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats, pre_review_tests=False,
+        agent_max_retries=0, **overrides,
+    )
+
+
+def _queue_1365(runner, seats, review=structured_pr_review):
+    from coding_review_agent_loop.agents.registry import agent_signature
+
+    for seat in seats:
+        outputs = runner.codex_outputs if seat.backend == "codex" else runner.antigravity_outputs
+        outputs.append(review(state="approved", reviewer=agent_signature(seat)))
+
+
+def _records_1365(runner):
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    return _extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.pr_payload.get("comments", [])],
+        flow="pr",
+    )
+
+
+def _agents_1365(runner, start=0):
+    return [cmd[0] for cmd, _cwd in runner.commands[start:] if cmd and cmd[0] in {"claude", "codex", "agy"}]
+
+
+def _writes_1365(runner, start=0):
+    return [
+        cmd for cmd, _cwd in runner.commands[start:]
+        if any(cmd[:len(prefix)] == prefix for prefix in _WRITE_PREFIXES_1365)
+        or (cmd[:2] == ["gh", "api"] and any(flag in cmd for flag in ("POST", "PATCH", "DELETE", "PUT")))
+    ]
+
+
+def _links_1365(runner):
+    from coding_review_agent_loop.board_change import BOARD_CHANGE_LINK_HEADING
+
+    return [
+        c["body"] for c in runner.pr_payload.get("comments", [])
+        if c["body"].startswith(BOARD_CHANGE_LINK_HEADING)
+    ]
+
+
+def _audits_1365(runner):
+    from coding_review_agent_loop.plan_verification import BOARD_CHANGE_AUDIT_HEADING
+
+    return [
+        c["body"] for c in (*runner.pr_payload.get("comments", []), *runner.issue_comments)
+        if BOARD_CHANGE_AUDIT_HEADING in c["body"]
+    ]
+
+
+def _serve_pr_rest_1365(runner):
+    """Serve PR #77's REST history from the PR's own comments, not issue #56's."""
+    runner.issue_comments_by_number[77] = runner.pr_payload.setdefault("comments", [])
+    return runner
+
+
+def _affected_issue_created_pr_1365(tmp_path, monkeypatch):
+    """A #1364-shaped PR: a named plan-first run stopped after the initial coder record.
+
+    The issue holds the actor-authored bound plan and canonical handoff
+    record; the PR holds only the actor-authored unbound authoritative coder
+    record at the exact head.
+    """
+    import coding_review_agent_loop.issue_implementation as issue_implementation
+
+    seats = _seats_1365(tmp_path, "sol", "flash", "opus-low")
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_plan_state(summary="Initial plan.", plan_steps=["Make the change."]),
+            "Implemented approved plan.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        pr_payload={"body": "Fixes #56"},
+        authenticated_actor=_ACTOR_1365,
+        serve_rest_issue_comments=True,
+    )
+    _serve_pr_rest_1365(runner)
+    _queue_1365(runner, seats, structured_plan_review)
+    config = _named_config_1365(tmp_path, seats)
+
+    def stopped(*_args, **_kwargs):
+        raise _PrLoopStopped1365("pre-#1375 named PR entry refusal")
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(issue_implementation, "run_pr_loop", stopped)
+        with pytest.raises(_PrLoopStopped1365):
+            run_issue_loop(
+                runner, issue_number=56, config=config, plan_first=True,
+                implement_after_approval=True,
+            )
+    (coder,) = _records_1365(runner)
+    assert (coder.metadata.role, coder.metadata.phase, coder.metadata.subject) == (
+        "coder", "authoritative", runner.pr_payload.get("headRefOid", "abc123"),
+    )
+    assert coder.metadata.seat_binding is None and coder.metadata.pr_board_root is None
+    return runner, seats, config
+
+
+def test_affected_issue_created_named_pr_recovers_into_review_by_rerun(tmp_path, monkeypatch):
+    """Row affected-pr-recovery: a #1364-shaped PR resumes with no backfill."""
+    runner, seats, config = _affected_issue_created_pr_1365(tmp_path, monkeypatch)
+    history = [dict(comment) for comment in runner.pr_payload["comments"]]
+    issue_history = [dict(comment) for comment in runner.issue_comments]
+    _queue_1365(runner, seats)
+    start = len(runner.commands)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # The entry check read the PR and the owning issue through REST first.
+    reads = [cmd[2] for cmd, _cwd in runner.commands[start:] if cmd[:2] == ["gh", "api"]]
+    assert "repos/OWNER/REPO/issues/77/comments?per_page=100&page=1" in reads
+    assert "repos/OWNER/REPO/issues/56/comments?per_page=100&page=1" in reads
+    # The coder record at the exact head is adopted: the coder never reruns
+    # and every seat reviews that head.
+    assert _agents_1365(runner, start) == ["codex", "agy", "agy"]
+    coder, *later = _records_1365(runner)
+    assert coder.metadata.role == "coder" and coder.metadata.seat_binding is None
+    assert [(r.metadata.role, r.metadata.agent, r.metadata.subject, r.metadata.state) for r in later] == [
+        ("reviewer", "sol", "abc123", "approved"),
+        ("reviewer", "flash", "abc123", "approved"),
+        ("reviewer", "opus-low", "abc123", "approved"),
+    ]
+    assert all(r.metadata.pr_board_root is not None for r in later)
+    # Historical comments are untouched and nothing was backfilled.
+    assert runner.pr_payload["comments"][:len(history)] == history
+    assert runner.issue_comments[:len(issue_history)] == issue_history
+    assert not any(
+        cmd[:2] == ["gh", "api"] and ("PATCH" in cmd or "DELETE" in cmd)
+        for cmd, _cwd in runner.commands[start:]
+    )
+    assert _links_1365(runner) == [] and _audits_1365(runner) == []
+
+
+def test_coder_only_named_pr_under_changed_board_posts_one_audit_and_no_link(tmp_path, monkeypatch):
+    """Row coder-only-changed-board: the handoff audit, never a lineage link."""
+    runner, _seats, _config = _affected_issue_created_pr_1365(tmp_path, monkeypatch)
+    changed = _seats_1365(tmp_path, "sol", "flash", "opus-high")
+    # The floor is enforced on the changed board and refuses it below three.
+    reduced = _named_config_1365(tmp_path, changed[:2], min_reviewers=3)
+    comments = len(runner.pr_payload["comments"])
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="below the floor of 3"):
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert len(runner.pr_payload["comments"]) == comments
+    assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
+
+    config = _named_config_1365(tmp_path, changed, min_reviewers=3)
+    _queue_1365(runner, changed)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _links_1365(runner) == []
+    (audit,) = _audits_1365(runner)
+    assert "opus-high" in audit
+    reviews = [r.metadata for r in _records_1365(runner) if r.metadata.role == "reviewer"]
+    assert sorted(m.agent for m in reviews) == ["flash", "opus-high", "sol"]
+    # A rerun derives the same board: no second audit record and no link.
+    _queue_1365(runner, changed)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_audits_1365(runner)) == 1 and _links_1365(runner) == []
+
+
+@pytest.mark.parametrize("floor", [None, 3], ids=["no-floor", "floor"])
+def test_foreign_legacy_coder_record_is_refused_at_named_pr_entry(tmp_path, monkeypatch, floor):
+    """Row foreign-coder-refused: the unconditional entry check, with and without a floor."""
+    runner, seats, config = _affected_issue_created_pr_1365(tmp_path, monkeypatch)
+    (coder,) = runner.pr_payload["comments"]
+    coder["_rest_author_id"] = _FOREIGN_1365
+    coder["author"] = {"login": "intruder"}
+    if floor is not None:
+        config = dataclasses.replace(config, min_reviewers=floor)
+    _queue_1365(runner, seats)
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="Human decision required") as refused:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "coder round record" in str(refused.value) and "intruder" in str(refused.value)
+    assert len(runner.pr_payload["comments"]) == 1
+    assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
+
+
+def test_foreign_canonical_handoff_record_is_refused_at_named_pr_entry(tmp_path, monkeypatch):
+    """Row foreign-handoff-refused: no floor, no amendments and no links."""
+    from coding_review_agent_loop.issue_pr_handoff import find_latest_issue_pr_handoff
+
+    runner, seats, config = _affected_issue_created_pr_1365(tmp_path, monkeypatch)
+    (handoff_comment,) = [
+        c for c in runner.issue_comments if "AGENT_ISSUE_PR_HANDOFF" in c["body"]
+    ]
+    selected = find_latest_issue_pr_handoff(
+        [SimpleNamespace(body=c["body"]) for c in runner.issue_comments],
+        issue_number=56, repo="OWNER/REPO",
+    )
+    assert selected.pr_number == 77 and selected.flow == "approved-plan-implementation"
+    handoff_comment["_rest_author_id"] = _FOREIGN_1365
+    handoff_comment["author"] = {"login": "intruder"}
+    _queue_1365(runner, seats)
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="Human decision required") as refused:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "handoff record on issue #56" in str(refused.value)
+    assert len(runner.pr_payload["comments"]) == 1
+    assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
+
+
+@pytest.mark.parametrize("head", ["abc123", "def456"], ids=["exact-head", "stale-head"])
+def test_named_pr_adopts_the_legacy_coder_record_only_at_its_exact_head(tmp_path, monkeypatch, head):
+    """Row wrong-head-coder: a coder record at another head is not this round's output."""
+    from coding_review_agent_loop.round_state import pr_resume_needs_author_admission
+
+    runner, seats, config = _affected_issue_created_pr_1365(tmp_path, monkeypatch)
+    runner.pr_payload["headRefOid"] = head
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
+    # A record-less live head is the existing unrecorded-head path.
+    assert pr_resume_needs_author_admission(comments, head) is (head != "abc123")
+    _queue_1365(runner, seats)
+    start = len(runner.commands)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    reviews = [r.metadata for r in _records_1365(runner) if r.metadata.role == "reviewer"]
+    assert {m.subject for m in reviews} == {head}
+    prompts = [cmd[-1] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"codex", "agy"}]
+    assert len(prompts) == 3
+    # Only the exact-head coder record reaches the reviewers as the round's
+    # coder output; the stale one is never shown for the live head.
+    assert all(("Implemented approved plan." in prompt) is (head == "abc123") for prompt in prompts)
+
+
+def _issue_created_named_pr_after_review_1365(tmp_path):
+    """A direct-issue named PR after one approved, anchored reviewer round."""
+    seats = _seats_1365(tmp_path, "sol", "flash", "opus-low")
+    runner = _serve_pr_rest_1365(FakeRunner(
+        claude_outputs=[structured_issue_implementation(pr_number=77)],
+        pr_payload={"body": "Fixes #56"},
+        authenticated_actor=_ACTOR_1365,
+        serve_rest_issue_comments=True,
+    ))
+    _queue_1365(runner, seats)
+    assert run_issue_loop(runner, issue_number=56, config=_named_config_1365(tmp_path, seats)) == 0
+    coder, *later = _records_1365(runner)
+    assert coder.metadata.role == "coder" and coder.metadata.pr_board_root is None
+    assert later and all(r.metadata.pr_board_root is not None for r in later)
+    return runner
+
+
+def test_issue_created_named_pr_changes_board_mid_run_and_merges_the_approved_head(tmp_path):
+    """Row midrun-board-change: one link, the new seat approves, one exact-head merge."""
+    from coding_review_agent_loop.board_change import BoardIdentity
+
+    runner = _issue_created_named_pr_after_review_1365(tmp_path)
+    changed = _seats_1365(tmp_path, "sol", "flash", "opus-high")
+    config = _named_config_1365(tmp_path, changed, min_reviewers=3)
+    _queue_1365(runner, changed)
+    start = len(runner.commands)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    (link,) = _links_1365(runner)
+    assert "opus-high" in link and "opus-low" in link
+    assert "agy" in _agents_1365(runner, start)
+    replacement = [
+        r.metadata for r in _records_1365(runner)
+        if r.metadata.role == "reviewer" and r.metadata.agent == "opus-high"
+    ]
+    assert replacement and all(m.state == "approved" and m.subject == "abc123" for m in replacement)
+    # The initial coder record never pinned the board: every later record keeps
+    # the handoff root while the run's identity is the changed board.
+    roots = {
+        BoardIdentity.from_payload(r.metadata.pr_board_root).names
+        for r in _records_1365(runner) if r.metadata.pr_board_root is not None
+    }
+    assert roots == {("sol", "flash", "opus-low")}
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+    # The same board with merging enabled posts no second link and merges
+    # exactly the approved head.
+    _queue_1365(runner, changed)
+    merging = dataclasses.replace(config, auto_merge=True)
+    assert run_pr_loop(runner, pr_number=77, config=merging) == 0
+    assert len(_links_1365(runner)) == 1
+    merges = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]]
+    assert merges == [
+        ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"]
+    ]
+
+
+def test_issue_created_named_pr_below_floor_board_change_is_refused_before_any_write(tmp_path):
+    """Row floor-still-enforced: an unsigned below-floor board posts nothing."""
+    runner = _issue_created_named_pr_after_review_1365(tmp_path)
+    reduced = _named_config_1365(tmp_path, _seats_1365(tmp_path, "sol", "flash"), min_reviewers=3)
+    comments = len(runner.pr_payload["comments"])
+    start = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="below the floor of 3"):
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert len(runner.pr_payload["comments"]) == comments and _links_1365(runner) == []
+    assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []

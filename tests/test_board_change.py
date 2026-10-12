@@ -1394,11 +1394,28 @@ def test_all_reviewers_same_seat_backend_change(tmp_path):
     _qualify(runner, rebound)
 
 
-@pytest.mark.parametrize("defect", ["identity-without-root", "foreign-root", "wrong-identity"])
+@pytest.mark.parametrize(
+    "defect", ["identity-without-root", "foreign-root", "wrong-identity", "mixed-bound-unbound"],
+)
 def test_malformed_board_history_fails_closed(defect):
-    """Row pr-all-reviewers-board-change: malformed board history is never accepted."""
+    """Row pr-all-reviewers-board-change: malformed board history is never accepted.
+
+    Row mixed-legacy-refused (#1365): unanchored history whose unbound coder
+    record is followed by a bound reviewer record is never read as a named board.
+    """
     root = _identity(("a", "codex"), ("b", "claude"))
     other = _identity(("a", "codex"), ("c", "gemini"))
+    if defect == "mixed-bound-unbound":
+        bound_review = _attach_round_metadata(
+            structured_pr_review(reviewer="a"),
+            PostedRoundMetadata(
+                flow="pr", role="reviewer", agent="a", round_number=1, subject="abc123",
+                state="approved", seat_binding=root.seat_binding(),
+            ),
+        )
+        with pytest.raises(AgentLoopError, match="PR history mixes bound and unbound round records"):
+            _resolve([_legacy("coder", "Claude", 1), bound_review], configured=root)
+        return
     if defect == "identity-without-root":
         bad = _attach_round_metadata(
             "x", PostedRoundMetadata(
@@ -2377,7 +2394,9 @@ def test_named_legacy_all_reviewers_signed_reduction(tmp_path, floor, flags):
     with pytest.raises(AgentLoopError, match="below the floor of 3") as refused:
         run_pr_loop(runner, pr_number=77, config=reduced)
     assert len(runner.pr_payload["comments"]) == comments and _agents(runner, before) == []
-    _append(runner, _amendment_from(str(refused.value)))
+    # REST attributes the operator's signed amendment to its own user ID; the
+    # named legacy entry check (#1365) reads every comment's author.
+    _append(runner, _amendment_from(str(refused.value)), author_id=81)
     start = len(runner.commands)
     _queue_reviews(runner, kept)
     assert run_pr_loop(runner, pr_number=77, config=reduced if flags == "reduced" else original) == 0
@@ -4712,3 +4731,63 @@ def test_approved_staged_plan_implemented_under_default_flags_is_not_reopened(tm
         "primary-then-panel", "Codex",
     )
     assert _plan_links(runner) == []
+
+
+# --- Authenticated named-board legacy PR entry (#1365) ---------------------------------
+
+
+def _entry_check(runner, config, bodies, *, owning_issue_number=None):
+    from coding_review_agent_loop.pr_board_state import authenticate_named_legacy_pr_entry
+
+    authenticate_named_legacy_pr_entry(
+        runner, config=config, pr_number=77,
+        comments=[SimpleNamespace(body=body) for body in bodies],
+        owning_issue_number=owning_issue_number,
+    )
+
+
+def _rest_reads(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"]]
+
+
+@pytest.mark.parametrize("case", ["plain-board", "anchored-history", "empty-history", "link-history"])
+def test_named_legacy_entry_check_is_a_no_op_without_unanchored_named_history(tmp_path, case):
+    """Row entry-check-noop: no authenticated read and no refusal."""
+    from coding_review_agent_loop.pr_board_state import named_legacy_entry_required
+
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    named = _named(tmp_path, "codex", flash)
+    root = identity_from_config(named)
+    config, bodies = {
+        "plain-board": (make_config(tmp_path, reviewer=("codex",)), [_legacy("coder", "Claude", 1)]),
+        "anchored-history": (named, [_legacy("coder", "Claude", 1), _record_body(1, root, root)]),
+        "empty-history": (named, []),
+        "link-history": (named, [
+            _legacy("coder", "Claude", 1),
+            _link_body(root, root.digest, root, root, anchor=1, advance=True)[0],
+        ]),
+    }[case]
+    assert named_legacy_entry_required(
+        config, [SimpleNamespace(body=body) for body in bodies]
+    ) is False
+    # A runner that would refuse any authenticated read: nothing is read.
+    runner = FakeRunner(serve_rest_issue_comments=False)
+    runner.default_pr_actor = False
+    _entry_check(runner, config, bodies, owning_issue_number=56)
+    assert runner.commands == []
+
+
+def test_named_legacy_entry_check_requires_actor_authored_records(tmp_path):
+    """The check reads the PR through REST and refuses a foreign coder record."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash)
+    body = _legacy("coder", "Claude", 1)
+    runner = _legacy_runner([body])
+    runner.pr_payload["body"] = "Task PR."
+    _entry_check(runner, config, [body])
+    assert ["gh", "api", "repos/OWNER/REPO/issues/77/comments?per_page=100&page=1"] in _rest_reads(runner)
+
+    foreign = _legacy_runner([body])
+    foreign.pr_payload["comments"][0].update(_rest_author_id=999, author={"login": "intruder"})
+    with pytest.raises(AgentLoopError, match="Human decision required: PR #77 has unanchored"):
+        _entry_check(foreign, config, [body])

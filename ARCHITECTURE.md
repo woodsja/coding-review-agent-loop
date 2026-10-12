@@ -2196,6 +2196,20 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   initialized from configuration by the first durable artifact
   (`pr_board_binding_init`) and compared exactly afterwards. Before that, it
   is compared compatibly (seat ID, order, primary and backend only).
+- **Authenticated named legacy entry (#1365).** Issue, plan-first and task
+  hand-offs post an initial PR coder record with no seat binding and no root,
+  so a named board derives its legacy root from the configured board and the
+  first PR round anchors it. Before that derivation adopts unanchored history,
+  `pr_board_state.authenticate_named_legacy_pr_entry` runs once at
+  `run_pr_loop` entry. It is a top-level call after base resolution and before
+  the floor/amendment block and the first PR write, with no other gate. It
+  applies only when named seats are configured and the PR has unanchored coder,
+  reviewer or summary records and no link. It reads the PR, and the owning issue,
+  with `github.read_authenticated_protocol_comments`. Each such record, the PR
+  contract record, and the latest handoff record naming the PR (compared with
+  the unfiltered `resolve_issue_pr_handoff_lineage` selection) must be authored
+  by the authenticated actor; otherwise it refuses for a human decision.
+  Validators and initial coder-record shapes are unchanged.
 - **Board-change links.** A configured board that differs from the effective
   board in membership, primary, backend, model chain or effort becomes one
   orchestrator-authored link comment: an audit text plus the reserved
