@@ -704,6 +704,49 @@ reviewers, the round the change takes effect from, and the reason
   plain boards, models were never recorded, so the first run adopts the
   configured models; later model changes are recorded.
 
+**Issue-created PRs with named seats (#1365).** An issue, `--plan-first` or task
+run hands off to its PR with an initial coder record that carries no seat binding
+and no board root. That record documents the hand-off; it does not fix the PR
+board. The first reviewer round stamps the handoff board as the PR's root on
+every later record, and later board changes are board-change records as above.
+The `--min-reviewers` and `--min-distinct-providers` floors apply unchanged.
+
+Before a named board adopts PR history that has no board root yet, the PR loop
+runs an authenticated entry check. It runs on every such entry, with or without
+floor flags, signed amendments or board-change records, and before any comment,
+label change, managed-CI write, workdir setup or agent run. The check reads the
+PR, and its owning issue when there is one, through the REST API under the
+authenticated GitHub account. The owning issue is the issue being run, else the
+PR's contract record's primary issue, else the single issue the PR body links.
+Every coder, reviewer and summary round record on the PR must be written by that
+account. The latest issue-to-PR handoff record naming the PR must be the latest
+one that account wrote, with the same comment, PR number, URL and contract hash.
+Anything else stops with `Human decision required` and posts nothing. A plain
+board, a PR whose history already carries a board root, and an empty PR history
+skip the check. Task PRs have no handoff record, so only the PR side is checked.
+
+**Recovering a PR stopped before #1375.** Older versions could stop such a PR
+with `Named PR reviewer board cannot adopt an unbound historical recovery record
+(coder, authoritative)`, as on PR #1364. Rerun `agent-loop pr N` (or resume the
+issue) with the named seats. No metadata backfill is needed and none is offered;
+historical comments are never edited. The rerun:
+
+- passes the authenticated entry check above;
+- verifies the approved plan's board on the owning issue, as for any
+  plan-bound PR;
+- adopts the coder record only when its head is the PR's live head. Reviewers
+  then review that head without rerunning the coder. A coder record for another
+  head is not the current round's coder output; the live head is reviewed as an
+  unrecorded head advance.
+
+If the rerun's board differs from the approved plan's board while the PR still
+has only the coder record, the change happens at the issue-to-PR handoff. The
+orchestrator posts one handoff board-change audit record (reruns do not repeat
+it) and no PR board-change record, and the floors apply to the new board. Once
+reviewer rounds have recorded a board root, a different board posts a PR
+board-change record instead. Mixed history, where unbound and seat-bound records
+appear without a board root, still fails closed.
+
 ### Changing the plan reviewer board mid-run
 
 Plan review (`agent-loop issue N --plan-first`) chooses its board per

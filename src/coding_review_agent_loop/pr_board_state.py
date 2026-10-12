@@ -307,3 +307,127 @@ def qualification_board_check(
                 log(config, f"PR #{pr_number}: {diagnostic}")
 
     return check
+
+
+# Roles whose unanchored records seed a derived legacy root and are adopted as
+# round history (#1365).
+_LEGACY_ENTRY_ROLES = frozenset({"coder", "reviewer", "summary"})
+
+
+def named_legacy_entry_required(config: object, comments: Sequence[object]) -> bool:
+    """Whether a named board would adopt unanchored legacy PR history (#1365).
+
+    True only when named seats are configured and the PR carries PR-flow
+    coder, reviewer or summary records but no root anchor and no board-change
+    link, so the lineage root would come from :func:`derive_legacy_root`.
+    Plain boards, anchored history and empty history need no check.
+    """
+    from .reviewer_seats import reviewer_seat_binding
+
+    if reviewer_seat_binding(config) is None:
+        return False
+    records = _extract_round_metadata_records(comments, flow="pr")
+    if not records:
+        return False
+    if any(record.metadata.pr_board_root is not None for record in records):
+        return False
+    if comments_bear_board_change_links(comments):
+        return False
+    return any(record.metadata.role in _LEGACY_ENTRY_ROLES for record in records)
+
+
+def authenticate_named_legacy_pr_entry(
+    runner: object,
+    *,
+    config: object,
+    pr_number: int,
+    comments: Sequence[object],
+    owning_issue_number: int | None,
+    pr_body: str | None = None,
+) -> None:
+    """Refuse unanchored named-board PR history not written by the actor (#1365).
+
+    Before the PR loop adopts unanchored legacy round records under a named
+    board, every coder, reviewer or summary record and the owning issue's
+    canonical handoff record must be authored by the authenticated actor.
+    The owning issue is chosen as the PR loop chooses it: the caller's issue,
+    else the PR contract's primary issue, else the single issue the PR body
+    links.  Reads only; any failure raises before a PR write or agent
+    invocation.
+    """
+    from .github import parse_linked_issue_numbers, read_authenticated_protocol_comments
+    from .issue_pr_handoff import resolve_issue_pr_handoff_lineage
+    from .pr_contract import find_latest_pr_contract
+    from .pr_loop_support import _cached_trusted_actor
+
+    if not named_legacy_entry_required(config, comments):
+        return
+    repo = getattr(config, "repo")
+    if getattr(config, "dry_run", False) and _cached_trusted_actor(runner) is None:  # type: ignore[arg-type]
+        raise AgentLoopError(
+            f"PR #{pr_number} has unanchored round history under a named reviewer board, but the "
+            "authenticated GitHub actor is unavailable in dry-run mode, so it cannot be admitted."
+        )
+
+    def refuse(detail: str) -> AgentLoopError:
+        return AgentLoopError(
+            f"Human decision required: PR #{pr_number} has unanchored round history under a "
+            f"named reviewer board, and {detail}. Nothing was posted. Only records written by "
+            "the authenticated orchestrator actor can seed a named board."
+        )
+
+    pr_view = read_authenticated_protocol_comments(
+        runner, config=config, surface_kind="pr", number=pr_number  # type: ignore[arg-type]
+    )
+    pr_full = sorted((*pr_view.authored, *pr_view.ignored_foreign), key=lambda c: c.comment_id)
+    for record in _extract_round_metadata_records(pr_full, flow="pr"):
+        if record.metadata.role not in _LEGACY_ENTRY_ROLES:
+            continue
+        comment = pr_full[record.index]
+        if comment.author_id != pr_view.actor_id:
+            raise refuse(
+                f"the {record.metadata.role} round record in comment {comment.comment_id} was "
+                f"written by {comment.author_login}, not {pr_view.actor_login}"
+            )
+    recorded = find_latest_pr_contract(pr_full, repository=repo, pr_number=pr_number)
+    if recorded != find_latest_pr_contract(pr_view.authored, repository=repo, pr_number=pr_number):
+        raise refuse("its PR contract record was not written by the authenticated actor")
+    if owning_issue_number is None and recorded is not None:
+        owning_issue_number = recorded.primary_issue_number
+    if owning_issue_number is None:
+        linked = parse_linked_issue_numbers(pr_body, repo=repo)
+        if len(linked) == 1:
+            owning_issue_number = linked[0]
+    if owning_issue_number is None:
+        # Task-origin PRs have no issue handoff record.
+        return
+    issue_view = read_authenticated_protocol_comments(
+        runner, config=config, surface_kind="issue", number=owning_issue_number  # type: ignore[arg-type]
+    )
+    issue_full = sorted(
+        (*issue_view.authored, *issue_view.ignored_foreign), key=lambda c: c.comment_id
+    )
+    unfiltered = resolve_issue_pr_handoff_lineage(
+        issue_full, issue_number=owning_issue_number, repo=repo
+    )
+    authored = resolve_issue_pr_handoff_lineage(
+        issue_view.authored, issue_number=owning_issue_number, repo=repo
+    )
+    names_pr = any(
+        lineage is not None and lineage.latest.pr_number == pr_number
+        for lineage in (unfiltered, authored)
+    )
+    if not names_pr:
+        # No handoff names this PR, so no plan association is adopted.
+        return
+    if (
+        unfiltered is None
+        or authored is None
+        or unfiltered.latest != authored.latest
+        or issue_full[unfiltered.latest_comment_index].comment_id
+        != issue_view.authored[authored.latest_comment_index].comment_id
+    ):
+        raise refuse(
+            f"the canonical issue-to-PR handoff record on issue #{owning_issue_number} is not "
+            "the latest one written by the authenticated actor"
+        )

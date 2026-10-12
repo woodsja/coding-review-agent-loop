@@ -491,6 +491,9 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
         "read_authenticated_protocol_comments", "AuthenticatedComment",
         "AuthenticatedCommentView", "WorkflowTransactionError",
     }
+    # The named-board legacy PR entry check (#1365) reads the actor-bound
+    # comment view, and only the reader itself; it consumes no v2 record.
+    allowed = {("pr_board_state.py", "read_authenticated_protocol_comments")}
     offenders: list[str] = []
     for path in sorted(source_root.rglob("*.py")):
         if path.name == "workflow_transaction.py":
@@ -503,7 +506,8 @@ def test_no_existing_module_imports_the_v2_aware_entry_points():
                 if module_name.endswith("workflow_transaction") or "workflow_transaction" in imported:
                     offenders.append(f"{path.name} imports workflow_transaction")
                 for name in sorted(imported & v2_names):
-                    offenders.append(f"{path.name} imports {name}")
+                    if (path.name, name) not in allowed:
+                        offenders.append(f"{path.name} imports {name}")
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.name.endswith("workflow_transaction"):
