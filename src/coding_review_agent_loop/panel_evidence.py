@@ -865,23 +865,29 @@ class PlanPrimaryStreak:
         return threshold > 0 and self.undigested_prefix >= threshold
 
 
+def normalize_plan_issue_text(text: str | None) -> str:
+    """CRLF-to-LF and per-line trailing-whitespace normalization of #1112."""
+    return "\n".join(
+        line.rstrip() for line in (text or "").replace("\r\n", "\n").split("\n")
+    )
+
+
+def plan_issue_text_digest_for(title: str | None, body: str | None) -> str:
+    """The #1112 digest of one title/body pair (see ``plan_issue_text_digest``)."""
+    payload = json.dumps(
+        [normalize_plan_issue_text(title), normalize_plan_issue_text(body)],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def plan_issue_text_digest(issue_context: IssueContext) -> str:
     """16-hex digest of the normalized issue title and body (#1112).
 
     Comments are deliberately excluded: loop-posted comments share the
     operator's account, so a comment cannot be trusted as operator intent.
     """
-
-    def normalize(text: str | None) -> str:
-        return "\n".join(
-            line.rstrip() for line in (text or "").replace("\r\n", "\n").split("\n")
-        )
-
-    payload = json.dumps(
-        [normalize(issue_context.title), normalize(issue_context.body)],
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return plan_issue_text_digest_for(issue_context.title, issue_context.body)
 
 
 def plan_primary_blocking_streak(
@@ -1025,6 +1031,11 @@ def plan_primary_blocking_streak_detail(
     return PlanPrimaryStreak(count=streak, undigested_prefix=undigested_prefix)
 
 
+# Leading bytes of the primary-phase stall stop; history_export recognizes the
+# posted diagnostic through this constant.
+PLAN_PRIMARY_STALL_PREFIX = "the primary plan reviewer has blocked "
+
+
 def plan_primary_stall_message(
     *,
     streak: int,
@@ -1047,7 +1058,8 @@ def plan_primary_stall_message(
         else ""
     )
     return (
-        f"the primary plan reviewer has blocked {streak} consecutive primary-phase "
+        PLAN_PRIMARY_STALL_PREFIX
+        + f"{streak} consecutive primary-phase "
         f"planning round(s) with no exact-plan primary approval, reaching "
         f"--plan-primary-stall-rounds {threshold} (current canonical plan: "
         f"{plan_chars} characters). The secondary plan panel was not convened, "

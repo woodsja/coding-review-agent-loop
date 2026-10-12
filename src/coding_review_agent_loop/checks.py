@@ -270,13 +270,22 @@ def _pr_check_details(pr_checks: PullRequestChecks) -> list[str]:
     return details
 
 
+# Render-side headline templates, shared with history_export's recognizer.
+CI_INFRASTRUCTURE_COMMENT_HEADLINE = (
+    "External GitHub Actions infrastructure is blocking PR #{pr_number}."
+)
+CI_INFRASTRUCTURE_STOP_HEADLINE = (
+    "PR #{pr_number} is blocked on external GitHub Actions infrastructure, not a code defect."
+)
+
+
 def _ci_infrastructure_details(stall: CiInfrastructureStall) -> list[str]:
     return [check.describe() for check in stall.checks]
 
 
 def _format_ci_infrastructure_comment(pr_number: int, stall: CiInfrastructureStall) -> str:
     lines = [
-        f"External GitHub Actions infrastructure is blocking PR #{pr_number}.",
+        CI_INFRASTRUCTURE_COMMENT_HEADLINE.format(pr_number=pr_number),
         "",
         "This is not a repository defect: no code change is required, and no merge was attempted.",
         "",
@@ -292,7 +301,7 @@ def _ci_infrastructure_stop_message(
     carried_items: list[str],
 ) -> str:
     lines = [
-        f"PR #{pr_number} is blocked on external GitHub Actions infrastructure, not a code defect.",
+        CI_INFRASTRUCTURE_STOP_HEADLINE.format(pr_number=pr_number),
         "",
         "No code change is required and no merge was attempted. Rerun the same command once "
         "GitHub Actions runners recover; the stalled check(s) should simply be rerun at that point.",

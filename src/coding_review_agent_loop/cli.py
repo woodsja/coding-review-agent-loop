@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import re
 import contextlib
 import os
@@ -1471,6 +1472,53 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--trusted-actor", required=True, help="Expected authenticated GitHub login.")
     preflight.add_argument("--gh-cmd", default="gh", help="GitHub CLI executable (default: gh).")
 
+    history = subparsers.add_parser(
+        "history", help="Read-only outcome history derived from authenticated round records."
+    )
+    history_subparsers = history.add_subparsers(dest="history_command", required=True)
+    history_export = history_subparsers.add_parser(
+        "export",
+        help=(
+            "Export one outcome row per issue (route taken, plan/PR rounds, step-backs, "
+            "human-decision stops, merge state, infrastructure failures, run-start "
+            "snapshot) from records the authenticated actor posted. Reads GitHub only: "
+            "no writes, no agents, no model calls."
+        ),
+    )
+    history_export.add_argument("--repo", required=True, help="GitHub repository as owner/name.")
+    history_export.add_argument(
+        "--output", type=Path, default=None,
+        help="Local output path; stdout is used when omitted.",
+    )
+    history_export.add_argument(
+        "--format", choices=("json", "csv"), default="json",
+        help="Output format (default: json, schema_version 1).",
+    )
+    history_export.add_argument(
+        "--issue", type=int, action="append", default=None, metavar="N",
+        help="Export only this issue (repeatable); explicit issues always yield a row.",
+    )
+    history_export.add_argument(
+        "--since", default=None, metavar="YYYY-MM-DD",
+        help="Only issues created on or after this UTC date.",
+    )
+    history_export.add_argument(
+        "--usage-summaries", type=Path, default=None, metavar="DIR",
+        help=(
+            "Directory of local *-usage-summary.json files; a row's tool commit is read "
+            "from summaries joined to the issue or its PRs by run-start attribution "
+            "records, otherwise it is `unavailable`."
+        ),
+    )
+    history_export.add_argument(
+        "--run-attribution-log", type=Path, default=None, metavar="PATH",
+        help=(
+            "Run-start attribution JSONL joined with --usage-summaries "
+            "(default: the worker telemetry log)."
+        ),
+    )
+    history_export.add_argument("--gh-cmd", default="gh", help="GitHub CLI executable (default: gh).")
+
     task = subparsers.add_parser(
         "task",
         help="Ask the coder to implement a free-form task, then review it.",
@@ -2294,6 +2342,51 @@ def _resolve_task_text(args: argparse.Namespace) -> str:
     return text
 
 
+def _history_export_command(args: argparse.Namespace) -> int:
+    """``agent-loop history export``: GitHub reads and a local write only."""
+    from .history_export import (
+        export_history,
+        load_tool_commits,
+        read_only_history_config,
+        render_csv,
+        render_json,
+    )
+    from .worker_telemetry import telemetry_log_path
+
+    try:
+        since = None
+        if args.since is not None:
+            try:
+                since = datetime.datetime.strptime(args.since, "%Y-%m-%d").replace(
+                    tzinfo=datetime.timezone.utc
+                )
+            except ValueError as exc:
+                raise AgentLoopError("--since must be a YYYY-MM-DD date.") from exc
+        tool_commit_index = None
+        if args.usage_summaries is not None:
+            attribution = args.run_attribution_log or telemetry_log_path()
+            lines: list[str] = []
+            if attribution is not None and attribution.is_file():
+                lines = attribution.read_text(encoding="utf-8").splitlines()
+            tool_commit_index = load_tool_commits(args.usage_summaries, lines, repo=args.repo)
+        rows = export_history(
+            Runner(dry_run=False),
+            config=read_only_history_config(args.repo, gh_cmd=args.gh_cmd),
+            issue_numbers=tuple(args.issue or ()),
+            since=since,
+            tool_commit_index=tool_commit_index,
+        )
+        rendered = render_csv(rows) if args.format == "csv" else render_json(rows, repo=args.repo)
+        if args.output is None:
+            print(rendered, end="")
+        else:
+            args.output.write_text(rendered, encoding="utf-8")
+        return 0
+    except (AgentLoopError, OSError) as exc:
+        print(f"agent-loop: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     tokens = list(sys.argv[1:] if argv is None else argv)
     if tokens and tokens[0] == "inspect":
@@ -2334,6 +2427,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
     if args.command == "run-tests":
         return _run_tests_command(args)
+    if args.command == "history" and args.history_command == "export":
+        return _history_export_command(args)
     if args.command == "managed-ci" and args.managed_ci_command == "preflight":
         try:
             context = ManagedCiProbeContext(args.repo, args.gh_cmd, Path.cwd())

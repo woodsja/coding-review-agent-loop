@@ -5357,3 +5357,264 @@ def merge_pr(
             f"{expected_head_sha} merged, so the merge is refused."
         )
     raise AgentLoopError(f"{base}; {detail}" + history)
+
+
+# ---------------------------------------------------------------------------
+# Read-only outcome-history reads for ``agent-loop history export`` (#1433).
+# Every function here is a read; none posts, edits or labels anything.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepositoryIssueSummary:
+    """One issue (never a PR) from an exhaustive repository listing."""
+
+    number: int
+    title: str
+    created_at: str
+    closed_at: str | None
+    state: str
+
+
+@dataclass(frozen=True)
+class LinkedPullRequest:
+    """A PR GitHub links to an issue as closing it, with its final state."""
+
+    number: int
+    state: str
+    merged_at: str | None
+    closed_at: str | None
+
+
+@dataclass(frozen=True)
+class IssueOutcomeHistory:
+    """An issue's text history and linked PRs.
+
+    ``body_revisions`` is every body version, oldest first, as
+    ``(effective_at, body)`` (the creation version included); ``()`` means the
+    body was never edited and ``None`` means the edit history is missing or
+    incomplete.  ``title_renames`` holds ``(at, previous, current)`` events,
+    oldest first, with the same ``None`` meaning.
+    """
+
+    number: int
+    title: str
+    body: str
+    state: str
+    created_at: str
+    closed_at: str | None
+    body_revisions: tuple[tuple[str, str], ...] | None
+    title_renames: tuple[tuple[str, str, str], ...] | None
+    linked_prs: tuple[LinkedPullRequest, ...]
+
+
+def list_repository_issues(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    since: datetime.datetime | None = None,
+) -> tuple[RepositoryIssueSummary, ...]:
+    """Page every issue in the repository (PRs excluded); any defect raises.
+
+    ``since`` is GitHub's updated-since filter, which only narrows the read.
+    """
+    page_size = 100
+    since_query = (
+        "&since=" + since.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if since is not None
+        else ""
+    )
+    issues: dict[int, RepositoryIssueSummary] = {}
+    for page in range(1, 10_001):
+        result = run_gh_read(
+            runner,
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/issues?state=all&per_page={page_size}&page={page}"
+                + since_query,
+            ],
+            cwd=github_api_cwd(),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AgentLoopError(
+                f"Issue listing of {config.repo} failed on page {page}." + _failure_detail(result)
+            )
+        try:
+            raw_page = json.loads(result.stdout or "")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"Issue listing of {config.repo} returned malformed JSON on page {page}."
+            ) from exc
+        if not isinstance(raw_page, list) or len(raw_page) > page_size:
+            raise AgentLoopError(
+                f"Issue listing of {config.repo} returned an unusable page {page}."
+            )
+        for raw in raw_page:
+            if not isinstance(raw, dict):
+                raise AgentLoopError(f"Issue listing of {config.repo} returned a malformed item.")
+            if "pull_request" in raw:
+                continue
+            number = raw.get("number")
+            created_at = raw.get("created_at")
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, int)
+                or number < 1
+                or not isinstance(created_at, str)
+            ):
+                raise AgentLoopError(f"Issue listing of {config.repo} returned a malformed issue.")
+            issues[number] = RepositoryIssueSummary(
+                number=number,
+                title=_optional_str(raw.get("title")) or "",
+                created_at=created_at,
+                closed_at=_optional_str(raw.get("closed_at")),
+                state=_optional_str(raw.get("state")) or "",
+            )
+        if len(raw_page) < page_size:
+            break
+    else:
+        raise AgentLoopError(f"Issue listing of {config.repo} exceeded its pagination bound.")
+    return tuple(issues[number] for number in sorted(issues))
+
+
+_ISSUE_OUTCOME_HISTORY_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      number title body state createdAt closedAt lastEditedAt includesCreatedEdit
+      userContentEdits(first: 100) {
+        totalCount
+        nodes { editedAt deletedAt diff }
+      }
+      timelineItems(first: 100, itemTypes: [RENAMED_TITLE_EVENT]) {
+        totalCount
+        nodes { ... on RenamedTitleEvent { createdAt previousTitle currentTitle } }
+      }
+      closedByPullRequestsReferences(first: 100, includeClosedPrs: true) {
+        totalCount
+        nodes { number state mergedAt closedAt }
+      }
+    }
+  }
+}
+""".strip()
+
+
+def _parse_body_revisions(issue: dict) -> tuple[tuple[str, str], ...] | None:
+    edits = issue.get("userContentEdits")
+    if not isinstance(edits, dict):
+        return None
+    nodes = edits.get("nodes")
+    total = edits.get("totalCount")
+    if not isinstance(nodes, list) or not isinstance(total, int):
+        return None
+    if total == 0 and not nodes:
+        return () if issue.get("lastEditedAt") is None else None
+    if total != len(nodes) or issue.get("includesCreatedEdit") is not True:
+        return None
+    revisions: list[tuple[str, str]] = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("deletedAt") is not None:
+            return None
+        edited_at, diff = node.get("editedAt"), node.get("diff")
+        if not isinstance(edited_at, str) or not isinstance(diff, str):
+            return None
+        revisions.append((edited_at, diff))
+    revisions.sort(key=lambda item: parse_comment_timestamp(item[0]))
+    return tuple(revisions)
+
+
+def _parse_title_renames(issue: dict) -> tuple[tuple[str, str, str], ...] | None:
+    timeline = issue.get("timelineItems")
+    if not isinstance(timeline, dict):
+        return None
+    nodes = timeline.get("nodes")
+    total = timeline.get("totalCount")
+    if not isinstance(nodes, list) or not isinstance(total, int) or total != len(nodes):
+        return None
+    renames: list[tuple[str, str, str]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            return None
+        at, previous, current = (
+            node.get("createdAt"), node.get("previousTitle"), node.get("currentTitle")
+        )
+        if not all(isinstance(value, str) for value in (at, previous, current)):
+            return None
+        renames.append((at, previous, current))
+    renames.sort(key=lambda item: parse_comment_timestamp(item[0]))
+    return tuple(renames)
+
+
+def read_issue_outcome_history(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+) -> IssueOutcomeHistory:
+    """Read one issue's edit history and closing PRs in a single GraphQL read."""
+    owner, name = _graphql_repository_parts(config.repo)
+    result = run_gh_read(
+        runner,
+        [
+            config.gh_cmd, "api", "graphql",
+            "-f", f"query={_ISSUE_OUTCOME_HISTORY_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-F", f"number={issue_number}",
+        ],
+        cwd=github_api_cwd(),
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AgentLoopError(
+            f"Outcome-history read of issue #{issue_number} failed." + _failure_detail(result)
+        )
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(
+            f"Outcome-history read of issue #{issue_number} returned malformed JSON."
+        ) from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    issue = repository.get("issue") if isinstance(repository, dict) else None
+    if not isinstance(issue, dict) or (isinstance(payload, dict) and payload.get("errors")):
+        raise AgentLoopError(f"Outcome-history read of issue #{issue_number} returned no issue.")
+    created_at = issue.get("createdAt")
+    if not isinstance(created_at, str):
+        raise AgentLoopError(f"Outcome-history read of issue #{issue_number} lacks createdAt.")
+    references = issue.get("closedByPullRequestsReferences")
+    nodes = references.get("nodes") if isinstance(references, dict) else None
+    total = references.get("totalCount") if isinstance(references, dict) else None
+    if not isinstance(nodes, list) or not isinstance(total, int) or total != len(nodes):
+        raise AgentLoopError(
+            f"Outcome-history read of issue #{issue_number} returned an incomplete "
+            "linked-PR list; a partial list is never used."
+        )
+    linked: dict[int, LinkedPullRequest] = {}
+    for node in nodes:
+        number = node.get("number") if isinstance(node, dict) else None
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise AgentLoopError(
+                f"Outcome-history read of issue #{issue_number} returned a malformed linked PR."
+            )
+        linked[number] = LinkedPullRequest(
+            number=number,
+            state=_optional_str(node.get("state")) or "",
+            merged_at=_optional_str(node.get("mergedAt")),
+            closed_at=_optional_str(node.get("closedAt")),
+        )
+    return IssueOutcomeHistory(
+        number=issue_number,
+        title=_optional_str(issue.get("title")) or "",
+        body=_optional_str(issue.get("body")) or "",
+        state=_optional_str(issue.get("state")) or "",
+        created_at=created_at,
+        closed_at=_optional_str(issue.get("closedAt")),
+        body_revisions=_parse_body_revisions(issue),
+        title_renames=_parse_title_renames(issue),
+        linked_prs=tuple(linked[number] for number in sorted(linked)),
+    )
