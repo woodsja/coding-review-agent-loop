@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from statistics import median
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .errors import AgentLoopError
 from .scratch import make_private_dirs, scratch_root
@@ -1451,6 +1451,16 @@ def runtime_row_is_evidence(row: Mapping[str, object]) -> bool:
     return row.get("launch_integrity") == "verified"
 
 
+def _fixture_identity(value: object) -> tuple[str, str] | None:
+    """The (path, digest) a runtime row or request is keyed by; ``None`` without one."""
+    if not isinstance(value, Mapping):
+        return None
+    path, digest = value.get("path"), value.get("digest")
+    if not isinstance(path, str) or not isinstance(digest, str):
+        return ("<malformed>", "<malformed>")
+    return (path, digest)
+
+
 def record_test_observation(
     memory_dir: Path | None,
     *,
@@ -1472,8 +1482,13 @@ def record_test_observation(
     caveats: Sequence[str] = (),
     launch_integrity: str | None = None,
     launch_state: Mapping[str, str] | None = None,
+    fixture: Mapping[str, object] | None = None,
 ) -> bool:
     """Append a bounded observation; persistence failure never affects execution.
+
+    ``fixture`` (issue #1326) stores the fixture path and digest on the row and
+    keys its timing cohort apart from fixture-less runs of the same command.
+    Fixture-less rows carry no ``fixture`` key and are byte-identical.
 
     ``workers`` is the cohort label (``serial``, a count or ``unknown``).  When
     omitted it is derived from ``argv`` with the proven-serial rule, so an
@@ -1531,18 +1546,23 @@ def record_test_observation(
                     launch_integrity if launch_integrity in LAUNCH_INTEGRITY_STATES else "unverified"
                 )
             observation.update(_coerce_launch_state(launch_state or {}))
+            if fixture is not None:
+                identity = _fixture_identity(fixture)
+                assert identity is not None
+                observation["fixture"] = {"path": identity[0], "digest": identity[1]}
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.
                 observation["containment"] = dict(containment)
             rows = payload["observations"]
             rows.append(observation)
-            by_cohort: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+            by_cohort: dict[tuple[object, ...], list[dict]] = defaultdict(list)
             for row in rows:
                 key = (
                     str(row.get("normalized_command", "")),
                     str(row.get("environment_fingerprint", "")),
                     row_workers_label(row),
+                    _fixture_identity(row.get("fixture")),
                 )
                 by_cohort[key].append(row)
             cohorts = sorted(
@@ -3133,24 +3153,14 @@ def _recognized_inner_probe_tokens(
     return None
 
 
-def probe_inner_launcher(
-    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
-    environment_is_complete: bool = False,
-    cancel: "threading.Event | None" = None,
-    package_script: "PackageScriptResolution | None" = None,
-) -> LauncherProbeResult:
-    """Run only a recognized, identity-cached five-second bootstrap probe.
+PROBE_DEADLINE_DIAGNOSTIC = "inner probe truncated at the request deadline"
 
-    ``package_script`` (issue #1294) marks ``argv`` as the post-policy resolved
-    body of an adopted package script: the probe is bound to that exact argv,
-    the identity covers the script, the result's ``candidate`` is the frozen
-    requested spelling, and a verified result always carries a full
-    ``launch_argv`` so the package manager is never spawned.
 
-    ``cancel`` (issue #1108) aborts the probe: the owner kills its probe group
-    and nothing is published to the cache, so a cancelled probe is never
-    treated as authentication of the launcher.
-    """
+def _inner_probe_identity(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None,
+    environment_is_complete: bool, package_script: "PackageScriptResolution | None",
+) -> tuple[dict[str, str], tuple[str, ...], tuple[str, ...], Any, str | None]:
+    """Shared identity derivation for the probe and the pre-spawn re-check."""
     values = (
         dict(environment)
         if environment is not None and environment_is_complete
@@ -3160,7 +3170,7 @@ def probe_inner_launcher(
     reported = package_script.requested_argv if package_script is not None else original
     recognized = _recognized_inner_probe_with_environment(original, cwd=cwd, environment=values)
     if recognized is None:
-        return LauncherProbeResult(reported, "unknown", "unrecognized inner launcher")
+        return values, original, reported, None, None
     probe, target, env_assignments, launch_argv, env_prefix = recognized
     if env_assignments:
         values = {**values, **env_assignments}
@@ -3180,7 +3190,61 @@ def probe_inner_launcher(
                 list(package_script.appended_args),
             ]).encode("utf-8")
         ).hexdigest()
-    identity_key = _identity_key(identity)
+    return values, original, reported, recognized, _identity_key(identity)
+
+
+def inner_launcher_identity_key(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
+    environment_is_complete: bool = False,
+    package_script: "PackageScriptResolution | None" = None,
+) -> str | None:
+    """Re-read the inner launcher identity the probe authenticated (#1326).
+
+    ``None`` for an unrecognized launcher.  A fixture run compares this with
+    the post-setup probe's identity immediately before the guarded spawn.
+    """
+    try:
+        return _inner_probe_identity(
+            argv, cwd=cwd, environment=environment,
+            environment_is_complete=environment_is_complete, package_script=package_script,
+        )[4]
+    except Exception:
+        return "unreadable"
+
+
+def probe_inner_launcher(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
+    environment_is_complete: bool = False,
+    cancel: "threading.Event | None" = None,
+    package_script: "PackageScriptResolution | None" = None,
+    deadline: float | None = None,
+    use_cache: bool = True,
+) -> LauncherProbeResult:
+    """Run only a recognized, identity-cached five-second bootstrap probe.
+
+    ``package_script`` (issue #1294) marks ``argv`` as the post-policy resolved
+    body of an adopted package script: the probe is bound to that exact argv,
+    the identity covers the script, the result's ``candidate`` is the frozen
+    requested spelling, and a verified result always carries a full
+    ``launch_argv`` so the package manager is never spawned.
+
+    ``cancel`` (issue #1108) aborts the probe: the owner kills its probe group
+    and nothing is published to the cache, so a cancelled probe is never
+    treated as authentication of the launcher.
+
+    ``deadline`` (issue #1326) is an absolute monotonic bound: the probe
+    watchdog and the follower wait never run past it, and a probe truncated by
+    it returns ``unknown`` with ``PROBE_DEADLINE_DIAGNOSTIC`` and is never
+    cached.  ``use_cache=False`` neither reads nor writes the per-invocation
+    cache, so a fixture run always authenticates its post-setup context.
+    """
+    values, original, reported, recognized, identity_key = _inner_probe_identity(
+        argv, cwd=cwd, environment=environment,
+        environment_is_complete=environment_is_complete, package_script=package_script,
+    )
+    if recognized is None or identity_key is None:
+        return LauncherProbeResult(reported, "unknown", "unrecognized inner launcher")
+    probe, target, env_assignments, launch_argv, env_prefix = recognized
     rebound = launch_argv if package_script is not None or launch_argv != original else ()
 
     def bind(result: LauncherProbeResult) -> LauncherProbeResult:
@@ -3195,7 +3259,12 @@ def probe_inner_launcher(
         )
 
     invocation = values.get("AGENT_LOOP_INVOCATION_ID")
-    cache_key = (invocation, identity_key) if invocation else None
+    cache_key = (invocation, identity_key) if invocation and use_cache else None
+    probe_timeout = LAUNCHER_PROBE_TIMEOUT_SECONDS
+    if deadline is not None:
+        probe_timeout = min(probe_timeout, deadline - time.monotonic())
+        if probe_timeout <= 0:
+            return LauncherProbeResult(reported, "unknown", PROBE_DEADLINE_DIAGNOSTIC, identity_key)
     flight: threading.Event | None = None
     owner = True
     if cache_key is not None:
@@ -3226,6 +3295,8 @@ def probe_inner_launcher(
         # headroom lets waiters receive its published result without ever
         # starting a duplicate probe if the owner is slow to publish.
         flight_deadline = time.monotonic() + LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0
+        if deadline is not None:
+            flight_deadline = min(flight_deadline, deadline)
         while True:
             remaining = flight_deadline - time.monotonic()
             if cancel is not None and cancel.is_set():
@@ -3256,13 +3327,17 @@ def probe_inner_launcher(
                     if environment_is_complete or environment is not None or env_assignments
                     else None
                 ),
-                timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+                timeout_seconds=probe_timeout,
                 cancel=cancel,
             )
         except ProbeCancelled:
             # Never published: the next request probes afresh.
             return LauncherProbeResult(reported, "unknown", "inner probe cancelled", identity_key)
         except subprocess.TimeoutExpired:
+            if probe_timeout < LAUNCHER_PROBE_TIMEOUT_SECONDS:
+                # Truncated by the request deadline, not a launcher verdict:
+                # never published, and the probe group is already torn down.
+                return LauncherProbeResult(reported, "unknown", PROBE_DEADLINE_DIAGNOSTIC, identity_key)
             result = LauncherProbeResult(reported, "failed", "inner bootstrap probe timed out after 5s", identity_key)
         except _ProbeContainmentUnavailable as exc:
             result = LauncherProbeResult(reported, "unknown", str(exc), identity_key)
@@ -3323,8 +3398,12 @@ def recommend_timeout(
     normalized_command_override: str | None = None,
     fingerprint_override: str | None = None,
     workers: str | None = None,
+    fixture: Mapping[str, object] | None = None,
 ) -> RuntimeRecommendation:
     """Recommend a watchdog from the (command, fingerprint, workers) cohort.
+
+    Fixture runs (issue #1326) form their own cohort: rows recorded with a
+    fixture match only the same fixture identity, never fixture-less lookups.
 
     ``workers`` defaults to the proven-serial argv label.  Unknown rows only
     feed an unknown-cohort lookup, never serial or explicit-count ones.
@@ -3351,6 +3430,8 @@ def recommend_timeout(
         if row.get("normalized_command") != normalized or row.get("environment_fingerprint") != fingerprint:
             continue
         if row_workers_label(row) != cohort:
+            continue
+        if _fixture_identity(row.get("fixture")) != _fixture_identity(fixture):
             continue
         stamp = _timestamp(row.get("timestamp"))
         if stamp is None or stamp < cutoff:

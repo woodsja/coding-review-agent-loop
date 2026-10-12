@@ -1268,3 +1268,34 @@ def test_operator_docs_document_the_pr_non_convergence_stop():
         assert term in text
     assert "`exact_head_evidence_requests`" in readme
     assert "find_pr_non_convergence" in architecture
+
+
+FIXTURE_HEADING_TEXT = "Multi-process fixtures (`run-tests --fixture`)"
+
+
+def test_fixture_hook_contract_is_documented_and_linked():
+    from coding_review_agent_loop.prompts import FIXTURE_CODER_GUIDANCE, _coder_test_reporting_guidance
+
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert f"#### {FIXTURE_HEADING_TEXT}\n" in doc
+    anchor = _github_anchor(FIXTURE_HEADING_TEXT)
+    assert anchor == "multi-process-fixtures-run-tests---fixture"
+    assert f"(#{anchor})" in doc
+    assert f"(docs/local_agent_loop.md#{anchor})" in README.read_text(encoding="utf-8")
+    section = doc.split(f"#### {FIXTURE_HEADING_TEXT}\n", 1)[1].split("\n#### ", 1)[0]
+    for required in (
+        "`<fixture> setup`", "`<fixture> teardown`", "AGENT_LOOP_FIXTURE_STATE_DIR",
+        "min(55, max(5, 0.1 × timeout))", "fixture-tree-dirty", "fixture-scope-unsupported",
+        "never probed or recorded as a\nlauncher", "another machine over the network",
+        "nothing was run (not evidence)", "broker result unknown after dispatch",
+    ):
+        assert required in section, required
+    assert "--fixture" in FIXTURE_CODER_GUIDANCE
+    assert FIXTURE_CODER_GUIDANCE in _coder_test_reporting_guidance()
+    assert "fixture_supervisor.py" in ARCHITECTURE.read_text(encoding="utf-8")
+    help_text = build_parser().format_help()
+    run_tests = next(
+        action for action in build_parser()._subparsers._group_actions[0].choices["run-tests"]._actions
+        if "--fixture" in action.option_strings
+    )
+    assert run_tests.metavar == "PATH" and "run-tests" in help_text

@@ -4894,3 +4894,190 @@ def test_numeric_and_unknown_shell_caps_share_one_identity():
     # Exact names only: a lookalike variable still splits identity.
     lookalike = registry.capture({**base, "AGENT_LOOP_SHELL_CAP_MS_EXTRA": "1"})
     assert registry.compare(other_backend, lookalike) != "equivalent"
+
+
+# ---------------------------------------------------------------------------
+# run-tests --fixture records (issue #1326)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
+    FIXTURE_UNREADABLE_CAVEAT,
+    FixtureRecord,
+    decode_fixture_record,
+    observation_from_mapping,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    _authoritative_receipt_passes,
+    _receipt_expected_status,
+)
+import coding_review_agent_loop.test_runtime as fixture_test_runtime  # noqa: E402
+
+
+def _clean_fixture(digest: str = "100755:" + "a" * 40, path: str = "scripts/fixture.sh") -> FixtureRecord:
+    return FixtureRecord(
+        path=path, digest=digest, setup_status=0, setup_duration_seconds=1.25,
+        setup_log_digest="b" * 64, teardown_status=0, teardown_duration_seconds=0.5,
+        teardown_log_digest="c" * 64, cleanup="confirmed", inventoried=4, swept=1,
+    )
+
+
+def _fixture_row(*, outcome, receipt_id, timestamp, registry, fixture, environment=None):
+    row = _observation(
+        outcome=outcome, timestamp=timestamp, receipt_id=receipt_id, registry=registry,
+        environment=environment,
+    )
+    return dataclasses_replace(row, fixture=fixture)
+
+
+def dataclasses_replace(row, **changes):
+    from dataclasses import replace
+
+    return replace(row, **changes)
+
+
+def test_fixture_identity_isolation_failure_is_not_superseded_by_another_fixture_or_none():
+    registry = EnvironmentIdentityRegistry()
+    failing = _fixture_row(
+        outcome="failed", receipt_id="fixture-fail", timestamp="2026-10-12T10:00:00+00:00",
+        registry=registry, fixture=dataclasses_replace(_clean_fixture(), teardown_status=4),
+    )
+    for later_fixture, label in (
+        (None, "fixture-less"),
+        (_clean_fixture(digest="100755:" + "d" * 40), "other digest"),
+        (_clean_fixture(path="scripts/other.sh"), "other path"),
+    ):
+        passing = _fixture_row(
+            outcome="passed", receipt_id="later-pass", timestamp="2026-10-12T10:05:00+00:00",
+            registry=registry, fixture=later_fixture,
+        )
+        evidence = reconcile_test_observations([failing, passing], registry=registry)
+        first = evidence.observations[0]
+        assert first.superseded_by is None, label
+        assert "fixture-fail" in evidence.authoritative_failures, label
+        assert evidence_module._observation_key(failing) != evidence_module._observation_key(passing)
+    # Control: the same fixture identity can supersede its own failure.
+    same = _fixture_row(
+        outcome="passed", receipt_id="same-pass", timestamp="2026-10-12T10:06:00+00:00",
+        registry=registry, fixture=_clean_fixture(),
+    )
+    evidence = reconcile_test_observations([failing, same], registry=registry)
+    assert evidence.observations[0].superseded_by == "same-pass"
+
+
+def test_fixture_identity_isolation_keys_runtime_memory_timing_apart(tmp_path):
+    memory = tmp_path / "memory"
+    argv = ["python", "-m", "pytest", "tests/test_x.py"]
+    fixture = {"path": "scripts/fixture.sh", "digest": "100755:" + "a" * 40}
+    common = dict(
+        argv=argv, cwd=tmp_path, policy_ceiling_seconds=1800, commit="c",
+        launch_integrity="verified", attempted_timeout_seconds=600,
+    )
+    for _ in range(3):
+        assert fixture_test_runtime.record_test_observation(memory, outcome="passed", elapsed_seconds=400.0, fixture=fixture, **common)
+        assert fixture_test_runtime.record_test_observation(memory, outcome="passed", elapsed_seconds=10.0, **common)
+    rows = fixture_test_runtime.load_runtime_memory(memory)
+    assert sum(1 for row in rows if "fixture" in row) == 3
+    assert all(row["fixture"] == fixture for row in rows if "fixture" in row)
+    plain = fixture_test_runtime.recommend_timeout(memory, argv=argv, cwd=tmp_path, policy_ceiling_seconds=1800)
+    with_fixture = fixture_test_runtime.recommend_timeout(
+        memory, argv=argv, cwd=tmp_path, policy_ceiling_seconds=1800, fixture=fixture,
+    )
+    other = fixture_test_runtime.recommend_timeout(
+        memory, argv=argv, cwd=tmp_path, policy_ceiling_seconds=1800,
+        fixture={"path": "scripts/fixture.sh", "digest": "100755:" + "e" * 40},
+    )
+    assert plain.successful_samples == 3 and with_fixture.successful_samples == 3 and other.successful_samples == 0
+    assert with_fixture.recommended_timeout_seconds > plain.recommended_timeout_seconds
+
+
+def _projected_fixture_row(fixture_value, *, outcome="passed"):
+    observation = LocalTestObservation(
+        command=(sys.executable, "-m", "pytest", "-q"), outcome=outcome, provenance="parent-observed",
+        receipt_id="fixture-receipt", attribution=TreeAttribution(state="current-head", stable=True, head="h", tracked_digest="t"),
+        environment_state="not-compared", wrapper_bootstrap="verified", inner_exec="started",
+        suite_start="verified",
+    )
+    projection = observation.public_projection()
+    if fixture_value is not _ABSENT:
+        projection["fixture"] = fixture_value
+    return projection
+
+
+_ABSENT = object()
+
+
+def test_fixture_restart_decode_round_trips_the_record():
+    registry = EnvironmentIdentityRegistry()
+    row = _fixture_row(
+        outcome="passed", receipt_id="fixture-pass", timestamp="2026-10-12T10:00:00+00:00",
+        registry=registry, fixture=_clean_fixture(),
+    )
+    escaped = _fixture_row(
+        outcome="failed", receipt_id="fixture-escaped", timestamp="2026-10-12T10:01:00+00:00",
+        registry=registry,
+        fixture=dataclasses_replace(
+            _clean_fixture(), cleanup="escaped", escaped=2,
+            escaped_processes=("pid=10 uid=0 comm=shim cgroup=0::/system.slice",),
+        ),
+    )
+    encoded = bounded_evidence_for_round(LocalTestEvidence(observations=(row, escaped)))
+    decoded = decode_bounded_evidence(encoded)
+    assert [item.fixture for item in decoded.observations] == [row.fixture, escaped.fixture]
+    restored = decoded.observations[0].fixture
+    assert restored.setup_duration_seconds == 1.25 and restored.teardown_log_digest == "c" * 64
+    # Canonicalization after a restart keeps the record too.
+    canonical = decode_bounded_evidence(canonicalize_bounded_evidence(encoded))
+    assert [item.fixture for item in canonical.observations] == [row.fixture, escaped.fixture]
+    # The private excerpts never reach the projection.
+    assert "diagnostic" not in json.dumps(json.loads(encoded))
+    # A clean record passes the citation gate's fixture check; a failure does not.
+    assert _authoritative_receipt_passes(_projected_fixture_row(_clean_fixture().to_dict()), claim="current-result")
+    assert not _authoritative_receipt_passes(_projected_fixture_row(escaped.fixture.to_dict()), claim="current-result")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-field", "extra-field", "bad-status", "boolean-status", "bad-cleanup", "oversized-path",
+     "absolute-path", "bad-digest", "not-a-mapping", "null"],
+)
+def test_fixture_restart_decode_malformed_records_are_never_citable(mutation):
+    value = _clean_fixture().to_dict()
+    if mutation == "missing-field":
+        value.pop("cleanup")
+    elif mutation == "extra-field":
+        value["extra"] = 1
+    elif mutation == "bad-status":
+        value["setup_status"] = "ok"
+    elif mutation == "boolean-status":
+        value["teardown_status"] = False
+    elif mutation == "bad-cleanup":
+        value["cleanup"] = "maybe"
+    elif mutation == "oversized-path":
+        value["path"] = "x" * 4096
+    elif mutation == "absolute-path":
+        value["path"] = "/etc/fixture"
+    elif mutation == "bad-digest":
+        value["digest"] = "sha:nothex"
+    elif mutation == "not-a-mapping":
+        value = ["fixture"]
+    else:
+        value = None
+    record, caveats = decode_fixture_record(value)
+    assert record.cleanup == "unconfirmed" and caveats == (FIXTURE_UNREADABLE_CAVEAT,)
+    projection = _projected_fixture_row(value)
+    restored = observation_from_mapping(projection)
+    assert restored.fixture is not None and restored.fixture.cleanup == "unconfirmed"
+    assert FIXTURE_UNREADABLE_CAVEAT in restored.caveats
+    assert not _authoritative_receipt_passes(projection, claim="current-result")
+    assert _receipt_expected_status(projection, claim="current-result") != "verified"
+    encoded = bounded_evidence_for_round({"observations": [projection]})
+    decoded = decode_bounded_evidence(encoded)
+    assert decoded.observations[0].fixture.cleanup == "unconfirmed"
+    assert not _authoritative_receipt_passes(decoded.observations[0], claim="current-result")
+
+
+def test_fixture_restart_decode_legacy_rows_have_no_fixture():
+    projection = _projected_fixture_row(_ABSENT)
+    assert "fixture" not in projection
+    assert observation_from_mapping(projection).fixture is None
+    assert _authoritative_receipt_passes(projection, claim="current-result")

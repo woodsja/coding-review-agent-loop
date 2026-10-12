@@ -1635,6 +1635,23 @@ interpreter cannot import xdist, and a command that reaches its watchdog gets a
 timeout advisory. Claude coder turns get Bash limits sized to the whole budget.
 See [Running a long or full suite](docs/local_agent_loop.md#running-a-long-or-full-suite).
 
+Suites that need long-lived helper processes (servers, workers, proxies) can
+declare them in a committed executable fixture script instead of wrapping the
+test command:
+
+```bash
+agent-loop run-tests --timeout-seconds 600 --fixture scripts/test-fixture.sh -- pytest tests/test_app.py -q
+```
+
+The test broker checks that the script is a tracked `100755` blob identical to
+`HEAD` in a clean tree, then runs `<script> setup`, the unchanged test command,
+and `<script> teardown` in one supervised scope with a shared
+`AGENT_LOOP_FIXTURE_STATE_DIR`. Only a run whose setup and teardown exit 0 and
+whose cleanup is confirmed (Linux, initial PID namespace, no hidepid) is
+citable. `--fixture` needs at least 30 seconds and the broker; it never runs
+locally. See
+[Multi-process fixtures](docs/local_agent_loop.md#multi-process-fixtures-run-tests---fixture).
+
 When agent memory is enabled, the wrapper records measured outcomes, elapsed
 time, the attempted cap, a privacy-preserving environment fingerprint, and
 cheap lockfile/configuration hashes in `test-runtime.json`. Recent successful

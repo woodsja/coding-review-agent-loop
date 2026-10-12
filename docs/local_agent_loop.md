@@ -1552,8 +1552,11 @@ capabilities, and environments are not logged.
 The client snapshots its actual cwd and environment after startup. The broker
 removes exactly the transport control variables
 `AGENT_LOOP_TEST_BROKER_ENDPOINT`, `AGENT_LOOP_TEST_BROKER_CAPABILITY`,
-and `AGENT_LOOP_TEST_BROKER_PROTOCOL` before launching the target, then supplies the
-authenticated `AGENT_LOOP_INVOCATION_ID`. All other variables, including
+and `AGENT_LOOP_TEST_BROKER_PROTOCOL`, plus the broker-owned
+`AGENT_LOOP_FIXTURE_STATE_DIR`, before launching the target, then supplies the
+authenticated `AGENT_LOOP_INVOCATION_ID`. A request may add one optional
+`fixture` field; see
+[Multi-process fixtures](#multi-process-fixtures-run-tests---fixture). All other variables, including
 `PATH`, virtual-environment, locale, inline-assignment, and test variables,
 remain comparison-bearing. Environment identity bytes are retained only in
 trusted memory within one orchestrator process. A restart therefore renders
@@ -1680,6 +1683,161 @@ capture degrades to explicit incomplete-capture caveats. Evidence is advisory
 history for coders and reviewers, including same-head and changed-head resume;
 it cannot replace GitHub CI, override configured gates, or turn every
 historical intermediate failure into a permanent blocker.
+
+#### Multi-process fixtures (`run-tests --fixture`)
+
+Some suites need long-lived helper processes, such as a web server, a worker,
+a private Redis or an edge proxy. A wrapper script that owns those processes is
+an unrecognized launcher, so its runs are never citable. Instead, declare the
+helpers in a tracked fixture script and keep the recognized test command as the
+inner command:
+
+```bash
+agent-loop run-tests --timeout-seconds 600 --fixture scripts/test-fixture.sh -- \
+  python -m pytest tests/test_share.py -q
+```
+
+**Argv and state contract.** The broker runs `<fixture> setup`, then the
+unchanged inner command, then `<fixture> teardown`, all in one broker request.
+The inner command runs only after setup exits 0. Teardown is attempted whenever
+setup started, including after a setup failure, an inner timeout, an exception
+or a broker stop. Setup, the inner command and teardown all see
+`AGENT_LOOP_FIXTURE_STATE_DIR`: one private, mode-0700 directory per request,
+created by the broker outside the checkout and removed after cleanup. Use it to
+pass ports and PID files from the fixture to the tests. A client-supplied value
+for this variable is discarded. The fixture is never probed or recorded as a
+launcher. Launch integrity, launcher health and runtime timing describe only
+the inner command, which still has to be a recognized launcher to be citable.
+
+**Provenance refusals.** Before anything launches, the broker returns an error
+frame `fixture refused: <code>` and journals at most a telemetry-unverified
+capture-failure row for these codes:
+
+| Code | Cause |
+| --- | --- |
+| `fixture-outside-checkout`, `fixture-missing` | The path does not resolve inside the assigned checkout. |
+| `fixture-symlink`, `fixture-not-regular-file` | A path component is a symlink, or the path is not a regular file. |
+| `fixture-untracked`, `fixture-ignored` | The path is not exactly one tracked index entry. |
+| `fixture-gitlink`, `fixture-not-executable`, `fixture-unsupported-mode` | The tracked mode is not `100755`. |
+| `fixture-modified`, `fixture-not-in-head` | The worktree bytes differ from the `HEAD` blob. |
+| `fixture-tree-dirty` | The tracked tree is not clean, or untracked input is present. |
+| `fixture-timeout-below-floor` | The timeout is below 30 s. The CLI also refuses it before dispatch. |
+| `fixture-scope-unsupported` | The broker cannot prove that it sees the whole host process table (see below). |
+
+The recorded digest is `<mode>:<HEAD blob id>`. A fixture that edits a tracked
+file is caught by the ordinary before and after tree snapshots. Its row is
+journaled with unknown attribution after teardown and is never citable.
+
+**Timeout split.** The request deadline is fixed when the broker accepts the
+request, after the before snapshot. The teardown bound is
+`min(55, max(5, 0.1 × timeout))` seconds, followed by a separate 5 s allowance
+for the sweep and the census. The inner deadline is the request deadline minus
+that reserve, so the 30 s floor leaves a 5 s teardown bound and a 5 s sweep
+allowance. The inner deadline bounds host worker admission, the probes, setup,
+the inner watchdog and the output drain. Setup starts only after host
+admission, and only when at least 10 s remain before the inner deadline;
+otherwise the row is `timed_out` with setup `not-run`. The launcher and
+lifecycle probes run after setup, bypass the per-invocation probe cache and
+are cut off at the inner deadline. A truncated probe never spawns the target
+and journals `timed_out` with `inner_exec=not-attempted`. If the launcher
+identity changes between the post-setup probe and the spawn, the target is not
+spawned and the row is a non-citable `launch-failed` row with the caveat
+`launcher changed after authentication`. The before and after snapshots run
+outside the deadline as declared overhead, so the client's socket bound for a
+fixture request is the timeout plus twice the 30 s snapshot cap plus 10 s. The
+inner command's worker reservation is held while setup runs; fixture processes
+are not counted against the worker budget.
+
+**Supervision and cleanup authority.** A Linux supervisor runs as
+`python -I` with `PR_SET_CHILD_SUBREAPER` and `PR_SET_NO_NEW_PRIVS`, so no
+fixture descendant can gain another uid through setuid binaries. It
+inventories every descendant while setup runs and before teardown. After
+teardown it sweeps the owned tree (SIGTERM, a short wait, SIGKILL, reap).
+Cleanup is `confirmed` only when both of these hold:
+
+- the owned tree is empty and every inventoried `(pid, start time)` is gone;
+- a host-wide census of `/proc` finds no live non-kernel process, of any uid,
+  started at or after the supervisor's start, other than the supervisor itself
+  and the owned inventory.
+
+The census has no uid, scope or ancestry exemption, so work delegated to
+`systemd-run --user`, a session manager, cron, another agent-loop scope or a
+daemon of another uid is flagged. Flagged processes yield `cleanup=escaped` and
+are printed to stderr with their PIDs, uids, command names and cgroups. They
+are not killed, because they cannot be attributed safely. An unreadable `/proc`
+entry, a census that exceeds its bound, or a host-authority check that fails
+again at census time yields `cleanup=unconfirmed`. Both states are never
+citable. The census also flags unrelated long-lived processes that happen to
+start anywhere on the host during the window, such as another agent-loop turn
+or a timer unit. Collect fixture evidence on a quiet host and rerun when the
+listed PIDs are unrelated.
+
+The cleanup authority covers the local host's process table. Work requested
+from a daemon on another machine over the network is outside it.
+
+**Host gate.** `--fixture` is refused with `fixture-scope-unsupported` unless
+the broker proves all of the following with checks an unprivileged process can
+make. It never reads `/proc/1/ns`.
+
+1. `/proc/self/ns/pid` has the initial PID namespace inode (`0xEFFFFFFC`) on
+   the nsfs device.
+2. `NS_GET_PARENT` fails with `EPERM`.
+3. `/proc/self/stat` names the caller's own PID.
+4. The `/proc` mount is `proc` without `hidepid` or `subset=pid`.
+5. `PR_SET_CHILD_SUBREAPER` is available and `/proc/1/stat` is readable.
+
+Containers, nested `unshare --pid --mount-proc` environments and hidepid hosts
+are therefore refused before setup, even when their local PID 1 is readable
+and `NSpid` has a single entry.
+
+**Observation and citation.** A fixture row's observation, the broker
+response, the public projection and bounded round evidence carry an optional
+`fixture` record: the path, the digest, the setup and teardown statuses and
+durations, the sha256 digests of their bounded and redacted log tails, the
+cleanup state, and inventoried, swept and escaped counts. The redacted log
+excerpts stay in the private journal row only. Fixture-less rows have no
+`fixture` key. The observation key and the runtime-memory timing cohort include
+the fixture identity (path and digest), so a fixture run never supersedes, or
+is superseded by, a run with another fixture or none. A malformed persisted
+record decodes as `cleanup=unconfirmed` with the caveat
+`fixture record unreadable`. A fixture row is `verified` only when setup and
+teardown exited 0, cleanup is `confirmed`, and every ordinary launch-integrity
+and attribution check passes. Otherwise:
+
+| Event | Journaled row |
+| --- | --- |
+| Setup fails or hits its bound | `failed`, `inner_exec=not-attempted`, caveat `fixture setup failed` |
+| Inner pass, then teardown fails | `failed`, caveat `fixture teardown failed` |
+| Inner pass, cleanup escaped or unconfirmed | `failed`, caveat `fixture cleanup escaped` or `fixture cleanup unconfirmed` |
+| Inner timeout | `timed_out` |
+| Broker stop after the supervisor launched | `interrupted`, attribution `unattributed: broker shutdown`; the client receives the cancelled frame |
+
+On a broker stop, a running setup is interrupted and teardown runs. Each
+supervisor gets its reserve before it and every inventoried PID are killed.
+
+**Client behaviour and exit codes.** `--fixture` needs a non-empty inner
+command and cannot be combined with `--preflight`. It never falls back to a
+local run. With no broker, or when connecting or sending fails before the
+request frame is fully written, the client prints
+`agent-loop: --fixture requires the test broker; nothing was run (not evidence)`
+and exits 1. When the response is lost after dispatch, it prints
+`agent-loop: broker result unknown after dispatch; the broker owns this fixture run, its teardown and its journal; not retried locally (not evidence)`
+and exits 1. Neither case records runtime memory or launcher health. On a
+result, one stderr line reports `setup=… teardown=… cleanup=…`. The exit code
+is 0 only when the outcome is `passed`, setup, the inner command and teardown
+all exited 0, cleanup is `confirmed`, and the reply is a result frame.
+Otherwise it is the first that applies:
+
+| Rule | Exit code |
+| --- | --- |
+| Outcome `interrupted` or `cancelled`, or a cancelled frame | 130 |
+| Numeric non-zero setup status | that status |
+| Setup `timed_out` | 124 |
+| Setup `not-run` or `cancelled`, or `inner_exec=not-attempted` | 1 |
+| Non-zero inner return code; inner timeout without one | that code; 124 |
+| Numeric non-zero teardown status; teardown `timed_out` | that status; 124 |
+| Cleanup other than `confirmed` | 1 |
+| Anything else | 1 |
 
 #### Semantic matrix claims and derived evidence
 

@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -317,12 +318,14 @@ def module_launch_xdist_check(
 
 def prepare_lifecycle_probe(
     argv: Sequence[str], env: Mapping[str, str] | None, cwd: Path,
+    *, deadline: float | None = None,
 ) -> ProbeSetup | None:
     """Return the injected argv/env and report, or ``None`` for no injection.
 
     ``None`` leaves argv and environment byte-identical to the caller's.  Every
     failure (an unsupported launcher, a failed preflight, a report that cannot
-    be created) means no injection.
+    be created) means no injection.  ``deadline`` (issue #1326) is an absolute
+    monotonic bound on the preflight; an expired bound means no injection.
     """
     base = dict(os.environ) if env is None else {str(k): str(v) for k, v in env.items()}
     try:
@@ -335,7 +338,12 @@ def prepare_lifecycle_probe(
     child = _child_env(base)
     # Positive preflight through the same execution path the target will use:
     # a wrapper that drops PYTHONPATH (for example by adding -I) fails it.
-    if _run_check(eligibility.invocation, _PREFLIGHT_CODE, child, cwd, PREFLIGHT_TIMEOUT_SECONDS) != 0:
+    preflight_timeout = PREFLIGHT_TIMEOUT_SECONDS
+    if deadline is not None:
+        preflight_timeout = min(preflight_timeout, deadline - time.monotonic())
+        if preflight_timeout <= 0:
+            return None
+    if _run_check(eligibility.invocation, _PREFLIGHT_CODE, child, cwd, preflight_timeout) != 0:
         return None
     report_dir: Path | None = None
     try:

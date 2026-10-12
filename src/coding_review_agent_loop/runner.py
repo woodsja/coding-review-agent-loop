@@ -36,8 +36,10 @@ from .test_runtime import (
     OVERLAP_REJECTED_MESSAGE,
     SUITE_START_STATES,
     WRAPPER_BOOTSTRAP_STATES,
+    PROBE_DEADLINE_DIAGNOSTIC,
     acquire_command_lane,
     argv_is_transportable,
+    inner_launcher_identity_key,
     probe_inner_launcher,
     resolve_adopted_package_script,
 )
@@ -520,6 +522,8 @@ def _run_foreground_test_body(
     host_launch_guard: Callable[[], Any] | None = None,
     package_script: Any = _UNRESOLVED_PACKAGE_SCRIPT,
     classify_pre_collection: bool = False,
+    absolute_deadline: float | None = None,
+    post_admission_setup: Callable[[float], Any] | None = None,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group.
 
@@ -544,6 +548,15 @@ def _run_foreground_test_body(
     lock.  With a budget, the effective argv/env are resolved before the
     command lane and launcher probe; in clamp and refuse the per-invocation
     worker-budget lock is held until the target's process group is gone.
+
+    ``absolute_deadline`` and ``post_admission_setup`` (issue #1326) default to
+    ``None``, which leaves every fixture-less call unchanged.  The deadline is
+    an absolute monotonic bound on host admission, the probes, the target
+    watchdog and the drain.  The hook runs once host admission and the worker
+    environment are settled and before the lifecycle and launcher probes; it
+    returns a decision whose ``proceed`` is false to skip the target.  With a
+    hook the launcher probe bypasses the per-invocation cache and the launcher
+    identity is re-read immediately before the guarded spawn.
     """
     requested_cmd = [str(value) for value in args]
     cmd = list(requested_cmd)
@@ -697,6 +710,9 @@ def _run_foreground_test_body(
             bound, bound_notice = host_wait_seconds(invocation_values)
             if bound_notice:
                 admission_notify(bound_notice)
+            if absolute_deadline is not None:
+                # Admission can never consume the time reserved after it.
+                bound = max(0.0, min(bound, absolute_deadline - time.monotonic()))
             try:
                 wait = worker_lock.wait_for_host_workers(
                     worker_budget.workers,
@@ -807,10 +823,31 @@ def _run_foreground_test_body(
     probe_setup = None
     launch_source = cmd
     try:
+        if post_admission_setup is not None:
+            setup_decision = post_admission_setup(
+                absolute_deadline if absolute_deadline is not None else started + timeout_seconds
+            )
+            if not setup_decision.proceed:
+                if handle is not None:
+                    handle.close()
+                lane_lock.close()
+                if setup_decision.action == "cancel":
+                    tel.set_outcome("cancelled")
+                    return _cancelled_result(
+                        cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
+                    )
+                reason = str(setup_decision.reason or "fixture setup did not succeed")
+                return ForegroundTestResult(
+                    cmd, cwd, "timed_out" if setup_decision.action == "timed_out" else "failed",
+                    None, time.monotonic() - started, timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
         if classify_pre_collection and package_script is None:
             from .lifecycle_probe import prepare_lifecycle_probe
 
-            probe_setup = prepare_lifecycle_probe(cmd, spawn_environment, cwd)
+            probe_setup = prepare_lifecycle_probe(
+                cmd, spawn_environment, cwd, deadline=absolute_deadline,
+            )
             if probe_setup is not None:
                 lane_lock.extra_cleanups.append(probe_setup.cleanup)
                 launch_source = list(probe_setup.argv)
@@ -825,6 +862,8 @@ def _run_foreground_test_body(
             environment_is_complete=spawn_environment is not None,
             cancel=host_wait_cancel,
             package_script=package_script,
+            deadline=absolute_deadline,
+            use_cache=post_admission_setup is None,
         )
         if host_wait_cancel is not None and host_wait_cancel.is_set():
             if handle is not None:
@@ -835,6 +874,21 @@ def _run_foreground_test_body(
                 cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
             )
         inner_probe_state = inner_probe.state
+        if absolute_deadline is not None and (
+            inner_probe.diagnostic == PROBE_DEADLINE_DIAGNOSTIC
+            or time.monotonic() >= absolute_deadline
+        ):
+            # Issue #1326: a truncated probe is not authentication; the target
+            # is never spawned and the caller keeps its teardown reserve.
+            if handle is not None:
+                handle.close()
+            lane_lock.close()
+            return ForegroundTestResult(
+                cmd, cwd, "timed_out", None, time.monotonic() - started,
+                timeout_seconds, PROBE_DEADLINE_DIAGNOSTIC, None, False,
+                wrapper_bootstrap, "not-attempted", "not-started", PROBE_DEADLINE_DIAGNOSTIC,
+                health_provenance,
+            )
         if inner_probe.state == "failed":
             missing_pytest = None
             if probe_setup is not None:
@@ -945,6 +999,25 @@ def _run_foreground_test_body(
             # directory handle is still private to this parent process.
             spawn_cwd = "/"
             spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
+        if post_admission_setup is not None and inner_probe.identity:
+            # Issue #1326: a fixture process may change the launcher context
+            # after the post-setup probe authenticated it.
+            current_identity = inner_launcher_identity_key(
+                launch_source, cwd=cwd, environment=spawn_environment,
+                environment_is_complete=spawn_environment is not None,
+                package_script=package_script,
+            )
+            if current_identity != inner_probe.identity:
+                if handle is not None:
+                    handle.close()
+                _close_held_fds(held_fds)
+                lane_lock.close()
+                reason = "launcher changed after authentication"
+                return ForegroundTestResult(
+                    cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
         anchor = worker_lock.launch_anchor() if worker_lock is not None else None
         if anchor is not None:
             # Issue #987: the child keeps the reservation live from fork
@@ -1115,6 +1188,8 @@ def _run_foreground_test_body(
     timed_out = False
     interrupted = False
     watchdog_deadline = started + timeout_seconds
+    if absolute_deadline is not None:
+        watchdog_deadline = min(watchdog_deadline, absolute_deadline)
     post_termination_deadline: float | None = None
     try:
         # A selector keeps output flowing to the terminal while allowing the
