@@ -20235,10 +20235,14 @@ def test_m1390_staged_budget_exhausts_with_a_pending_phase_advance_at_the_scope_
     assert not any("phase advance to round" in c["body"] for c in runner.issue_comments)
 
 
-def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reject", [False, True])
+def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
+    tmp_path, monkeypatch, reject,
+):
     """#1366: the creation intent guards the first coder turn, and a bypass
     ordinary dispatch on the reserved branch is reported after the created PR
-    is authenticated, never as qualification."""
+    is authenticated, never as qualification -- also when the report is
+    rejected after that authentication (item-11)."""
     import datetime
     import os
     import shutil
@@ -20298,6 +20302,18 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     handoff = _managed_issue_handoff(nonce=nonce)
     runner = IssueRunner(
         claude_outputs=[
+            # A report citing an out-of-checkout receipt is rejected only after
+            # the managed draft has been authenticated.
+            structured_issue_implementation(
+                pr_number=77,
+                tests_run=["python3 -m pytest"],
+                test_observations=[{
+                    "command": "cd /outside && python -m pytest",
+                    "receipt_id": "outside-receipt",
+                    "claim": "current-result",
+                }],
+            )
+            if reject else
             "Implemented the issue.\n<!-- AGENT_PR: 77 -->\n"
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
@@ -20335,6 +20351,22 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     monkeypatch.setattr(orchestrator_module, "prepare_v2_merge", lambda *_a, **_k: None)
     monkeypatch.setattr(orchestrator_module, "merge_pr", lambda *_a, **_k: None)
 
+    if reject:
+        with pytest.raises(AgentLoopError) as rejected:
+            run_issue_loop(runner, issue_number=56, config=config)
+        notes = [
+            comment["body"] for comment in runner.pr_payload.get("comments", [])
+            if "Coder-turn CI dispatch audit" in comment["body"]
+        ]
+        assert len(notes) == 1
+        assert "run 4242 on `abc123`" in notes[0]
+        assert "non-authoritative diagnostic, not qualification" in notes[0]
+        assert "coder response for this turn was rejected" in notes[0]
+        assert "Coder-turn" not in str(rejected.value)
+        assert dispatches == []
+        assert [attempt.returncode for attempt in runner.attempts] == [3]
+        assert not record.exists()
+        return
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
     # The guard refused the coder's gh trigger; the real gh was never reached.

@@ -4792,9 +4792,12 @@ a green check:
   created PR is authenticated. A non-managed run found there, for example one
   started through an absolute `gh` path, `curl`, or the web UI, is prepended to
   the coder's round comment as a non-authoritative diagnostic. It is never
-  qualification and never cancelled. If the coder's response is rejected
-  (for example, format repair fails), the same audit still runs and posts its
-  note as a separate orchestrator comment before the rejection is raised. A
+  qualification and never cancelled. If the turn is rejected (for example,
+  format repair fails, a report is invalid, or the checkout fails during
+  semantic correction), the same audit still runs and posts its note as a
+  separate orchestrator comment before the rejection is raised. In issue and
+  approved-plan implementation this applies once the created managed draft is
+  authenticated. A
   lookup failure adds only a diagnostic note and never blocks the round.
 
 The guard and the prompt text share one invocation-scoped decision. In the PR

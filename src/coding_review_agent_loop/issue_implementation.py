@@ -42,6 +42,7 @@ from .expected_closure import (
 )
 from .github import (
     coder_turn_dispatch_audit_note,
+    publish_rejected_coder_turn_dispatch_audit,
     IssueContext,
     PullRequestMetadata,
     deduplicate_human_requirements,
@@ -672,219 +673,236 @@ def _implement_approved_issue(
         )
 
     log(config, f"{coder_name} reported PR #{pr_number}; validating it is open")
-    initial_pr_context, managed_ci_handoff, implementation_config = _authenticate_reported_pr(
-        implementation_config
-    )
-    coverage_reask_used = False
-    coverage_discard_note: str | None = None
-    if coverage_map_applies(approved_plan_context):
-        # Read-only guards run before any coverage invocation so a wrongly
-        # reported PR never receives a mutating continuation (#1290).
-        _read_only_reference_guards(initial_pr_context, implementation_config)
-        gate_assessment = assess_risk_coverage_map(
+    # Once the managed draft is authenticated, a rejection of this turn
+    # (for example a failed report validation or a checkout failure during
+    # semantic correction) still publishes the dispatch audit (#1366).
+    managed_pr_authenticated = False
+    try:
+        initial_pr_context, managed_ci_handoff, implementation_config = _authenticate_reported_pr(
+            implementation_config
+        )
+        managed_pr_authenticated = True
+        coverage_reask_used = False
+        coverage_discard_note: str | None = None
+        if coverage_map_applies(approved_plan_context):
+            # Read-only guards run before any coverage invocation so a wrongly
+            # reported PR never receives a mutating continuation (#1290).
+            _read_only_reference_guards(initial_pr_context, implementation_config)
+            gate_assessment = assess_risk_coverage_map(
+                implementation_result,
+                approved_plan_context=approved_plan_context,
+                workdir=active_workdir(implementation_config),
+                head_sha=initial_pr_context.metadata.head_sha,
+            )
+            if gate_assessment is not None and gate_assessment.deficiencies and gate_assessment.tree_available:
+                coverage_reask_used = True
+                log(
+                    config,
+                    f"Risk-matrix coverage map incomplete for PR #{pr_number} "
+                    f"({', '.join(gate_assessment.deficient_row_ids)}); sending one coverage re-ask",
+                )
+                try:
+                    reask_response = _invoke_implementation_coder(
+                        _risk_coverage_reask_prompt(implementation_prompt, gate_assessment),
+                        session_id=coder_response.session_id,
+                        attempt_label="coverage-reask",
+                        invoke_config=implementation_config,
+                    )
+                except CheckoutVerificationError:
+                    raise
+                except AgentLoopError as exc:
+                    coverage_discard_note = (
+                        f"coverage re-ask response discarded: invocation failed ({type(exc).__name__})"
+                    )
+                    log(config, coverage_discard_note)
+                else:
+                    reask_result = reask_response.marker_value
+                    if isinstance(reask_result, _TerminalIssueImplementationConflict):
+                        reask_result = _TerminalIssueImplementationConflict(
+                            _degrade_out_of_checkout_tests(
+                                reask_result.parsed, config=implementation_config
+                            )
+                        )
+                        _post_structured_issue_implementation_terminal_comment(
+                            runner,
+                            config=implementation_config,
+                            issue_number=issue_number,
+                            parsed=reask_result.parsed,
+                            model_used=reask_response.model_used,
+                        )
+                        raise AgentLoopError(
+                            "Coder implementation result was not accepted for handoff because a signed "
+                            "human requirement is blocked."
+                        )
+                    if (
+                        isinstance(reask_result, StructuredIssueImplementation)
+                        and reask_result.pr_number == pr_number
+                    ):
+                        coder_response = reask_response
+                        coder_output = reask_response.text
+                        implementation_result = reask_result
+                    else:
+                        coverage_discard_note = (
+                            "coverage re-ask response discarded: it did not report the same PR"
+                        )
+                        log(config, coverage_discard_note)
+                # The re-ask may have pushed or edited the PR whether or not its
+                # response was adopted, so re-authenticate the refreshed PR before
+                # any publication binds its head or body.
+                initial_pr_context, managed_ci_handoff, implementation_config = _authenticate_reported_pr(
+                    implementation_config
+                )
+                _read_only_reference_guards(initial_pr_context, implementation_config)
+        if managed_ci_handoff is not None:
+            managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                runner,
+                config=implementation_config,
+                handoff=managed_ci_handoff,
+                metadata=initial_pr_context.metadata,
+                issue_number=issue_number,
+                approved_plan_hash_value=plan_hash,
+            )
+        if isinstance(implementation_result, StructuredIssueImplementation):
+            implementation_result = _validate_structured_response_tests_with_post_pr_context(
+                implementation_result,
+                runner=runner,
+                config=implementation_config,
+                pr_number=pr_number,
+            )
+            _validate_structured_response_observations_with_post_pr_context(
+                implementation_result.test_observations,
+                runner=runner,
+                config=implementation_config,
+                pr_number=pr_number,
+            )
+        validate_pr_references_issue(
+            runner,
+            config=implementation_config,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            staged_parent_issue=staged_parent_issue,
+            body=initial_pr_context.metadata.body,
+        )
+        validate_pr_expected_closing_issues(
+            runner,
+            config=implementation_config,
+            pr_number=pr_number,
+            expected_issue_ids=closing_contract.issue_ids,
+            body=initial_pr_context.metadata.body,
+        )
+        _advisory_issue_pr_provenance(
+            runner,
+            config=implementation_config,
+            pr_number=pr_number,
+            expected_scope=IssuePrProvenanceScope(
+                repository=implementation_config.repo,
+                issue_number=issue_number,
+                flow="approved",
+                approved_plan_hash=plan_hash,
+            ),
+        )
+        initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
+        pr_contract = make_pr_contract(
+            repository=implementation_config.repo,
+            pr_number=pr_number,
+            origin_flow="approved-plan-implementation",
+            primary_issue_number=issue_number,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            supersedes_hash=closing_contract.supersedes_hash,
+        )
+        post_trusted_pr_contract_record(
+            runner,
+            config=implementation_config,
+            pr_number=pr_number,
+            body=TrustedBody.canonical(
+                format_pr_contract_comment(pr_contract),
+                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+            ),
+        )
+        post_issue_pr_handoff_comment(
+            runner,
+            config=implementation_config,
+            issue_number=issue_number,
+            pr_number=pr_number,
+            pr_url=initial_pr_url,
+            pr_head_sha=initial_pr_head_sha,
+            flow="approved-plan-implementation",
+            plan_hash=plan_hash,
+            expected_closing_issue_ids=closing_contract.issue_ids,
+            supersedes_hash=closing_contract.supersedes_hash,
+            plan_growth_verdict=plan_growth_verdict,
+        )
+        if one_shot_parent_issue is not None:
+            post_one_shot_impl_handoff_comment(
+                runner,
+                config=implementation_config,
+                parent_issue=one_shot_parent_issue,
+                mode="implement-one-shot",
+                plan_hash=plan_hash,
+                plan_subject=plan_subject or "",
+                pr_number=pr_number,
+                pr_head_sha=initial_pr_context.metadata.head_sha,
+                strategy=(execution_recommendation.strategy if execution_recommendation is not None else None),
+                topology_source=(
+                    str(execution_identity["topology_source"])
+                    if execution_identity is not None else None
+                ),
+                execution_strategy_contract_version=(
+                    1 if execution_recommendation is not None else None
+                ),
+                recommendation_digest=(
+                    str(execution_identity["recommendation_sha256"])
+                    if execution_identity is not None else None
+                ),
+            )
+        implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
+            implementation_result,
+            approved_plan_context=approved_plan_context,
+            runner=runner,
+            assigned_workdir=active_workdir(implementation_config),
+            head_sha=initial_pr_context.metadata.head_sha,
+            # A semantic correction resumes this coder turn, so it carries the
+            # same guard (#1366).
+            config=dataclasses_replace(implementation_config, coder_ci_dispatch_guard=coder_ci_guarded),
+            session_id=coder_response.session_id,
+            invocation_id=coder_response.acquisition_test_turn_id,
+            _closed_execution_catalog=coder_response.acquisition_test_observations,
+            _journal_observations=coder_response.acquisition_test_observations,
+            reauthenticate_head=lambda: get_pr_review_context(
+                runner, config=implementation_config, pr_number=pr_number
+            ).metadata.head_sha,
+        )
+        final_coverage_assessment = final_risk_coverage_assessment(
             implementation_result,
             approved_plan_context=approved_plan_context,
             workdir=active_workdir(implementation_config),
-            head_sha=initial_pr_context.metadata.head_sha,
+            initial_head_sha=initial_pr_context.metadata.head_sha,
+            derived=_initial_derived_risk_evidence,
         )
-        if gate_assessment is not None and gate_assessment.deficiencies and gate_assessment.tree_available:
-            coverage_reask_used = True
-            log(
-                config,
-                f"Risk-matrix coverage map incomplete for PR #{pr_number} "
-                f"({', '.join(gate_assessment.deficient_row_ids)}); sending one coverage re-ask",
+        # Evidence was derived for this exact head (the raced head when semantic
+        # correction observed a push), so the round record binds to it too.
+        bound_round_head = (
+            _initial_derived_risk_evidence.bound_head_sha
+            if _initial_derived_risk_evidence is not None
+            and _initial_derived_risk_evidence.bound_head_sha is not None
+            else initial_pr_context.metadata.head_sha
+        )
+        initial_local_test_evidence = runner.render_local_test_evidence(
+            current_head=initial_pr_context.metadata.head_sha,
+            legacy_tests_run=implementation_result.tests_run,
+            cwd=active_workdir(implementation_config),
+        )
+    except AgentLoopError:
+        if managed_pr_authenticated and managed_ci_creation_intent is not None:
+            publish_rejected_coder_turn_dispatch_audit(
+                runner,
+                implementation_config,
+                pr_number=pr_number,
+                branch=managed_ci_creation_intent.branch,
+                head_shas=(initial_pr_context.metadata.head_sha,),
+                turn_started_at=coder_turn_started_at,
             )
-            try:
-                reask_response = _invoke_implementation_coder(
-                    _risk_coverage_reask_prompt(implementation_prompt, gate_assessment),
-                    session_id=coder_response.session_id,
-                    attempt_label="coverage-reask",
-                    invoke_config=implementation_config,
-                )
-            except CheckoutVerificationError:
-                raise
-            except AgentLoopError as exc:
-                coverage_discard_note = (
-                    f"coverage re-ask response discarded: invocation failed ({type(exc).__name__})"
-                )
-                log(config, coverage_discard_note)
-            else:
-                reask_result = reask_response.marker_value
-                if isinstance(reask_result, _TerminalIssueImplementationConflict):
-                    reask_result = _TerminalIssueImplementationConflict(
-                        _degrade_out_of_checkout_tests(
-                            reask_result.parsed, config=implementation_config
-                        )
-                    )
-                    _post_structured_issue_implementation_terminal_comment(
-                        runner,
-                        config=implementation_config,
-                        issue_number=issue_number,
-                        parsed=reask_result.parsed,
-                        model_used=reask_response.model_used,
-                    )
-                    raise AgentLoopError(
-                        "Coder implementation result was not accepted for handoff because a signed "
-                        "human requirement is blocked."
-                    )
-                if (
-                    isinstance(reask_result, StructuredIssueImplementation)
-                    and reask_result.pr_number == pr_number
-                ):
-                    coder_response = reask_response
-                    coder_output = reask_response.text
-                    implementation_result = reask_result
-                else:
-                    coverage_discard_note = (
-                        "coverage re-ask response discarded: it did not report the same PR"
-                    )
-                    log(config, coverage_discard_note)
-            # The re-ask may have pushed or edited the PR whether or not its
-            # response was adopted, so re-authenticate the refreshed PR before
-            # any publication binds its head or body.
-            initial_pr_context, managed_ci_handoff, implementation_config = _authenticate_reported_pr(
-                implementation_config
-            )
-            _read_only_reference_guards(initial_pr_context, implementation_config)
-    if managed_ci_handoff is not None:
-        managed_ci_handoff = _publish_issue_authorization_with_recovery(
-            runner,
-            config=implementation_config,
-            handoff=managed_ci_handoff,
-            metadata=initial_pr_context.metadata,
-            issue_number=issue_number,
-            approved_plan_hash_value=plan_hash,
-        )
-    if isinstance(implementation_result, StructuredIssueImplementation):
-        implementation_result = _validate_structured_response_tests_with_post_pr_context(
-            implementation_result,
-            runner=runner,
-            config=implementation_config,
-            pr_number=pr_number,
-        )
-        _validate_structured_response_observations_with_post_pr_context(
-            implementation_result.test_observations,
-            runner=runner,
-            config=implementation_config,
-            pr_number=pr_number,
-        )
-    validate_pr_references_issue(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        issue_number=issue_number,
-        staged_parent_issue=staged_parent_issue,
-        body=initial_pr_context.metadata.body,
-    )
-    validate_pr_expected_closing_issues(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        expected_issue_ids=closing_contract.issue_ids,
-        body=initial_pr_context.metadata.body,
-    )
-    _advisory_issue_pr_provenance(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        expected_scope=IssuePrProvenanceScope(
-            repository=implementation_config.repo,
-            issue_number=issue_number,
-            flow="approved",
-            approved_plan_hash=plan_hash,
-        ),
-    )
-    initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_context.metadata)
-    pr_contract = make_pr_contract(
-        repository=implementation_config.repo,
-        pr_number=pr_number,
-        origin_flow="approved-plan-implementation",
-        primary_issue_number=issue_number,
-        expected_closing_issue_ids=closing_contract.issue_ids,
-        supersedes_hash=closing_contract.supersedes_hash,
-    )
-    post_trusted_pr_contract_record(
-        runner,
-        config=implementation_config,
-        pr_number=pr_number,
-        body=TrustedBody.canonical(
-            format_pr_contract_comment(pr_contract),
-            expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-        ),
-    )
-    post_issue_pr_handoff_comment(
-        runner,
-        config=implementation_config,
-        issue_number=issue_number,
-        pr_number=pr_number,
-        pr_url=initial_pr_url,
-        pr_head_sha=initial_pr_head_sha,
-        flow="approved-plan-implementation",
-        plan_hash=plan_hash,
-        expected_closing_issue_ids=closing_contract.issue_ids,
-        supersedes_hash=closing_contract.supersedes_hash,
-        plan_growth_verdict=plan_growth_verdict,
-    )
-    if one_shot_parent_issue is not None:
-        post_one_shot_impl_handoff_comment(
-            runner,
-            config=implementation_config,
-            parent_issue=one_shot_parent_issue,
-            mode="implement-one-shot",
-            plan_hash=plan_hash,
-            plan_subject=plan_subject or "",
-            pr_number=pr_number,
-            pr_head_sha=initial_pr_context.metadata.head_sha,
-            strategy=(execution_recommendation.strategy if execution_recommendation is not None else None),
-            topology_source=(
-                str(execution_identity["topology_source"])
-                if execution_identity is not None else None
-            ),
-            execution_strategy_contract_version=(
-                1 if execution_recommendation is not None else None
-            ),
-            recommendation_digest=(
-                str(execution_identity["recommendation_sha256"])
-                if execution_identity is not None else None
-            ),
-        )
-    implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
-        implementation_result,
-        approved_plan_context=approved_plan_context,
-        runner=runner,
-        assigned_workdir=active_workdir(implementation_config),
-        head_sha=initial_pr_context.metadata.head_sha,
-        # A semantic correction resumes this coder turn, so it carries the
-        # same guard (#1366).
-        config=dataclasses_replace(implementation_config, coder_ci_dispatch_guard=coder_ci_guarded),
-        session_id=coder_response.session_id,
-        invocation_id=coder_response.acquisition_test_turn_id,
-        _closed_execution_catalog=coder_response.acquisition_test_observations,
-        _journal_observations=coder_response.acquisition_test_observations,
-        reauthenticate_head=lambda: get_pr_review_context(
-            runner, config=implementation_config, pr_number=pr_number
-        ).metadata.head_sha,
-    )
-    final_coverage_assessment = final_risk_coverage_assessment(
-        implementation_result,
-        approved_plan_context=approved_plan_context,
-        workdir=active_workdir(implementation_config),
-        initial_head_sha=initial_pr_context.metadata.head_sha,
-        derived=_initial_derived_risk_evidence,
-    )
-    # Evidence was derived for this exact head (the raced head when semantic
-    # correction observed a push), so the round record binds to it too.
-    bound_round_head = (
-        _initial_derived_risk_evidence.bound_head_sha
-        if _initial_derived_risk_evidence is not None
-        and _initial_derived_risk_evidence.bound_head_sha is not None
-        else initial_pr_context.metadata.head_sha
-    )
-    initial_local_test_evidence = runner.render_local_test_evidence(
-        current_head=initial_pr_context.metadata.head_sha,
-        legacy_tests_run=implementation_result.tests_run,
-        cwd=active_workdir(implementation_config),
-    )
+        raise
     initial_coder_public = render_public_agent_comment(
         kind="issue_implementation",
         parsed=implementation_result,
