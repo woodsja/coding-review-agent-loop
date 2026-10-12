@@ -2699,6 +2699,10 @@ class _M936World:
     def config(self, **kwargs):
         kwargs.setdefault("max_rounds", 4)
         kwargs.setdefault("plan_execution_mode", "auto")
+        # The durable plan history is generated under the fixture's default
+        # issue text, not the child context served afterwards, so its recorded
+        # issue digest differs by construction; keep the plan (#1390).
+        kwargs.setdefault("plan_resume_keep_on_issue_edit", True)
         return make_config(
             self.tmp_path, execution_strategy_contract_required=True, **kwargs,
         )
@@ -4961,3 +4965,15 @@ def test_m1377_signed_supersession_revises_and_approves_before_the_pr_is_rebound
         if index < revision_index and m.role == "reviewer" and m.state == "approved"
     }
     assert superseded_approvals == board_names
+
+
+def test_child_planning_cycle_does_not_inherit_the_keep_on_issue_edit_opt_out(
+    tmp_path, monkeypatch, capsys
+):
+    """#1390 `flag-not-inherited`: the per-invocation opt-out never reaches a child."""
+    _parent_config, child_config, err = _capture_child_planning_config(
+        tmp_path, monkeypatch, capsys, plan_resume_keep_on_issue_edit=True,
+    )
+
+    assert child_config.plan_resume_keep_on_issue_edit is False
+    assert err.count("does not inherit --plan-resume-keep-on-issue-edit") == 1

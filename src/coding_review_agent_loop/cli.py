@@ -1063,6 +1063,18 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-resume-keep-on-issue-edit",
+            dest="plan_resume_keep_on_issue_edit",
+            action="store_true",
+            help=(
+                "With issue --plan-first, keep resuming the existing unapproved plan even "
+                "though the issue title or body changed since it was planned. Meant for "
+                "typo-level edits; by default an edited issue starts a fresh plan in a new "
+                "planning scope. Applies to this invocation only and is not inherited by "
+                "child planning or recovery commands."
+            ),
+        )
+        subparser.add_argument(
             "--plan-growth-gate",
             choices=("enforce", "off"),
             default="enforce",
@@ -2212,6 +2224,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             or args.implementation_codex_reasoning_effort
             or args.implementation_claude_effort
         )
+        if args.command != "issue" and getattr(args, "plan_resume_keep_on_issue_edit", False):
+            raise AgentLoopError("--plan-resume-keep-on-issue-edit requires issue --plan-first.")
         if args.command != "issue" and implementation_override_requested:
             raise AgentLoopError("--implementation-coder options are only supported with issue --plan-first.")
         if getattr(args, "supersede_expected_closing_contract", False):
@@ -2275,6 +2289,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--plan-execution-mode requires --plan-first.")
             if getattr(args, "plan_narrow_staged", False) and not args.plan_first:
                 raise AgentLoopError("--plan-narrow-staged requires --plan-first.")
+            if getattr(args, "plan_resume_keep_on_issue_edit", False) and not args.plan_first:
+                raise AgentLoopError("--plan-resume-keep-on-issue-edit requires --plan-first.")
             if implementation_override_requested and not args.plan_first:
                 raise AgentLoopError("--implementation-coder options require --plan-first.")
             plan_execution_mode = args.plan_execution_mode

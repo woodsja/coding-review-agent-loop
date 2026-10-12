@@ -136,6 +136,7 @@ from .response_validation import (
 )
 from .panel_evidence import (
     _plan_growth_verdict_for_hash,
+    plan_issue_text_digest,
 )
 from .execution_policy import (
     _extract_current_expected_closing_issue_ids,
@@ -243,6 +244,8 @@ def run_issue_loop(
                     build_plan_approval_inputs(runner, config=config, issue_context=plan_owner)
                     if planning else None
                 ),
+                # The same edited-issue scope decision plan startup makes (#1390).
+                issue_digest=plan_issue_text_digest(plan_owner) if planning else None,
             )
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
@@ -395,8 +398,16 @@ def run_issue_loop(
                 # This is a comment-only reconstruction. It must happen before
                 # memory preparation or any agent invocation so an existing
                 # plan can be checked without re-planning.
+                from .plan_issue_scope import resolve_plan_scope
+
+                # Only the current planning scope's plan is reconstructed (#1390).
                 recovered_plan_state = _resume_plan_round(
-                    issue_context.comments, configured_reviewers=reviewers(config)
+                    issue_context.comments,
+                    configured_reviewers=reviewers(config),
+                    min_round_number=resolve_plan_scope(
+                        issue_context.comments, None, runner=runner, config=config,
+                        issue_number=issue_number,
+                    ),
                 )
                 if recovered_plan_state is not None:
                     recovered_plan_hash = approved_plan_hash(recovered_plan_state[0])

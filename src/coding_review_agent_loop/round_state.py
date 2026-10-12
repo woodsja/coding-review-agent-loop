@@ -240,6 +240,11 @@ class PostedRoundMetadata:
     # so legacy records stay byte-stable, and an unknown value decodes to None.
     plan_execution_mode: str | None = None
     scheduler_execution_mode: str | None = None
+    # The normalized issue title/body digest a plan-flow planner (coder) record
+    # was planned against (#1390).  Deliberately not a ``scheduler_*`` field,
+    # so a planner record is never mistaken for a scheduler checkpoint; omitted
+    # when None so legacy records stay byte-stable.
+    plan_issue_digest: str | None = None
     # This is an in-memory decode-quality signal, deliberately not serialized.
     # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
     # fields were present but could not be reconstructed safely.
@@ -1209,7 +1214,9 @@ def _authenticated_canonical_plan_success_exists(
             and metadata.execution_strategy_contract_version == execution_strategy_contract_version
             and metadata.risk_test_matrix_contract_version == risk_test_matrix_contract_version
             and (
-                (candidate_kind == "plan_state" and target_coder_round == 1)
+                # A fresh plan opens round 1 or, after an edited-issue
+                # rescope, the scope start round (#1390).
+                (candidate_kind == "plan_state" and target_coder_round >= 1)
                 or (candidate_kind == "plan_revision" and target_coder_round > 1)
             )
         ):
@@ -2753,6 +2760,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["scheduler_execution_mode"] = metadata.scheduler_execution_mode
     if metadata.plan_execution_mode is not None:
         payload["plan_execution_mode"] = metadata.plan_execution_mode
+    if metadata.plan_issue_digest is not None:
+        payload["plan_issue_digest"] = metadata.plan_issue_digest
     if metadata.plan_supersession_digest is not None:
         payload["plan_supersession_digest"] = metadata.plan_supersession_digest
         payload["plan_supersession_superseded_hash"] = (
@@ -3319,6 +3328,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             evidence_stall=_decode_evidence_stall(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
+            plan_issue_digest=_decode_plan_issue_digest(payload),
             **_decode_recovery_fields(payload),
             **_decode_step_back_fields(payload),
             **_decode_evidence_fields(payload),
@@ -3327,6 +3337,18 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError(f"Invalid AGENT_LOOP_META payload: {exc}") from exc
+
+
+def _decode_plan_issue_digest(payload: Mapping[str, object]) -> str | None:
+    """Tolerant decode (#1390): only a 16-hex digest on a plan-flow record survives."""
+    value = payload.get("plan_issue_digest")
+    if (
+        payload.get("flow") == "plan"
+        and isinstance(value, str)
+        and re.fullmatch(r"[0-9a-f]{16}", value)
+    ):
+        return value
+    return None
 
 
 def prior_plan_execution_mode(records: Sequence[PostedRoundRecord]) -> str | None:
@@ -5650,8 +5672,15 @@ def _resume_plan_round(
     comments: Sequence[object],
     *,
     configured_reviewers: Sequence[AgentName],
+    min_round_number: int = 1,
 ) -> tuple[str, ResumedReviewRound] | None:
     records = _extract_round_metadata_records(comments, flow="plan")
+    if min_round_number > 1:
+        # Planning-scope projection (#1390): records of an earlier planning
+        # scope never select the resumed plan or its carried ledger.
+        records = tuple(
+            record for record in records if record.metadata.round_number >= min_round_number
+        )
     if not records:
         return None
     latest_coder_record = next((record for record in reversed(records) if record.metadata.role == "coder"), None)

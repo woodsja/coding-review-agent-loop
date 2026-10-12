@@ -224,6 +224,7 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             "primary_plan_reviewer": None,
             "plan_review_force_full": False,
             "plan_reset_stall_streak": False,
+            "plan_resume_keep_on_issue_edit": False,
             "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
             "plan_step_back_rounds": DEFAULT_PLAN_STEP_BACK_ROUNDS,
             "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,

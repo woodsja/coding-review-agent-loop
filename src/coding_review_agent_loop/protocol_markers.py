@@ -367,6 +367,10 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         # Orchestrator-only plan reviewer-board change link (#1377), posted on
         # the issue that owns the plan; same admission rule as the PR link.
         _b64_definition("AGENT_PLAN_BOARD_CHANGE", surfaces=frozenset({ISSUE_COMMENT_SURFACE})),
+        # Orchestrator-only planning-scope boundary (#1390), posted on the
+        # issue when an edited issue opens a fresh plan; admitted only from the
+        # authenticated orchestrator actor.
+        _b64_definition("AGENT_PLAN_SCOPE_BOUNDARY", surfaces=frozenset({ISSUE_COMMENT_SURFACE})),
         # Cross-surface workflow transaction record (#827).  Prepared and
         # terminal records live only in trusted PR comments.
         MarkerDefinition(

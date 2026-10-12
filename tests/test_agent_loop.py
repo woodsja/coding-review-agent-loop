@@ -8002,3 +8002,94 @@ def test_codex_oversized_structured_billing_error_gets_billing_suggestion(tmp_pa
     assert n == 1 and sleeps == []
     text = str(out)
     assert "non-retryable" in text and "billing" in text and "authenticated" not in text
+
+
+# --- Edited-issue planning scope metadata and opt-out (#1390) -----------------
+
+
+def test_plan_issue_digest_round_trips_and_legacy_records_stay_byte_stable():
+    """`metadata-roundtrip-legacy-stable`."""
+    plan = "Plan.\n\n### Plan steps\n1. Step."
+    legacy = PostedRoundMetadata(
+        flow="plan", role="coder", agent="Claude", round_number=2,
+        subject=_plan_subject(plan), canonical_plan=plan,
+    )
+    encoded = _encode_round_metadata(legacy)
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.plan_issue_digest is None
+    # A record without the field re-encodes byte-identically, with no new key.
+    assert _encode_round_metadata(decoded) == encoded
+    stamped = replace(legacy, plan_issue_digest="0123456789abcdef")
+    stamped_encoded = _encode_round_metadata(stamped)
+    assert stamped_encoded != encoded
+    round_tripped = _decode_round_metadata(stamped_encoded)
+    assert round_tripped.plan_issue_digest == "0123456789abcdef"
+    assert _encode_round_metadata(round_tripped) == stamped_encoded
+    # Never a scheduler checkpoint: the planner record keeps scheduler state absent.
+    assert round_tripped.scheduler_metadata_status == "absent"
+    assert round_tripped.scheduler_issue_digest is None
+    # A malformed or non-plan digest decodes as absent.
+    assert _decode_round_metadata(
+        _encode_round_metadata(replace(legacy, plan_issue_digest="NOT-HEX"))
+    ).plan_issue_digest is None
+
+
+def test_plan_resume_keep_on_issue_edit_flag_parses_and_requires_plan_first(capsys):
+    """`flag-not-inherited` (CLI/config)."""
+    parser = build_parser()
+    base = ["issue", "56", "--repo", "OWNER/REPO"]
+    assert parser.parse_args([*base, "--plan-first"]).plan_resume_keep_on_issue_edit is False
+    with_flag = parser.parse_args([*base, "--plan-first", "--plan-resume-keep-on-issue-edit"])
+    assert with_flag.plan_resume_keep_on_issue_edit is True
+    assert config_from_args(with_flag, FakeRunner()).plan_resume_keep_on_issue_edit is True
+    assert config_from_args(
+        parser.parse_args([*base, "--plan-first"]), FakeRunner()
+    ).plan_resume_keep_on_issue_edit is False
+
+    assert main([*base, "--plan-resume-keep-on-issue-edit"]) == 1
+    assert "--plan-resume-keep-on-issue-edit requires --plan-first" in capsys.readouterr().err
+    assert main(["pr", "7", "--repo", "OWNER/REPO", "--plan-resume-keep-on-issue-edit"]) == 1
+    assert "--plan-resume-keep-on-issue-edit requires issue --plan-first" in (
+        capsys.readouterr().err
+    )
+
+
+def test_plan_resume_keep_on_issue_edit_is_reset_in_derived_configs(tmp_path):
+    """`flag-not-inherited`: approving-board, isolated-provider and recovery configs."""
+    from coding_review_agent_loop.managed_ci import _render_recovery_command
+    from coding_review_agent_loop.plan_verification import PlanVerificationContext
+    from coding_review_agent_loop.semantic_dedupe import _isolated_provider_config
+    from coding_review_agent_loop.reviewer_floor import BoardSeat
+
+    config = make_config(
+        tmp_path, reviewer=("codex", "claude"), plan_resume_keep_on_issue_edit=True,
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--plan-first",
+            "--plan-resume-keep-on-issue-edit", "--reviewer", "codex",
+        ),
+    )
+    context = PlanVerificationContext(
+        issue_number=56,
+        original_reviewers=("Codex",),
+        effective_reviewers=("Codex",),
+        original_seats=(BoardSeat(seat_id="Codex", backend="codex"),),
+        effective_seats=(BoardSeat(seat_id="Codex", backend="codex"),),
+        policy="all-reviewers",
+        primary_reviewer=None,
+        seat_binding=None,
+        signed_amendment_count=0,
+    )
+    assert context.config_for(config).plan_resume_keep_on_issue_edit is False
+    isolated, isolated_dir = _isolated_provider_config(config, "claude", "")
+    try:
+        assert isolated.plan_resume_keep_on_issue_edit is False
+    finally:
+        import shutil
+
+        shutil.rmtree(isolated_dir, ignore_errors=True)
+    for target in ("issue", "pr"):
+        rendered = _render_recovery_command(
+            config, target=target, identifier=7, managed_ci=True,
+            preserve_managed_options=True,
+        )
+        assert "--plan-resume-keep-on-issue-edit" not in rendered

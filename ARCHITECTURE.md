@@ -2370,3 +2370,65 @@ startup.
   approve. That covers a stale or unproven requirement binding, an open or
   unreconstructible obligation, inherited inadmissibility and a pending
   signed supersession.
+
+### Planning scopes across an edited issue (#1390)
+
+A plan-first resume compares the normalized issue title/body digest
+(`panel_evidence.plan_issue_text_digest`; comments never contribute) with the
+digest the current plan was written against. Every plan-flow planner (coder)
+record carries that digest as the optional `plan_issue_digest` field. It is not
+a `scheduler_*` field, so a planner record is never read as a scheduler
+checkpoint, and it is omitted when unset so legacy records stay byte-stable.
+`plan_issue_scope.recorded_plan_issue_digest` prefers the newest in-scope
+planner digest, then the newest in-scope `scheduler_issue_digest`, then the
+admitted boundary's current digest. Legacy history with none of these resumes
+as before and logs that an edit cannot be detected.
+
+When the digests differ for a plan that is not completely approved, plan
+startup (`plan_issue_scope.plan_scope_decision`, shared with the issue floor
+preflight) logs both digests and the archived round R. By default it then:
+
+1. runs the read-only plan-board floor check at the new scope start R+1, so a
+   refused board publishes nothing;
+2. posts one orchestrator-only **scope-boundary record**
+   (`AGENT_PLAN_SCOPE_BOUNDARY`, a reserved marker agent output cannot emit),
+   naming both digests, the archived round and plan subject, and
+   `scope_start_round = R + 1`;
+3. starts a fresh plan at round R+1 with no prior plan and no carried items.
+   The planning round budget restarts there: the limit is
+   `scope start + --max-rounds - 1` for every budget exit.
+
+Round numbers stay monotonic, so board lineage, freshness and primary epochs
+keep their meaning. Old plan comments are never edited or deleted.
+`--plan-resume-keep-on-issue-edit` (per invocation, never inherited by child
+planning, isolated providers or rendered recovery commands) keeps today's
+resume instead. An approved plan is never reopened.
+
+**Admission.** `plan_board_state.admitted_issue_comments` reads REST author
+identities and the authenticated actor whenever a boundary or a plan
+board-change link is present. A boundary is honoured only when its author is
+that actor; a lookalike by anyone else is ignored and logged, and retires
+nothing. `resolve_plan_scope` makes no network call without a boundary-shaped
+record and fails closed on an incomplete read.
+
+**Two inputs.** Reviewer-board lineage (root anchor, binding initialization,
+links, signed amendments) is always resolved from the full admitted history.
+Planning candidates, the obligation ledger, panel evidence, the stall streak,
+step-back state, force-full and calls-avoided replay, growth revision counts,
+validation-diagnostic recovery and the planner/reviewer prompt context read
+the current scope. `scope_plan_comments` blanks earlier-scope plan round
+records and validation diagnostics in place (indices stay comparable with the
+lineage); the prompt view drops them, keeping human comments, signed
+requirements and the boundary audit text. Every shared reader derives the
+scope itself when no explicit scope is given: `plan_verification_inputs`,
+`classify_plan_approval`, `require_recoverable_plan_approval`,
+`plan_resume_round` and issue-loop comment-only recovery, so managed-CI
+recovery and strict qualification never report an archived item as an
+unreconstructible obligation. `_resume_plan_round` takes `min_round_number`.
+
+The approval classification has a distinct **`empty-scope`** state: a scope
+start above 1 with no in-scope plan candidate. Consumers treat it like
+`no-plan`, except the issue floor preflight, which floor-checks the plan board
+at the scope start instead of deriving the archived plan's handoff board. A
+restart after the boundary but before the first fresh planner record reopens
+the same scope without a second boundary and skips board-anchor re-entry.

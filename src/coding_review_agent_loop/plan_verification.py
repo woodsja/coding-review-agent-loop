@@ -166,6 +166,7 @@ class PlanVerificationContext:
             primary_plan_reviewer=primary,
             plan_review_force_full=False,
             plan_reset_stall_streak=False,
+            plan_resume_keep_on_issue_edit=False,
             plan_primary_stall_rounds=(
                 config.plan_primary_stall_rounds if staged else DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
             ),
@@ -528,6 +529,7 @@ def plan_verification_inputs(
     *,
     issue_number: int | None,
     trusted_actor: tuple[str, int] | None = None,
+    scope_start_round: int | None = None,
 ) -> tuple[object, tuple[object, ...]]:
     """The config and comments every plan-approval reader uses.
 
@@ -535,21 +537,34 @@ def plan_verification_inputs(
     approvals bound to a superseded seat model neutralized.  Without a plan
     candidate there is nothing to verify, and every consumer already fails
     closed on a missing canonical plan.
+
+    The returned comments are the current planning scope (#1390): planning
+    records of an earlier scope are blanked in place, so every candidate and
+    obligation reader downstream sees only the current scope while the board
+    is still derived from the full history.  ``scope_start_round`` defaults
+    to the admitted scope-boundary record's.
     """
+    from .plan_issue_scope import resolve_plan_scope, scope_plan_comments
     from .round_state import _extract_round_metadata_records
 
     comments = tuple(comments)
+    if scope_start_round is None:
+        scope_start_round = resolve_plan_scope(
+            comments, trusted_actor, issue_number=issue_number
+        )
     if not any(
         record.metadata.role == "coder"
         for record in _extract_round_metadata_records(comments, flow="plan")
     ):
-        return config, comments
+        return config, scope_plan_comments(comments, scope_start_round)
     context = derive_plan_verification_context(
         comments, issue_number=issue_number, trusted_actor=trusted_actor,
     )
     if context is None:
-        return config, comments
-    return context.config_for(config), context.verification_comments(comments)
+        return config, scope_plan_comments(comments, scope_start_round)
+    return context.config_for(config), scope_plan_comments(
+        context.verification_comments(comments), scope_start_round
+    )
 
 
 # --- Board-change audit record ------------------------------------------------
@@ -678,7 +693,11 @@ def signed_lineage_authorization(
 
 # --- Plan approval classification (#1377) --------------------------------------
 
-PLAN_APPROVAL_STATES = ("no-plan", "unfinished", "undetermined", "approved")
+# ``empty-scope`` (#1390): an edited-issue rescope opened a planning scope that
+# has no plan candidate yet.  Every consumer treats it like ``no-plan`` except
+# the issue floor preflight, which floor-checks the plan board at the scope
+# start instead of deriving the archived plan's handoff board.
+PLAN_APPROVAL_STATES = ("no-plan", "empty-scope", "unfinished", "undetermined", "approved")
 
 
 @dataclass(frozen=True)
@@ -974,9 +993,34 @@ class PlanApprovalInputs:
     supersession_check: Callable[[str], bool] | None = None
     derivable: bool = True
     underivable_reason: str = ""
+    # The planning scope start the classification judges (#1390); ``None``
+    # derives it from the admitted scope-boundary record.
+    scope_start_round: int | None = None
 
 
 def build_plan_approval_inputs(
+    runner: object | None,
+    *,
+    config: object,
+    issue_context: object,
+    parent_issue_context: object | None = None,
+    scope_start_round: int | None = None,
+) -> PlanApprovalInputs:
+    """Derive every live classification input read-only from the issue and its parent.
+
+    ``scope_start_round`` carries a planning scope the caller already decided
+    (#1390), including one the plan loop is about to open.
+    """
+    inputs = _build_plan_approval_inputs(
+        runner, config=config, issue_context=issue_context,
+        parent_issue_context=parent_issue_context,
+    )
+    if scope_start_round is None:
+        return inputs
+    return replace(inputs, scope_start_round=scope_start_round)
+
+
+def _build_plan_approval_inputs(
     runner: object | None,
     *,
     config: object,
@@ -1079,6 +1123,7 @@ def classify_plan_approval(
     inputs: PlanApprovalInputs | None = None,
     poster_completion_proven: bool = False,
     execution_mode_guard: bool = True,
+    scope_start_round: int | None = None,
 ) -> PlanApprovalClassification:
     """Read-only plan approval classification from history alone (#1377 step 12).
 
@@ -1096,6 +1141,12 @@ def classify_plan_approval(
     qualification, whose own complete-approval check over the plan board
     proves completion of unanchored plain history (as before #1377);
     ``execution_mode_guard`` is off there because no planning turn follows.
+
+    Two inputs (#1390): the approving board is derived from the full history,
+    while the plan candidate, its ledger and its approvals are read from the
+    current planning scope (``scope_start_round``, derived from the admitted
+    scope-boundary record when omitted).  A scope with no candidate yet is
+    ``empty-scope``.
     """
     from .config import reviewers
     from .panel_evidence import _require_complete_canonical_plan_approval
@@ -1117,10 +1168,21 @@ def classify_plan_approval(
         parent_requirement_ids = inputs.parent_requirement_ids
         inherited_check = inputs.inherited_check
         supersession_check = inputs.supersession_check
+        if scope_start_round is None:
+            scope_start_round = inputs.scope_start_round
+    from .plan_issue_scope import resolve_plan_scope, scope_plan_comments
+
     comments = tuple(comments)
+    if scope_start_round is None:
+        scope_start_round = resolve_plan_scope(
+            comments, trusted_actor, issue_number=issue_number
+        )
     records = _extract_round_metadata_records(comments, flow="plan")
     if not records:
         return PlanApprovalClassification("no-plan", "no plan round records")
+    scoped_records = tuple(
+        record for record in records if record.metadata.round_number >= scope_start_round
+    )
     lineage_bearing = plan_history_bears_lineage(comments, records)
     try:
         context = derive_plan_verification_context(
@@ -1132,12 +1194,25 @@ def classify_plan_approval(
             raise
         # Degraded legacy history keeps today's handling in the live loop.
         return PlanApprovalClassification("undetermined", f"legacy plan history: {exc}")
+    if scope_start_round > 1 and not any(
+        record.metadata.role == "coder" for record in scoped_records
+    ):
+        return PlanApprovalClassification(
+            "empty-scope",
+            f"the planning scope starting at round {scope_start_round} has no plan candidate yet",
+            context,
+        )
     if context is None:
         return PlanApprovalClassification("unfinished", "no plan reviewer has reviewed the plan")
     plan_config = context.config_for(config)
-    plan_comments = context.verification_comments(comments)
+    plan_comments = scope_plan_comments(
+        context.verification_comments(comments), scope_start_round
+    )
     try:
-        resumed = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
+        resumed = _resume_plan_round(
+            plan_comments, configured_reviewers=reviewers(plan_config),
+            min_round_number=scope_start_round,
+        )
     except (AgentLoopError, ValueError, KeyError, TypeError) as exc:
         return PlanApprovalClassification(
             "undetermined", f"the latest plan round cannot be reconstructed: {exc}", context,
@@ -1201,9 +1276,11 @@ def classify_plan_approval(
     # Recorded reconciliation evidence, not the resume reader's conservative
     # incompleteness flag, distinguishes cleared history from lost items.
     # Publication and reconciliation history is never filtered: a primary
-    # epoch or stale approval neutralizes evidence, not obligations.
+    # epoch or stale approval neutralizes evidence, not obligations.  Only a
+    # planning-scope boundary retires obligations: they belong to the archived
+    # plan, which no longer binds the issue (#1390).
     verification_records = _extract_round_metadata_records(plan_comments, flow="plan")
-    lost = plan_ledger_unreconstructible_items(records, plan_round)
+    lost = plan_ledger_unreconstructible_items(scoped_records, plan_round)
     if lost:
         return result("undetermined", "unreconstructible plan obligation(s) " + ", ".join(lost))
     open_items = plan_open_obligations(plan_round, board=board)
@@ -1258,6 +1335,7 @@ def enforce_issue_board_floor(
     human_requirements: Sequence[object] = (),
     planning: bool = False,
     inputs: PlanApprovalInputs | None = None,
+    issue_digest: str | None = None,
 ) -> None:
     """Issue-mode floor preflight, before any planning or implementation turn.
 
@@ -1270,6 +1348,13 @@ def enforce_issue_board_floor(
     so neither floor applies.  Otherwise a plan-first run resolves its plan
     board read-only, including any board-change candidate, and refuses a
     below-floor plan board before any agent invocation or comment post.
+
+    ``issue_digest`` is the current issue title/body digest of a plan-first
+    run (#1390).  The preflight then makes the same read-only edited-issue
+    decision as plan startup: when the loop is about to open a fresh planning
+    scope, the classification is ``empty-scope`` and the plan board is
+    resolved from full lineage and floor-checked at that scope start, so a
+    board the plan floor refuses is refused before the boundary is posted.
     """
     from .reviewer_floor import board_floor_enabled, enforce_configured_board_floor
     from .reviewer_seats import resolve_plan_handoff_board
@@ -1284,6 +1369,13 @@ def enforce_issue_board_floor(
             runner, config=config, issue_number=issue_number, comments=comments,
         )
     if planning:
+        from .plan_issue_scope import plan_scope_decision, resolve_plan_scope
+
+        scope_start = (
+            inputs.scope_start_round
+            if inputs is not None and inputs.scope_start_round is not None
+            else resolve_plan_scope(comments, trusted_actor, issue_number=issue_number)
+        )
         classification = classify_plan_approval(
             comments,
             config=config,
@@ -1291,7 +1383,30 @@ def enforce_issue_board_floor(
             human_requirements=human_requirements,
             trusted_actor=trusted_actor,
             inputs=inputs,
+            scope_start_round=scope_start,
         )
+        if issue_digest is not None:
+            decision = plan_scope_decision(
+                comments,
+                trusted_actor,
+                issue_digest,
+                bool(getattr(config, "plan_resume_keep_on_issue_edit", False)),
+                plan_approved=classification.approved,
+                issue_number=issue_number,
+            )
+            if decision.reset_required:
+                # The plan loop is about to open this scope: judge it as the
+                # loop will, before anything is posted.
+                scope_start = decision.scope_start_round
+                classification = classify_plan_approval(
+                    comments,
+                    config=config,
+                    issue_number=issue_number,
+                    human_requirements=human_requirements,
+                    trusted_actor=trusted_actor,
+                    inputs=inputs,
+                    scope_start_round=scope_start,
+                )
         if classification.approved and getattr(config, "plan_execution_mode", None) == "plan-only":
             # Nothing is implemented and planning is not reopened: no board
             # is chosen by this invocation, so there is nothing to floor.
@@ -1304,6 +1419,12 @@ def enforce_issue_board_floor(
                 resolve_plan_board_state,
             )
 
+            def scope_resume_round(effective_config: object, _lineage: object = None) -> int:
+                return plan_resume_round(
+                    comments, effective_config, min_round_number=scope_start,
+                    trusted_actor=trusted_actor,
+                )
+
             resolve_plan_board_state(
                 runner,
                 config=config,
@@ -1312,8 +1433,13 @@ def enforce_issue_board_floor(
                 admitted=(comments, trusted_actor),
                 drift_error=plan_drift_error(issue_number),
                 floor_context=f"Issue #{issue_number} plan reviewer board",
+                # An empty fresh scope re-enters at its start round, where a
+                # pending signed amendment must take effect (#1390).
+                resume_round=(
+                    scope_resume_round if classification.state == "empty-scope" else None
+                ),
                 floor_refusal_hint=plan_floor_refusal_hint(
-                    issue_number, lambda: plan_resume_round(comments, config),
+                    issue_number, lambda: scope_resume_round(config),
                 ),
             )
             return
