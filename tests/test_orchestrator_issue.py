@@ -20176,3 +20176,60 @@ def test_m1390_active_primary_changing_link_governs_the_fresh_scope(tmp_path):
     assert checkpoints[0].scheduler_primary_reviewer == "Gemini"
     # The changed primary reviews first; Codex audits only as the panel.
     assert _m1103_agent_calls(runner) == ["claude", "gemini", "codex"]
+
+
+@pytest.mark.parametrize("max_rounds", [1, 2])
+def test_m1390_staged_budget_exhausts_with_a_pending_phase_advance_at_the_scope_limit(
+    tmp_path, max_rounds
+):
+    """`budget-restarts-per-scope` (primary-then-panel): the fresh scope's primary
+    approves its candidate at the scope-relative limit, so the reviewer-only
+    secondary-audit advance is still outstanding and the run stops there."""
+    history, config = _m1390_staged_stalled_history(tmp_path)
+    start = 4
+    limit = start + max_rounds - 1
+    fresh = structured_v1_plan_state()
+    claude, codex = [fresh], []
+    if max_rounds == 2:
+        base = AuthenticatedPlanState.from_plan(
+            validate_structured_plan_state(fresh), round_number=start
+        )
+        block_codex, block_claude, _base = _m1103_blocking_chain(
+            start, start, base=base, item_offset=start - 1
+        )
+        claude += block_claude
+        codex += block_codex
+        codex.append(structured_plan_review(
+            state="approved",
+            prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ))
+    else:
+        codex.append(structured_plan_review(state="approved"))
+    runner, result, _messages = _m1390_rerun(
+        tmp_path, history,
+        config=replace(config, max_rounds=max_rounds, plan_primary_stall_rounds=0),
+        issue_payload=_M1390_EDIT,
+        claude_outputs=claude, codex_outputs=codex,
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    assert isinstance(result, AgentLoopError)
+    message = str(result)
+    assert "reviewer-only plan phase advance was still pending" in message
+    assert f"counted from planning-scope start round {start}" in message
+    assert "Gemini" in message
+    assert len(_m1390_boundaries(runner)) == 1
+    fresh_records = _plan_round_records(
+        SimpleNamespace(issue_comments=runner.issue_comments[len(history):])
+    )
+    assert max(record.round_number for record in fresh_records) == limit
+    # No secondary audit, planner turn, candidate or phase-advance record past the limit.
+    assert not any(
+        record.scheduler_phase not in (None, "primary") for record in fresh_records
+    )
+    assert [r.round_number for r in fresh_records if r.role == "coder"] == list(
+        range(start, limit + 1)
+    )
+    assert _m1103_agent_calls(runner).count("claude") == max_rounds
+    assert "gemini" not in _m1103_agent_calls(runner)
+    assert not any("phase advance to round" in c["body"] for c in runner.issue_comments)
