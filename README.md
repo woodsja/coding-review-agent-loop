@@ -632,7 +632,8 @@ board-change record on the issue, and a completely approved plan is never
 reopened by a different board. See
 [Changing the plan reviewer board mid-run](docs/local_agent_loop.md#changing-the-plan-reviewer-board-mid-run). Antigravity fallback
 stays inside one seat; seats share account quota and serialize turns through a
-bounded host settings lock. Existing `--reviewer agy` with
+host settings lock whose wait follows the holder's turn bound; an expired wait
+is a transient, seat-local failure. Existing `--reviewer agy` with
 `--antigravity-models` remains one reviewer with an ordered fallback chain.
 When a legacy Codex, Claude, or Gemini reviewer shares a backend with a named
 seat, select its model explicitly so preflight can check for overlap. Backend

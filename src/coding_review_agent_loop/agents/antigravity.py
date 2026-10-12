@@ -27,9 +27,11 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import errno
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
+import secrets
 import stat as stat_module
 import tempfile
 import threading
@@ -46,7 +48,7 @@ from .base import (
     with_public_response_file_instruction,
 )
 from .replacement import classify_provider_executable_replacement_interruption
-from ..errors import AgentLoopError, CheckoutVerificationError
+from ..errors import AgentLoopError, AgentSettingsLockWaitTimeout, CheckoutVerificationError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
@@ -55,7 +57,22 @@ from .. import workdir_claims
 from ..scratch import make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
-SETTINGS_LOCK_WAIT_SECONDS = 120
+# The shared agy settings lock is held for a whole agy turn (#1400), so a
+# waiter allows the holder's turn bound plus a margin for the holder's
+# post-turn cleanup, never less than the floor.
+SETTINGS_LOCK_WAIT_FLOOR_SECONDS = 120
+SETTINGS_LOCK_WAIT_MARGIN_SECONDS = 180
+# Deprecated alias of the floor, kept for external imports.
+SETTINGS_LOCK_WAIT_SECONDS = SETTINGS_LOCK_WAIT_FLOOR_SECONDS
+# An advertised holder bound above this is not trusted.
+SETTINGS_LOCK_HOLDER_BOUND_CEILING_SECONDS = 24 * 60 * 60
+# Contention across successive holders is capped at this multiple of the
+# largest single-holder allowance seen during one wait.
+SETTINGS_LOCK_OVERALL_CAP_FACTOR = 3
+SETTINGS_LOCK_POLL_SECONDS = 0.25
+# Indirections so tests can drive the lock wait with a fake clock.
+_settings_lock_monotonic = time.monotonic
+_settings_lock_sleep = time.sleep
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
@@ -75,6 +92,135 @@ def antigravity_quota_group(model: str, overrides: tuple[tuple[str, str], ...] =
     if name.startswith("claude"):
         return "claude"
     return f"model:{model.strip()}"
+
+
+
+def settings_lock_turn_bound_seconds(
+    config: AgentLoopConfig, timeout_seconds: float | None = None
+) -> float:
+    """Longest agy turn this invocation may hold the settings lock for.
+
+    Role-independent on purpose: the same bound is the fallback allowance for
+    an unknown holder, which may be a reviewer, coder or repair turn.
+    """
+    return float(max(
+        config.antigravity_print_timeout_seconds,
+        config.repair_timeout_seconds,
+        timeout_seconds or 0,
+    ))
+
+
+def settings_lock_wait_budget_seconds(turn_bound_seconds: float) -> float:
+    """Wait allowance for one holder whose turn is bounded by *turn_bound_seconds*."""
+    return float(max(
+        SETTINGS_LOCK_WAIT_FLOOR_SECONDS,
+        turn_bound_seconds + SETTINGS_LOCK_WAIT_MARGIN_SECONDS,
+    ))
+
+
+@dataclass(frozen=True)
+class SettingsLockHolder:
+    """Best-effort identity a settings-lock holder publishes for waiters."""
+
+    token: str
+    pid: int | None
+    run_id: str | None
+    seat: str | None
+    role: str | None
+    turn_bound_seconds: float | None
+
+    def describe(self) -> str:
+        bound = (
+            f"{self.turn_bound_seconds:.0f}s"
+            if self.turn_bound_seconds is not None
+            else "unknown"
+        )
+        return (
+            f"holder pid {self.pid if self.pid is not None else 'unknown'}, "
+            f"run {self.run_id or 'unknown'}, seat {self.seat or 'unknown'}, "
+            f"role {self.role or 'unknown'}, turn bound {bound}"
+        )
+
+
+def _settings_lock_holder_path(settings_lock_path: Path) -> Path:
+    return settings_lock_path.with_name(settings_lock_path.name + ".holder")
+
+
+def _valid_holder_bound(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    # Range-check before converting: a huge JSON integer overflows float().
+    if isinstance(value, int) and not 0 < value <= SETTINGS_LOCK_HOLDER_BOUND_CEILING_SECONDS:
+        return None
+    bound = float(value)
+    if not math.isfinite(bound) or bound <= 0 or bound > SETTINGS_LOCK_HOLDER_BOUND_CEILING_SECONDS:
+        return None
+    return bound
+
+
+def read_settings_lock_holder(holder_path: Path) -> SettingsLockHolder | None:
+    """Return the published holder, or None when missing, torn or malformed."""
+    import json
+
+    try:
+        payload = json.loads(holder_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        return None
+    pid = payload.get("pid")
+
+    def text(key: str) -> str | None:
+        value = payload.get(key)
+        return value if isinstance(value, str) and value else None
+
+    return SettingsLockHolder(
+        token=token,
+        pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+        run_id=text("run_id"),
+        seat=text("seat"),
+        role=text("role"),
+        turn_bound_seconds=_valid_holder_bound(payload.get("turn_bound_seconds")),
+    )
+
+
+def _publish_settings_lock_holder(holder_path: Path, holder: SettingsLockHolder) -> None:
+    """Atomically replace the holder record (temp file + os.replace)."""
+    import json
+
+    payload = {
+        "token": holder.token,
+        "pid": holder.pid,
+        "run_id": holder.run_id,
+        "seat": holder.seat,
+        "role": holder.role,
+        "turn_bound_seconds": holder.turn_bound_seconds,
+    }
+    fd, temp_name = tempfile.mkstemp(
+        prefix=holder_path.name + ".", suffix=".tmp", dir=holder_path.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(temp_name, holder_path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_own_settings_lock_holder(holder_path: Path, token: str) -> bool:
+    """Remove the holder record only when it still carries *token*."""
+    current = read_settings_lock_holder(holder_path)
+    if current is None or current.token != token:
+        return False
+    holder_path.unlink(missing_ok=True)
+    return True
 
 
 @dataclass
@@ -1082,28 +1228,34 @@ class AntigravityBackend:
         settings_was_injected = role in {"reviewer", "repair"}
         original_settings_text: str | None = None
         settings_restore_required = False
+        seat_label = config.active_reviewer_seat_id or "Antigravity"
+        holder_path = _settings_lock_holder_path(settings_lock_path)
+        own_turn_bound = settings_lock_turn_bound_seconds(config, timeout_seconds)
+        holder_token = secrets.token_hex(16)
+        # Set only after this invocation acquired the lock AND replaced the
+        # holder record, so a timed-out waiter never removes another's record.
+        holder_token_published = False
         try:
-            # The settings file is shared by every agy seat on this host. A
-            # bounded wait is distinct from the provider turn timeout; an
-            # interrupted wait leaves no completed reviewer response.
-            lock_wait_started = time.monotonic()
-            announced_wait = False
-            while True:
-                try:
-                    fcntl.flock(settings_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    elapsed = time.monotonic() - lock_wait_started
-                    if not announced_wait:
-                        log(config, f"{config.active_reviewer_seat_id or 'Antigravity'} waiting for shared agy settings lock")
-                        announced_wait = True
-                    if elapsed >= SETTINGS_LOCK_WAIT_SECONDS:
-                        raise AgentLoopError(
-                            f"{config.active_reviewer_seat_id or 'Antigravity'} waited {SETTINGS_LOCK_WAIT_SECONDS}s for the shared agy settings lock; review is incomplete"
-                        )
-                    time.sleep(min(0.25, SETTINGS_LOCK_WAIT_SECONDS - elapsed))
-            if announced_wait:
-                log(config, f"{config.active_reviewer_seat_id or 'Antigravity'} acquired shared agy settings lock after {time.monotonic() - lock_wait_started:.1f}s")
+            # The settings file is shared by every agy seat on this host and is
+            # held for a whole agy turn. Each observed holder gets its own
+            # advertised turn bound plus a margin (or this invocation's bound
+            # when it advertises none), under an overall cap (#1400).
+            self._wait_for_settings_lock(
+                fcntl, settings_lock, holder_path, config,
+                seat_label=seat_label, own_turn_bound=own_turn_bound,
+            )
+            try:
+                _publish_settings_lock_holder(holder_path, SettingsLockHolder(
+                    token=holder_token,
+                    pid=os.getpid(),
+                    run_id=run_id,
+                    seat=config.active_reviewer_seat_id,
+                    role=role,
+                    turn_bound_seconds=own_turn_bound,
+                ))
+                holder_token_published = True
+            except OSError as exc:
+                log(config, f"{seat_label} could not publish the shared agy settings lock holder record: {exc}")
             existing_settings: dict[str, object] = {}
             if settings_was_injected:
                 try:
@@ -1238,6 +1390,11 @@ class AntigravityBackend:
                     settings_path.unlink(missing_ok=True)
                 else:
                     settings_path.write_text(original_settings_text, encoding="utf-8")
+            if holder_token_published:
+                try:
+                    _remove_own_settings_lock_holder(holder_path, holder_token)
+                except OSError as exc:
+                    log(config, f"{seat_label} could not remove its shared agy settings lock holder record: {exc}")
             fcntl.flock(settings_lock, fcntl.LOCK_UN)
             settings_lock.close()
         log(config, f"Antigravity ({model}) finished; log: {log_path}")
@@ -1275,6 +1432,81 @@ class AntigravityBackend:
                 candidate.replay_refusal_detail if candidate else None
             ),
         )
+
+    @staticmethod
+    def _wait_for_settings_lock(
+        fcntl,
+        settings_lock,
+        holder_path: Path,
+        config: AgentLoopConfig,
+        *,
+        seat_label: str,
+        own_turn_bound: float,
+    ) -> None:
+        """Poll the host settings lock; raise AgentSettingsLockWaitTimeout when exhausted.
+
+        A new holder token opens a fresh window at the waiter's own monotonic
+        time of first observation (no cross-process wall-clock comparison). A
+        missing or torn record keeps the current window; an unknown holder
+        gets this invocation's own allowance.
+        """
+        own_allowance = settings_lock_wait_budget_seconds(own_turn_bound)
+        started = _settings_lock_monotonic()
+        window_started = started
+        window_allowance = own_allowance
+        largest_allowance = own_allowance
+        holder: SettingsLockHolder | None = None
+        announced = False
+        while True:
+            try:
+                fcntl.flock(settings_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                pass
+            now = _settings_lock_monotonic()
+            observed = read_settings_lock_holder(holder_path)
+            if not announced or (
+                observed is not None and (holder is None or observed.token != holder.token)
+            ):
+                if observed is not None:
+                    holder = observed
+                window_started = now
+                window_allowance = (
+                    settings_lock_wait_budget_seconds(observed.turn_bound_seconds)
+                    if observed is not None and observed.turn_bound_seconds is not None
+                    else own_allowance
+                )
+                largest_allowance = max(largest_allowance, window_allowance)
+                description = observed.describe() if observed is not None else "unknown holder"
+                if not announced:
+                    log(config, f"{seat_label} waiting for shared agy settings lock ({description}; allowing {window_allowance:.0f}s)")
+                    announced = True
+                else:
+                    log(config, f"{seat_label} shared agy settings lock passed to a new holder ({description}; allowing {window_allowance:.0f}s)")
+            overall_cap = SETTINGS_LOCK_OVERALL_CAP_FACTOR * largest_allowance
+            window_left = window_allowance - (now - window_started)
+            overall_left = overall_cap - (now - started)
+            if window_left <= 0 or overall_left <= 0:
+                waited = now - started
+                description = holder.describe() if holder is not None else "unknown holder"
+                limit = (
+                    f"the {window_allowance:.0f}s allowance for this holder"
+                    if window_left <= 0
+                    else f"the {overall_cap:.0f}s overall contention cap"
+                )
+                raise AgentSettingsLockWaitTimeout(
+                    f"{seat_label} waited {waited:.0f}s for the shared agy settings lock "
+                    f"({description}) and exceeded {limit}; lock contention is transient",
+                    holder_pid=holder.pid if holder is not None else None,
+                    holder_run_id=holder.run_id if holder is not None else None,
+                    holder_seat=holder.seat if holder is not None else None,
+                    holder_role=holder.role if holder is not None else None,
+                    holder_turn_bound_seconds=holder.turn_bound_seconds if holder is not None else None,
+                    waited_seconds=waited,
+                )
+            _settings_lock_sleep(min(SETTINGS_LOCK_POLL_SECONDS, window_left, overall_left))
+        if announced:
+            log(config, f"{seat_label} acquired shared agy settings lock after {_settings_lock_monotonic() - started:.1f}s")
 
     def run_repair(
         self,

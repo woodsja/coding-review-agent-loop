@@ -94,6 +94,7 @@ from .evidence_stall import approved_matrix_row_ids
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
+    AgentSettingsLockWaitTimeout,
     HumanDecisionRequiredError,
     QuotaResetExceededError,
 )
@@ -4805,7 +4806,15 @@ def run_pr_loop(
 
                         def _pr_retry_bound(reviewer: AgentName, turn: _ReviewerTurnResult) -> AgentLoopError | None:
                             if turn.error is not None:
-                                return turn.error if _pr_failure_is_fatal(turn.error) else None
+                                # Settings-lock contention is transient and seat-local,
+                                # but the seat only needs the lock to clear: keep the
+                                # healthy peers' outcomes withheld in the spool so a
+                                # rerun completes the round independently (#1400).
+                                if _pr_failure_is_fatal(turn.error) or isinstance(
+                                    turn.error, AgentSettingsLockWaitTimeout
+                                ):
+                                    return turn.error
+                                return None
                             parsed = _pr_publication_parsed(turn)
                             if (
                                 parsed is not None
@@ -5700,12 +5709,13 @@ def run_pr_loop(
                     agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
                 ]
                 # A host/account outage affects every seat of that backend.
-                # Model access and one seat's fallback exhaustion remain local.
+                # Model access, one seat's fallback exhaustion and shared agy
+                # settings-lock contention (#1400) remain local to the seat.
                 outage_backends = {
                     seat_backend(reviewer)
                     for reviewer, failure in unavailable_reviewer_failures.items()
                     if any(phrase in str(failure).lower() for phrase in (
-                        "backend outage", "provider outage", "settings lock", "cli not found"
+                        "backend outage", "provider outage", "cli not found"
                     ))
                 }
                 if outage_backends:

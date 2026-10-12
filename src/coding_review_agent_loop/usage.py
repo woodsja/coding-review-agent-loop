@@ -105,7 +105,7 @@ class UsageCallRecord:
         "self_update_interruption",
         "executable_replacement_interruption", "self_update_replay_refused_changed_workdir",
         "self_update_replay_refused_unavailable_workdir",
-        "architecture_contract_unsatisfied",
+        "architecture_contract_unsatisfied", "settings_lock_contention",
     ] | None = None
     log_path: str | None = None
     fallback_planned: bool | None = None
@@ -234,7 +234,7 @@ class RunUsageContext:
             "self_update_interruption",
             "executable_replacement_interruption", "self_update_replay_refused_changed_workdir",
             "self_update_replay_refused_unavailable_workdir",
-            "architecture_contract_unsatisfied",
+            "architecture_contract_unsatisfied", "settings_lock_contention",
         ] | None = None,
         log_path: str | None = None,
         fallback_planned: bool | None = None,

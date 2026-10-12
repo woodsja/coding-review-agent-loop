@@ -25,7 +25,7 @@ from .config import (
     ANTIGRAVITY_TRANSIENT_MODEL_ACCESS_SIGNATURES,
     DEFAULT_REASONING_EFFORT,
 )
-from .logging import agent_log_path
+from .logging import agent_log_path, log
 from .runner import strip_ansi
 from .repair_preservation import (
     REVIEW_KINDS,
@@ -53,7 +53,11 @@ from .protocol import (
     semantic_risk_claim_example_json,
     semantic_risk_claim_schema_text,
 )
-from .errors import FreshContractIntegrityError, ReviewSubstanceIntegrityError
+from .errors import (
+    AgentSettingsLockWaitTimeout,
+    FreshContractIntegrityError,
+    ReviewSubstanceIntegrityError,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -1338,6 +1342,7 @@ RepairOutcome = Literal[
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
     "transient_provider_error", "fresh_contract_integrity", "semantic_patch_integrity",
     "review_substance_integrity", "architecture_contract_unsatisfied",
+    "settings_lock_contention",
 ]
 
 
@@ -1817,14 +1822,30 @@ def execute_repair(
             try:
                 if config.repair_backend == "antigravity":
                     log_path = agent_log_path(config, "antigravity-repair", run_id=run_id)
-                    result = AntigravityBackend().run_repair(
-                        runner,
-                        config,
-                        prompt,
-                        model=model,
-                        run_id=run_id,
-                        log_path=log_path,
-                    )
+                    lock_wait_retry_used = False
+                    while True:
+                        try:
+                            result = AntigravityBackend().run_repair(
+                                runner,
+                                config,
+                                prompt,
+                                model=model,
+                                run_id=run_id,
+                                log_path=log_path,
+                            )
+                            break
+                        except AgentSettingsLockWaitTimeout as exc:
+                            # Host-wide lock contention, not a model failure:
+                            # one same-model re-wait that leaves retry_index
+                            # and the model chain untouched (#1400).
+                            if lock_wait_retry_used:
+                                raise
+                            lock_wait_retry_used = True
+                            log(
+                                config,
+                                f"Antigravity repair ({model}): shared agy settings lock wait "
+                                f"expired ({exc}); retrying the lock wait once",
+                            )
                     output = result.text.strip()
                     returncode = result.returncode
                     log_path = result.log_path
@@ -1873,6 +1894,12 @@ def execute_repair(
                 if log_path is not None:
                     log_path.parent.mkdir(parents=True, exist_ok=True)
                     log_path.write_text(diagnostic + "\n", encoding="utf-8")
+            except AgentSettingsLockWaitTimeout as exc:
+                outcome = "settings_lock_contention"
+                diagnostic = _sanitize_diagnostic(str(exc), config=config)
+                if log_path is not None:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(diagnostic + "\n", encoding="utf-8")
             except Exception as exc:
                 outcome = "spawn_error"
                 diagnostic = _sanitize_diagnostic(str(exc), config=config)
@@ -1890,6 +1917,10 @@ def execute_repair(
                     + (f"\n{diagnostic}" if diagnostic else "")
                 )
 
+            if outcome == "settings_lock_contention":
+                # The lock is host-wide, so another model would hit the same
+                # contention: no fallback is planned.
+                fallback_planned = False
             attempt = RepairAttemptResult(
                 backend=config.repair_backend,
                 model=model,
@@ -2019,6 +2050,8 @@ def execute_repair(
                     usage_record.outcome = attempt.outcome
                     usage_record.fallback_planned = attempt.fallback_planned
             attempts.append(attempt)
+            if attempt.outcome == "settings_lock_contention":
+                return None, None, attempts
             if attempt.outcome != "transient_provider_error":
                 break
     return None, None, attempts

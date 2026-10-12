@@ -5182,3 +5182,76 @@ def test_1388_optional_ids_are_refused_for_non_coder_kinds():
     assert "## Required coder follow-up item IDs:" not in _build_repair_prompt(
         "malformed plan review", expected_kind="plan_review"
     )
+
+
+def _lock_contended_repair(tmp_path, monkeypatch, *, blocked_waits, outputs):
+    """Run execute_repair with the next *blocked_waits* settings-lock waits expiring (#1400)."""
+    import fcntl
+    import importlib
+
+    from coding_review_agent_loop.usage import RunUsageContext
+
+    agy_mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
+    settings = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings)
+    monkeypatch.setattr(agy_mod, "settings_lock_wait_budget_seconds", lambda _bound: 0.0)
+    lock_name = str(settings.with_suffix(".json.lock"))
+    state = {"remaining": blocked_waits, "expired": 0}
+    real_flock = fcntl.flock
+
+    def interposed(handle, operation):
+        if (
+            getattr(handle, "name", None) == lock_name
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+            and state["remaining"]
+        ):
+            state["remaining"] -= 1
+            state["expired"] += 1
+            raise BlockingIOError
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", interposed)
+    runner = FakeRunner(
+        antigravity_catalog_outputs=[("Available models:\nModelA\nModelB\n", 0)],
+        antigravity_outputs=list(outputs),
+    )
+    config = make_config(tmp_path, repair_models=("ModelA",), antigravity_models=("ModelB",))
+    usage = RunUsageContext("lock", tmp_path / "usage.json")
+    repaired, _, attempts = execute_repair(
+        malformed_pr_review_source(state="approved"), runner=runner, config=config,
+        run_id="lock", usage_context=usage, validate=_accept_valid_repair,
+        expected_kind="pr_review",
+    )
+    invocations = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"] and "models" not in cmd]
+    return repaired, attempts, invocations, usage, state
+
+
+def test_antigravity_repair_retries_an_expired_settings_lock_wait_on_the_same_model(
+    tmp_path, monkeypatch
+):
+    repaired, attempts, invocations, usage, state = _lock_contended_repair(
+        tmp_path, monkeypatch, blocked_waits=1, outputs=[(_VALID_REPAIR, 0)]
+    )
+    assert repaired == _VALID_REPAIR
+    assert state["expired"] == 1
+    # One attempt on ModelA: the re-wait spent no retry_index or chain slot.
+    assert [(a.model, a.outcome) for a in attempts] == [("ModelA", "succeeded")]
+    assert [cmd[cmd.index("--model") + 1] for cmd in invocations] == ["ModelA"]
+    assert [r.outcome for r in usage.records] == ["succeeded"]
+
+
+def test_antigravity_repair_exhausted_settings_lock_contention_is_distinct_and_stops(
+    tmp_path, monkeypatch
+):
+    repaired, attempts, invocations, usage, state = _lock_contended_repair(
+        tmp_path, monkeypatch, blocked_waits=2, outputs=[(_VALID_REPAIR, 0)]
+    )
+    assert repaired is None
+    assert state["expired"] == 2
+    assert [(a.model, a.outcome) for a in attempts] == [("ModelA", "settings_lock_contention")]
+    assert attempts[0].fallback_planned is False
+    assert "for the shared agy settings lock" in attempts[0].diagnostic
+    # Never a spawn or provider failure, and ModelB is never tried.
+    assert invocations == []
+    assert [r.outcome for r in usage.records] == ["settings_lock_contention"]
+    assert [r.fallback_planned for r in usage.records] == [False]
