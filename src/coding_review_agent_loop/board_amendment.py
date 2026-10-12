@@ -919,7 +919,15 @@ def apply_board_amendment_to_ledger(
     result: list[UnresolvedReviewItem] = []
     reassignments: list[LedgerReassignment] = []
     for item in items:
-        if item.status not in _ACTIVE_LEDGER_STATUSES or not removed:
+        if (
+            item.status not in _ACTIVE_LEDGER_STATUSES
+            or not removed
+            # A row-converted evidence obligation keeps its stored owners
+            # (#1325): its clearance rule already falls back to the whole
+            # current board when no stored owner remains, and a primary-only
+            # reassignment would let one reviewer clear it alone.
+            or getattr(item, "converted_row_id", None) is not None
+        ):
             result.append(item)
             continue
         owners, states = _effective_ownership(item)

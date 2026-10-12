@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from .errors import (
@@ -82,6 +82,8 @@ def select_coder_followup_items(
         # Human-only exact-head evidence is never coder work (#1068).
         and not _is_evidence_obligation(item)
         and item.status != "future"
+        # A finding fully converted to operator evidence is inert (#1325).
+        and not item.is_inert_ledger_record
     )
 
 
@@ -278,6 +280,174 @@ def _upsert_evidence_obligation(
         obligation_identity=identity,
     )
     return [*unresolved_items, item], True
+
+
+def converted_evidence_obligation_identity(row_id: str, matrix_identity: str) -> str:
+    """Stable identity of a row-converted evidence obligation (#1325).
+
+    Keyed by (row ID, approved matrix identity) and namespaced apart from the
+    text-and-reviewer identities of reviewer requests, which stay unchanged.
+    """
+    digest = hashlib.sha256(
+        json.dumps([row_id, matrix_identity], ensure_ascii=True).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{EVIDENCE_OBLIGATION_KIND}:row:{digest}"
+
+
+def _is_row_converted_obligation(item: UnresolvedReviewItem) -> bool:
+    return _is_evidence_obligation(item) and item.converted_row_id is not None
+
+
+def converted_evidence_obligation_text(
+    *, row_id: str, matrix_identity: str, head_sha: str, explanation: str
+) -> str:
+    """Orchestrator-rendered request text for a converted row."""
+    detail = " ".join(str(explanation).split()).replace("`", "'")[:240]
+    return (
+        f"Operator evidence for approved risk-matrix row `{row_id}` (matrix "
+        f"`{matrix_identity[:12]}`), converted at head `{head_sha}`: the coder could not "
+        f"capture admissible tool evidence ({detail or 'capture limited'}). Supply evidence "
+        "that this row's expected outcome holds, and its forbidden side effects do not occur, "
+        "at exactly the frozen head."
+    )
+
+
+def _upsert_converted_evidence_obligation(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    *,
+    item_number: int,
+    row_id: str,
+    matrix_identity: str,
+    head_sha: str,
+    owners: Sequence[str],
+    source_round: int,
+    explanation: str,
+) -> tuple[list[UnresolvedReviewItem], UnresolvedReviewItem, bool]:
+    """Mint (or reuse) the one evidence obligation for a converted row (#1325).
+
+    Returns the ledger, the obligation, and whether ``item_number`` was
+    consumed.  An existing obligation with the same identity keeps its item
+    ID; a retained tombstone reopens as deferred instead of being re-minted.
+    """
+    identity = converted_evidence_obligation_identity(row_id, matrix_identity)
+    for index, existing in enumerate(unresolved_items):
+        if _is_evidence_obligation(existing) and existing.obligation_identity == identity:
+            if existing.status in {"blocking", "same-pr"} and existing.lifecycle in {
+                "evidence_deferred", "evidence_frozen"
+            }:
+                return list(unresolved_items), existing, False
+            reopened = replace(
+                existing,
+                status="blocking",
+                source_status="blocking",
+                lifecycle="evidence_deferred",
+                candidate_head_sha=None,
+                owner_states=tuple((owner, "pending") for owner in existing.resolution_owners),
+            )
+            result = list(unresolved_items)
+            result[index] = reopened
+            return result, reopened, False
+    owner_tuple = tuple(dict.fromkeys(owners))
+    item = UnresolvedReviewItem(
+        item_id=f"item-{item_number}",
+        reviewer="Orchestrator",
+        source_round=source_round,
+        text=converted_evidence_obligation_text(
+            row_id=row_id, matrix_identity=matrix_identity, head_sha=head_sha,
+            explanation=explanation,
+        ),
+        status="blocking",
+        source_status="blocking",
+        resolution_owners=owner_tuple,
+        owner_states=tuple((owner, "pending") for owner in owner_tuple),
+        authority=MACHINE_AUTHORITY,
+        obligation_kind=EVIDENCE_OBLIGATION_KIND,
+        lifecycle="evidence_deferred",
+        obligation_identity=identity,
+        converted_row_id=row_id,
+        converted_matrix_identity=matrix_identity,
+    )
+    return [*unresolved_items, item], item, True
+
+
+def converted_row_owners(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    row_id: str,
+    *,
+    configured_reviewers: Sequence[str],
+) -> tuple[str, ...]:
+    """Reviewers whose open evidence-only finding names ``row_id`` (#1325).
+
+    The residual tag decides, so a row already converted out of a finding
+    never makes that finding's reviewer an owner again.  With no such finding
+    (operator conversion) the whole configured board owns the obligation.
+    """
+    owners: list[str] = []
+    for item in unresolved_items:
+        if (
+            item.is_machine_obligation
+            or item.status not in {"blocking", "same-pr"}
+            or row_id not in item.residual_evidence_row_ids
+        ):
+            continue
+        for owner in item.resolution_owners or (item.reviewer,):
+            if owner not in owners:
+                owners.append(owner)
+    return tuple(owners) if owners else tuple(dict.fromkeys(configured_reviewers))
+
+
+def apply_residual_row_conversion(
+    unresolved_items: Sequence[UnresolvedReviewItem],
+    obligation_item_ids_by_row: Mapping[str, str],
+) -> tuple[list[UnresolvedReviewItem], dict[str, tuple[str, ...]]]:
+    """Move converted rows out of open findings' residual tags (#1325).
+
+    A finding keeps its original ``evidence_row_ids`` as provenance and gains
+    the converted subset.  Only when nothing residual remains does it move to
+    the terminal ``converted`` status, which is never mandatory and never
+    counted as resolved.  Returns the ledger and ``row -> finding item IDs``.
+    """
+    converted_by_row: dict[str, list[str]] = {row: [] for row in obligation_item_ids_by_row}
+    result: list[UnresolvedReviewItem] = []
+    for item in unresolved_items:
+        if item.is_machine_obligation or item.status not in {"blocking", "same-pr"}:
+            result.append(item)
+            continue
+        newly = [row for row in item.residual_evidence_row_ids if row in obligation_item_ids_by_row]
+        if not newly:
+            result.append(item)
+            continue
+        for row in newly:
+            converted_by_row[row].append(item.item_id)
+        converted = tuple(
+            row for row in item.evidence_row_ids
+            if row in set(item.converted_row_ids) | set(newly)
+        )
+        if set(converted) == set(item.evidence_row_ids):
+            obligations = sorted(
+                {obligation_item_ids_by_row[row] for row in newly}, key=_item_sort_key
+            )
+            note = (
+                "Converted to human-only exact-head evidence obligation(s) "
+                + ", ".join(obligations)
+                + "; this finding is no longer coder work."
+            )
+            result.append(
+                replace(
+                    item,
+                    status="converted",
+                    converted_row_ids=converted,
+                    notes=(*item.notes, note) if note not in item.notes else item.notes,
+                )
+            )
+        else:
+            result.append(replace(item, converted_row_ids=converted))
+    return result, {row: tuple(ids) for row, ids in converted_by_row.items()}
+
+
+def _item_sort_key(item_id: str) -> tuple[int, str]:
+    match = re.fullmatch(r"item-(\d+)", item_id)
+    return (int(match.group(1)) if match else 0, item_id)
 
 
 def freeze_evidence_obligations(
@@ -1137,7 +1307,9 @@ def _apply_unresolved_item_dispositions(
     future_items: list[UnresolvedReviewItem] = []
     for item in unresolved_items:
         dispositions = dispositions_by_item.get(item.item_id, [])
-        if not dispositions:
+        if not dispositions or item.is_inert_ledger_record:
+            # Converted findings and cleared row tombstones (#1325) are inert:
+            # reviewer dispositions never change them.
             next_unresolved.append(item)
             continue
         if any(d.sub_item_dispositions for d in dispositions) and _is_machine_obligation(item):
@@ -1165,6 +1337,29 @@ def _apply_unresolved_item_dispositions(
                 if evidence_clearances is not None and item.obligation_identity:
                     evidence_clearances.append(
                         (item.obligation_identity, evidence_response_head)
+                    )
+                if _is_row_converted_obligation(item):
+                    # A durable tombstone (#1325): it keeps its item ID and
+                    # identity so a head change can reopen it in place.
+                    clearers = sorted(
+                        {d.reviewer for d in dispositions if d.disposition == "resolved"}
+                    )
+                    note = (
+                        f"Cleared at head {evidence_response_head} by "
+                        + ", ".join(clearers)
+                        + " after signed human evidence."
+                    )
+                    next_unresolved.append(
+                        replace(
+                            preserved,
+                            status="resolved",
+                            lifecycle="cleared",
+                            candidate_head_sha=evidence_response_head,
+                            owner_states=tuple(
+                                (owner, "cleared") for owner in preserved.resolution_owners
+                            ),
+                            notes=(*preserved.notes, note),
+                        )
                     )
                 continue
             next_unresolved.append(preserved)
@@ -1583,6 +1778,10 @@ def _evidence_clearance_authorized(
 
     When the requester is no longer on the configured board, every configured
     reviewer must resolve the request, so no single reviewer can waive it.
+
+    A row-converted obligation (#1325) needs every stored owner still on the
+    configured board; when none remains, every configured reviewer must
+    resolve it, so a board change can never strand it.
     """
     owner = item.reviewer
     resolved_by = {
@@ -1590,6 +1789,15 @@ def _evidence_clearance_authorized(
         for disposition in dispositions
         if disposition.disposition == "resolved"
     }
+    if item.converted_row_id is not None:
+        owners = tuple(item.resolution_owners) or (item.reviewer,)
+        if configured_reviewers is None:
+            required = set(owners)
+        else:
+            board = set(configured_reviewers)
+            present = {name for name in owners if name in board}
+            required = present or board
+        return bool(required) and required <= resolved_by
     if configured_reviewers is not None and owner not in set(configured_reviewers):
         return bool(configured_reviewers) and set(configured_reviewers) <= resolved_by
     return owner in resolved_by
@@ -1873,6 +2081,15 @@ def _format_unresolved_items_for_coder(items: Sequence[UnresolvedReviewItem]) ->
                 "wait for authoritative source-specific validation."
             )
         lines.append(f"- {item.text}")
+        if item.converted_row_ids:
+            # Partly converted evidence-only finding (#1325).
+            lines.append(
+                "Risk-matrix rows converted to human-only exact-head evidence (not coder work): "
+                + ", ".join(item.converted_row_ids)
+                + "; rows this finding still demands evidence for: "
+                + (", ".join(item.residual_evidence_row_ids) or "(none)")
+                + "."
+            )
         lines.extend(format_sub_item_lines(item))
         if item.notes:
             lines.append("Latest reviewer updates:")

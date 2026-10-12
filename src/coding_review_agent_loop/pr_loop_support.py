@@ -64,6 +64,11 @@ from .github import (
 from .issue_pr_handoff import find_latest_issue_pr_handoff
 from .logging import log
 from . import evidence_stall as _evidence_stall
+from . import evidence_conversion as _evidence_conversion
+from .evidence_conversion import (
+    ConversionAuditRow,
+    EvidenceConversionAudit,
+)
 from .managed_ci import (
     AuthenticatedIssueCreatedHandoff,
     FINAL_CONTEXT,
@@ -85,6 +90,10 @@ from .protocol import (
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
     EVIDENCE_OBLIGATION_KIND,
+    EVIDENCE_SOURCE_OPERATOR_SIGNED,
+    SignedEvidenceReference,
+    apply_signed_evidence_references,
+    parse_risk_test_matrix_evidence,
     MACHINE_OBLIGATION_KINDS,
     parse_historical_structured_coder_followup,
     parse_historical_structured_issue_implementation,
@@ -115,6 +124,9 @@ from .followups import (
 from .round_state import (
     ApprovedPlanContext,
     EVIDENCE_FREEZE_PHASE,
+    EVIDENCE_CONVERSION_PHASE,
+    admit_evidence_authority_records,
+    record_carries_evidence_authority,
     EVIDENCE_RELEASE_PHASE,
     EvidenceFreezeRecord,
     EvidenceReleaseRecord,
@@ -166,6 +178,11 @@ from .unresolved_items import (
     _is_evidence_obligation,
     _pending_evidence_obligations,
     freeze_evidence_obligations,
+    _is_row_converted_obligation,
+    _upsert_converted_evidence_obligation,
+    apply_residual_row_conversion,
+    converted_evidence_obligation_identity,
+    converted_row_owners,
     release_evidence_freeze,
 )
 from .architecture_contract import (
@@ -336,6 +353,7 @@ def _coder_followup_review_context(
     head_sha: str | None,
     assigned_workdir: Path | None = None,
     coverage_map: str | None = None,
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
 ) -> str:
     if not text or metadata is None:
         return ""
@@ -372,7 +390,9 @@ def _coder_followup_review_context(
     # same round metadata as the public comment. Do not reconstruct it from
     # the coder's fresh response or from the cumulative local journal.
     if metadata.risk_test_matrix_evidence is not None:
-        payload["risk_test_matrix_evidence"] = metadata.risk_test_matrix_evidence
+        payload["risk_test_matrix_evidence"] = _overlay_signed_evidence_payload(
+            metadata.risk_test_matrix_evidence, signed_evidence_references, head_sha=head_sha
+        )
     if metadata.risk_test_matrix_diagnostics:
         payload["risk_test_matrix_diagnostics"] = [
             dict(item) for item in metadata.risk_test_matrix_diagnostics
@@ -449,6 +469,32 @@ def _coder_followup_review_context(
         + json.dumps(payload, ensure_ascii=True, indent=2)
         + "\n"
     )
+
+
+def _overlay_signed_evidence_payload(
+    evidence: object,
+    references: Sequence[SignedEvidenceReference],
+    *,
+    head_sha: str | None,
+) -> object:
+    """Overlay admitted operator-signed rows onto persisted evidence for display (#1325).
+
+    The persisted coder evidence is never rewritten; an unparsable payload is
+    shown unchanged.
+    """
+    if not references or not isinstance(evidence, Mapping):
+        return evidence
+    identity = evidence.get("matrix_identity")
+    if not isinstance(identity, str):
+        return evidence
+    try:
+        parsed = parse_risk_test_matrix_evidence(evidence)
+    except AgentLoopError:
+        return evidence
+    overlaid = apply_signed_evidence_references(
+        parsed, references, matrix_identity=identity, current_head=head_sha
+    )
+    return overlaid.to_payload() if overlaid is not parsed else evidence
 
 
 def _reviewer_summary_context(
@@ -1560,9 +1606,16 @@ def _append_evidence_barrier_note(body: str, items: Sequence[UnresolvedReviewIte
     return f"{text.rstrip()}\n\n{note}"
 
 
+def _evidence_requester(item: UnresolvedReviewItem) -> str:
+    if item.converted_row_id is not None:
+        owners = ", ".join(item.resolution_owners) or item.reviewer
+        return f"converted row `{item.converted_row_id}`, owned by {owners}"
+    return f"requested by {item.reviewer}"
+
+
 def _evidence_item_lines(items: Sequence[UnresolvedReviewItem]) -> list[str]:
     return [
-        f"- [{item.item_id}] requested by {item.reviewer}: {item.text}"
+        f"- [{item.item_id}] {_evidence_requester(item)}: {item.text}"
         for item in items
     ]
 
@@ -1574,7 +1627,12 @@ def _evidence_freeze_diagnostic(
     return (
         f"PR #{pr_number} is frozen at head {head_sha or 'unknown'} awaiting human-only "
         "exact-head evidence: "
-        + "; ".join(f"{item.item_id} from {item.reviewer}" for item in evidence)
+        + "; ".join(
+            f"{item.item_id} for converted row {item.converted_row_id}"
+            if item.converted_row_id is not None
+            else f"{item.item_id} from {item.reviewer}"
+            for item in evidence
+        )
         + ". No coder, CI qualification, or merge was started. Supply the evidence for "
         "exactly this head, or withdraw the request, in a PR comment whose last line is "
         f"exactly `-- Human Reviewer`, then rerun `agent-loop pr {pr_number}`. Pushing a new "
@@ -1656,6 +1714,7 @@ def _publish_evidence_freeze(
     watch_head_extension_used: bool,
     clearances: Sequence[tuple[str, str]] = (),
     still_frozen: bool = False,
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
 ) -> list[UnresolvedReviewItem]:
     """Publish and persist a freeze with exactly one comment (#1068).
 
@@ -1697,6 +1756,7 @@ def _publish_evidence_freeze(
                     watch_head_extension_used=watch_head_extension_used,
                 ),
                 evidence_clearances=tuple(clearances),
+                signed_evidence_references=_cumulative_references(signed_evidence_references),
                 **_architecture_metadata_fields(config),
             ),
         ),
@@ -1719,8 +1779,14 @@ def _publish_evidence_release(
     watch_head_extension_used: bool,
     clearances: Sequence[tuple[str, str]] = (),
     detail: str = "",
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
 ) -> list[UnresolvedReviewItem]:
-    """Post the single terminal release comment carrying the released ledger."""
+    """Post the single terminal release comment carrying the released ledger.
+
+    The cumulative signed-evidence references (#1325) ride on every terminal
+    record, so neither a partial clearance nor a release for findings loses
+    a reference minted in this pass.
+    """
     released = release_evidence_freeze(items)
     message = _EVIDENCE_RELEASE_MESSAGES[reason].format(detail=detail or "see the checks comment")
     heading = {
@@ -1733,6 +1799,7 @@ def _publish_evidence_release(
         pr_number=pr_number,
         body=_attach_round_metadata(
             f"{heading}\n\nAt head `{head_sha}`: {message}"
+            + _operator_signed_rows_note(signed_evidence_references, head_sha=head_sha)
             + _evidence_barrier_note(released)
             + "\n\n-- coding-review-agent-loop",
             PostedRoundMetadata(
@@ -1754,11 +1821,37 @@ def _publish_evidence_release(
                     watch_head_extension_used=watch_head_extension_used,
                 ),
                 evidence_clearances=tuple(clearances),
+                signed_evidence_references=_cumulative_references(signed_evidence_references),
                 **_architecture_metadata_fields(config),
             ),
         ),
     )
     return released
+
+
+def _cumulative_references(
+    references: Sequence[SignedEvidenceReference],
+) -> tuple[SignedEvidenceReference, ...]:
+    """Deduplicated references in first-seen order (#1325)."""
+    seen: dict[str, SignedEvidenceReference] = {}
+    for reference in references:
+        seen.setdefault(reference.reference_id, reference)
+    return tuple(seen.values())
+
+
+def _operator_signed_rows_note(
+    references: Sequence[SignedEvidenceReference], *, head_sha: str
+) -> str:
+    """Public labels for rows verified by operator-signed evidence at this head."""
+    rows = sorted(
+        {reference.row_id for reference in references if reference.head == head_sha}
+    )
+    if not rows:
+        return ""
+    return "\n\nRisk-matrix rows verified by operator-signed evidence:\n" + "\n".join(
+        f"- `{row_id}`: verified ({EVIDENCE_SOURCE_OPERATOR_SIGNED} at `{head_sha}`)"
+        for row_id in rows
+    )
 
 
 @dataclass(frozen=True)
@@ -1783,6 +1876,9 @@ def _evidence_freeze_gate(
     watch_failure_extension_used: bool,
     watch_head_extension_used: bool,
     clearances: Sequence[tuple[str, str]] = (),
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
+    approved_plan_context: ApprovedPlanContext | None = None,
+    in_process_audits: Sequence[EvidenceConversionAudit] = (),
 ) -> _EvidenceGateOutcome:
     """Final revalidation and, when evidence is pending, the single freeze write.
 
@@ -1805,6 +1901,20 @@ def _evidence_freeze_gate(
     live_ids = tuple(collect_requirement_ids(fresh))
     if set(live_ids) - set(surfaced_requirement_ids or ()):
         return _EvidenceGateOutcome("refresh", fresh)
+    if any(_is_row_converted_obligation(item) for item in items):
+        # Defense in depth (#1325): a stale converted tombstone that survived
+        # into finalization reopens here and freezes instead of proceeding.
+        items = _reconcile_converted_evidence(
+            runner,
+            config,
+            pr_number=pr_number,
+            ledger=items,
+            head_sha=head_sha,
+            approved_plan_context=approved_plan_context,
+            comments=fresh.comments,
+            in_process_references=signed_evidence_references,
+            in_process_audits=in_process_audits,
+        )
     if not _pending_evidence_obligations(items):
         return _EvidenceGateOutcome("proceed", fresh)
     still_frozen = bool(_frozen_evidence_obligations(items))
@@ -1821,9 +1931,17 @@ def _evidence_freeze_gate(
         watch_head_extension_used=watch_head_extension_used,
         clearances=clearances,
         still_frozen=still_frozen,
+        signed_evidence_references=signed_evidence_references,
     )
     raise HumanDecisionRequiredError(
         _evidence_freeze_diagnostic(pr_number=pr_number, head_sha=head_sha, items=frozen)
+    )
+
+
+def _evidence_gate_needed(items: Sequence[UnresolvedReviewItem]) -> bool:
+    """Pending evidence, or a converted row whose tombstone must be rebound (#1325)."""
+    return bool(_pending_evidence_obligations(items)) or any(
+        _is_row_converted_obligation(item) for item in items
     )
 
 
@@ -1881,7 +1999,7 @@ def _evidence_review_context(
             if item.lifecycle == "evidence_frozen"
             else "deferred until every code finding and machine gate is clean"
         )
-        lines.append(f"- [{item.item_id}] requested by {item.reviewer}; {state}: {item.text}")
+        lines.append(f"- [{item.item_id}] {_evidence_requester(item)}; {state}: {item.text}")
     lines.append(
         "These are machine-owned records. Disposition each one: `blocking` with a short "
         "note keeps a request that is still needed; `resolved` is only a note unless the "
@@ -1898,6 +2016,14 @@ def _evidence_review_context(
             "reviewers' dispositions on your item are notes only. Do not re-emit a request "
             "you just resolved. Report any code defect the evidence reveals in "
             "`blocking_items`."
+        )
+    if any(item.converted_row_id is not None for item in evidence):
+        lines.append(
+            "A converted-row obligation stands for an approved risk-matrix row whose evidence "
+            "could not be tool-captured. Every listed owner still on the board must dispose it "
+            "`resolved` at the frozen head for the row to be verified as operator-signed. Do "
+            "not re-tag a converted row in `evidence_row_ids`; a new finding naming it is an "
+            "ordinary code finding."
         )
     return "\n".join(lines) + "\n"
 
@@ -3813,8 +3939,10 @@ def render_evidence_stall_decision(
         "Decide how to proceed:\n"
         "1. Continue so the coder retries capture: rerun with `--pr-evidence-stall-rounds 0` "
         "(or a larger K).\n"
-        "2. Convert the named rows to the operator evidence freeze: not yet available in this "
-        "version; use option 3.\n"
+        "2. Convert the named rows to the operator evidence freeze: rerun with "
+        f"`--pr-convert-evidence-rows {','.join(clean(row_id) for row_id in sorted(rows))}` "
+        "(only rows listed above are accepted); the rows are then answered by signed "
+        "operator evidence at the final exact-head freeze.\n"
         "3. Override with a signed human decision through the existing signed-requirement "
         "path, then rerun the same command."
     )
@@ -3854,7 +3982,9 @@ def _followup_reports_code_changes(
             if item.obligation_kind != EVIDENCE_OBLIGATION_KIND:
                 return True
             continue
-        if not item.evidence_row_ids or not set(item.evidence_row_ids) <= citation_rows:
+        # The residual tag (#1325): rows already converted no longer count.
+        residual = item.residual_evidence_row_ids
+        if not residual or not set(residual) <= citation_rows:
             return True
     return False
 
@@ -3877,29 +4007,37 @@ def _evidence_stall_citation_rows(
     return frozenset(row for row in rows if isinstance(row, str) and row)
 
 
+def _head_bound_coder_record(
+    records: Sequence[PostedRoundRecord], head_sha: str
+) -> PostedRoundRecord | None:
+    """The newest PR coder record whose subject is ``head_sha``."""
+    return next(
+        (
+            record
+            for record in reversed(records)
+            if record.metadata.flow == "pr"
+            and record.metadata.role == "coder"
+            and record.metadata.subject == head_sha
+        ),
+        None,
+    )
+
+
 def _head_bound_unsatisfied_rows(
     records: Sequence[PostedRoundRecord],
     head_sha: str,
     approved_plan_context: ApprovedPlanContext,
+    *,
+    excluded_row_ids: Iterable[str] = (),
+    signed_references: Sequence[SignedEvidenceReference] = (),
 ) -> "_evidence_stall.UnsatisfiedRows | None":
     """Unsatisfied rows from the newest coder record bound to ``head_sha``.
 
-    ``None`` when no coder record produced that head.
+    ``None`` when no coder record produced that head.  Rows already converted
+    to the operator evidence freeze are excluded and admitted signed
+    references for ``head_sha`` overlay the evidence (#1325).
     """
-    bound = next(
-        (
-            record
-            for record in reversed(
-                [
-                    record
-                    for record in records
-                    if record.metadata.flow == "pr" and record.metadata.role == "coder"
-                ]
-            )
-            if record.metadata.subject == head_sha
-        ),
-        None,
-    )
+    bound = _head_bound_coder_record(records, head_sha)
     if bound is None:
         return None
     return _evidence_stall.unsatisfied_rows(
@@ -3907,6 +4045,9 @@ def _head_bound_unsatisfied_rows(
         bound.metadata.risk_test_matrix_diagnostics,
         approved_plan_context.risk_test_matrix_expected_row_ids or (),
         approved_plan_context.risk_test_matrix_identity,
+        excluded_row_ids=excluded_row_ids,
+        signed_references=signed_references,
+        head_sha=head_sha,
     )
 
 
@@ -3932,6 +4073,442 @@ def _non_convergence_evidence_owned_rows(
     return frozenset(unsatisfied.rows)
 
 
+def authenticated_pr_comments(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object] | None = None,
+    resume: bool = False,
+) -> tuple[tuple[object, ...], tuple[str, int] | None]:
+    """Hydrated comments and the actor; see :func:`_authenticated_pr_comments_status`."""
+    hydrated, actor, _complete = _authenticated_pr_comments_status(
+        runner, config, pr_number=pr_number, comments=comments, resume=resume
+    )
+    return hydrated, actor
+
+
+def _authenticated_pr_comments_status(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object] | None = None,
+    resume: bool = False,
+) -> tuple[tuple[object, ...], tuple[str, int] | None, bool]:
+    """PR comments with REST identities whenever evidence authority is present (#1325).
+
+    The one accessor every consumer of conversion or signed-evidence authority
+    uses instead of the raw GraphQL projection.  When any record carries such
+    authority, identities are merged from the REST history and the
+    authenticated actor is resolved (and cached on the runner).  On
+    ``resume`` an incomplete REST read raises before any agent runs; in a
+    mid-run reread an uncovered record simply stays unadmitted.  In dry-run
+    nothing is fetched and history grants no authority.
+
+    The third value says whether every authority-carrying record was read
+    with a covered identity and a resolved actor.  ``False`` means history is
+    *unavailable*, not rejected: callers must keep any established evidence
+    barrier rather than treat the missing authority as absent (#1325).
+    """
+    if comments is None:
+        comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    comments = tuple(comments)
+    try:
+        records = _extract_round_metadata_records(comments, flow="pr")
+    except AgentLoopError:
+        if resume:
+            raise
+        return comments, None, False
+    authority_indexes = [
+        record.index for record in records if record_carries_evidence_authority(record.metadata)
+    ]
+    if not authority_indexes:
+        return comments, _cached_trusted_actor(runner), True
+    if config.dry_run:
+        return comments, None, False
+    try:
+        merged = tuple(
+            merge_pr_comment_transport_identity(
+                runner, config=config, pr_number=pr_number, comments=comments  # type: ignore[arg-type]
+            )
+        )
+        actor = resolve_authenticated_github_actor(runner, config=config)
+    except AgentLoopError as exc:
+        if resume:
+            raise
+        log(config, f"Evidence-conversion authority not admitted: identity read failed ({exc})")
+        return comments, None, False
+    missing = [
+        index for index in authority_indexes
+        if index < len(merged) and getattr(merged[index], "author_id", None) is None
+    ]
+    if missing and resume:
+        raise AgentLoopError(
+            "PR evidence-conversion records cannot be authenticated: the REST comment read did "
+            f"not cover record(s) at comment index {', '.join(map(str, missing))}; rerun once "
+            "the complete comment history is readable. No agent was run."
+        )
+    if missing:
+        log(
+            config,
+            "Evidence-conversion records at comment index "
+            + ", ".join(map(str, missing))
+            + " were not covered by the REST identity read and are not admitted",
+        )
+    return merged, actor, not missing
+
+
+def admitted_pr_records(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object] | None = None,
+    resume: bool = False,
+) -> tuple[PostedRoundRecord, ...]:
+    """PR round records with #1325 authority admitted only from the actor."""
+    records, _complete = admitted_pr_records_status(
+        runner, config, pr_number=pr_number, comments=comments, resume=resume
+    )
+    return records
+
+
+def admitted_pr_records_status(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object] | None = None,
+    resume: bool = False,
+) -> tuple[tuple[PostedRoundRecord, ...], bool]:
+    """Admitted records plus whether the authority history was fully available."""
+    hydrated, actor, complete = _authenticated_pr_comments_status(
+        runner, config, pr_number=pr_number, comments=comments, resume=resume
+    )
+    return admit_evidence_authority_records(
+        _extract_round_metadata_records(hydrated, flow="pr"), hydrated, actor
+    ), complete
+
+
+_EVIDENCE_AUTHORITY_PHASES = frozenset(
+    {EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PHASE, EVIDENCE_CONVERSION_PHASE}
+)
+
+
+def evidence_authority_from_records(
+    records: Sequence[PostedRoundRecord],
+) -> tuple[tuple[SignedEvidenceReference, ...], tuple[EvidenceConversionAudit, ...]]:
+    """Union of admitted references and the admitted audits (#1325).
+
+    Only orchestrator summary records of the freeze, release and conversion
+    phases carry either; callers pass records already through
+    :func:`admit_evidence_authority_records`.
+    """
+    references: dict[str, SignedEvidenceReference] = {}
+    audits: list[EvidenceConversionAudit] = []
+    for record in records:
+        metadata = record.metadata
+        if metadata.role != "summary" or metadata.phase not in _EVIDENCE_AUTHORITY_PHASES:
+            continue
+        for reference in metadata.signed_evidence_references:
+            references.setdefault(reference.reference_id, reference)
+        if metadata.phase == EVIDENCE_CONVERSION_PHASE and metadata.evidence_conversion is not None:
+            audits.append(metadata.evidence_conversion)
+    return tuple(references.values()), tuple(audits)
+
+
+def _tool_verified_rows_at_head(
+    records: Sequence[PostedRoundRecord],
+    head_sha: str,
+    approved_plan_context: ApprovedPlanContext,
+) -> frozenset[str]:
+    """Rows tool-verified by the canonical evidence of the coder record at ``head_sha``."""
+    bound = _head_bound_coder_record(records, head_sha)
+    if bound is None or bound.metadata.risk_test_matrix_evidence is None:
+        return frozenset()
+    try:
+        evidence = parse_risk_test_matrix_evidence(
+            bound.metadata.risk_test_matrix_evidence,
+            expected_identity=approved_plan_context.risk_test_matrix_identity,
+            expected_row_ids=tuple(approved_plan_context.risk_test_matrix_expected_row_ids or ()),
+        )
+    except AgentLoopError:
+        return frozenset()
+    return frozenset(row.row_id for row in evidence.rows if row.status == "verified")
+
+
+def _matrix_applies(approved_plan_context: ApprovedPlanContext | None) -> bool:
+    return bool(
+        approved_plan_context is not None
+        and approved_plan_context.matrix_available
+        and approved_plan_context.risk_test_matrix_identity
+    )
+
+
+def _reconcile_converted_evidence(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    ledger: Sequence[UnresolvedReviewItem],
+    head_sha: str | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    comments: Sequence[object] | None = None,
+    in_process_references: Sequence[SignedEvidenceReference] = (),
+    records: Sequence[PostedRoundRecord] | None = None,
+    history_complete: bool = True,
+    in_process_audits: Sequence[EvidenceConversionAudit] = (),
+) -> list[UnresolvedReviewItem]:
+    """Live-head reconciliation of row-converted obligations (#1325).
+
+    Runs at round start after the authoritative ledger assignment and again
+    inside the finalization gate.  Without any converted obligation or
+    conversion record this is a no-op that performs no extra read.
+
+    Conversions this process posted (``in_process_audits``) are trusted
+    directly.  When the authority history is unavailable (a failed or
+    uncovered identity read, ``history_complete`` false) nothing is dropped
+    as unbacked: an established evidence barrier is kept, never removed for
+    want of a reread.  Tombstones still need an admitted reference, so they
+    reopen rather than satisfy, which is the fail-closed direction.
+    """
+    if not head_sha or not _matrix_applies(approved_plan_context):
+        return list(ledger)
+    assert approved_plan_context is not None
+    if records is None:
+        try:
+            raw_records = _extract_round_metadata_records(
+                comments if comments is not None else get_pr_review_context(
+                    runner, config=config, pr_number=pr_number
+                ).comments,
+                flow="pr",
+            )
+        except AgentLoopError:
+            raw_records = ()
+        if not any(_is_row_converted_obligation(item) for item in ledger) and not any(
+            record.metadata.phase == EVIDENCE_CONVERSION_PHASE for record in raw_records
+        ):
+            return list(ledger)
+        try:
+            records, history_complete = admitted_pr_records_status(
+                runner, config, pr_number=pr_number, comments=comments
+            )
+        except AgentLoopError as exc:
+            log(config, f"Converted-evidence reconciliation used no history ({exc})")
+            records, history_complete = (), False
+    references, audits = evidence_authority_from_records(records)
+    if not history_complete:
+        log(
+            config,
+            "Converted-evidence history is unavailable; keeping every converted obligation "
+            "already in the ledger",
+        )
+    return _evidence_conversion.reconcile_converted_obligations(
+        ledger,
+        live_head=head_sha,
+        matrix_identity=approved_plan_context.risk_test_matrix_identity,
+        admitted_audits=(*audits, *in_process_audits),
+        drop_unbacked=history_complete,
+        admitted_references=_cumulative_references((*references, *in_process_references)),
+        tool_verified_rows_at_live_head=_tool_verified_rows_at_head(
+            records, head_sha, approved_plan_context
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class EvidenceConversionOutcome:
+    """The ledger after a persisted conversion (#1325)."""
+
+    ledger: tuple[UnresolvedReviewItem, ...]
+    next_item_number: int
+    audit: EvidenceConversionAudit
+
+
+@dataclass(frozen=True)
+class EvidenceStallOutcome:
+    """The dispatch-path stall classification and any automatic conversion."""
+
+    snapshot: dict[str, object] | None
+    conversion: EvidenceConversionOutcome | None = None
+
+
+def _render_evidence_conversion_notice(
+    *,
+    pr_number: int,
+    head_sha: str,
+    audit: EvidenceConversionAudit,
+    explanations: Mapping[str, str],
+) -> str:
+    source = (
+        "after repeated coder attempts that could only produce capture-limited evidence"
+        if audit.source == "auto"
+        else "at the operator's request (`--pr-convert-evidence-rows`)"
+    )
+    lines = [
+        "## Risk-matrix evidence converted to the operator evidence freeze",
+        "",
+        f"At head `{head_sha}`, {source}, these approved risk-matrix rows now need "
+        "human-only exact-head evidence instead of tool-captured citations:",
+        "",
+    ]
+    for row in audit.rows:
+        detail = " ".join(str(explanations.get(row.row_id, "")).split()).replace("`", "'")[:240]
+        lines.append(
+            f"- `{row.row_id}` -> {row.obligation_item_id}, owned by {', '.join(row.owners)}"
+            + (f"; capture status: {detail}" if detail else "")
+        )
+    lines.extend(
+        [
+            "",
+            "The approved matrix is unchanged; only the source of these rows' evidence changed. "
+            "The evidence is requested once every code finding and machine gate is clean, at "
+            "the final barrier; a signed `-- Human Reviewer` answer for exactly the frozen head, "
+            "cleared by the owning reviewer(s), verifies each row as operator-signed.",
+            "",
+            "-- coding-review-agent-loop",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _apply_evidence_conversion(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    round_number: int,
+    head_sha: str,
+    matrix_identity: str,
+    ledger: Sequence[UnresolvedReviewItem],
+    rows: Mapping[str, Sequence[int]],
+    explanations: Mapping[str, str],
+    source: str,
+    next_item_number: int,
+    configured_reviewers: Sequence[str],
+    stall_snapshot: Mapping[str, object] | None,
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
+) -> EvidenceConversionOutcome:
+    """Mint one obligation per row and persist the conversion in one write.
+
+    The converted ledger exists only in memory until the single summary
+    record is posted, so a failed write leaves no conversion behind.
+    """
+    result = list(ledger)
+    owners_by_row = {
+        row_id: converted_row_owners(ledger, row_id, configured_reviewers=configured_reviewers)
+        for row_id in rows
+    }
+    obligation_ids: dict[str, str] = {}
+    for row_id in sorted(rows):
+        result, obligation, consumed = _upsert_converted_evidence_obligation(
+            result,
+            item_number=next_item_number,
+            row_id=row_id,
+            matrix_identity=matrix_identity,
+            head_sha=head_sha,
+            owners=owners_by_row[row_id],
+            source_round=round_number,
+            explanation=explanations.get(row_id, ""),
+        )
+        if consumed:
+            next_item_number += 1
+        obligation_ids[row_id] = obligation.item_id
+    result, converted_by_row = apply_residual_row_conversion(result, obligation_ids)
+    audit = EvidenceConversionAudit(
+        source=source,
+        matrix_identity=matrix_identity,
+        head=head_sha,
+        rows=tuple(
+            ConversionAuditRow(
+                row_id=row_id,
+                obligation_identity=converted_evidence_obligation_identity(row_id, matrix_identity),
+                obligation_item_id=obligation_ids[row_id],
+                owners=tuple(
+                    next(
+                        item.resolution_owners
+                        for item in result
+                        if item.item_id == obligation_ids[row_id]
+                    )
+                ) or tuple(owners_by_row[row_id]),
+                converted_item_ids=converted_by_row.get(row_id, ()),
+                attempt_record_rounds=tuple(rows[row_id]),
+            )
+            for row_id in sorted(rows)
+        ),
+    )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_attach_round_metadata(
+            _render_evidence_conversion_notice(
+                pr_number=pr_number, head_sha=head_sha, audit=audit, explanations=explanations
+            ),
+            PostedRoundMetadata(
+                flow="pr",
+                role="summary",
+                agent="Orchestrator",
+                seat_binding=reviewer_seat_binding(config),
+                round_number=round_number,
+                subject=head_sha,
+                prior_items=tuple(result),
+                state="blocking",
+                phase=EVIDENCE_CONVERSION_PHASE,
+                evidence_conversion=audit,
+                conversion_stall_snapshot=(dict(stall_snapshot) if stall_snapshot is not None else None),
+                conversion_review_round=(round_number if source == "auto" else None),
+                signed_evidence_references=_cumulative_references(signed_evidence_references),
+                **_architecture_metadata_fields(config),
+            ),
+        ),
+    )
+    log(
+        config,
+        f"Round {round_number}: PR #{pr_number} converted risk-matrix row(s) "
+        f"{', '.join(audit.row_ids)} to the operator evidence freeze at {head_sha} ({source})",
+    )
+    return EvidenceConversionOutcome(
+        ledger=tuple(result), next_item_number=next_item_number, audit=audit
+    )
+
+
+def _prior_stall_snapshots(
+    records: Sequence[PostedRoundRecord],
+) -> dict[int, Mapping[str, object]]:
+    """Review-round snapshots from coder and conversion records; the latest wins."""
+    prior: dict[int, Mapping[str, object]] = {}
+    for record in records:
+        metadata = record.metadata
+        if metadata.flow != "pr":
+            continue
+        if metadata.role == "coder" and metadata.evidence_stall is not None:
+            prior[metadata.round_number - 1] = metadata.evidence_stall
+        elif (
+            metadata.phase == EVIDENCE_CONVERSION_PHASE
+            and metadata.conversion_stall_snapshot is not None
+        ):
+            prior[metadata.round_number] = metadata.conversion_stall_snapshot
+    return prior
+
+
+def _capture_classifications_by_round(
+    records: Sequence[PostedRoundRecord],
+) -> dict[int, Mapping[str, object]]:
+    """Admitted per-attempt classifications keyed by coder record round."""
+    result: dict[int, Mapping[str, object]] = {}
+    for record in records:
+        metadata = record.metadata
+        if (
+            metadata.flow == "pr"
+            and metadata.role == "coder"
+            and metadata.risk_test_matrix_capture_classification is not None
+        ):
+            result[metadata.round_number] = metadata.risk_test_matrix_capture_classification
+    return result
+
+
 def _pr_evidence_stall_decision(
     runner: Runner,
     config: AgentLoopConfig,
@@ -3942,40 +4519,43 @@ def _pr_evidence_stall_decision(
     approved_plan_context: ApprovedPlanContext | None,
     open_items: Sequence[UnresolvedReviewItem],
     pr_checks: PullRequestChecks | None,
-) -> dict[str, object] | None:
-    """Classify this review round and stop when the evidence-only window fills.
+    configured_reviewers: Sequence[str] = (),
+    next_item_number: int | None = None,
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
+) -> EvidenceStallOutcome | None:
+    """Classify this review round, convert eligible rows, then apply the stall stop.
 
     Evaluated on the ordinary dispatch path after the check-board snapshot and
     CI-failure reconciliation, before any coder invocation.  State comes only
-    from orchestrator-owned records: the persisted canonical matrix evidence
-    bound to the current head, the ledger, and prior stall snapshots on posted
-    coder follow-up records.  Returns the snapshot payload to persist on the
-    coder follow-up record, or ``None`` when no applicable approved matrix
-    exists or history cannot be read.  Raises ``HumanDecisionRequiredError``
-    (exit 4) when K consecutive qualifying rounds share one unsatisfied-row set.
+    from orchestrator-owned records, with #1325 authority admitted from the
+    authenticated actor alone.  Order (#1325): the current snapshot (with its
+    bound attempt) is computed first; automatic conversion is evaluated and
+    persisted next; only when nothing converted is the stall window evaluated,
+    so an eligible conversion is never pre-empted by the stall stop.  Returns
+    ``None`` when no applicable approved matrix exists or history cannot be
+    read.  Raises ``HumanDecisionRequiredError`` (exit 4) when K consecutive
+    qualifying rounds share one unsatisfied-row set.
     """
-    if (
-        approved_plan_context is None
-        or not approved_plan_context.matrix_available
-        or not approved_plan_context.risk_test_matrix_identity
-        or not head_sha
-    ):
+    if not _matrix_applies(approved_plan_context) or not head_sha:
         return None
+    assert approved_plan_context is not None
     identity = approved_plan_context.risk_test_matrix_identity
     try:
-        records = _extract_round_metadata_records(
-            get_pr_review_context(runner, config=config, pr_number=pr_number).comments,
-            flow="pr",
-        )
+        records = admitted_pr_records(runner, config, pr_number=pr_number)
     except AgentLoopError as exc:
         log(config, f"PR evidence stall suppressed: round history is unavailable ({exc})")
         return None
-    coder_records = [
-        record
-        for record in records
-        if record.metadata.flow == "pr" and record.metadata.role == "coder"
-    ]
-    unsatisfied = _head_bound_unsatisfied_rows(records, head_sha, approved_plan_context)
+    history_references, _audits = evidence_authority_from_records(records)
+    references = _cumulative_references((*history_references, *signed_evidence_references))
+    already = _evidence_conversion.converted_rows(open_items, matrix_identity=identity)
+    bound = _head_bound_coder_record(records, head_sha)
+    unsatisfied = _head_bound_unsatisfied_rows(
+        records,
+        head_sha,
+        approved_plan_context,
+        excluded_row_ids=already,
+        signed_references=references,
+    )
     snapshot = _evidence_stall.classify_round(
         review_round=round_number,
         review_head=head_sha,
@@ -3989,12 +4569,41 @@ def _pr_evidence_stall_decision(
             and item.lifecycle == "evidence_frozen"
             for item in open_items
         ),
+        bound_attempt_round=(bound.metadata.round_number if bound is not None else None),
     )
-    prior = {
-        record.metadata.round_number - 1: record.metadata.evidence_stall
-        for record in coder_records
-        if record.metadata.evidence_stall is not None
-    }
+    prior = _prior_stall_snapshots(records)
+    if (
+        next_item_number is not None
+        and config.pr_evidence_capture_attempts > 0
+        and unsatisfied is not None
+        and unsatisfied.reason is None
+    ):
+        rows = _evidence_conversion.auto_conversion_rows(
+            snapshot,
+            prior,
+            _capture_classifications_by_round(records),
+            config.pr_evidence_capture_attempts,
+            identity,
+            already,
+        )
+        if rows:
+            conversion = _apply_evidence_conversion(
+                runner,
+                config,
+                pr_number=pr_number,
+                round_number=round_number,
+                head_sha=head_sha,
+                matrix_identity=identity,
+                ledger=open_items,
+                rows=rows,
+                explanations=unsatisfied.rows,
+                source="auto",
+                next_item_number=next_item_number,
+                configured_reviewers=configured_reviewers,
+                stall_snapshot=snapshot.to_payload(),
+                signed_evidence_references=references,
+            )
+            return EvidenceStallOutcome(snapshot.to_payload(), conversion)
     window = _evidence_stall.stall_window(snapshot, prior, config.pr_evidence_stall_rounds)
     if window.stop and unsatisfied is not None:
         log(
@@ -4007,4 +4616,323 @@ def _pr_evidence_stall_decision(
                 pr_number, head_sha, identity, unsatisfied.rows, config.pr_evidence_stall_rounds
             )
         )
-    return snapshot.to_payload()
+    return EvidenceStallOutcome(snapshot.to_payload())
+
+
+def preflight_operator_evidence_conversion(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object],
+    head_sha: str | None,
+    approved_plan_context: ApprovedPlanContext | None,
+) -> None:
+    """Read-only ``--pr-convert-evidence-rows`` validation before any PR write (#1325).
+
+    Runs at entry, before board-change links, plan-handoff audits, recovery
+    handoffs or any other startup write, from admitted history alone: the
+    unsatisfied set bound to the live head (with admitted signed references
+    overlaid), minus every row an admitted conversion audit already converted,
+    and refusal while the latest record at the head is an evidence freeze.
+    The round-start conversion re-validates against the reconciled ledger.
+    """
+    requested = tuple(config.pr_convert_evidence_rows)
+    if not requested:
+        return
+    if not _matrix_applies(approved_plan_context):
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None,
+            reason="the approved plan has no applicable risk-test matrix",
+        )
+    assert approved_plan_context is not None
+    if not head_sha:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None, reason="the live PR head is unknown"
+        )
+    assert head_sha is not None
+    records = admitted_pr_records(runner, config, pr_number=pr_number, comments=comments, resume=True)
+    identity = approved_plan_context.risk_test_matrix_identity
+    at_head = [record for record in records if record.metadata.subject == head_sha]
+    if at_head and at_head[-1].metadata.phase == EVIDENCE_FREEZE_PHASE:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None,
+            reason="an exact-head evidence freeze is active; answer or release it first",
+        )
+    references, audits = evidence_authority_from_records(records)
+    already = {
+        row_id
+        for audit in audits
+        if audit.matrix_identity == identity
+        for row_id in audit.row_ids
+    }
+    unsatisfied = _head_bound_unsatisfied_rows(
+        records, head_sha, approved_plan_context,
+        excluded_row_ids=already, signed_references=references,
+    )
+    if unsatisfied is None or unsatisfied.reason is not None:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested,
+            unsatisfied_row_ids=None,
+            reason=(
+                "no coder record is bound to the live head"
+                if unsatisfied is None
+                else f"the head-bound evidence is unusable ({unsatisfied.reason})"
+            ),
+        )
+    assert unsatisfied is not None
+    _evidence_conversion.validate_operator_conversion_rows(
+        requested, unsatisfied_row_ids=unsatisfied.row_ids, already_converted=already
+    )
+
+
+def _pr_operator_evidence_conversion(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    round_number: int,
+    head_sha: str | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    ledger: Sequence[UnresolvedReviewItem],
+    next_item_number: int,
+    configured_reviewers: Sequence[str],
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
+) -> EvidenceConversionOutcome:
+    """Apply ``--pr-convert-evidence-rows`` before any reviewer or coder (#1325).
+
+    The named rows must all be in the unsatisfied set derived from the coder
+    record bound to the live head, minus rows already converted.  Anything
+    else raises before any agent runs and before anything is posted.
+    """
+    requested = tuple(config.pr_convert_evidence_rows)
+    if not _matrix_applies(approved_plan_context):
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None,
+            reason="the approved plan has no applicable risk-test matrix",
+        )
+    assert approved_plan_context is not None
+    identity = approved_plan_context.risk_test_matrix_identity
+    if any(
+        _is_evidence_obligation(item) and item.lifecycle == "evidence_frozen"
+        for item in ledger
+    ):
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None,
+            reason="an exact-head evidence freeze is active; answer or release it first",
+        )
+    if not head_sha:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested, unsatisfied_row_ids=None, reason="the live PR head is unknown"
+        )
+    assert head_sha is not None
+    records = admitted_pr_records(runner, config, pr_number=pr_number)
+    history_references, _audits = evidence_authority_from_records(records)
+    references = _cumulative_references((*history_references, *signed_evidence_references))
+    already = _evidence_conversion.converted_rows(ledger, matrix_identity=identity)
+    unsatisfied = _head_bound_unsatisfied_rows(
+        records,
+        head_sha,
+        approved_plan_context,
+        excluded_row_ids=already,
+        signed_references=references,
+    )
+    if unsatisfied is None or unsatisfied.reason is not None:
+        _evidence_conversion.validate_operator_conversion_rows(
+            requested,
+            unsatisfied_row_ids=None,
+            reason=(
+                "no coder record is bound to the live head"
+                if unsatisfied is None
+                else f"the head-bound evidence is unusable ({unsatisfied.reason})"
+            ),
+        )
+    assert unsatisfied is not None
+    rows = _evidence_conversion.validate_operator_conversion_rows(
+        requested, unsatisfied_row_ids=unsatisfied.row_ids, already_converted=already
+    )
+    return _apply_evidence_conversion(
+        runner,
+        config,
+        pr_number=pr_number,
+        round_number=round_number,
+        head_sha=head_sha,
+        matrix_identity=identity,
+        ledger=ledger,
+        rows={row_id: () for row_id in rows},
+        explanations=unsatisfied.rows,
+        source="operator",
+        next_item_number=next_item_number,
+        configured_reviewers=configured_reviewers,
+        stall_snapshot=None,
+        signed_evidence_references=references,
+    )
+
+
+def mint_signed_evidence_references(
+    *,
+    prior_items: Sequence[UnresolvedReviewItem],
+    reconciled_items: Sequence[UnresolvedReviewItem],
+    clearances: Sequence[tuple[str, str]],
+    dispositions_by_item: Mapping[str, Sequence[object]],
+    response_head: str | None,
+    surfaced_requirement_ids: Sequence[str],
+    freeze_signed_requirement_ids: Sequence[str] | None,
+    round_number: int,
+) -> tuple[SignedEvidenceReference, ...]:
+    """Mint references for row-converted obligations cleared in this pass (#1325).
+
+    Built in the same evidence-response pass, before any later freeze moves
+    the signed-input baseline.  The signed-requirement set is the one
+    surfaced to this pass minus the freeze record's; with nothing newly
+    signed, or no freeze baseline, no reference is minted and the row stays
+    unverified.
+    """
+    if response_head is None or freeze_signed_requirement_ids is None:
+        return ()
+    signed = sorted(set(surfaced_requirement_ids) - set(freeze_signed_requirement_ids))
+    if not signed:
+        return ()
+    cleared = {identity for identity, head in clearances if head == response_head}
+    prior_by_identity = {
+        item.obligation_identity: item
+        for item in prior_items
+        if _is_row_converted_obligation(item)
+        and item.lifecycle == "evidence_frozen"
+        and item.candidate_head_sha == response_head
+    }
+    minted: list[SignedEvidenceReference] = []
+    for item in reconciled_items:
+        if (
+            not _is_row_converted_obligation(item)
+            or item.lifecycle != "cleared"
+            or item.candidate_head_sha != response_head
+            or item.obligation_identity not in cleared
+            or item.obligation_identity not in prior_by_identity
+        ):
+            continue
+        clearing = sorted(
+            {
+                getattr(disposition, "reviewer", "")
+                for disposition in dispositions_by_item.get(item.item_id, ())
+                if getattr(disposition, "disposition", None) == "resolved"
+            }
+            - {""}
+        )
+        if not clearing:
+            continue
+        minted.append(
+            SignedEvidenceReference.build(
+                matrix_identity=str(item.converted_matrix_identity),
+                row_id=str(item.converted_row_id),
+                head=response_head,
+                obligation_identity=str(item.obligation_identity),
+                obligation_item_id=item.item_id,
+                owners=item.resolution_owners,
+                signed_requirement_ids=signed,
+                clearing_reviewers=clearing,
+                cleared_round=round_number,
+            )
+        )
+    return tuple(minted)
+
+
+def freeze_signed_baseline(
+    records: Sequence[PostedRoundRecord], head_sha: str | None
+) -> tuple[str, ...] | None:
+    """Signed-requirement IDs recorded by the newest freeze record at ``head_sha``."""
+    if not head_sha:
+        return None
+    for record in reversed(records):
+        metadata = record.metadata
+        if (
+            metadata.phase == EVIDENCE_FREEZE_PHASE
+            and metadata.subject == head_sha
+            and metadata.evidence_freeze is not None
+            and metadata.evidence_freeze.valid
+        ):
+            return tuple(metadata.evidence_freeze.signed_requirement_ids_at_freeze)
+    return None
+
+
+def conversion_repeat_round(
+    records: Sequence[PostedRoundRecord], *, round_number: int, head_sha: str | None
+) -> bool:
+    """Whether a resumed round is an unfinished conversion repeat (#1325).
+
+    True when the latest admitted conversion record names this round as its
+    ``conversion_review_round`` at the live head and no later admitted freeze,
+    release, or coder record exists at that head.
+    """
+    if not head_sha:
+        return False
+    conversion = next(
+        (
+            record
+            for record in reversed(records)
+            if record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+            and record.metadata.conversion_review_round is not None
+        ),
+        None,
+    )
+    if (
+        conversion is None
+        or conversion.metadata.conversion_review_round != round_number
+        or conversion.metadata.subject != head_sha
+    ):
+        return False
+    return not any(
+        record.index > conversion.index
+        and record.metadata.subject == head_sha
+        and (
+            record.metadata.phase in {EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PHASE}
+            or record.metadata.role == "coder"
+        )
+        for record in records
+    )
+
+
+def latest_conversion_index(records: Sequence[PostedRoundRecord], *, head_sha: str | None) -> int:
+    """Comment index of the newest admitted conversion record at ``head_sha`` (or -1)."""
+    for record in reversed(records):
+        if record.metadata.phase == EVIDENCE_CONVERSION_PHASE and record.metadata.subject == head_sha:
+            return record.index
+    return -1
+
+
+def round_evidence_authority_records(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object],
+    ledger: Sequence[UnresolvedReviewItem],
+    force: bool = False,
+) -> tuple[tuple[PostedRoundRecord, ...], bool]:
+    """Admitted records for round-start reconciliation and the review overlay.
+
+    Also returns whether the authority history was fully available.
+
+    Reads identities only when a converted obligation, a conversion record,
+    or a signed-evidence reference exists (or ``force``); otherwise there is
+    no #1325 authority to admit and nothing extra is fetched.
+    """
+    try:
+        raw = _extract_round_metadata_records(comments, flow="pr")
+    except AgentLoopError:
+        return (), False
+    if not (
+        force
+        or any(_is_row_converted_obligation(item) for item in ledger)
+        or any(
+            record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+            or record.metadata.signed_evidence_references
+            for record in raw
+        )
+    ):
+        return (), True
+    try:
+        return admitted_pr_records_status(runner, config, pr_number=pr_number, comments=comments)
+    except AgentLoopError as exc:
+        log(config, f"Evidence-conversion history not admitted this round ({exc})")
+        return (), False

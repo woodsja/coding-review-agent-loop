@@ -1333,6 +1333,25 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "an agent defect."
         ),
     ),
+    "_parse_operator_signed_row": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "An operator-signed row is verified without tool receipts, so its provenance "
+            "is accepted only through an orchestrator-owned reference bound to the row, "
+            "matrix identity and head (#1325). Fatal sites: authentication-or-forgery: "
+            "orchestrator-owned authority fields or canonical evidence rows."
+        ),
+    ),
+    "apply_signed_evidence_references": ShapeCheckClassification(
+        "fatal",
+        frozenset({"orchestrator-authored"}),
+        (
+            "Overlays orchestrator-admitted references onto canonical evidence (#1325). "
+            "Fatal sites: orchestrator-authored: state the orchestrator wrote or "
+            "configured, where a violation is corruption rather than an agent defect."
+        ),
+    ),
     "parse_agent_state": ShapeCheckClassification(
         "fatal",
         frozenset({"unparseable-envelope"}),

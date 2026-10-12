@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import contextlib
 import os
 import sys
@@ -133,6 +134,20 @@ _PR_SIGNED_REQUIREMENT_EPILOG = (
     "requested evidence for exactly the frozen head, or withdraw the request, and "
     "rerun; the requesting reviewer re-reviews that head without a code change."
 )
+
+
+def _evidence_row_list(value: str) -> tuple[str, ...]:
+    """Parse ``ROW[,ROW...]``; empty or duplicate entries are rejected (#1325)."""
+    rows = [entry.strip() for entry in str(value).split(",")]
+    if not rows or any(not row for row in rows):
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of non-empty risk-matrix row IDs"
+        )
+    if len(set(rows)) != len(rows):
+        raise argparse.ArgumentTypeError("a risk-matrix row ID is listed more than once")
+    if any(re.search(r"\s", row) for row in rows):
+        raise argparse.ArgumentTypeError("risk-matrix row IDs cannot contain whitespace")
+    return tuple(rows)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1051,6 +1066,20 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--pr-evidence-capture-attempts",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "In the PR fix loop, convert an approved risk-matrix row to the exact-head "
+                "human evidence freeze once N consecutive coder attempts could produce only "
+                "capture-limited evidence for it (incomplete capture, unverified launch, "
+                "unknown or cross-turn selectors) with no code finding or other machine "
+                "obligation open. An authoritative failed or timed-out test, or wrong-head or "
+                "wrong-tree evidence, never converts (default: 2; 0 disables)."
+            ),
+        )
+        subparser.add_argument(
             "--pr-non-convergence-rounds",
             type=int,
             default=None,
@@ -1368,6 +1397,20 @@ def build_parser() -> argparse.ArgumentParser:
             "Explicitly adopt an eligible already-open PR into the separately advertised "
             "v2 managed-CI protocol. Requires an effective managed-CI request and "
             "--managed-ci-trusted-actor."
+        ),
+    )
+    pr.add_argument(
+        "--pr-convert-evidence-rows",
+        dest="pr_convert_evidence_rows",
+        type=_evidence_row_list,
+        default=None,
+        metavar="ROW[,ROW...]",
+        help=(
+            "Convert the named approved risk-matrix rows to the exact-head human evidence "
+            "freeze before any agent runs. Every row must be currently unsatisfied at the "
+            "live head; any other row fails the whole list before an agent runs or anything "
+            "is posted. The rows are then answered by a signed `-- Human Reviewer` comment at "
+            "the final freeze. One-shot: rerun commands never replay it."
         ),
     )
     add_review_parallel(pr)

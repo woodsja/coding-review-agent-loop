@@ -3110,7 +3110,14 @@ def test_degraded_claim_citing_a_failing_selector_still_rejects_927():
         _parse_927([_claim_927("row-a"), claim], catalog=catalog)
 
 
-@pytest.mark.parametrize("key", ["status", "evidence_citations", "receipt_id", "command", "claim"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "status", "evidence_citations", "receipt_id", "command", "claim",
+        # Agent-supplied operator-signed provenance is rejected (#1325).
+        "evidence_source", "signed_evidence_reference",
+    ],
+)
 def test_reserved_authority_key_rejects_while_ordinary_unknown_keys_degrade_927(key):
     with pytest.raises(AgentLoopError, match="orchestrator-owned authority"):
         _parse_927([_claim_927("row-a"), {**_claim_927("row-b"), key: "forged"}])
@@ -3730,3 +3737,164 @@ def test_schema_text_states_execution_ref_bound_1300(kwargs):
     assert "not every run" in text
     assert "list a selector at most once within a row" in text
     assert f"in a list of {bound} or fewer still drops the claim" in text
+
+
+# --- Operator-signed evidence overlay and parse contract (#1325) ------------
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    EVIDENCE_SOURCE_OPERATOR_SIGNED,
+    SignedEvidenceReference,
+    apply_signed_evidence_references,
+)
+
+_SIGNED_HEAD = "c0ffee12"
+
+
+def _signed_matrix():
+    return parse_risk_test_matrix({**_matrix(), "rows": [_row("row-signed"), _row("row-tool")]})
+
+
+def _tool_evidence(matrix):
+    """Canonical evidence: row-tool verified by a receipt, row-signed capture-limited."""
+    claims = SemanticRiskCoverageClaims(tuple(
+        SemanticRiskCoverageClaim(
+            row_id=row_id,
+            execution_refs=(ref,),
+            test_identifiers=(f"test_{row_id}",),
+            test_locations=(f"tests/test_protocol.py::test_{row_id}",),
+            workflow_path_claim="The workflow path ran.",
+            outcome_assertions=("It passed.",),
+            forbidden_effect_assertions=("No forbidden effect.",),
+        )
+        for row_id, ref in (("row-signed", "invocation:o-1"), ("row-tool", "invocation:o-2"))
+    ))
+    return derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claims,
+        observations=(_derived_observation(execution_ref="invocation:o-2", receipt_id="r-2"),),
+        execution_catalog=(
+            _derived_observation(execution_ref="invocation:o-1", receipt_id="r-1", outcome="incomplete"),
+            _derived_observation(execution_ref="invocation:o-2", receipt_id="r-2"),
+        ),
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    ).evidence
+
+
+def _signed_reference(matrix, *, head=_SIGNED_HEAD, row_id="row-signed", identity=None):
+    identity = identity or risk_test_matrix_identity(matrix)
+    return SignedEvidenceReference.build(
+        matrix_identity=identity,
+        row_id=row_id,
+        head=head,
+        obligation_identity=f"human-exact-head-evidence:row:{row_id}",
+        obligation_item_id="item-7",
+        owners=("Codex",),
+        signed_requirement_ids=("hr-abc",),
+        clearing_reviewers=("Codex",),
+        cleared_round=4,
+    )
+
+
+def test_bound_signed_reference_verifies_a_row_without_receipts_and_round_trips():
+    """`signed-reference-binding`: the bound reference round-trips through parse and render."""
+    matrix = _signed_matrix()
+    identity = risk_test_matrix_identity(matrix)
+    evidence = _tool_evidence(matrix)
+    reference = _signed_reference(matrix)
+    overlaid = apply_signed_evidence_references(
+        evidence, [reference], matrix_identity=identity, current_head=_SIGNED_HEAD, approved_matrix=matrix
+    )
+    signed_row = next(row for row in overlaid.rows if row.row_id == "row-signed")
+    tool_row = next(row for row in overlaid.rows if row.row_id == "row-tool")
+    assert signed_row.status == "verified"
+    assert signed_row.evidence_source == EVIDENCE_SOURCE_OPERATOR_SIGNED
+    assert signed_row.signed_evidence_reference == reference.reference_id
+    assert signed_row.evidence_citations == ()
+    assert tool_row.evidence_source == "tool-captured"
+    payload = overlaid.to_payload()
+    reparsed = parse_risk_test_matrix_evidence(
+        payload,
+        expected_identity=identity,
+        trusted_signed_references=[reference],
+        expected_signed_head=_SIGNED_HEAD,
+    )
+    assert reparsed == overlaid
+    # Replayed after a restart: the decoded reference is identical.
+    assert SignedEvidenceReference.from_payload(reference.to_payload()) == reference
+
+
+def test_tool_captured_payloads_are_unchanged_and_decode_as_tool_captured():
+    matrix = _signed_matrix()
+    evidence = _tool_evidence(matrix)
+    payload = evidence.to_payload()
+    for row in payload["rows"]:
+        assert "evidence_source" not in row and "signed_evidence_reference" not in row
+        assert set(row) == {
+            "row_id", "status", "test_identifiers", "test_locations", "workflow_path_claim",
+            "outcome_assertions", "forbidden_effect_assertions", "evidence_citations", "caveats",
+        }
+    assert [row["status"] for row in payload["rows"]] == ["stale/unverified", "verified"]
+    reparsed = parse_risk_test_matrix_evidence(payload)
+    assert all(row.evidence_source == "tool-captured" for row in reparsed.rows)
+    assert json.dumps(reparsed.to_payload(), sort_keys=True) == json.dumps(payload, sort_keys=True)
+    # A tool-captured verified row still needs its receipts and semantic facts.
+    stripped = json.loads(json.dumps(payload))
+    tool = next(row for row in stripped["rows"] if row["row_id"] == "row-tool")
+    tool["evidence_citations"] = []
+    with pytest.raises(AgentLoopError, match="evidence citations"):
+        parse_risk_test_matrix_evidence(stripped)
+
+
+def test_agent_provenance_and_foreign_references_are_rejected():
+    matrix = _signed_matrix()
+    identity = risk_test_matrix_identity(matrix)
+    reference = _signed_reference(matrix)
+    overlaid = apply_signed_evidence_references(
+        _tool_evidence(matrix), [reference], matrix_identity=identity, current_head=_SIGNED_HEAD
+    ).to_payload()
+    # Without trusted references (every agent-output path) the label is refused.
+    with pytest.raises(AgentLoopError, match="only the orchestrator"):
+        parse_risk_test_matrix_evidence(overlaid)
+    # A label alone, with no reference, never verifies.
+    label_only = json.loads(json.dumps(_tool_evidence(matrix).to_payload()))
+    signed = next(row for row in label_only["rows"] if row["row_id"] == "row-signed")
+    signed.update(status="verified", evidence_source="operator-signed")
+    with pytest.raises(AgentLoopError, match="invalid evidence provenance"):
+        parse_risk_test_matrix_evidence(
+            label_only, trusted_signed_references=[reference], expected_signed_head=_SIGNED_HEAD
+        )
+    for foreign in (
+        _signed_reference(matrix, head="deadbeef"),
+        _signed_reference(matrix, row_id="row-tool"),
+        _signed_reference(matrix, identity="0" * 64),
+    ):
+        foreign_payload = json.loads(json.dumps(overlaid))
+        row = next(row for row in foreign_payload["rows"] if row["row_id"] == "row-signed")
+        row["signed_evidence_reference"] = foreign.reference_id
+        with pytest.raises(AgentLoopError, match="not bound to this row"):
+            parse_risk_test_matrix_evidence(
+                foreign_payload,
+                trusted_signed_references=[foreign],
+                expected_signed_head=_SIGNED_HEAD,
+            )
+    # A reference for another head leaves the row unverified in the overlay.
+    elsewhere = apply_signed_evidence_references(
+        _tool_evidence(matrix), [_signed_reference(matrix, head="deadbeef")],
+        matrix_identity=identity, current_head=_SIGNED_HEAD,
+    )
+    assert next(row for row in elsewhere.rows if row.row_id == "row-signed").status != "verified"
+
+
+def test_a_tampered_reference_does_not_decode():
+    reference = _signed_reference(_signed_matrix())
+    tampered = reference.to_payload()
+    tampered["head"] = "deadbeef"
+    assert SignedEvidenceReference.from_payload(tampered) is None
+    unsigned = reference.to_payload()
+    unsigned["signed_requirement_ids"] = []
+    assert SignedEvidenceReference.from_payload(unsigned) is None

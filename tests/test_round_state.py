@@ -1460,3 +1460,176 @@ def test_canonical_deferred_history_items_drops_reappearing_mandatory_item_and_m
     assert canonical_deferred_history_items(
         [round_1, downgrade, reintroduced], reconciliation_mode="aggregate", same_status="same-pr"
     ) == ()
+
+
+# --- evidence conversion records (#1325) -----------------------------------------
+
+_CONV_IDENTITY = "c" * 64
+_CONV_HEAD = "a" * 40
+
+
+def _conversion_fixtures():
+    from coding_review_agent_loop.evidence_conversion import (
+        ConversionAuditRow,
+        EvidenceConversionAudit,
+    )
+    from coding_review_agent_loop.protocol import SignedEvidenceReference, UnresolvedReviewItem
+    from coding_review_agent_loop.unresolved_items import (
+        _upsert_converted_evidence_obligation,
+        converted_evidence_obligation_identity,
+    )
+
+    _ledger, obligation, _ = _upsert_converted_evidence_obligation(
+        [], item_number=4, row_id="row-a", matrix_identity=_CONV_IDENTITY, head_sha=_CONV_HEAD,
+        owners=("Codex", "Gemini"), source_round=2, explanation="canonical-status:missing",
+    )
+    finding = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Codex", source_round=1, text="Capture evidence",
+        status="converted", evidence_row_ids=("row-a",), converted_row_ids=("row-a",),
+    )
+    partial = UnresolvedReviewItem(
+        item_id="item-2", reviewer="Gemini", source_round=1, text="Capture more evidence",
+        status="blocking", evidence_row_ids=("row-a", "row-b"), converted_row_ids=("row-a",),
+    )
+    audit = EvidenceConversionAudit(
+        source="auto", matrix_identity=_CONV_IDENTITY, head=_CONV_HEAD,
+        rows=(ConversionAuditRow(
+            row_id="row-a",
+            obligation_identity=converted_evidence_obligation_identity("row-a", _CONV_IDENTITY),
+            obligation_item_id="item-4", owners=("Codex", "Gemini"),
+            converted_item_ids=("item-1", "item-2"), attempt_record_rounds=(1, 2),
+        ),),
+    )
+    reference = SignedEvidenceReference.build(
+        matrix_identity=_CONV_IDENTITY, row_id="row-a", head=_CONV_HEAD,
+        obligation_identity=obligation.obligation_identity, obligation_item_id="item-4",
+        owners=("Codex", "Gemini"), signed_requirement_ids=("hr-1",),
+        clearing_reviewers=("Codex", "Gemini"), cleared_round=3,
+    )
+    return obligation, finding, partial, audit, reference
+
+
+def _conversion_record(**overrides):
+    obligation, finding, partial, audit, reference = _conversion_fixtures()
+    values = dict(
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject=_CONV_HEAD,
+        prior_items=(finding, partial, obligation), state="blocking", phase="evidence-conversion",
+        evidence_conversion=audit,
+        conversion_stall_snapshot=_stall_payload(
+            review_round=2, bound_attempt_round=2, unsatisfied_row_ids=["row-a", "row-b"]
+        ),
+        conversion_review_round=2,
+        signed_evidence_references=(reference,),
+    )
+    values.update(overrides)
+    return PostedRoundMetadata(**values)
+
+
+def test_conversion_record_fields_round_trip_identically_after_restart():
+    """`convert-restart`: audit, snapshot, converted status and references decode identically."""
+    record = _conversion_record()
+    decoded = _decode_round_metadata(_encode_round_metadata(record))
+    assert decoded == record
+    obligation, finding, partial, audit, reference = _conversion_fixtures()
+    assert decoded.evidence_conversion == audit
+    assert decoded.signed_evidence_references == (reference,)
+    assert decoded.conversion_stall_snapshot["bound_attempt_round"] == 2
+    items = {item.item_id: item for item in decoded.prior_items}
+    assert items["item-1"].status == "converted" and items["item-1"].is_inert_ledger_record
+    assert items["item-2"].residual_evidence_row_ids == ("row-b",)
+    assert items["item-4"].converted_row_id == "row-a"
+    assert items["item-4"].obligation_identity == obligation.obligation_identity
+
+
+def test_invalid_conversion_fields_decode_as_unconverted_without_raising():
+    stored = decode_mapping(_encode_round_metadata(_conversion_record()))
+    stored["evidence_conversion"]["rows"][0]["obligation_identity"] = "forged"
+    stored["signed_evidence_references"][0]["head"] = "b" * 40
+    stored["conversion_review_round"] = 7
+    stored["conversion_stall_snapshot"]["review_round"] = 1
+    decoded = _decode_round_metadata(encode_mapping(stored))
+    assert decoded.evidence_conversion is None
+    assert decoded.signed_evidence_references == ()
+    assert decoded.conversion_review_round is None
+    assert decoded.conversion_stall_snapshot == {"invalid": True}
+
+
+def test_malformed_converted_item_fields_fail_safe():
+    from coding_review_agent_loop.round_state import _deserialize_unresolved_item, _serialize_unresolved_item
+
+    obligation, finding, partial, _audit, _reference = _conversion_fixtures()
+    bad_binding = _serialize_unresolved_item(obligation)
+    bad_binding["converted_row_id"] = "row-z"  # no longer reproduces the identity
+    assert _deserialize_unresolved_item(bad_binding).converted_row_id is None
+    bad_subset = _serialize_unresolved_item(finding)
+    bad_subset["converted_row_ids"] = ["row-z"]
+    restored = _deserialize_unresolved_item(bad_subset)
+    # An inconsistent converted finding is restored as an open blocker.
+    assert (restored.status, restored.converted_row_ids) == ("blocking", ())
+
+
+def test_legacy_records_without_conversion_fields_decode_and_reencode_unchanged():
+    """`legacy-evidence-compat`: no new required fields; reviewer identities unchanged."""
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.unresolved_items import (
+        _upsert_evidence_obligation,
+        evidence_obligation_identity,
+    )
+
+    ledger, _consumed = _upsert_evidence_obligation(
+        [], item_number=1, reviewer="Codex", text="Run the live suite at this head",
+        source_round=1, current_head_sha=_CONV_HEAD,
+    )
+    [request] = ledger
+    assert request.obligation_identity == evidence_obligation_identity("Run the live suite at this head", "Codex")
+    assert ":row:" not in request.obligation_identity and request.converted_row_id is None
+    legacy = _coder_record(
+        prior_items=(request, UnresolvedReviewItem(
+            item_id="item-2", reviewer="Codex", source_round=1, text="t", status="blocking",
+        )),
+        evidence_stall=_stall_payload(unsatisfied_row_ids=["row-a", "row-b"]),
+    )
+    encoded = _encode_round_metadata(legacy)
+    payload = decode_mapping(encoded)
+    for key in (
+        "risk_test_matrix_capture_classification", "evidence_conversion",
+        "conversion_stall_snapshot", "conversion_review_round", "signed_evidence_references",
+    ):
+        assert key not in payload
+    for item in payload["prior_items"]:
+        assert not {"converted_row_ids", "converted_row_id", "converted_matrix_identity"} & set(item)
+    decoded = _decode_round_metadata(encoded)
+    assert decoded == legacy
+    assert _encode_round_metadata(decoded) == encoded
+    assert "bound_attempt_round" not in decoded.evidence_stall
+
+
+def test_resume_adopts_an_admitted_conversion_record_and_drops_a_foreign_one():
+    from coding_review_agent_loop.round_state import _resume_pr_round
+
+    coder = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=2, subject=_CONV_HEAD,
+        raw_structured_coder_response="{}",
+    )
+    record = _conversion_record()
+    comments = [
+        IssueComment(author="coding-review-agent-loop", created_at="2026-10-01T00:00:01Z", body=_attach_round_metadata("Coder.", coder), author_id=424242),
+        IssueComment(author="coding-review-agent-loop", created_at="2026-10-01T00:00:02Z", body=_attach_round_metadata("Converted.", record), author_id=424242),
+    ]
+    trusted = ("coding-review-agent-loop", 424242)
+    resumed = _resume_pr_round(
+        comments, head_sha=_CONV_HEAD, configured_reviewers=("codex",), trusted_actor=trusted,
+    )
+    assert resumed.round_number == 2
+    assert {item.item_id for item in resumed.prior_items} == {"item-1", "item-2", "item-4"}
+    assert resumed.completed_reviews == ()
+    foreign = [
+        comments[0],
+        IssueComment(author="mallory", created_at="2026-10-01T00:00:02Z", body=comments[1].body, author_id=999),
+    ]
+    resumed_foreign = _resume_pr_round(
+        foreign, head_sha=_CONV_HEAD, configured_reviewers=("codex",), trusted_actor=trusted,
+    )
+    assert resumed_foreign is None or not any(
+        item.converted_row_id for item in resumed_foreign.prior_items
+    )

@@ -1420,10 +1420,17 @@ class FakeRunner(Runner):
                 rest_comments = None
         if rest_comments is not None:
             number, per_page, page = (int(value) for value in rest_comments.groups())
-            # A PR's conversation comments are issue comments on GitHub.
+            # A PR's conversation comments are issue comments on GitHub.  The
+            # default issue's comments belong to that issue's own number, so a
+            # PR with a different number serves its own thread (#1325).
             rest_source = (
                 self.pr_payload.get("comments", [])
-                if number == self.pr_payload.get("number") and not self._issue_comments_for(number)
+                if number == self.pr_payload.get("number")
+                and number not in self.issue_comments_by_number
+                and (
+                    not self.issue_comments
+                    or self.issue_payload.get("number") != number
+                )
                 else self._issue_comments_for(number)
             )
             rest_page = [

@@ -83,6 +83,8 @@ DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
 # PR fix-loop step-back (#1251): K clustered new-finding blocks, and the line window.
 DEFAULT_PR_STEP_BACK_ROUNDS = 3
 DEFAULT_PR_EVIDENCE_STALL_ROUNDS = 2
+# Evidence conversion (#1325): N consecutive capture-limited coder attempts.
+DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS = 2
 DEFAULT_PR_STEP_BACK_LINE_WINDOW = 40
 DEFAULT_PR_NON_CONVERGENCE_ROUNDS = 3
 DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
@@ -261,6 +263,9 @@ class AgentLoopConfig:
     plan_step_back_escalation_rounds: int = DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
     pr_step_back_rounds: int = DEFAULT_PR_STEP_BACK_ROUNDS
     pr_evidence_stall_rounds: int = DEFAULT_PR_EVIDENCE_STALL_ROUNDS
+    pr_evidence_capture_attempts: int = DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
+    # One-shot operator conversion (#1325), applied before any agent runs.
+    pr_convert_evidence_rows: tuple[str, ...] = ()
     pr_step_back_line_window: int = DEFAULT_PR_STEP_BACK_LINE_WINDOW
     pr_non_convergence_rounds: int = DEFAULT_PR_NON_CONVERGENCE_ROUNDS
     # One-shot operator retirement of the stall streak (#1112): the run's first
@@ -795,6 +800,7 @@ class AgentLoopConfig:
             ("--pr-step-back-rounds", self.pr_step_back_rounds),
             ("--pr-step-back-line-window", self.pr_step_back_line_window),
             ("--pr-evidence-stall-rounds", self.pr_evidence_stall_rounds),
+            ("--pr-evidence-capture-attempts", self.pr_evidence_capture_attempts),
             ("--pr-non-convergence-rounds", self.pr_non_convergence_rounds),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -806,11 +812,19 @@ class AgentLoopConfig:
                         in {
                             "--pr-step-back-rounds",
                             "--pr-evidence-stall-rounds",
+                            "--pr-evidence-capture-attempts",
                             "--pr-non-convergence-rounds",
                         }
                         else "."
                     )
                 )
+        rows = self.pr_convert_evidence_rows
+        if not isinstance(rows, tuple) or any(
+            not isinstance(row, str) or not row.strip() for row in rows
+        ) or len(set(rows)) != len(rows):
+            raise AgentLoopError(
+                "--pr-convert-evidence-rows must be a list of distinct non-empty row IDs."
+            )
         if (
             isinstance(self.sub_item_stall_rounds, bool)
             or not isinstance(self.sub_item_stall_rounds, int)
@@ -2413,6 +2427,10 @@ def config_from_args(
         pr_evidence_stall_rounds=_arg_or_default(
             args, "pr_evidence_stall_rounds", DEFAULT_PR_EVIDENCE_STALL_ROUNDS
         ),
+        pr_evidence_capture_attempts=_arg_or_default(
+            args, "pr_evidence_capture_attempts", DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
+        ),
+        pr_convert_evidence_rows=tuple(getattr(args, "pr_convert_evidence_rows", None) or ()),
         pr_non_convergence_rounds=_arg_or_default(
             args, "pr_non_convergence_rounds", DEFAULT_PR_NON_CONVERGENCE_ROUNDS
         ),

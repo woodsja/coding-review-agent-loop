@@ -925,6 +925,50 @@ defect is its budget stays in effect with the conservative defaults and is
 re-persisted once. Any other malformed evidence record becomes a non-bypassable
 `unknown` obligation.
 
+**Converted risk-matrix rows (#1325).** A risk-matrix row whose evidence the
+coder could not capture can be converted into a `human-exact-head-evidence`
+obligation that rides this same lifecycle (see
+[PR evidence-only stall stop](#pr-evidence-only-stall-stop) for when that
+happens). Its identity is keyed by the row ID and the approved matrix identity
+(`human-exact-head-evidence:row:<digest>`), separate from the text-and-reviewer
+identities of reviewer requests, which are unchanged. Its owners are the
+reviewers whose open evidence-only finding named the row; when none did
+(operator conversion), the whole configured board owns it. Every stored owner
+still on the board must resolve it at the frozen head; if no stored owner
+remains on the board, every configured reviewer must, so a board change can
+never strand it.
+
+When the owners clear a converted row after new signed input, the orchestrator
+mints a signed-evidence reference bound to the matrix identity, the row, the
+frozen head, the newly surfaced signed-requirement IDs (the set surfaced to the
+response pass minus the freeze record's set), the clearing reviewers and the
+round. No reference is minted without newly surfaced signed input. The
+cumulative reference set rides on every terminal record of the pass (a
+re-published freeze, a release for findings, or an evidence-cleared release)
+and on conversion records, so neither a partial clearance nor a clearance that
+also raised a code finding loses a reference. The evidence-cleared release
+comment labels each such row `verified (operator-signed at <head>)`.
+
+A cleared converted obligation is kept in the ledger as a tombstone with the
+same item ID and identity. Live-head reconciliation runs at every round start
+(after the resumed ledger is assigned) and again inside the finalization gate.
+A tombstone is satisfied only by an admitted reference for the live head, or by
+tool-captured evidence bound to the live head that verifies the row (the
+obligation is then tombstoned as superseded by tool evidence). Any other
+tombstone, or a freeze at another head, reopens in place as deferred, so the
+answer for one head never satisfies another, and an approving review at the new
+head reaches a new freeze there with no coder turn. A converted obligation
+missing from the ledger but recorded in an admitted conversion audit is
+restored with its audit item ID and owners; conversion state that no admitted
+audit backs (for example a ledger adopted from a record whose audit was
+rejected) is dropped, so the row is treated as unconverted. That drop happens
+only when the authority history was fully read: when an identity read fails
+or leaves a record uncovered, every converted obligation already in the ledger
+is kept, and conversions this process posted are always trusted, so an
+unavailable reread can never remove an established evidence barrier. A reviewer-board
+change never reassigns a converted obligation's stored owners; the clearance
+rule above already falls back to the whole current board.
+
 Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on June 18, 2026; personal-account `gemini` users should migrate to the Antigravity CLI (`agy`) with `--coder antigravity` / `--reviewer antigravity` (pick a single model via `--antigravity-model`, or an ordered fallback chain via `--antigravity-models`; default chain `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)` → `Claude Opus 5.5 (Medium)`; see [Quota groups and fallback](#quota-groups-and-fallback)). Enterprise / API-key Gemini CLI paths may remain available for organizations that still have access, so the `gemini` backend is retained for those users. Direct Gemini CLI support is best-effort: maintainers without enterprise Gemini CLI access need reporter-provided `.agent-loop-logs/*gemini.log` output, response-file contents, CLI version, and any sharable account/access context to debug live `gemini` failures. Antigravity turns are single-shot (no cross-round session resume) and report estimated usage.
 
 
@@ -1658,6 +1702,34 @@ stale, cross-turn, wrong-tree, unbound, and restart-limited observations stay
 uncited with explicit non-verified caveats; a passing subset cannot erase an
 unsuperseded broader failure. Every enforceable row is retained, while
 not-applicable rows create no coder obligation.
+
+The same pass records a structured capture classification for every
+enforceable row (#1325), built beside the diagnostics from each selected
+observation's outcome, launch integrity, head/tree attribution and capture
+completeness, never from diagnostic codes. A row is `capture-limited` only when
+its claim is complete and every selected observation is an incomplete,
+interrupted, launch-failed or overlap-rejected run, a pass that is not an
+authoritative receipt, an authoritative pass without a receipt ID, or an
+unknown, cross-turn or dropped selector (an empty selection also qualifies).
+An authoritative failed or timed-out observation, head, tree or checkout
+mismatch, an unsuperseded parent-observed failed or timed-out journal entry, a
+semantic-claim defect, or a verified row makes it `not-capture-limited`. The
+classification is persisted on each coder record as
+`risk_test_matrix_capture_classification`, bound to that record's head and
+evidence identity.
+
+Canonical rows carry provenance. A row verified by receipts is
+`tool-captured`, and that payload is byte-identical to the earlier shape (the
+`evidence_source` key is emitted only for operator-signed rows, and a payload
+without it decodes as `tool-captured`). An `operator-signed` row is produced
+only by the orchestrator's overlay from an admitted signed-evidence reference
+for the row, matrix identity and current head; it is verified without
+receipts. The persisted coder evidence is never rewritten: the overlay is
+applied for the stall classification, reviewer context, and public comments.
+Agents can never emit `evidence_source` or `signed_evidence_reference`: in a
+semantic claim they are reserved authority keys that reject the response, and
+canonical-evidence parsing refuses either key unless the caller supplies
+trusted references, which then must match the row, matrix and expected head.
 
 The derived object and bounded diagnostics are carried through public comments,
 review context, round metadata, retry, and idempotent replay. Execution
@@ -3822,9 +3894,70 @@ decision from posted records; the stop posts no GitHub comment.
 **Stop message.** It names the PR, the exact head, the approved matrix identity prefix,
 K, and each unsatisfied row with its explanation, then offers: (1) continue so the
 coder retries capture (rerun with `--pr-evidence-stall-rounds 0` or a larger K);
-(2) convert the rows to the operator evidence freeze, which is not yet available in
-this version, so use (3); (3) override with a signed human decision through the existing
-signed-requirement path.
+(2) convert the rows to the operator evidence freeze, by rerunning with
+`--pr-convert-evidence-rows <rows>` (the message names the exact row list);
+(3) override with a signed human decision through the existing signed-requirement path.
+
+**Automatic conversion (#1325).** `--pr-evidence-capture-attempts N` (default 2, `0`
+disables automatic conversion) converts a row into a converted-row evidence obligation
+(see [Exact-head human evidence freeze](#exact-head-human-evidence-freeze)) once N
+consecutive coder attempts were capture-limited for it. Each review snapshot records
+`bound_attempt_round`, the round of the coder record whose evidence that review bound,
+so every attempt is paired with the review that judged it; the first attempt is the
+issue-implementation record, which has no snapshot of its own. An attempt counts for a
+row only when its review qualified, the row was in that review's unsatisfied set, and
+the bound record's classification is `capture-limited` for the same matrix identity and
+head. A verified, absent or not-capture-limited attempt, a legacy snapshot without
+`bound_attempt_round`, or a review that re-judged the same coder record ends the run and
+the count restarts. Aggregate diagnostic codes never qualify a row: the same
+`inadmissible-execution` code converts for an incomplete capture and never for an
+authoritative failure.
+
+Conversion is evaluated and persisted before the stall window. With the defaults K=2
+and N=2, a row that was capture-limited for both attempts converts instead of stopping.
+The conversion writes one `evidence-conversion` summary record before any dispatch,
+carrying the post-conversion ledger, an audit (`source`, matrix identity, head, and per
+row the obligation identity and item ID, owners, converted finding IDs and attempt
+rounds), the review's stall snapshot, and the round of the repeat. The coder is not
+dispatched and no coder follow-up record is posted: the complete configured board
+re-reviews the same head inside the same round (the round number and budget do not
+advance), every reviewer is invoked fresh with the converted obligation in its prompt,
+an approval recorded before the conversion is never carried, and no signed-input
+response semantics apply. A restart between the conversion record and the repeated
+reviews resumes the repeat; a reviewer that already reviewed after the conversion is
+resumed normally. A review that raises nothing new is evidence-only and approving, so
+the run reaches the final freeze; a new code finding dispatches the coder instead.
+Converted rows leave the stall window's unsatisfied set and never re-mint.
+
+**Residual tags.** A finding keeps its original `evidence_row_ids` as provenance and
+gains the converted subset. The residual (tags minus converted rows) is what the stall
+classification, the head-change expectation and further conversions read, so a finding
+tagged A,B with only A converted still demands B, and B can convert later. Only when no
+residual remains does the finding move to the terminal `converted` status, which is
+never mandatory, never counted as resolved, and hidden from reviewer prompts. A new tag
+naming a converted row is an ordinary finding.
+
+**Operator conversion.** `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]`
+converts the named rows before any reviewer or coder runs in that invocation. Every
+named row must be in the unsatisfied set derived from the coder record bound to the
+live head and not already converted (pending or cleared); any other ID, a duplicate, a
+missing applicable matrix, an unbound head or an active freeze fails the whole list.
+This validation is read-only and runs before any startup comment or activation
+(board-change link, plan-handoff audit, recovery handoff) and before any agent runs, so
+nothing is posted for an invalid list. On the ordinary `agent-loop pr N` path it runs
+right after the PR-bound approved plan is recovered read-only from the linked issue's
+handoff. The conversion is persisted in the same audit record
+(`source: operator`), and every reviewer then reviews fresh. The flag is one-shot:
+rendered rerun commands never replay it.
+
+**Authority.** Conversion audits, signed-evidence references, capture classifications
+and `bound_attempt_round` are admitted only from comments authored by the authenticated
+orchestrator actor. A resume that finds any of them hydrates comment identities over
+REST and resolves the actor, and an incomplete read stops before any agent runs; a
+mid-run reread leaves an uncovered record unadmitted. A foreign-authored or
+unauthenticated record keeps its ordinary content but grants no conversion,
+restoration, operator-signed status or counted attempt, and a foreign conversion
+record is not used as a resume handoff. In dry-run, history grants no such authority.
 
 **Precedence.** The existing evidence freeze, approval and finalization, step-back
 escalation, round limit, and merge-conflict handling run first and unchanged; the stall

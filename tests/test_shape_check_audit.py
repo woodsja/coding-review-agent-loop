@@ -943,7 +943,11 @@ def test_reserved_authority_keys_are_exact():
     from coding_review_agent_loop.protocol import CLAIM_RESERVED_AUTHORITY_KEYS
 
     assert CLAIM_RESERVED_AUTHORITY_KEYS == frozenset(
-        {"status", "evidence_citations", "receipt_id", "command", "claim"}
+        {
+            "status", "evidence_citations", "receipt_id", "command", "claim",
+            # Operator-signed provenance is orchestrator-only (#1325).
+            "evidence_source", "signed_evidence_reference",
+        }
     )
 
 

@@ -22,6 +22,7 @@ from .errors import AgentLoopError
 from .protocol import (
     EVIDENCE_OBLIGATION_KIND,
     UnresolvedReviewItem,
+    apply_signed_evidence_references,
     parse_risk_test_matrix_evidence,
 )
 
@@ -79,9 +80,13 @@ class StallRoundSnapshot:
     qualifies: bool
     unsatisfied_row_ids: tuple[str, ...]
     reasons: tuple[str, ...]
+    # Round of the coder record whose evidence this review bound (#1325); the
+    # pairing that lets automatic conversion count attempts.  ``None`` (and
+    # legacy snapshots without the key) means the attempt is unknown.
+    bound_attempt_round: int | None = None
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "version": 1,
             "review_round": self.review_round,
             "review_head": self.review_head,
@@ -90,6 +95,9 @@ class StallRoundSnapshot:
             "unsatisfied_row_ids": sorted(self.unsatisfied_row_ids),
             "reasons": sorted(self.reasons),
         }
+        if self.bound_attempt_round is not None:
+            payload["bound_attempt_round"] = self.bound_attempt_round
+        return payload
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,10 @@ def unsatisfied_rows(
     diagnostics: Iterable[Mapping[str, object]] | None,
     enforceable_row_ids: Sequence[str],
     approved_identity: str,
+    *,
+    excluded_row_ids: Iterable[str] = (),
+    signed_references: Sequence[object] = (),
+    head_sha: str | None = None,
 ) -> UnsatisfiedRows:
     """Derive ``row_id -> explanation`` for enforceable rows that are not verified.
 
@@ -111,6 +123,11 @@ def unsatisfied_rows(
     matrix evidence.  Every explanation starts with the row's own canonical
     status code and then lists the sorted row-specific diagnostic codes, so no
     unsatisfied row has an empty explanation and no code is ever invented.
+
+    ``excluded_row_ids`` are rows already converted to the operator evidence
+    freeze (#1325): they leave the stall window's unsatisfied set.  Admitted
+    ``signed_references`` for ``head_sha`` overlay the evidence, so a row
+    answered by operator-signed evidence at this head is satisfied.
     """
     if evidence is None:
         return UnsatisfiedRows(reason="evidence-absent")
@@ -122,6 +139,14 @@ def unsatisfied_rows(
         )
     except AgentLoopError:
         return UnsatisfiedRows(reason="evidence-matrix-mismatch")
+    if signed_references:
+        parsed = apply_signed_evidence_references(
+            parsed,
+            signed_references,  # type: ignore[arg-type]
+            matrix_identity=approved_identity,
+            current_head=head_sha,
+        )
+    excluded = set(excluded_row_ids)
     codes: dict[str, set[str]] = {}
     for diagnostic in diagnostics or ():
         row_id = diagnostic.get("row_id") if isinstance(diagnostic, Mapping) else None
@@ -131,7 +156,7 @@ def unsatisfied_rows(
     enforceable = set(enforceable_row_ids)
     rows: dict[str, str] = {}
     for row in sorted(parsed.rows, key=lambda r: r.row_id):
-        if row.row_id not in enforceable or row.status == "verified":
+        if row.row_id not in enforceable or row.status == "verified" or row.row_id in excluded:
             continue
         explanation = [f"{CANONICAL_STATUS_PREFIX}{row.status}", *sorted(codes.get(row.row_id, ()))]
         rows[row.row_id] = ", ".join(explanation)
@@ -147,6 +172,7 @@ def classify_round(
     unsatisfied: UnsatisfiedRows | None,
     checks: CheckBoardSummary | None,
     freeze_active: bool,
+    bound_attempt_round: int | None = None,
 ) -> StallRoundSnapshot:
     """Classify one review round; it qualifies only when no reason applies.
 
@@ -175,9 +201,12 @@ def classify_round(
                 reasons.add("machine-obligation-open")
             continue
         reviewer_items += 1
+        # The residual tag (#1325): rows converted out of a finding no longer
+        # count, so a finding tagged A,B with only A converted demands B.
+        residual = item.residual_evidence_row_ids
         if not item.evidence_row_ids:
             reasons.add("untagged-finding")
-        elif not set(item.evidence_row_ids) <= usable:
+        elif not residual or not set(residual) <= usable:
             reasons.add("tag-names-satisfied-row")
     if reviewer_items == 0:
         reasons.add("no-open-items")
@@ -194,6 +223,7 @@ def classify_round(
         qualifies=not reasons,
         unsatisfied_row_ids=row_ids,
         reasons=tuple(sorted(reasons)),
+        bound_attempt_round=bound_attempt_round,
     )
 
 
@@ -219,6 +249,18 @@ def stall_snapshot_is_consistent(snapshot: Mapping[str, object]) -> bool:
         return False
     if len(set(reasons)) != len(reasons) or len(set(row_ids)) != len(row_ids):
         return False
+    if "bound_attempt_round" in snapshot:
+        bound = snapshot.get("bound_attempt_round")
+        review_round = snapshot.get("review_round")
+        if (
+            isinstance(bound, bool)
+            or not isinstance(bound, int)
+            or bound < 1
+            or isinstance(review_round, bool)
+            or not isinstance(review_round, int)
+            or bound > review_round
+        ):
+            return False
     if qualifies != (not reasons):
         return False
     if qualifies:
