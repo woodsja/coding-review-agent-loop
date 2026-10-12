@@ -1988,7 +1988,8 @@ def publish_rejected_coder_turn_dispatch_audit(
     """Audit a guarded coder turn whose response was rejected (#1366).
 
     A rejected turn posts no coder comment, so any non-managed dispatch is
-    published as its own visible orchestrator comment.  Diagnostic only:
+    published as its own visible orchestrator comment; a lookup failure is
+    only logged.  Diagnostic only:
     this never raises, so the caller's original rejection is never masked.
     """
     try:
@@ -1997,10 +1998,21 @@ def publish_rejected_coder_turn_dispatch_audit(
             live_head = (get_pr_head_sha(runner, config, pr_number) or "").strip() or None
         except Exception:  # noqa: BLE001 - the branch query still covers it
             live_head = None
-        note = coder_turn_dispatch_audit_note(
+        audit = audit_coder_turn_dispatches(
             runner, config, branch=branch, head_shas=(*head_shas, live_head),
             turn_started_at=turn_started_at,
         )
+        for problem in audit.lookup_notes:
+            log(config, f"Coder-turn dispatch audit: {problem}")
+        # Only a found run is published: a lookup failure on a rejected turn
+        # stays a logged diagnostic, so a rejection adds no PR noise.
+        note = render_coder_dispatch_audit_note(CoderTurnDispatchAudit(runs=audit.runs))
+        for run in audit.runs:
+            log(
+                config,
+                f"Ordinary workflow_dispatch run {run.run_id} on {run.head_sha} was created during "
+                "a rejected guarded coder turn; non-authoritative diagnostic, not qualification",
+            )
         if note:
             post_pr_comment(
                 runner,

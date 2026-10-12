@@ -4797,7 +4797,7 @@ a green check:
   semantic correction), the same audit still runs and posts its note as a
   separate orchestrator comment before the rejection is raised. In issue and
   approved-plan implementation this applies once the created managed draft is
-  authenticated. A
+  authenticated. On a rejected turn a lookup failure is only logged. A
   lookup failure adds only a diagnostic note and never blocks the round.
 
 The guard and the prompt text share one invocation-scoped decision. In the PR
