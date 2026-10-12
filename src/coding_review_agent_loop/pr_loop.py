@@ -7773,6 +7773,15 @@ def run_pr_loop(
                 base_branch=pr_metadata.base_branch or config.base,
                 approved_plan_context=approved_plan_context,
             )
+            # A deferred non-convergence stop (#1372) waits for the evidence-stall
+            # decision below; on paths where that decision is not evaluated (the
+            # final allowed round, a merge-conflict round) it stops here instead.
+            deferred_non_convergence = step_back_decision.deferred_stop
+            if deferred_non_convergence and (
+                round_number == allowed_rounds
+                or any(item.item_id == MERGE_CONFLICT_ITEM_ID for item in unresolved_items)
+            ):
+                raise HumanDecisionRequiredError(deferred_non_convergence)
             if round_number == allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -7899,6 +7908,10 @@ def run_pr_loop(
                     pr_checks=pr_checks,
                 )
             )
+            if deferred_non_convergence:
+                # The evidence stall did not stop at this dispatch, so it cannot own
+                # the window: the non-convergence stop fires before any coder turn.
+                raise HumanDecisionRequiredError(deferred_non_convergence)
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)

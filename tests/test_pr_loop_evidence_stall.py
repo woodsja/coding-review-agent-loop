@@ -80,6 +80,10 @@ def _coder(*numbers):
 
 def _config(tmp_path, **overrides):
     overrides.setdefault("max_rounds", 8)
+    # Isolate the evidence-stall window mechanics from the non-convergence stop
+    # (#1372), which would otherwise stop these persisting-item scripts at the
+    # fourth dispatch; the interaction tests below enable it explicitly.
+    overrides.setdefault("pr_non_convergence_rounds", 0)
     return make_config(tmp_path, coder="claude", reviewer="codex", **overrides)
 
 
@@ -561,7 +565,8 @@ def test_tag_naming_a_row_that_became_verified_is_an_ordinary_finding(tmp_path, 
     runner = _evidence_only_runner(4, 3)
     with pytest.raises(HumanDecisionRequiredError) as raised:
         run_pr_loop(
-            runner, pr_number=77, config=_config(tmp_path, max_rounds=4),
+            runner, pr_number=77,
+            config=_config(tmp_path, max_rounds=4, pr_non_convergence_rounds=3),
             approved_plan_context=_plan_context("row-a", "row-b"),
         )
     message = str(raised.value)
@@ -581,7 +586,7 @@ def test_head_matched_record_without_matrix_evidence_never_qualifies(tmp_path, m
     _shape_evidence(monkeypatch, ["absent"] * 3)
     calls = _spy_classifier(monkeypatch)
     runner = _evidence_only_runner(4, 3)
-    config = _config(tmp_path, max_rounds=4)
+    config = _config(tmp_path, max_rounds=4, pr_non_convergence_rounds=3)
     with pytest.raises(HumanDecisionRequiredError) as raised:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
     # No usable row set: the stall cannot own the tagged finding, so the
@@ -1373,7 +1378,7 @@ def test_persistent_tagged_finding_mixed_with_churning_code_findings_stops_for_n
             _review(["code gap at src/d.py:40"], carried=["item-1"], resolved=["item-4"]),
         ],
     )
-    config = _config(tmp_path)
+    config = _config(tmp_path, pr_non_convergence_rounds=3)
     with pytest.raises(HumanDecisionRequiredError) as raised:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
     message = str(raised.value)
@@ -1383,12 +1388,131 @@ def test_persistent_tagged_finding_mixed_with_churning_code_findings_stops_for_n
     assert _coder_count(runner) == 3
 
 
-def test_evidence_only_window_stays_with_the_evidence_stall_not_non_convergence(tmp_path):
-    """#1372: evidence-only reviews whose rows are unsatisfied belong to the stall."""
+def _spy_deferral(monkeypatch):
+    """Record each non-convergence deferral decision made at a dispatch."""
+    import coding_review_agent_loop.review_step_back as step_back_module
+
+    seen = []
+    real = step_back_module.defers_to_evidence_stall
+
+    def spy(result, rows):
+        decision = real(result, rows)
+        seen.append(decision)
+        return decision
+
+    monkeypatch.setattr(step_back_module, "defers_to_evidence_stall", spy)
+    return seen
+
+
+def _nc_stop_message(runner, config, plan_context):
+    with pytest.raises(HumanDecisionRequiredError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    return str(raised.value)
+
+
+def test_a_qualifying_evidence_stall_wins_over_non_convergence_at_the_same_dispatch(
+    tmp_path, monkeypatch
+):
+    """#1372 precedence: both qualify at dispatch 4; the evidence stall decides first."""
+    deferrals = _spy_deferral(monkeypatch)
     runner = _evidence_only_runner(4, 3)
-    config = _config(tmp_path, pr_evidence_stall_rounds=0)
-    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
-    # Neither gate stops: the stall is disabled and non-convergence defers to it,
-    # so the fourth coder turn is dispatched (and exhausts the script).
-    assert _coder_count(runner) == 4
+    config = _config(tmp_path, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3)
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert "is stalled on evidence only" in message and "not converging" not in message
+    assert True in deferrals  # the non-convergence window existed and was deferred
+    assert _coder_count(runner) == 3
+
+
+def test_with_the_evidence_stall_disabled_non_convergence_owns_an_evidence_only_window(tmp_path):
+    runner = _evidence_only_runner(4, 3)
+    config = _config(tmp_path, pr_evidence_stall_rounds=0, pr_non_convergence_rounds=3)
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert "not converging" in message and "[item-1] (attempts: 3)" in message
+    assert _coder_count(runner) == 3
+
+
+@pytest.mark.parametrize("disqualifier", ["stalled-check", "machine-obligation"])
+def test_a_reset_evidence_stall_window_leaves_the_stop_to_non_convergence(
+    tmp_path, monkeypatch, disqualifier
+):
+    """#1372: review 3 resets the K=3 stall window, so at dispatch 4 the stall
+    cannot stop and the deferred non-convergence stop fires before a fourth coder."""
+    deferrals = _spy_deferral(monkeypatch)
+    runner = _evidence_only_runner(6, 5)
+    if disqualifier == "stalled-check":
+        _checks_switch(monkeypatch, runner, {3: _STALLED_RUNS})
+    else:
+        _inject_obligation(monkeypatch, "alembic-migration", at_rounds={3})
+    config = _config(tmp_path, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3)
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert True in deferrals
+    assert "not converging" in message and "is stalled on evidence only" not in message
+    assert _coder_count(runner) == 3
+
+
+def test_changing_unsatisfied_row_sets_leave_the_stop_to_non_convergence(tmp_path, monkeypatch):
+    """#1372: the stall window resets whenever the row set changes; the tagged item
+    still persists, so non-convergence stops at dispatch 4."""
+    deferrals = _spy_deferral(monkeypatch)
+    stale = ("stale/unverified", ())
+    _shape_evidence(monkeypatch, [
+        {"row-a": stale, "row-b": stale},
+        {"row-a": stale, "row-b": ("verified", ())},
+        {"row-a": stale, "row-b": stale},
+    ])
+    runner = _evidence_only_runner(4, 3)
+    config = _config(tmp_path, pr_non_convergence_rounds=3)
+    message = _nc_stop_message(runner, config, _plan_context("row-a", "row-b"))
+    assert True in deferrals
+    assert "not converging" in message and "[item-1] (attempts: 3)" in message
+    assert "is stalled on evidence only" not in message
+    assert _coder_count(runner) == 3
+
+
+def _gemini(text):
+    return text.replace("-- OpenAI Codex", "-- Google Gemini")
+
+
+def test_cross_reviewer_mixed_findings_stop_for_non_convergence(tmp_path, monkeypatch):
+    """#1372: Codex keeps a tagged item while Gemini churns untagged findings across
+    files.  The combined ledger disqualifies every stall round, so the deferred
+    non-convergence stop for Codex fires before a fourth coder turn."""
+    deferrals = _spy_deferral(monkeypatch)
+    runner = FakeRunner(
+        claude_outputs=[_coder(1, 2), _coder(1, 3), _coder(1, 4)],
+        codex_outputs=[
+            _review([_tagged()]),
+            _review(carried=["item-1"], resolved=["item-2"]),
+            _review(carried=["item-1"], resolved=["item-3"]),
+            _review(carried=["item-1"], resolved=["item-4"]),
+        ],
+        gemini_outputs=[
+            _gemini(_review(["code gap at src/a.py:10"])),
+            _gemini(_review(["code gap at src/b.py:20"], carried=["item-1"], resolved=["item-2"])),
+            _gemini(_review(["code gap at src/c.py:30"], carried=["item-1"], resolved=["item-3"])),
+            _gemini(_review(["code gap at src/d.py:40"], carried=["item-1"], resolved=["item-4"])),
+        ],
+    )
+    config = make_config(
+        tmp_path, coder="claude", reviewer=("codex", "gemini"), max_rounds=8,
+        pr_non_convergence_rounds=3,
+    )
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert "Codex kept the same item(s) blocking" in message
+    assert True in deferrals  # deferred to the stall, which declined on the combined ledger
+    assert "[item-1] (attempts: 3)" in message and "is stalled on evidence only" not in message
+    assert _coder_count(runner) == 3
+
+
+def test_a_deferred_non_convergence_stop_still_beats_the_round_limit(tmp_path, monkeypatch):
+    """#1372: the evidence stall is not evaluated on the final allowed round, so a
+    deferred non-convergence stop fires there instead of the round-limit exit."""
+    deferrals = _spy_deferral(monkeypatch)
+    runner = _evidence_only_runner(4, 3)
+    config = _config(
+        tmp_path, max_rounds=4, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3
+    )
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert True in deferrals
+    assert "not converging" in message and "Reached max rounds" not in message
+    assert _coder_count(runner) == 3

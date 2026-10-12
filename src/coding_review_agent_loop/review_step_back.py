@@ -1794,6 +1794,7 @@ class PersistingItem:
     first_line: str
     attempts: int
     asks_for_evidence: bool = False
+    evidence_row_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1810,20 +1811,15 @@ class PrNonConvergence:
     coder_rounds: tuple[int, ...]
 
 
-def _pr_blocking_set(
-    review: PrReviewRecord, evidence_owned_rows: frozenset[str] | None = None
-) -> dict | None:
+def _pr_blocking_set(review: PrReviewRecord) -> dict | None:
     """``{item_id: item}`` the reviewer still holds blocking after this review.
 
     Only the reviewer's own dispositions apply, so another reviewer's vote never
     extends the tracked reviewer's streak.  Machine and human exact-head evidence
-    obligations are already excluded.  An evidence-only review (every open item
-    tagged with rows that are all in ``evidence_owned_rows``, the unsatisfied rows
-    at the dispatch head) belongs to the evidence-stall gate and contributes an
-    empty set.  In a mixed review, a tag naming a satisfied row, or with no usable
-    row set, tagged items count like any other finding.  ``None`` when the review
-    is not a resolvable block (approved, other, or an unresolvable publication
-    record).
+    obligations are already excluded.  Findings tagged with risk-matrix rows count
+    like any other; precedence against the evidence-stall stop is decided at the
+    dispatch (see ``defers_to_evidence_stall``).  ``None`` when the review is not
+    a resolvable block (approved, other, or an unresolvable publication record).
     """
     if review.classification not in BLOCKING_CLASSES or review.new_items is None:
         return None
@@ -1835,18 +1831,7 @@ def _pr_blocking_set(
         review = dataclasses.replace(
             review, metadata=dataclasses.replace(metadata, dispositions=own)
         )
-    items = _remaining_mandatory_items(review)
-    if (
-        items
-        and evidence_owned_rows
-        and all(
-            getattr(item, "evidence_row_ids", ())
-            and set(item.evidence_row_ids) <= evidence_owned_rows
-            for item in items
-        )
-    ):
-        return {}
-    return {item.item_id: item for item in items}
+    return {item.item_id: item for item in _remaining_mandatory_items(review)}
 
 
 def _pr_coder_after(
@@ -1916,7 +1901,6 @@ def find_pr_non_convergence(
     k: int,
     current_round: int,
     current_head: str | None,
-    evidence_owned_rows: frozenset[str] | None = None,
 ) -> PrNonConvergence | None:
     """The reviewer's persisting items after K code-changing coder turns, if any.
 
@@ -1925,8 +1909,7 @@ def find_pr_non_convergence(
     resolvable block and every join must have moved the head with no external
     push; the persisting items are the IDs blocking in all K+1 reviews whose
     open sub-item count never dropped between two of them.  File spread and line
-    windows are ignored by design.  ``evidence_owned_rows`` hands evidence-only
-    reviews to the evidence-stall gate (see ``_pr_blocking_set``).  The reported
+    windows are ignored by design.  The reported
     first head is the head of the earliest review any persisting item's attempt
     scan reaches, so the measured growth covers every counted attempt.
     """
@@ -1939,7 +1922,7 @@ def find_pr_non_convergence(
         return None
     if current_head and window[-1].head != current_head:
         return None
-    blocking_sets = [_pr_blocking_set(review, evidence_owned_rows) for review in window]
+    blocking_sets = [_pr_blocking_set(review) for review in window]
     if any(found is None for found in blocking_sets):
         return None
     coders = [
@@ -1967,7 +1950,7 @@ def find_pr_non_convergence(
             earlier = by_round.get(later.round_number - 1)
             if earlier is None or _pr_code_changing_join(ordered, earlier, later) is None:
                 break
-            found = _pr_blocking_set(earlier, evidence_owned_rows)
+            found = _pr_blocking_set(earlier)
             if found is None or not _still_blocking_without_progress(found, later_set, item_id):
                 break
             attempts += 1
@@ -1984,6 +1967,7 @@ def find_pr_non_convergence(
                 asks_for_evidence=bool(
                     getattr(item, "evidence_row_ids", ()) or _EVIDENCE_REQUEST_RE.search(text)
                 ),
+                evidence_row_ids=tuple(getattr(item, "evidence_row_ids", ()) or ()),
             )
         )
     return PrNonConvergence(
@@ -1995,6 +1979,26 @@ def find_pr_non_convergence(
         current_head=current_head or window[-1].head,
         items=tuple(items),
         coder_rounds=tuple(coder.metadata.round_number for coder in coders),
+    )
+
+
+def defers_to_evidence_stall(
+    result: PrNonConvergence, unsatisfied_rows: frozenset[str] | None
+) -> bool:
+    """Whether the evidence-stall stop may own this window, so it decides first.
+
+    True only when every persisting item is a finding tagged with rows that are
+    all unsatisfied at the dispatch head.  The stall then evaluates the combined
+    ledger, the check board and its own window history at this dispatch; when it
+    does not stop, the non-convergence stop still fires before any coder turn.
+    Any untagged persisting item, a tag naming a satisfied row, or no usable row
+    set means the stall can never own the window.
+    """
+    if not unsatisfied_rows or not result.items:
+        return False
+    return all(
+        item.evidence_row_ids and set(item.evidence_row_ids) <= unsatisfied_rows
+        for item in result.items
     )
 
 

@@ -965,16 +965,20 @@ on that head, so a no-op turn, a missing record, or an external push breaks the
 chain. Each review's blocking set is `_remaining_mandatory_items` with only the
 reviewer's own dispositions, which drops machine and human exact-head evidence
 obligations and items whose last sub-item a completing disposition resolved;
-a review whose open items are all tagged with rows that are unsatisfied at the
-dispatch head (the set the evidence-stall gate reads from the head-bound coder
-record) is evidence-only and contributes nothing, so the stall keeps precedence,
-while tagged findings in mixed reviews, tags naming satisfied rows, and tags with no
-usable row set count like any finding; an unresolvable
+tagged findings count like any finding; an unresolvable
 `--review-parallel` publication breaks the chain. An item persists when it is in
 all K+1 blocking sets and its open sub-item count never drops between two of them
 (resolving a sub-item is progress). Any persisting item raises `HumanDecisionRequiredError` (exit 4) inside
 `_pr_step_back_decision`, after a clustered-sibling escalation and before a fresh
-clustered step-back turn, the round-limit exit, and any coder invocation. The
+clustered step-back turn, the round-limit exit, and any coder invocation. When
+`defers_to_evidence_stall` holds (every persisting item is tagged with rows
+unsatisfied at the dispatch head, read from the head-bound coder record as the
+stall reads them), the decision is returned as `deferred_stop` instead: the PR
+loop raises it right after `_pr_evidence_stall_decision`, so a stall that
+qualifies on the combined ledger and its window history wins, and otherwise the
+non-convergence stop fires before the coder; on the final round or a
+merge-conflict round, where the stall is not evaluated, it is raised before the
+round-limit exit. The
 snapshot pre-check only needs the reviews N-K..N-1 to be contiguous blocks, because
 the live snapshot predates coder record N; the joins are verified on the fresh
 read. The decision text lists each item with its attempt count and first line, the

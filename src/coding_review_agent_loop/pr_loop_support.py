@@ -3398,6 +3398,9 @@ class PrStepBackDecision:
     """Clusters that open a step-back turn at this coder dispatch."""
 
     triggers: tuple[_step_back.PrClusterTrigger, ...] = ()
+    # A non-convergence stop held back so the evidence-stall stop can decide
+    # first at this dispatch (#1372); raised before any coder invocation.
+    deferred_stop: str | None = None
 
     def coder_guidance(self) -> str:
         if not self.triggers:
@@ -3645,19 +3648,25 @@ def _pr_step_back_decision(
             )
         if episode.entry is None:
             trigger_candidates.append(reviewer)
-    # (2) Non-convergence wins over a fresh clustered step-back turn.  Evidence-only
-    # reviews the evidence-stall gate can own are left to it.
-    evidence_owned_rows = (
+    # (2) Non-convergence wins over a fresh clustered step-back turn.  When every
+    # persisting item is evidence the stall could own, the stop is deferred so the
+    # evidence-stall stop decides first at this dispatch.
+    unsatisfied_rows = (
         _non_convergence_evidence_owned_rows(fresh, head_sha, approved_plan_context)
-        if non_convergence_k > 0
+        if non_convergence_k > 0 and config.pr_evidence_stall_rounds > 0
         else None
     )
+    deferred: str | None = None
     for reviewer in tracked if non_convergence_k > 0 else ():
         stalled = _step_back.find_pr_non_convergence(
             fresh, reviewer, k=non_convergence_k, current_round=round_number,
-            current_head=head_sha, evidence_owned_rows=evidence_owned_rows,
+            current_head=head_sha,
         )
         if stalled is None:
+            continue
+        if deferred is not None and _step_back.defers_to_evidence_stall(
+            stalled, unsatisfied_rows
+        ):
             continue
         log(
             config,
@@ -3669,11 +3678,20 @@ def _pr_step_back_decision(
             runner, config, first_head=stalled.first_head, current_head=stalled.current_head,
             base_branch=base_branch,
         )
-        raise HumanDecisionRequiredError(
-            _step_back.render_pr_non_convergence_decision(
-                pr_number, stalled, diff_growth=diff_growth, pr_size=pr_size
-            )
+        message = _step_back.render_pr_non_convergence_decision(
+            pr_number, stalled, diff_growth=diff_growth, pr_size=pr_size
         )
+        if _step_back.defers_to_evidence_stall(stalled, unsatisfied_rows):
+            log(
+                config,
+                f"Round {round_number}: {reviewer}'s persisting items are all evidence the "
+                "evidence-stall stop may own; it decides first at this dispatch",
+            )
+            deferred = message
+            continue
+        raise HumanDecisionRequiredError(message)
+    if deferred is not None:
+        return PrStepBackDecision(deferred_stop=deferred)
     # (3) The clustered trigger opens a step-back turn.
     triggers: list[_step_back.PrClusterTrigger] = []
     for reviewer in trigger_candidates:
@@ -3897,11 +3915,10 @@ def _non_convergence_evidence_owned_rows(
     head_sha: str,
     approved_plan_context: ApprovedPlanContext | None,
 ) -> frozenset[str] | None:
-    """Rows whose evidence-only reviews the evidence-stall gate can own (#1372).
+    """Unsatisfied rows at the dispatch head, read as the evidence stall reads them.
 
-    Only a usable unsatisfied-row set at the dispatch head qualifies; absent or
-    mismatched evidence, or no applicable matrix, leaves tagged findings to the
-    non-convergence stop like any other finding.
+    ``None`` for absent or mismatched evidence, or no applicable matrix: the
+    evidence stall can then never qualify, so non-convergence never defers to it.
     """
     if (
         approved_plan_context is None

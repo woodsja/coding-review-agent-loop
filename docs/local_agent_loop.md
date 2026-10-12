@@ -3680,18 +3680,24 @@ that head, so a no-op turn or an external push breaks the chain. An item whose
 reviewer resolved at least one of its open sub-items in a review made progress, so
 that item's chain restarts (`--sub-item-stall-rounds` governs sub-item pacing). Machine
 obligations and human exact-head evidence requests do not count (the evidence freeze
-governs them). A review whose open items are all findings tagged with risk-matrix
-rows that are still unsatisfied at the dispatch head is evidence-only and is left to
-the evidence-stall stop. A tagged finding counts like any other when the same review
-also has an untagged finding, when its tag names a row that is already satisfied, or
-when no usable row set exists, because the evidence stall can never qualify then. Under `--review-parallel` the reviewer's blocking set is resolved
+governs them). Findings tagged with risk-matrix rows count like any other finding.
+When every persisting item is tagged with rows still unsatisfied at the dispatch
+head, the stop is deferred so the evidence-stall stop decides first at the same
+dispatch, judging the combined ledger of all reviewers, the check board and its
+own window history. If the evidence stall stops, it wins; if it does not (another
+reviewer's untagged finding, a failing check or obligation, a reset or changing
+row set, or `--pr-evidence-stall-rounds 0`), this stop fires before any coder
+turn. A tag naming a satisfied row, no usable row set, or any untagged persisting
+item never defers. Under `--review-parallel` the reviewer's blocking set is resolved
 through the round's reconciliation, and only the reviewer's own dispositions apply.
 The stop is derived from posted round records only and persists nothing, so a
 resumed run reaches the same decision with the same text.
 
 **Precedence.** A clustered-sibling escalation stops first; otherwise this stop
 wins over a fresh clustered step-back turn, and both run before the round-limit
-exit.
+exit. A deferred stop (above) is raised right after the evidence-stall decision,
+or before the round-limit exit and merge-conflict handling, where that decision is
+not evaluated.
 
 **Stop message.** It names the reviewer, K, the round range and the current head,
 lists each persisting item with its attempt count and first line, and reports the
