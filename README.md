@@ -738,6 +738,15 @@ Instead the error names a fixed class: `remote not found`, `host-key failure`,
 authentication failure suggests `--git-ssh-identity`. No HTTPS fallback is
 attempted after an SSH failure.
 
+Before merging a change to `git_transport.py`, `secure_git.py` or the checkout
+sync path, run the pre-merge transport smoke check with your real protocol
+and credentials: `scripts/transport_smoke.sh --repo OWNER/REPO
+[--trusted-origin-protocol ssh]`. It builds the PR head into a temporary venv
+and runs `agent-loop transport-check`, which fetches the default branch once
+into a private scratch repository and prints only `transport-check: pass` or
+`transport-check: fail (<class>)`. See
+[Pre-merge transport smoke check](docs/local_agent_loop.md#pre-merge-transport-smoke-check).
+
 On Windows, `~/.ssh/config` is not read and `--git-ssh-identity` is refused
 until a Windows ACL trust policy exists (#1371).
 SSH transport on Windows is untested: no Windows CI runner exists, so only

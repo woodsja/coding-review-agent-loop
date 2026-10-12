@@ -1524,6 +1524,12 @@ independently of inherited `PATH`, passed only as an in-memory scoped
 header to that private fetch. On POSIX hosts, both pinned executable paths,
 including their parent directories, must be root-owned so an unrestricted
 same-user agent cannot replace them before launch.
+Transport failures raise `TransportFailure`, whose `label` carries the fixed
+class. `agent-loop transport-check` (wrapped by `scripts/transport_smoke.sh`)
+runs a local configuration preflight and then one production `import_ref` fetch
+into a private scratch repository with the operator's credentials. It reports
+only that class or a fixed fallback (`configuration`, `local import`,
+`unclassified`). It is required before merging transport changes (#1383).
 The `--trusted-origin-protocol` setting selects HTTPS or SSH when creating a
 new default checkout; the pinned SSH client is validated before transport.
 Its command keeps `-F /dev/null` and executable-option hardening, retains

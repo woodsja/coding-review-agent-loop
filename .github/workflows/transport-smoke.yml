@@ -1,0 +1,75 @@
+name: Transport smoke
+
+# Optional real-host check of agent-loop's own trusted Git transport (#1383).
+# It fetches this repository's default branch over SSH with a read-only
+# deploy key, through the same scripts/transport_smoke.sh operators run
+# before merging transport changes.  It does not replace that local check for
+# operators who use HTTPS with a GitHub CLI token.
+#
+# Kept separate from ci.yml, whose managed-CI declarations are literal
+# readiness gates.  Without the AGENT_LOOP_TRANSPORT_DEPLOY_KEY secret (forks,
+# unconfigured repositories) the job reports a skip and succeeds.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  transport-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for the deploy-key secret
+        id: secret
+        env:
+          DEPLOY_KEY: ${{ secrets.AGENT_LOOP_TRANSPORT_DEPLOY_KEY }}
+        run: |
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "transport-smoke: skipped (AGENT_LOOP_TRANSPORT_DEPLOY_KEY is not configured)"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.secret.outputs.present == 'true'
+        with:
+          persist-credentials: false
+
+      - name: Run the transport smoke check over SSH
+        if: steps.secret.outputs.present == 'true'
+        env:
+          DEPLOY_KEY: ${{ secrets.AGENT_LOOP_TRANSPORT_DEPLOY_KEY }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          home=$(mktemp -d)
+          chmod 700 "$home"
+          mkdir -m 700 "$home/.ssh"
+          umask 077
+          printf '%s\n' "$DEPLOY_KEY" > "$home/.ssh/transport_deploy_key"
+          chmod 600 "$home/.ssh/transport_deploy_key"
+          # GitHub's published SSH host keys, pinned here (no trust on first
+          # use).  Update them if GitHub rotates its keys; a mismatch fails
+          # closed as a host-key failure.
+          cat > "$home/.ssh/known_hosts_github" <<'KNOWN_HOSTS'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          KNOWN_HOSTS
+          # The key is selected through ~/.ssh/config, so this job exercises
+          # the config-identity path that regressed in #1380.
+          cat > "$home/.ssh/config" <<'SSH_CONFIG'
+          Host github.com
+            IdentityFile ~/.ssh/transport_deploy_key
+            IdentitiesOnly yes
+            UserKnownHostsFile ~/.ssh/known_hosts_github
+          SSH_CONFIG
+          # --base comes from the event, so no GitHub API call precedes the fetch.
+          unset SSH_AUTH_SOCK
+          HOME="$home" scripts/transport_smoke.sh \
+            --repo "$GITHUB_REPOSITORY" --trusted-origin-protocol ssh --base "$DEFAULT_BRANCH"

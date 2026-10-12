@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import getpass
 import os
 import socket
@@ -19,6 +20,7 @@ import pytest
 
 from coding_review_agent_loop import git_transport
 from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.git_transport import TransportFailure
 from coding_review_agent_loop.runner import Runner
 
 
@@ -220,16 +222,14 @@ def _seed_origin(tmp_path: Path) -> tuple[Path, Path]:
     return bare, checkout
 
 
-@pytest.fixture
-def ssh_origin(tmp_path, monkeypatch):
-    """A local sshd serving one bare repository, plus a trusted operator HOME.
+@contextlib.contextmanager
+def _local_sshd(tmp_path: Path, home: Path, bare: Path, *, key_name: str = "github_key"):
+    """Start a local sshd serving ``bare`` to one non-default-named client key.
 
-    The client key has a non-default name and is reachable only through
-    ~/.ssh/config or the explicit override; there is no agent socket.
+    Yields the port, the authorized key, an unauthorized key and the pinned
+    known-hosts file.  Nothing here touches ``git_transport``.
     """
-    bare, checkout = _seed_origin(tmp_path)
-    home = _ssh_home(tmp_path, monkeypatch)
-    key = home / ".ssh" / "github_key"
+    key = home / ".ssh" / key_name
     unauthorized = home / ".ssh" / "unauthorized_key"
     host_key = tmp_path / "host_key"
     for path in (key, unauthorized, host_key):
@@ -265,6 +265,23 @@ def ssh_origin(tmp_path, monkeypatch):
                 time.sleep(0.02)
         else:
             pytest.skip("local sshd did not accept connections")
+        yield SimpleNamespace(port=port, key=key, unauthorized=unauthorized, known_hosts=known_hosts)
+    finally:
+        server.terminate()
+        server.communicate(timeout=5)
+
+
+@pytest.fixture
+def ssh_origin(tmp_path, monkeypatch):
+    """A local sshd serving one bare repository, plus a trusted operator HOME.
+
+    The client key has a non-default name and is reachable only through
+    ~/.ssh/config or the explicit override; there is no agent socket.
+    """
+    bare, checkout = _seed_origin(tmp_path)
+    home = _ssh_home(tmp_path, monkeypatch)
+    with _local_sshd(tmp_path, home, bare) as sshd:
+        port = sshd.port
         repo = f"localhost:{port}/OWNER/REPO"
         url = git_transport.default_origin(repo, protocol="ssh")
         _git(checkout, "config", "remote.origin.url", url)
@@ -281,13 +298,10 @@ def ssh_origin(tmp_path, monkeypatch):
             return env
 
         monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
-        yield SimpleNamespace(bare=bare, checkout=checkout, home=home, key=key,
-                              unauthorized=unauthorized, known_hosts=known_hosts,
+        yield SimpleNamespace(bare=bare, checkout=checkout, home=home, key=sshd.key,
+                              unauthorized=sshd.unauthorized, known_hosts=sshd.known_hosts,
                               port=port, repo=repo, url=url, commands=commands,
                               marker=tmp_path / "proxy-ran")
-    finally:
-        server.terminate()
-        server.communicate(timeout=5)
 
 
 def _hostile_lines(marker: Path) -> str:
@@ -437,3 +451,55 @@ def test_pinned_ssh_consumes_exactly_the_validated_paths(tmp_path, monkeypatch):
     assert values["userknownhostsfile"] == [str(known_hosts)]
     assert values["stricthostkeychecking"] == ["true"]
     assert values.get("proxycommand", ["none"]) == ["none"]
+
+
+_DEFAULT_KEY_NAMES = ("id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk", "id_dsa")
+
+
+@requires_sshd
+@pytest.mark.parametrize("with_identity", [True, False], ids=["config-identity", "no-identity"])
+def test_real_transport_env_fetches_with_config_selected_identity(tmp_path, monkeypatch, with_identity):
+    """#1383: the production ``_transport_env``, unwrapped, against a real sshd.
+
+    The only test-specific element is the URL user (the local sshd
+    authenticates the current OS user, and ``User`` is not an honoured
+    ssh_config key); it is an input, not an environment mutation.  The
+    negative companion drops the IdentityFile line and must fail with the
+    authentication class, proving the pass depends on the config identity.
+    """
+    bare, _ = _seed_origin(tmp_path)
+    home = _ssh_home(tmp_path, monkeypatch)
+    marker = tmp_path / "hostile-ran"
+    with _local_sshd(tmp_path, home, bare, key_name="ci_deploy_key") as sshd:
+        _write_private(home / ".ssh" / "config", (
+            "Host localhost\n"
+            + ("  IdentityFile ~/.ssh/ci_deploy_key\n" if with_identity else "")
+            + "  IdentitiesOnly yes\n"
+            "  UserKnownHostsFile ~/.ssh/known_hosts_test\n"
+            + _hostile_lines(marker)
+        ))
+        assert "SSH_AUTH_SOCK" not in os.environ
+        assert not any((home / ".ssh" / name).exists() for name in _DEFAULT_KEY_NAMES)
+        url = f"ssh://{getpass.getuser()}@localhost:{sshd.port}/OWNER/REPO.git"
+        env = git_transport._transport_env(url, None)
+        assert "SSH_AUTH_SOCK" not in env
+        command = env["GIT_SSH_COMMAND"]
+        _assert_no_test_injection(command)
+        argv = shlex.split(command)
+        assert f"UserKnownHostsFile={sshd.known_hosts}" in argv
+        private = tmp_path / "private"
+        private.mkdir()
+        git_transport._private_git(("init", "--bare", "-q"), cwd=private, env=env)
+        fetch = ("fetch", "--no-tags", "--no-recurse-submodules", url,
+                 "+refs/heads/main:refs/agent-loop/import")
+        if with_identity:
+            assert argv[argv.index("-i") + 1] == str(sshd.key)
+            git_transport._private_git(fetch, cwd=private, env=env, ssh=True)
+            assert _git(private, "rev-parse", "refs/agent-loop/import") == _git(bare, "rev-parse", "refs/heads/main")
+        else:
+            assert "-i" not in argv
+            with pytest.raises(TransportFailure) as raised:
+                git_transport._private_git(fetch, cwd=private, env=env, ssh=True)
+            assert raised.value.label == "authentication failure"
+            assert "(authentication failure)." in str(raised.value)
+    assert not marker.exists()

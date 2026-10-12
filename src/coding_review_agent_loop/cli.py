@@ -1584,6 +1584,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="--git=<path> [--gh=<path>] followed by git|gh and its arguments.",
     )
 
+    # Help-only listing: main() dispatches transport-check to its own parser
+    # before this one runs (see transport_check.build_parser).
+    subparsers.add_parser(
+        "transport-check",
+        help=(
+            "Pre-merge transport smoke check: one trusted-transport fetch of the default "
+            "branch with the operator's real credentials; prints only a pass/fail class. "
+            "Usage: transport-check --repo OWNER/REPO [--base BRANCH] "
+            "[--trusted-origin-protocol https|ssh] [--git-ssh-identity PATH] [--gh-cmd GH]."
+        ),
+        add_help=False,
+    )
+
     containment_preflight = subparsers.add_parser(
         "containment-preflight",
         help="Report resolved process-tree containment policy and host capabilities.",
@@ -2097,6 +2110,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         from .inspect_tool import run_inspect
 
         return run_inspect(tokens[1:])
+    if tokens and tokens[0] == "transport-check":
+        # Own parse-error boundary: argument errors print only a fixed class,
+        # never usage or the offending (possibly secret) token (#1383).
+        from .transport_check import main as run_transport_check_command
+
+        return run_transport_check_command(tokens[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command in {"review-evaluation", "evaluate-reviews", "evaluate-review"}:
