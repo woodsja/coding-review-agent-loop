@@ -106,7 +106,7 @@ from .test_runtime import (
     resolve_timeout_seconds,
     timeout_advisory,
 )
-from .local_test_evidence import broker_client_from_environment
+from .local_test_evidence import FIXTURE_MIN_TIMEOUT_SECONDS, broker_client_from_environment
 from .review_evaluation import (
     evaluate_frozen_artifacts,
     load_frozen_artifacts,
@@ -1612,6 +1612,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional repo memory directory in which agent-loop records this measured run.",
     )
+    run_tests.add_argument(
+        "--fixture",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Tracked executable fixture script run by the test broker as `PATH setup` before "
+            "and `PATH teardown` after the inner command, in one supervised scope. "
+            "Requires the broker and a timeout of at least 30s; never runs locally."
+        ),
+    )
     add_containment_options(run_tests)
     run_tests.add_argument(
         "inner_argv",
@@ -1913,6 +1923,116 @@ _NO_RECORD_OUTCOMES = frozenset(
 )
 
 
+FIXTURE_NOT_DISPATCHED_MESSAGE = (
+    "agent-loop: --fixture requires the test broker; nothing was run (not evidence)"
+)
+FIXTURE_RESULT_UNKNOWN_MESSAGE = (
+    "agent-loop: broker result unknown after dispatch; the broker owns this fixture run, "
+    "its teardown and its journal; not retried locally (not evidence)"
+)
+
+
+def _run_fixture_tests(
+    args: argparse.Namespace,
+    broker,
+    *,
+    raw_inner: Sequence[str],
+    fixture: str,
+    chosen,
+    policy: int,
+    worker_budget,
+) -> int:
+    """``run-tests --fixture`` (issue #1326): broker only, never a local fallback."""
+    from .fixture_runtime import fold_exit_code
+    from .local_test_evidence import BrokerNotDispatched, BrokerProtocolError, BrokerResultUnknown
+
+    if broker is None:
+        print(FIXTURE_NOT_DISPATCHED_MESSAGE, file=sys.stderr, flush=True)
+        return 1
+    try:
+        result = broker.run(
+            raw_inner,
+            timeout_seconds=chosen,
+            cwd=Path.cwd(),
+            environment_overrides=worker_budget.environment(),
+            fixture=fixture,
+        )
+    except BrokerNotDispatched as exc:
+        print(f"{FIXTURE_NOT_DISPATCHED_MESSAGE} [{exc}]", file=sys.stderr, flush=True)
+        return 1
+    except BrokerResultUnknown as exc:
+        print(f"{FIXTURE_RESULT_UNKNOWN_MESSAGE} [{exc}]", file=sys.stderr, flush=True)
+        return 1
+    except BrokerProtocolError as exc:
+        # An error frame: a pre-launch refusal names its fixture reason code.
+        if str(exc).startswith("fixture refused:"):
+            print(f"agent-loop: {exc}; nothing was run (not evidence)", file=sys.stderr, flush=True)
+        else:
+            print(f"agent-loop: broker fixture request failed: {exc} (not evidence)", file=sys.stderr, flush=True)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"{FIXTURE_RESULT_UNKNOWN_MESSAGE} [{type(exc).__name__}]", file=sys.stderr, flush=True)
+        return 1
+    if result.execution_ref:
+        print(f"agent-loop test execution_ref: {result.execution_ref}", file=sys.stderr, flush=True)
+    if result.receipt_id:
+        print(f"agent-loop test observation receipt: {result.receipt_id}", file=sys.stderr, flush=True)
+    record = dict(result.fixture or {})
+    print(
+        "agent-loop fixture: setup={setup} teardown={teardown} cleanup={cleanup}".format(
+            setup=record.get("setup_status", "not-run"),
+            teardown=record.get("teardown_status", "not-run"),
+            cleanup=record.get("cleanup", "unconfirmed"),
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    for item in record.get("escaped_processes") or ():
+        print(f"agent-loop fixture: escaped process {item}", file=sys.stderr, flush=True)
+    if result.outcome == "timed_out":
+        print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
+    # Timing and launcher health describe only the inner command; a fixture
+    # row is keyed by its fixture identity so it never pools with other runs.
+    if result.outcome not in _NO_RECORD_OUTCOMES and result.fixture is not None:
+        if result.inner_exec == "failed":
+            record_launcher_health(
+                args.memory_dir, cwd=Path.cwd(), candidate=raw_inner, state="failed",
+                provenance="broker-parent", environment=os.environ,
+                diagnostic=result.diagnostic or result.output_tail,
+            )
+        elif result.suite_start == "verified":
+            record_launcher_health(
+                args.memory_dir, cwd=Path.cwd(), candidate=raw_inner, state="verified",
+                provenance="broker-parent", environment=os.environ, diagnostic=result.diagnostic,
+            )
+        if result.suite_start != "not-started":
+            record_test_observation(
+                args.memory_dir,
+                argv=raw_inner,
+                cwd=Path.cwd(),
+                outcome=result.outcome,
+                elapsed_seconds=result.elapsed_seconds,
+                attempted_timeout_seconds=chosen,
+                policy_ceiling_seconds=policy,
+                returncode=result.returncode,
+                lane="broker",
+                workers=result.workers_cohort,
+                executed_argv=result.executed_argv or None,
+                worker_enforcement=result.worker_enforcement,
+                caveats=result.worker_caveats,
+                launch_integrity=launch_integrity_state(result),
+                launch_state=launch_state_fields(result),
+                fixture=record,
+            )
+    return fold_exit_code(
+        outcome=result.outcome,
+        returncode=result.returncode,
+        inner_exec=result.inner_exec,
+        fixture=result.fixture,
+        cancelled_frame=result.outcome == "cancelled",
+    )
+
+
 def _run_tests_command(args: argparse.Namespace) -> int:
     from .test_workers import (
         WORKER_BUDGET_REFUSED_EXIT_CODE,
@@ -1920,7 +2040,11 @@ def _run_tests_command(args: argparse.Namespace) -> int:
         client_refusal,
     )
 
+    fixture = getattr(args, "fixture", None)
     if args.preflight:
+        if fixture is not None:
+            print("agent-loop: --fixture cannot be combined with --preflight", file=sys.stderr)
+            return 2
         print("agent-loop preflight: verified")
         return 0
     raw_inner = list(args.inner_argv)
@@ -1933,6 +2057,14 @@ def _run_tests_command(args: argparse.Namespace) -> int:
             )
         policy = inherited_timeout_ceiling()
         chosen = resolve_timeout_seconds(args.timeout_seconds, policy_ceiling=policy)
+        if fixture is not None:
+            if not str(fixture).strip() or "\x00" in str(fixture):
+                raise TestRuntimeConfigurationError("--fixture requires a non-empty path.")
+            if not float(chosen) >= FIXTURE_MIN_TIMEOUT_SECONDS:
+                raise TestRuntimeConfigurationError(
+                    f"--fixture requires a timeout of at least {FIXTURE_MIN_TIMEOUT_SECONDS:g}s "
+                    f"(got {chosen:g}s); nothing was run."
+                )
         broker = broker_client_from_environment()
         try:
             worker_resolution = _resolve_run_tests_worker_budget(args, broker_present=broker is not None)
@@ -1953,6 +2085,11 @@ def _run_tests_command(args: argparse.Namespace) -> int:
         notice = prelaunch_notice(chosen, policy, os.environ)
         if notice is not None:
             print(notice, file=sys.stderr, flush=True)
+        if fixture is not None:
+            return _run_fixture_tests(
+                args, broker, raw_inner=raw_inner, fixture=str(fixture), chosen=chosen,
+                policy=policy, worker_budget=worker_budget,
+            )
         if broker is not None:
             try:
                 # Neither the command lane nor the worker-budget lock is taken

@@ -140,6 +140,9 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "AGENT_LOOP_WORKER_CAP_SPEC",
         "AGENT_LOOP_WORKER_CAP_NESTED",
         "AGENT_LOOP_PUBLIC_RESPONSE_BELOW",
+        # Broker-owned per-request fixture state directory (#1326); the
+        # fixture identity itself keys fixture rows apart.
+        "AGENT_LOOP_FIXTURE_STATE_DIR",
         "PWD",
         "OLDPWD",
         "SHLVL",
@@ -343,6 +346,175 @@ def environment_comparison_for_restart() -> str:
     return "identity-unknown"
 
 
+# Fixture lifecycle record (issue #1326) ---------------------------------------
+
+FIXTURE_STATUS_STRINGS = frozenset({"timed_out", "not-run", "cancelled"})
+FIXTURE_CLEANUP_STATES = frozenset({"confirmed", "escaped", "unconfirmed"})
+FIXTURE_UNREADABLE_CAVEAT = "fixture record unreadable"
+MAX_FIXTURE_PATH_BYTES = 512
+MAX_FIXTURE_ESCAPED_REPORTED = 8
+MAX_FIXTURE_ESCAPED_BYTES = 160
+MAX_FIXTURE_COUNT = 1_000_000
+_FIXTURE_DIGEST_RE = re.compile(r"^(?:100755|100644):[0-9a-f]{40,64}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FIXTURE_RECORD_FIELDS = frozenset(
+    {
+        "path", "digest",
+        "setup_status", "setup_duration_seconds", "setup_log_digest",
+        "teardown_status", "teardown_duration_seconds", "teardown_log_digest",
+        "cleanup", "inventoried", "swept", "escaped", "escaped_processes",
+    }
+)
+
+
+def _fixture_status(value: object) -> int | str:
+    if isinstance(value, bool):
+        raise ValueError("fixture status is a boolean")
+    if isinstance(value, int):
+        if not -255 <= value <= 255:
+            raise ValueError("fixture status is out of range")
+        return value
+    if isinstance(value, str) and value in FIXTURE_STATUS_STRINGS:
+        return value
+    raise ValueError("unknown fixture status")
+
+
+def _fixture_duration(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("fixture duration is not a number")
+    # Range-check before float(): an arbitrarily large int would overflow.
+    if not 0 <= value <= 86_400:
+        raise ValueError("fixture duration is out of range")
+    return round(float(value), 3)
+
+
+def _fixture_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_FIXTURE_COUNT:
+        raise ValueError("fixture count is out of range")
+    return value
+
+
+def _fixture_log_digest(value: object) -> str:
+    if value == "" or (isinstance(value, str) and _SHA256_RE.match(value)):
+        return str(value)
+    raise ValueError("fixture log digest is malformed")
+
+
+@dataclass(frozen=True)
+class FixtureRecord:
+    """Bounded lifecycle of one ``run-tests --fixture`` run.
+
+    The redacted log excerpts never live here; they stay in the private
+    journal row's ``diagnostic`` field and are never projected.
+    """
+
+    path: str
+    digest: str
+    setup_status: int | str = "not-run"
+    setup_duration_seconds: float = 0.0
+    setup_log_digest: str = ""
+    teardown_status: int | str = "not-run"
+    teardown_duration_seconds: float = 0.0
+    teardown_log_digest: str = ""
+    cleanup: str = "unconfirmed"
+    inventoried: int = 0
+    swept: int = 0
+    escaped: int = 0
+    escaped_processes: tuple[str, ...] = ()
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return (self.path, self.digest)
+
+    @property
+    def clean(self) -> bool:
+        return (
+            self.setup_status == 0
+            and not isinstance(self.setup_status, bool)
+            and self.teardown_status == 0
+            and not isinstance(self.teardown_status, bool)
+            and self.cleanup == "confirmed"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": _bounded(self.path, MAX_FIXTURE_PATH_BYTES),
+            "digest": self.digest,
+            "setup_status": self.setup_status,
+            "setup_duration_seconds": self.setup_duration_seconds,
+            "setup_log_digest": self.setup_log_digest,
+            "teardown_status": self.teardown_status,
+            "teardown_duration_seconds": self.teardown_duration_seconds,
+            "teardown_log_digest": self.teardown_log_digest,
+            "cleanup": self.cleanup,
+            "inventoried": self.inventoried,
+            "swept": self.swept,
+            "escaped": self.escaped,
+            "escaped_processes": list(self.escaped_processes[:MAX_FIXTURE_ESCAPED_REPORTED]),
+        }
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "FixtureRecord":
+        """Strictly decode a record; any deviation raises ``ValueError``."""
+        if not isinstance(value, Mapping) or set(value) != FIXTURE_RECORD_FIELDS:
+            raise ValueError("fixture record has unknown or missing fields")
+        path = value["path"]
+        if (
+            not isinstance(path, str) or not path or "\x00" in path
+            or len(path.encode("utf-8")) > MAX_FIXTURE_PATH_BYTES
+            or path.startswith("/") or ".." in Path(path).parts
+        ):
+            raise ValueError("fixture path is malformed")
+        digest = value["digest"]
+        if not isinstance(digest, str) or not _FIXTURE_DIGEST_RE.match(digest):
+            raise ValueError("fixture digest is malformed")
+        cleanup = value["cleanup"]
+        if cleanup not in FIXTURE_CLEANUP_STATES:
+            raise ValueError("fixture cleanup state is unknown")
+        escaped_processes = value["escaped_processes"]
+        if (
+            not isinstance(escaped_processes, list)
+            or len(escaped_processes) > MAX_FIXTURE_ESCAPED_REPORTED
+            or any(
+                not isinstance(item, str) or len(item.encode("utf-8")) > MAX_FIXTURE_ESCAPED_BYTES
+                for item in escaped_processes
+            )
+        ):
+            raise ValueError("fixture escaped list is malformed")
+        return cls(
+            path=path,
+            digest=digest,
+            setup_status=_fixture_status(value["setup_status"]),
+            setup_duration_seconds=_fixture_duration(value["setup_duration_seconds"]),
+            setup_log_digest=_fixture_log_digest(value["setup_log_digest"]),
+            teardown_status=_fixture_status(value["teardown_status"]),
+            teardown_duration_seconds=_fixture_duration(value["teardown_duration_seconds"]),
+            teardown_log_digest=_fixture_log_digest(value["teardown_log_digest"]),
+            cleanup=str(cleanup),
+            inventoried=_fixture_count(value["inventoried"]),
+            swept=_fixture_count(value["swept"]),
+            escaped=_fixture_count(value["escaped"]),
+            escaped_processes=tuple(_safe_text(item, MAX_FIXTURE_ESCAPED_BYTES) for item in escaped_processes),
+        )
+
+
+def unreadable_fixture_record(value: object = None) -> FixtureRecord:
+    """A fail-closed stand-in for a malformed or oversized persisted record."""
+    path = ""
+    if isinstance(value, Mapping) and isinstance(value.get("path"), str):
+        path = _safe_text(value["path"], MAX_FIXTURE_PATH_BYTES)
+    return FixtureRecord(path=path or "<unreadable>", digest="unreadable", cleanup="unconfirmed")
+
+
+def decode_fixture_record(value: object) -> tuple[FixtureRecord, tuple[str, ...]]:
+    """Decode defensively: a bad value is unconfirmed with a caveat, never raises."""
+    try:
+        return FixtureRecord.from_mapping(value), ()
+    except Exception:
+        # Any malformed value (including arithmetic overflow) fails closed.
+        return unreadable_fixture_record(value), (FIXTURE_UNREADABLE_CAVEAT,)
+
+
 @dataclass(frozen=True)
 class LocalTestObservation:
     command: tuple[str, ...]
@@ -378,6 +550,9 @@ class LocalTestObservation:
     # ``True`` only while every projected command token equals the raw token
     # byte for byte; ``None`` is a fresh live row that was never redacted.
     command_verbatim: bool | None = field(default=None, compare=False)
+    # Issue #1326: the ``run-tests --fixture`` lifecycle; ``None`` for every
+    # fixture-less row, which keeps the legacy projection unchanged.
+    fixture: FixtureRecord | None = None
 
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
@@ -465,6 +640,8 @@ class LocalTestObservation:
                 inner_exec=self.inner_exec,
                 suite_start=self.suite_start,
             )
+        if self.fixture is not None:
+            projection["fixture"] = self.fixture.to_dict()
         return projection
 
     def to_dict(self) -> dict[str, object]:
@@ -680,6 +857,14 @@ def observation_from_mapping(
     environment_state = str(value.get("environment_state", value.get("environment", "unknown")))
     if environment_state not in ENVIRONMENT_STATES:
         environment_state = "unknown"
+    fixture: FixtureRecord | None = None
+    fixture_caveats: tuple[str, ...] = ()
+    if "fixture" in value:
+        raw_fixture = value.get("fixture")
+        if isinstance(raw_fixture, FixtureRecord):
+            fixture = raw_fixture
+        else:
+            fixture, fixture_caveats = decode_fixture_record(raw_fixture)
     return LocalTestObservation(
         command=command,
         outcome="incomplete" if fallback_caveats else str(value.get("outcome", "incomplete")),
@@ -702,6 +887,7 @@ def observation_from_mapping(
             dict.fromkeys(
                 (
                     *fallback_caveats,
+                    *fixture_caveats,
                     *(_safe_text(item) for item in value.get("caveats", ()) if item is not None),
                 )
             )
@@ -714,6 +900,7 @@ def observation_from_mapping(
         suite_start=str(value.get("suite_start", "not-started")),
         # A restored row cannot prove its tokens were never altered.
         command_verbatim=value.get("command_verbatim") is True,
+        fixture=fixture,
     )
 
 
@@ -727,7 +914,13 @@ def _observation_key(observation: LocalTestObservation) -> tuple[object, ...]:
         observation.attribution.to_dict(),
         observation.environment_state,
         observation.returncode,
+        # Issue #1326: a fixture run never pools with another fixture or none.
+        observation.fixture.identity if observation.fixture is not None else None,
     )
+
+
+def _fixture_identity(observation: LocalTestObservation) -> tuple[str, str] | None:
+    return observation.fixture.identity if observation.fixture is not None else None
 
 
 def _same_receipt(left: LocalTestObservation, right: LocalTestObservation) -> bool:
@@ -746,6 +939,8 @@ def _can_supersede(
         return False, "later pass was not parent-observed"
     if failure.normalized_command != passing.normalized_command:
         return False, "command differs; subset/superset or command disagreement remains visible"
+    if _fixture_identity(failure) != _fixture_identity(passing):
+        return False, "fixture identity differs; a run with another fixture or none cannot supersede it"
     if failure.scope.normalized() != passing.scope.normalized():
         return False, "scope differs; subset/superset result cannot supersede the failure"
     if failure.attribution.state != passing.attribution.state:
@@ -946,6 +1141,7 @@ def reconcile_test_observations(
                 for previous in reversed(rows[:index])
                 if previous.normalized_command == row.normalized_command
                 and previous.scope.normalized() == row.scope.normalized()
+                and _fixture_identity(previous) == _fixture_identity(row)
             ),
             None,
         )
@@ -2120,6 +2316,11 @@ BROKER_MAX_ENV_VALUE_BYTES = 8 * 1024
 BROKER_REQUEST_FIELDS = frozenset(
     {"turn_id", "nonce", "argv", "timeout_seconds", "cwd", "environment"}
 )
+# Issue #1326: the only optional request field.  A request carries either the
+# exact legacy field set or that set plus ``fixture``.
+BROKER_FIXTURE_FIELD = "fixture"
+FIXTURE_STATE_DIR_ENV = "AGENT_LOOP_FIXTURE_STATE_DIR"
+FIXTURE_MIN_TIMEOUT_SECONDS = 30.0
 BROKER_RESPONSE_FIELDS = frozenset(
     {"type", "receipt_id", "outcome", "returncode", "elapsed_seconds", "output_tail", "error"}
 )
@@ -2127,6 +2328,14 @@ BROKER_RESPONSE_FIELDS = frozenset(
 
 class BrokerProtocolError(AgentLoopError):
     """A malformed, unauthenticated, or bounded-out broker request."""
+
+
+class BrokerNotDispatched(BrokerProtocolError):
+    """Connect or send failed before the request frame was fully written."""
+
+
+class BrokerResultUnknown(BrokerProtocolError):
+    """The request frame was sent but no terminal response was received."""
 
 
 class ExecutionReferenceRegistry:
@@ -2312,8 +2521,18 @@ class _ConnectionSender:
 def _validate_broker_request(
     request: Mapping[str, object], *, turn_id: str, capability: str, root: Path, ceiling: float
 ) -> dict[str, object]:
-    if set(request) != BROKER_REQUEST_FIELDS:
+    fields = set(request)
+    if fields != BROKER_REQUEST_FIELDS and fields != BROKER_REQUEST_FIELDS | {BROKER_FIXTURE_FIELD}:
         raise BrokerProtocolError("broker request has unknown or missing fields")
+    fixture: str | None = None
+    if BROKER_FIXTURE_FIELD in request:
+        raw_fixture = request[BROKER_FIXTURE_FIELD]
+        if (
+            not isinstance(raw_fixture, str) or not raw_fixture or "\x00" in raw_fixture
+            or len(raw_fixture.encode("utf-8")) > BROKER_MAX_CWD_BYTES
+        ):
+            raise BrokerProtocolError("broker fixture must be a bounded non-empty path")
+        fixture = raw_fixture
     supplied_turn = request.get("turn_id")
     if not isinstance(supplied_turn, str) or supplied_turn != turn_id or "\x00" in supplied_turn or not (1 <= len(supplied_turn) <= 128):
         raise BrokerProtocolError("broker request is bound to a different turn")
@@ -2344,6 +2563,11 @@ def _validate_broker_request(
     timeout = request.get("timeout_seconds")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)) or float(timeout) <= 0 or float(timeout) > ceiling:
         raise BrokerProtocolError("broker timeout is outside the configured ceiling")
+    if fixture is not None and float(timeout) < FIXTURE_MIN_TIMEOUT_SECONDS:
+        raise BrokerProtocolError(
+            f"fixture refused: fixture-timeout-below-floor (a --fixture run needs at least "
+            f"{FIXTURE_MIN_TIMEOUT_SECONDS:g}s)"
+        )
     cwd = request.get("cwd")
     if not isinstance(cwd, str) or "\x00" in cwd or len(cwd.encode("utf-8")) > BROKER_MAX_CWD_BYTES or not os.path.isabs(cwd):
         raise BrokerProtocolError("broker cwd must be an absolute bounded path")
@@ -2369,7 +2593,7 @@ def _validate_broker_request(
             raise BrokerProtocolError("broker cwd may not be a final symlink")
     except (OSError, ValueError) as exc:
         raise BrokerProtocolError("broker cwd could not be validated") from exc
-    return {
+    validated: dict[str, object] = {
         "turn_id": turn_id,
         "nonce": nonce,
         "argv": tuple(argv_values),
@@ -2377,6 +2601,9 @@ def _validate_broker_request(
         "cwd": canonical,
         "environment": dict(environment),
     }
+    if fixture is not None:
+        validated[BROKER_FIXTURE_FIELD] = fixture
+    return validated
 
 
 @dataclass(frozen=True)
@@ -2397,6 +2624,9 @@ class BrokerRunResult:
     worker_enforcement: str | None = None
     worker_caveats: tuple[str, ...] = ()
     worker_environment: Mapping[str, str] = field(default_factory=dict)
+    # Issue #1326: the projected fixture record, decoded defensively; ``None``
+    # for fixture-less responses.
+    fixture: Mapping[str, object] | None = None
 
 
 def _bounded_argv(values: Sequence[object]) -> list[str]:
@@ -2418,6 +2648,75 @@ class _ReplayReservation:
     digest: str
     ready: Event = field(default_factory=Event)
     response: dict[str, object] | None = None
+
+
+class _FixtureRun:
+    """Broker-side state of one ``run-tests --fixture`` request (issue #1326).
+
+    The absolute request deadline is fixed at acceptance (after the before
+    snapshot): the runner gets ``inner_deadline``, and teardown plus the
+    sweep keep the reserve after it.
+    """
+
+    def __init__(self, *, provenance: Any, mount_id: str, timeout_seconds: float) -> None:
+        from .fixture_runtime import reserve_seconds
+
+        self.provenance = provenance
+        self.mount_id = mount_id
+        self.timeout_seconds = float(timeout_seconds)
+        self.reserve = reserve_seconds(timeout_seconds)
+        self.request_deadline = time.monotonic() + self.timeout_seconds
+        self.inner_deadline = self.request_deadline - self.reserve
+        self.supervisor: Any | None = None
+        self.decision: Any | None = None
+        self.state_dir = Path(tempfile.mkdtemp(prefix="agent-loop-fixture-state-"))
+        os.chmod(self.state_dir, 0o700)
+        self._finished = False
+
+    def close(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.state_dir, ignore_errors=True)
+
+    def finish(self, server: "TestBrokerServer") -> None:
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            if self.supervisor is not None:
+                # Bounded by the original request deadline, not a fresh reserve.
+                self.supervisor.finish()
+                with server._journal_lock:
+                    server._active_fixtures.pop(id(self.supervisor), None)
+        finally:
+            self.close()
+
+    def fold(
+        self, outcome: str, *, inner_exec: str, shutdown: bool, diagnostic: str,
+    ) -> tuple[FixtureRecord, str, str, tuple[str, ...]]:
+        """Return (record, private excerpts, folded outcome, caveats)."""
+        from .fixture_runtime import LAUNCHER_CHANGED_CAVEAT, lifecycle_caveats, not_run_record
+
+        if self.supervisor is not None:
+            record, excerpts = self.supervisor.record()
+        else:
+            record, excerpts = not_run_record(self.provenance), ""
+        caveats: list[str] = []
+        if diagnostic == LAUNCHER_CHANGED_CAVEAT:
+            caveats.append(LAUNCHER_CHANGED_CAVEAT)
+        action = getattr(self.decision, "action", None)
+        if self.supervisor is not None and (shutdown or action == "cancel"):
+            # A stop after the supervisor launched is never ``passed``.
+            outcome = "interrupted"
+        elif action == "timed_out":
+            outcome = "timed_out"
+        elif action == "skip":
+            outcome = "failed"
+        elif outcome == "passed" and not record.clean:
+            outcome = "failed"
+        if self.supervisor is not None or action is not None:
+            caveats.extend(lifecycle_caveats(record))
+        return record, excerpts, outcome, tuple(dict.fromkeys(caveats))
 
 
 class TestBrokerServer:
@@ -2476,6 +2775,9 @@ class TestBrokerServer:
         self._process_started: Any | None = None
         self._process_finished: Any | None = None
         self._active_processes: dict[int, Any] = {}
+        # Issue #1326: fixture supervisors are never sent the ordinary
+        # SIGTERM/SIGKILL; stop() hands them a graceful teardown first.
+        self._active_fixtures: dict[int, tuple[Any, float]] = {}
         self._pinned_root: Any | None = None
         self._worker_budget: Any | None = None
         self._worker_lock_root: Path | None = None
@@ -2589,6 +2891,7 @@ class TestBrokerServer:
                 # precedes this point or observes the stop and is unattributed.
                 self._stop_event.set()
                 active = list(self._active_processes.values())
+                fixtures = list(self._active_fixtures.values())
         for proc in active:
             if proc.poll() is None:
                 try:
@@ -2602,6 +2905,12 @@ class TestBrokerServer:
                     except ProcessLookupError:
                         pass
                     proc.wait()
+        # Teardown interrupts a running setup; each supervisor then gets its
+        # reserve before it (and every inventoried PID) is forcibly killed.
+        for supervisor, _reserve in fixtures:
+            supervisor.request_teardown()
+        for supervisor, reserve in fixtures:
+            supervisor.finish(budget=reserve)
         if self._thread is not None and self._thread is not current_thread():
             self._thread.join(timeout=2)
         self._thread = None
@@ -2863,19 +3172,55 @@ class TestBrokerServer:
         # The server, not the client, decides the actual target environment.
         # Control variables are never forwarded to the target.  The server
         # owns the authenticated turn identity that remains in its context.
-        for name in (BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV):
+        for name in (
+            BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV, FIXTURE_STATE_DIR_ENV,
+        ):
             environment.pop(name, None)
         environment["AGENT_LOOP_INVOCATION_ID"] = self.turn_id
         pinned_root = self._pinned_root
         if pinned_root is None:
             raise BrokerProtocolError("test broker root is not pinned")
+        fixture_request = request.get(BROKER_FIXTURE_FIELD)
+        fixture_run: Any | None = None
         with open_confined_cwd(pinned_root, requested_cwd) as confined:
             cwd = confined.path
+            if fixture_request is not None:
+                from .fixture_runtime import (
+                    validate_fixture_path,
+                    validate_fixture_timeout,
+                    verify_host_process_authority,
+                )
+
+                # Issue #1326: every refusal happens before anything launches.
+                validate_fixture_timeout(float(request["timeout_seconds"]))
+                authority = verify_host_process_authority()
+                provenance = validate_fixture_path(self.root, cwd, str(fixture_request))
             before = stable_tracked_tree_snapshot(
                 self.root,
                 argv=argv,
                 timeout_seconds=min(MAX_SNAPSHOT_SECONDS, self.timeout_ceiling),
             )
+            if fixture_request is not None:
+                from .fixture_runtime import require_clean_tree
+
+                require_clean_tree(before)
+                fixture_run = _FixtureRun(
+                    provenance=provenance,
+                    mount_id=authority.mount_id,
+                    timeout_seconds=float(request["timeout_seconds"]),
+                )
+                environment[FIXTURE_STATE_DIR_ENV] = str(fixture_run.state_dir)
+
+            def bounded_grace(grace: float) -> float:
+                # Issue #1326: in a fixture run no send may outlive the inner
+                # watchdog cutoff, so a client that stopped reading can never
+                # push termination, teardown or the sweep past the deadline.
+                if fixture_run is None:
+                    return grace
+                from .runner import DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+
+                cutoff = fixture_run.inner_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+                return max(0.0, min(grace, cutoff - time.monotonic()))
 
             def stream(chunk: str) -> None:
                 safe = chunk.encode("utf-8", errors="replace")[:16 * 1024].decode("utf-8", errors="ignore")
@@ -2883,7 +3228,8 @@ class TestBrokerServer:
                     # A disconnected or non-reading client never stops the
                     # target; the evidence result is still returned.
                     sender.send(
-                        {"type": "output", "data": safe}, grace=BROKER_STREAM_SEND_GRACE_SECONDS,
+                        {"type": "output", "data": safe},
+                        grace=bounded_grace(BROKER_STREAM_SEND_GRACE_SECONDS),
                     )
                 except OSError:
                     pass
@@ -2891,97 +3237,236 @@ class TestBrokerServer:
             def heartbeat() -> None:
                 sender.send(
                     {"type": "output", "data": ""},
-                    grace=_host_heartbeat_grace(), skip_if_busy=True,
+                    grace=bounded_grace(_host_heartbeat_grace()), skip_if_busy=True,
                 )
 
             def wait_notice(text: str) -> None:
                 sender.send(
-                    {"type": "output", "data": text + "\n"}, grace=_host_heartbeat_grace(),
+                    {"type": "output", "data": text + "\n"},
+                    grace=bounded_grace(_host_heartbeat_grace()),
                 )
 
-            if self._execute is not None:
-                result = self._execute(argv, cwd, float(request["timeout_seconds"]), environment, stream)
-            else:
-                from .runner import run_foreground_test
-
-                parent_cgroup = None
+            parent_cgroup = None
+            if self._execute is None:
                 handle = self._parent_containment_handle
                 if handle is not None and getattr(handle, "managed", False):
                     report = handle.refresh_report()
                     if report is None or not report.target_started or handle.cgroup_path is None:
+                        if fixture_run is not None:
+                            fixture_run.close()
                         raise BrokerProtocolError("coder containment scope is not ready for broker tests")
                     parent_cgroup = handle.cgroup_path
-
-                def started(proc: Any) -> None:
-                    with self._journal_lock:
-                        self._active_processes[proc.pid] = proc
-                    if self._process_started is not None:
-                        self._process_started(proc)
-
-                def finished(proc: Any) -> None:
-                    with self._journal_lock:
-                        self._active_processes.pop(proc.pid, None)
-                    if self._process_finished is not None:
-                        self._process_finished(proc)
-
-                from .worker_telemetry import ReservationTelemetry, telemetry_log_path
-
-                telemetry = ReservationTelemetry(
-                    telemetry_log_path(),
-                    self._telemetry_attribution
-                    or {"attribution_source": "none", "lane": "broker"},
+            setup_hook = (
+                self._fixture_setup_hook(
+                    fixture_run, cwd=cwd, cwd_fd=confined.fd,
+                    environment=environment, parent_cgroup=parent_cgroup,
                 )
-                from .test_runtime import resolve_adopted_package_script
-
-                # One static package.json read per request (issue #1294).
-                package_script = resolve_adopted_package_script(
-                    argv, cwd=cwd, environment=environment
-                )
-                result = run_foreground_test(
-                    argv,
-                    package_script=package_script,
-                    reservation_telemetry=telemetry,
-                    worker_budget=self.effective_worker_budget(environment),
-                    worker_lock_root=self._worker_lock_root,
-                    host_wait_cancel=self._stop_event,
-                    host_wait_heartbeat=heartbeat,
-                    host_wait_notify=wait_notice,
-                    host_launch_guard=lambda: self._launch_lock,
-                    cwd=cwd,
-                    cwd_fd=confined.fd,
-                    timeout_seconds=float(request["timeout_seconds"]),
-                    env=environment,
-                    # Broker children either attach to the requesting managed
-                    # coder scope above or use their registered process group.
-                    # They must never infer containment from the broker
-                    # parent's own cgroup.
-                    containment_policy=None,
-                    containment_role="test-gate",
-                    environment_is_complete=True,
-                    output_callback=stream,
-                    echo_output=False,
-                    parent_cgroup_path=parent_cgroup,
-                    process_started=started,
-                    process_finished=finished,
-                    wrapper_bootstrap="verified",
-                    health_provenance="broker-parent",
-                    classify_pre_collection=True,
-                )
-            if str(getattr(result, "outcome", "")) == "cancelled":
-                # Nothing launched: no post-run snapshot, attribution or evidence.
-                return _cancelled_frame()
-            shutdown = self._stop_event.is_set()
-            after = None
-            if not shutdown:
-                try:
-                    after = stable_tracked_tree_snapshot(
-                        self.root,
-                        argv=argv,
-                        timeout_seconds=min(MAX_SNAPSHOT_SECONDS, self.timeout_ceiling),
-                        cancel=self._stop_event,
+                if fixture_run is not None else None
+            )
+            try:
+                if self._execute is not None:
+                    result = self._execute_injected(
+                        argv, cwd, float(request["timeout_seconds"]), environment, stream,
+                        fixture_run=fixture_run, setup_hook=setup_hook,
                     )
-                except SnapshotCancelled:
-                    shutdown = True
+                else:
+                    result = self._run_foreground(
+                        argv, cwd=cwd, cwd_fd=confined.fd,
+                        timeout_seconds=float(request["timeout_seconds"]),
+                        environment=environment, stream=stream, heartbeat=heartbeat,
+                        wait_notice=wait_notice, parent_cgroup=parent_cgroup,
+                        fixture_run=fixture_run, setup_hook=setup_hook,
+                    )
+            finally:
+                if fixture_run is not None:
+                    # Teardown, the sweep and the census run on success,
+                    # failure, exceptions and stop alike, before the after
+                    # snapshot (issue #1326).
+                    fixture_run.finish(self)
+            return self._complete_request(
+                argv=argv, cwd=cwd, environment=environment, before=before,
+                result=result, fixture_run=fixture_run,
+            )
+
+    def _run_foreground(
+        self, argv: tuple[str, ...], *, cwd: Path, cwd_fd: int, timeout_seconds: float,
+        environment: dict[str, str], stream: Any, heartbeat: Any, wait_notice: Any,
+        parent_cgroup: Path | None, fixture_run: "_FixtureRun | None", setup_hook: Any | None,
+    ) -> Any:
+        from .runner import run_foreground_test
+
+        def started(proc: Any) -> None:
+            with self._journal_lock:
+                self._active_processes[proc.pid] = proc
+            if self._process_started is not None:
+                self._process_started(proc)
+
+        def finished(proc: Any) -> None:
+            with self._journal_lock:
+                self._active_processes.pop(proc.pid, None)
+            if self._process_finished is not None:
+                self._process_finished(proc)
+
+        from .worker_telemetry import ReservationTelemetry, telemetry_log_path
+
+        telemetry = ReservationTelemetry(
+            telemetry_log_path(),
+            self._telemetry_attribution
+            or {"attribution_source": "none", "lane": "broker"},
+        )
+        from .test_runtime import resolve_adopted_package_script
+
+        # One static package.json read per request (issue #1294).
+        package_script = resolve_adopted_package_script(
+            argv, cwd=cwd, environment=environment
+        )
+        return run_foreground_test(
+            argv,
+            package_script=package_script,
+            reservation_telemetry=telemetry,
+            worker_budget=self.effective_worker_budget(environment),
+            worker_lock_root=self._worker_lock_root,
+            host_wait_cancel=self._stop_event,
+            host_wait_heartbeat=heartbeat,
+            host_wait_notify=wait_notice,
+            host_launch_guard=lambda: self._launch_lock,
+            cwd=cwd,
+            cwd_fd=cwd_fd,
+            timeout_seconds=timeout_seconds,
+            env=environment,
+            # Broker children either attach to the requesting managed
+            # coder scope above or use their registered process group.
+            # They must never infer containment from the broker
+            # parent's own cgroup.
+            containment_policy=None,
+            containment_role="test-gate",
+            environment_is_complete=True,
+            output_callback=stream,
+            echo_output=False,
+            parent_cgroup_path=parent_cgroup,
+            process_started=started,
+            process_finished=finished,
+            wrapper_bootstrap="verified",
+            health_provenance="broker-parent",
+            classify_pre_collection=True,
+            # Issue #1326: both stay None for fixture-less requests.
+            absolute_deadline=(fixture_run.inner_deadline if fixture_run is not None else None),
+            post_admission_setup=setup_hook,
+        )
+
+    def _execute_injected(
+        self, argv: tuple[str, ...], cwd: Path, timeout: float, environment: dict[str, str],
+        stream: Any, *, fixture_run: "_FixtureRun | None", setup_hook: Any | None,
+    ) -> Any:
+        """The test-injected executor, with the fixture hook applied around it."""
+        assert self._execute is not None
+        if setup_hook is not None and fixture_run is not None:
+            decision = setup_hook(fixture_run.inner_deadline)
+            if not decision.proceed:
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    outcome=(
+                        "cancelled" if decision.action == "cancel"
+                        else "timed_out" if decision.action == "timed_out" else "failed"
+                    ),
+                    returncode=None, elapsed_seconds=0.0, output_tail=decision.reason,
+                    wrapper_bootstrap="verified", inner_exec="not-attempted",
+                    suite_start="not-started", diagnostic=decision.reason, args=list(argv),
+                )
+        return self._execute(argv, cwd, timeout, environment, stream)
+
+    def _fixture_setup_hook(
+        self, fixture_run: "_FixtureRun", *, cwd: Path, cwd_fd: int,
+        environment: Mapping[str, str], parent_cgroup: Path | None,
+    ) -> Any:
+        """The runner's post-admission hook: launch the supervisor, run setup."""
+        from .fixture_runtime import (
+            MIN_SETUP_AND_INNER_SECONDS,
+            SETUP_TERMINATION_MARGIN_SECONDS,
+            FixtureSupervisor,
+            SetupDecision,
+            teardown_budget_seconds,
+        )
+
+        def hook(deadline: float) -> Any:
+            if deadline - time.monotonic() < MIN_SETUP_AND_INNER_SECONDS:
+                fixture_run.decision = SetupDecision(
+                    "timed_out", "fixture setup budget exhausted before setup could start",
+                )
+                return fixture_run.decision
+            # The host_launch_guard handshake: a stop either sees this
+            # registered supervisor or this launch sees the stop.
+            with self._launch_lock:
+                if self._stop_event.is_set():
+                    fixture_run.decision = SetupDecision(
+                        "cancel", "broker stopping before the fixture launch",
+                    )
+                    return fixture_run.decision
+                # Setup stops early enough for its termination grace to end
+                # by the inner deadline; both deadlines are absolute.
+                setup_deadline = deadline - SETUP_TERMINATION_MARGIN_SECONDS
+                supervisor = FixtureSupervisor.launch(
+                    fixture_run.provenance, cwd=cwd, cwd_fd=cwd_fd, environment=environment,
+                    setup_deadline=setup_deadline,
+                    request_deadline=fixture_run.request_deadline,
+                    teardown_seconds=teardown_budget_seconds(fixture_run.timeout_seconds),
+                    mount_id=fixture_run.mount_id,
+                )
+                fixture_run.supervisor = supervisor
+                with self._journal_lock:
+                    self._active_fixtures[id(supervisor)] = (supervisor, fixture_run.reserve)
+            try:
+                released = supervisor.start_setup(parent_cgroup, setup_deadline=setup_deadline)
+            except (AgentLoopError, OSError) as exc:
+                fixture_run.decision = SetupDecision(
+                    "skip", f"fixture supervisor failed: {_safe_text(exc)}",
+                )
+                return fixture_run.decision
+            if not released:
+                fixture_run.decision = SetupDecision(
+                    "timed_out", "fixture setup budget expired before the supervisor was ready",
+                )
+                return fixture_run.decision
+            # The supervisor stops setup at its deadline; the report must
+            # arrive by the inner deadline, never inside the teardown reserve.
+            event = supervisor.wait_setup(deadline)
+            status = event.get("status") if event is not None else None
+            if self._stop_event.is_set() or status == "cancelled":
+                fixture_run.decision = SetupDecision("cancel", "broker stopping during fixture setup")
+            elif status == 0 and not isinstance(status, bool):
+                fixture_run.decision = SetupDecision("proceed")
+            else:
+                fixture_run.decision = SetupDecision(
+                    "skip",
+                    "fixture setup failed (status "
+                    + (str(status) if status is not None else "unknown") + ")",
+                )
+            return fixture_run.decision
+
+        return hook
+
+    def _complete_request(
+        self, *, argv: tuple[str, ...], cwd: Path, environment: Mapping[str, str],
+        before: "TrackedTreeSnapshot", result: Any, fixture_run: "_FixtureRun | None",
+    ) -> dict[str, object]:
+        """Snapshot, attribute, fold, journal and build the result frame."""
+        launched_fixture = fixture_run is not None and fixture_run.supervisor is not None
+        if str(getattr(result, "outcome", "")) == "cancelled" and not launched_fixture:
+            # Nothing launched: no post-run snapshot, attribution or evidence.
+            return _cancelled_frame()
+        shutdown = self._stop_event.is_set()
+        after = None
+        if not shutdown:
+            try:
+                after = stable_tracked_tree_snapshot(
+                    self.root,
+                    argv=argv,
+                    timeout_seconds=min(MAX_SNAPSHOT_SECONDS, self.timeout_ceiling),
+                    cancel=self._stop_event,
+                )
+            except SnapshotCancelled:
+                shutdown = True
         if shutdown or after is None:
             # The target ran before the broker stopped: record it, but never as
             # attributable (passing) evidence.
@@ -3030,9 +3515,28 @@ class TestBrokerServer:
             result_diagnostic = caveat
         else:
             pre_collection = None
-        if (suite_start != "not-started" or pre_collection) and str(getattr(result, "outcome", "")) not in {
-            "overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled",
-        }:
+        inner_exec = str(getattr(result, "inner_exec", "not-attempted"))
+        fixture_record: FixtureRecord | None = None
+        fixture_diagnostic = ""
+        journal_fixture_row = False
+        if fixture_run is not None:
+            fixture_record, fixture_diagnostic, result_outcome, fixture_caveats = fixture_run.fold(
+                result_outcome, inner_exec=inner_exec, shutdown=self._stop_event.is_set(),
+                diagnostic=str(result_diagnostic or ""),
+            )
+            journal_caveats = (*fixture_caveats, *journal_caveats)
+            # Fixture rows bypass the suite_start gate: a setup failure, a
+            # deadline before setup or a stop is still a journaled lifecycle.
+            journal_fixture_row = result_outcome not in {
+                "overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled",
+            } and (launched_fixture or fixture_run.decision is not None)
+        if (
+            journal_fixture_row
+            or (suite_start != "not-started" or pre_collection)
+            and str(getattr(result, "outcome", "")) not in {
+                "overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled",
+            }
+        ):
             observation = LocalTestObservation(
                 command=argv,
                 outcome=result_outcome,
@@ -3048,13 +3552,17 @@ class TestBrokerServer:
                 environment_state="not-compared",
                 environment_identity=identity,
                 caveats=journal_caveats,
-                diagnostic=getattr(result, "output_tail", None),
+                diagnostic=(
+                    "\n".join(item for item in (getattr(result, "output_tail", None), fixture_diagnostic) if item)
+                    if fixture_run is not None else getattr(result, "output_tail", None)
+                ),
                 wrapper_bootstrap=str(getattr(result, "wrapper_bootstrap", "unknown")),
-                inner_exec=str(getattr(result, "inner_exec", "not-attempted")),
+                inner_exec=inner_exec,
                 suite_start=suite_start,
                 executed_command=tuple(
                     str(item) for item in (getattr(result, "args", ()) or ())
                 ),
+                fixture=fixture_record,
             )
             with self._journal_lock:
                 if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:
@@ -3067,7 +3575,17 @@ class TestBrokerServer:
                     )
                 retained = self._append_journal_locked(observation)
                 execution_ref = retained.execution_ref if retained is not None else None
-        return {
+        if fixture_record is not None and result_outcome in {"interrupted", "cancelled"}:
+            # The client still receives the cancelled frame, now carrying the
+            # fixture lifecycle and the interrupted row's receipt.
+            return {
+                **_cancelled_frame(),
+                "receipt_id": receipt_id if execution_ref is not None else "",
+                "execution_ref": execution_ref,
+                "diagnostic": "fixture run interrupted (the broker is stopping)",
+                BROKER_FIXTURE_FIELD: fixture_record.to_dict(),
+            }
+        response: dict[str, object] = {
             "type": "result",
             "receipt_id": receipt_id,
             "execution_ref": execution_ref,
@@ -3076,7 +3594,7 @@ class TestBrokerServer:
             "elapsed_seconds": float(result.elapsed_seconds),
             "output_tail": _safe_text(getattr(result, "output_tail", ""), 8 * 1024),
             "wrapper_bootstrap": str(getattr(result, "wrapper_bootstrap", "unknown")),
-            "inner_exec": str(getattr(result, "inner_exec", "not-attempted")),
+            "inner_exec": inner_exec,
             "suite_start": suite_start,
             "diagnostic": _safe_text(result_diagnostic, MAX_SAFE_CAVEAT_BYTES),
             "executed_argv": _bounded_argv(getattr(result, "args", argv) or argv),
@@ -3085,6 +3603,9 @@ class TestBrokerServer:
             "worker_caveats": list(worker_caveats)[:16],
             "worker_environment": self._worker_environment_summary(environment),
         }
+        if fixture_record is not None:
+            response[BROKER_FIXTURE_FIELD] = fixture_record.to_dict()
+        return response
 
     def _worker_environment_summary(self, environment: Mapping[str, str]) -> dict[str, str]:
         """Effective controlled values, without PYTHONPATH/PYTEST_PLUGINS contents."""
@@ -3123,9 +3644,17 @@ class TestBrokerClient:
         timeout_seconds: float,
         cwd: Path | None = None,
         environment_overrides: Mapping[str, str] | None = None,
+        fixture: str | None = None,
     ) -> BrokerRunResult:
+        """Run one command through the broker.
+
+        ``BrokerNotDispatched`` means the request frame was never fully
+        written, so nothing ran; ``BrokerResultUnknown`` means it was sent and
+        the broker owns whatever happened.  Both subclass
+        ``BrokerProtocolError`` so fixture-less callers see no change.
+        """
         if not self.available:
-            raise BrokerProtocolError("test broker is unavailable")
+            raise BrokerNotDispatched("test broker is unavailable")
         assert self.endpoint is not None and self.capability is not None and self.turn_id is not None
         snapshot_cwd = str(cwd or Path.cwd())
         snapshot_environment = dict(self._environment)
@@ -3152,16 +3681,40 @@ class TestBrokerClient:
             "cwd": snapshot_cwd,
             "environment": snapshot_environment,
         }
+        if fixture is not None:
+            # Omitted when absent so the fixture-less request (and its replay
+            # digest) stays byte-identical.
+            request[BROKER_FIXTURE_FIELD] = str(fixture)
+            # Declared overhead: the before/after tree snapshots run outside
+            # the request deadline (issue #1326).
+            socket_bound = float(timeout_seconds) + 2 * MAX_SNAPSHOT_SECONDS + 10.0
+        else:
+            socket_bound = max(5.0, min(float(timeout_seconds) + 10.0, 1800.0))
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(max(5.0, min(float(timeout_seconds) + 10.0, 1800.0)))
-            connection.connect(self.endpoint)
-            # The capability is an out-of-band secret carried by a protected
-            # environment and turned into the exact request binding. It is
-            # intentionally not part of the request schema or any response.
-            request["turn_id"] = self.turn_id
-            _send_frame(connection, request)
+            connection.settimeout(socket_bound)
+            try:
+                connection.connect(self.endpoint)
+                # The capability is an out-of-band secret carried by a protected
+                # environment and turned into the exact request binding. It is
+                # intentionally not part of the request schema or any response.
+                request["turn_id"] = self.turn_id
+                _send_frame(connection, request)
+            except BrokerProtocolError as exc:
+                # Only an oversized frame, refused before any byte was sent.
+                raise BrokerNotDispatched(str(exc)) from exc
+            except (OSError, ValueError) as exc:
+                raise BrokerNotDispatched(
+                    f"broker request was not dispatched: {type(exc).__name__}"
+                ) from exc
             while True:
-                response = _recv_frame(connection)
+                try:
+                    response = _recv_frame(connection)
+                except BrokerProtocolError as exc:
+                    raise BrokerResultUnknown(str(exc)) from exc
+                except (OSError, ValueError) as exc:
+                    raise BrokerResultUnknown(
+                        f"broker response lost after dispatch: {type(exc).__name__}"
+                    ) from exc
                 if response.get("type") == "output":
                     data = response.get("data")
                     if isinstance(data, str):
@@ -3205,6 +3758,10 @@ class TestBrokerClient:
                         str(key): str(value)
                         for key, value in dict(response.get("worker_environment") or {}).items()
                     },
+                    fixture=(
+                        decode_fixture_record(response[BROKER_FIXTURE_FIELD])[0].to_dict()
+                        if BROKER_FIXTURE_FIELD in response else None
+                    ),
                 )
 
 

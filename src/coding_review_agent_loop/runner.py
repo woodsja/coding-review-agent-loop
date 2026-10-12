@@ -36,8 +36,10 @@ from .test_runtime import (
     OVERLAP_REJECTED_MESSAGE,
     SUITE_START_STATES,
     WRAPPER_BOOTSTRAP_STATES,
+    PROBE_DEADLINE_DIAGNOSTIC,
     acquire_command_lane,
     argv_is_transportable,
+    inner_launcher_identity_key,
     probe_inner_launcher,
     resolve_adopted_package_script,
 )
@@ -267,6 +269,11 @@ class ForegroundTestResult:
 
 
 TEST_OUTPUT_DRAIN_GRACE_SECONDS = 0.25
+# ``_terminate_process_group`` waits this long after SIGTERM before SIGKILL.
+TERMINATION_GRACE_SECONDS = 2.0
+# With an absolute deadline (#1326) the watchdog fires early enough that the
+# SIGTERM grace, SIGKILL and the output drain all end by the deadline.
+DEADLINE_TERMINATION_ALLOWANCE_SECONDS = TERMINATION_GRACE_SECONDS + TEST_OUTPUT_DRAIN_GRACE_SECONDS + 0.25
 
 
 def _drain_nonblocking_test_output(
@@ -520,6 +527,8 @@ def _run_foreground_test_body(
     host_launch_guard: Callable[[], Any] | None = None,
     package_script: Any = _UNRESOLVED_PACKAGE_SCRIPT,
     classify_pre_collection: bool = False,
+    absolute_deadline: float | None = None,
+    post_admission_setup: Callable[[float], Any] | None = None,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group.
 
@@ -544,6 +553,15 @@ def _run_foreground_test_body(
     lock.  With a budget, the effective argv/env are resolved before the
     command lane and launcher probe; in clamp and refuse the per-invocation
     worker-budget lock is held until the target's process group is gone.
+
+    ``absolute_deadline`` and ``post_admission_setup`` (issue #1326) default to
+    ``None``, which leaves every fixture-less call unchanged.  The deadline is
+    an absolute monotonic bound on host admission, the probes, the target
+    watchdog and the drain.  The hook runs once host admission and the worker
+    environment are settled and before the lifecycle and launcher probes; it
+    returns a decision whose ``proceed`` is false to skip the target.  With a
+    hook the launcher probe bypasses the per-invocation cache and the launcher
+    identity is re-read immediately before the guarded spawn.
     """
     requested_cmd = [str(value) for value in args]
     cmd = list(requested_cmd)
@@ -697,6 +715,9 @@ def _run_foreground_test_body(
             bound, bound_notice = host_wait_seconds(invocation_values)
             if bound_notice:
                 admission_notify(bound_notice)
+            if absolute_deadline is not None:
+                # Admission can never consume the time reserved after it.
+                bound = max(0.0, min(bound, absolute_deadline - time.monotonic()))
             try:
                 wait = worker_lock.wait_for_host_workers(
                     worker_budget.workers,
@@ -807,10 +828,31 @@ def _run_foreground_test_body(
     probe_setup = None
     launch_source = cmd
     try:
+        if post_admission_setup is not None:
+            setup_decision = post_admission_setup(
+                absolute_deadline if absolute_deadline is not None else started + timeout_seconds
+            )
+            if not setup_decision.proceed:
+                if handle is not None:
+                    handle.close()
+                lane_lock.close()
+                if setup_decision.action == "cancel":
+                    tel.set_outcome("cancelled")
+                    return _cancelled_result(
+                        cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
+                    )
+                reason = str(setup_decision.reason or "fixture setup did not succeed")
+                return ForegroundTestResult(
+                    cmd, cwd, "timed_out" if setup_decision.action == "timed_out" else "failed",
+                    None, time.monotonic() - started, timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
         if classify_pre_collection and package_script is None:
             from .lifecycle_probe import prepare_lifecycle_probe
 
-            probe_setup = prepare_lifecycle_probe(cmd, spawn_environment, cwd)
+            probe_setup = prepare_lifecycle_probe(
+                cmd, spawn_environment, cwd, deadline=absolute_deadline,
+            )
             if probe_setup is not None:
                 lane_lock.extra_cleanups.append(probe_setup.cleanup)
                 launch_source = list(probe_setup.argv)
@@ -825,6 +867,8 @@ def _run_foreground_test_body(
             environment_is_complete=spawn_environment is not None,
             cancel=host_wait_cancel,
             package_script=package_script,
+            deadline=absolute_deadline,
+            use_cache=post_admission_setup is None,
         )
         if host_wait_cancel is not None and host_wait_cancel.is_set():
             if handle is not None:
@@ -835,11 +879,42 @@ def _run_foreground_test_body(
                 cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
             )
         inner_probe_state = inner_probe.state
+        if absolute_deadline is not None and (
+            inner_probe.diagnostic == PROBE_DEADLINE_DIAGNOSTIC
+            or time.monotonic() >= absolute_deadline
+        ):
+            # Issue #1326: a truncated probe is not authentication; the target
+            # is never spawned and the caller keeps its teardown reserve.
+            if handle is not None:
+                handle.close()
+            lane_lock.close()
+            return ForegroundTestResult(
+                cmd, cwd, "timed_out", None, time.monotonic() - started,
+                timeout_seconds, PROBE_DEADLINE_DIAGNOSTIC, None, False,
+                wrapper_bootstrap, "not-attempted", "not-started", PROBE_DEADLINE_DIAGNOSTIC,
+                health_provenance,
+            )
+        if post_admission_setup is not None and inner_probe.state != "verified" and inner_probe.state != "failed":
+            # Issue #1326: a fixture target runs only after the post-setup
+            # context was authenticated; any unknown verdict (unrecognized
+            # launcher, unavailable probe containment, a cancelled follower)
+            # skips the target and leaves teardown to the caller.
+            if handle is not None:
+                handle.close()
+            lane_lock.close()
+            reason = f"fixture inner launcher not authenticated after setup: {inner_probe.diagnostic}"
+            return ForegroundTestResult(
+                cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                timeout_seconds, reason, None, False,
+                wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+            )
         if inner_probe.state == "failed":
             missing_pytest = None
             if probe_setup is not None:
+                # Issue #1326: the optional diagnostic stays inside the
+                # fixture allocation (None for fixture-less runs).
                 missing_pytest = _classify_missing_pytest_bootstrap(
-                    cmd, probe_setup, inner_probe.diagnostic, cwd,
+                    cmd, probe_setup, inner_probe.diagnostic, cwd, absolute_deadline,
                 )
             if handle is not None:
                 handle.close()
@@ -945,6 +1020,25 @@ def _run_foreground_test_body(
             # directory handle is still private to this parent process.
             spawn_cwd = "/"
             spawn_preexec = lambda fd=cwd_fd: os.fchdir(fd)
+        if post_admission_setup is not None and inner_probe.identity:
+            # Issue #1326: a fixture process may change the launcher context
+            # after the post-setup probe authenticated it.
+            current_identity = inner_launcher_identity_key(
+                launch_source, cwd=cwd, environment=spawn_environment,
+                environment_is_complete=spawn_environment is not None,
+                package_script=package_script,
+            )
+            if current_identity != inner_probe.identity:
+                if handle is not None:
+                    handle.close()
+                _close_held_fds(held_fds)
+                lane_lock.close()
+                reason = "launcher changed after authentication"
+                return ForegroundTestResult(
+                    cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
         anchor = worker_lock.launch_anchor() if worker_lock is not None else None
         if anchor is not None:
             # Issue #987: the child keeps the reservation live from fork
@@ -962,8 +1056,17 @@ def _run_foreground_test_body(
             # process or stop this launch; the guard covers exactly the final
             # cancel check, Popen and process registration (nothing blocking).
             with (host_launch_guard() if host_launch_guard is not None else contextlib.nullcontext()):
+                launch_expired = (
+                    absolute_deadline is not None
+                    and time.monotonic() >= absolute_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+                )
                 if host_wait_cancel is not None and host_wait_cancel.is_set():
                     cancelled_before_launch = True
+                    proc = None
+                elif launch_expired:
+                    # Issue #1326: the target's termination allocation no
+                    # longer fits before the deadline; never launch it.
+                    cancelled_before_launch = False
                     proc = None
                 else:
                     cancelled_before_launch = False
@@ -982,6 +1085,17 @@ def _run_foreground_test_body(
                     )
                     if process_started is not None:
                         process_started(proc)
+            if proc is None and not cancelled_before_launch:
+                if handle is not None:
+                    handle.close()
+                _close_held_fds(held_fds)
+                lane_lock.close()
+                reason = "test target not launched: its termination allowance no longer fits before the deadline"
+                return ForegroundTestResult(
+                    cmd, cwd, "timed_out", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
             if cancelled_before_launch:
                 if handle is not None:
                     handle.close()
@@ -1008,13 +1122,27 @@ def _run_foreground_test_body(
             os.close(ready_write)
             os.close(release_read)
             handshake_cancelled = False
+            handshake_expired = False
+            launcher_changed = False
+            # Issue #1326: with an absolute deadline the held target may only be
+            # released while its termination allowance still fits before it.
+            release_by = (
+                absolute_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+                if absolute_deadline is not None else None
+            )
             try:
                 ready = []
                 handshake_deadline = time.monotonic() + 5.0
+                if release_by is not None:
+                    handshake_deadline = min(handshake_deadline, release_by)
                 while not ready and time.monotonic() < handshake_deadline:
                     if host_wait_cancel is not None and host_wait_cancel.is_set():
                         break
-                    ready, _, _ = select.select([ready_read], [], [], 0.05)
+                    ready, _, _ = select.select(
+                        [ready_read], [], [], max(0.0, min(0.05, handshake_deadline - time.monotonic())),
+                    )
+                if not ready and release_by is not None and time.monotonic() >= release_by:
+                    raise _HandshakeExpired("held child was not ready before the request deadline")
                 if not ready or os.read(ready_read, 1) != b"1":
                     raise AgentLoopError("broker test child did not reach the containment handshake")
                 (parent_cgroup_path / "cgroup.procs").write_text(str(proc.pid), encoding="ascii")
@@ -1028,12 +1156,27 @@ def _run_foreground_test_body(
                 with (host_launch_guard() if host_launch_guard is not None else contextlib.nullcontext()):
                     if host_wait_cancel is not None and host_wait_cancel.is_set():
                         raise AgentLoopError("broker shutdown before the held child was released")
+                    if release_by is not None and time.monotonic() >= release_by:
+                        raise _HandshakeExpired("held child release would pass the request deadline")
+                    if post_admission_setup is not None and inner_probe.identity:
+                        # Issue #1326: a fixture process may retarget the
+                        # launcher while the held child waits for readiness.
+                        if inner_launcher_identity_key(
+                            launch_source, cwd=cwd, environment=spawn_environment,
+                            environment_is_complete=spawn_environment is not None,
+                            package_script=package_script,
+                        ) != inner_probe.identity:
+                            raise _LauncherChangedBeforeRelease("launcher changed after authentication")
                     os.write(release_write, b"1")
             except BaseException as handshake_error:
                 _terminate_process_group(proc)
                 # A broker stop that ended the held child before its release
                 # means the target never executed: complete as cancelled.
-                if (
+                if isinstance(handshake_error, _HandshakeExpired):
+                    handshake_expired = True
+                elif isinstance(handshake_error, _LauncherChangedBeforeRelease):
+                    launcher_changed = True
+                elif (
                     isinstance(handshake_error, (OSError, AgentLoopError))
                     and host_wait_cancel is not None
                     and host_wait_cancel.is_set()
@@ -1044,6 +1187,32 @@ def _run_foreground_test_body(
             finally:
                 os.close(ready_read)
                 os.close(release_write)
+            if launcher_changed:
+                # The held target was never released into a changed launcher.
+                if handle is not None:
+                    handle.close()
+                if process_finished is not None:
+                    process_finished(proc)
+                lane_lock.close()
+                reason = "launcher changed after authentication"
+                return ForegroundTestResult(
+                    cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
+            if handshake_expired:
+                # The target was never released: no execution, no evidence.
+                if handle is not None:
+                    handle.close()
+                if process_finished is not None:
+                    process_finished(proc)
+                lane_lock.close()
+                reason = "held test child not released before the request deadline"
+                return ForegroundTestResult(
+                    cmd, cwd, "timed_out", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
             if handshake_cancelled:
                 if handle is not None:
                     handle.close()
@@ -1115,6 +1284,10 @@ def _run_foreground_test_body(
     timed_out = False
     interrupted = False
     watchdog_deadline = started + timeout_seconds
+    if absolute_deadline is not None:
+        watchdog_deadline = min(
+            watchdog_deadline, absolute_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS,
+        )
     post_termination_deadline: float | None = None
     try:
         # A selector keeps output flowing to the terminal while allowing the
@@ -1261,7 +1434,13 @@ def _run_foreground_test_body(
             # Processes that escaped into a new session are outside it.
             # The group is signalled even where /proc cannot enumerate it,
             # and the lock is released only after termination is confirmed.
-            termination = terminate_process_group_descendants(proc.pid)
+            # Issue #1326: a fixture run keeps this cleanup inside its
+            # absolute deadline (None leaves fixture-less runs unchanged).
+            termination = (
+                terminate_process_group_descendants(proc.pid)
+                if absolute_deadline is None
+                else terminate_process_group_descendants(proc.pid, deadline=absolute_deadline)
+            )
             descendants_terminated = termination.count
             descendants_unconfirmed = not termination.confirmed
             if descendants_unconfirmed:
@@ -1286,6 +1465,7 @@ def _run_foreground_test_body(
             pre_collection_reason = _classify_pre_collection_run(
                 requested=cmd, probe_setup=probe_setup, returncode=returncode,
                 scan=pre_collection_scan, analysis=analysis, cwd=cwd,
+                deadline=absolute_deadline,
             )
     finally:
         lane_lock.close()
@@ -1345,14 +1525,14 @@ def _run_foreground_test_body(
     )
 
 
-def _classify_missing_pytest_bootstrap(requested, probe_setup, diagnostic, cwd) -> str | None:
+def _classify_missing_pytest_bootstrap(requested, probe_setup, diagnostic, cwd, deadline=None) -> str | None:
     """Classify a failed launcher bootstrap as a missing pytest; errors mean no."""
     try:
         from .lifecycle_probe import run_independent_import_check
         from .test_runtime import classify_missing_pytest_bootstrap
 
         check = run_independent_import_check(
-            probe_setup.eligibility, requested, probe_setup.env, cwd,
+            probe_setup.eligibility, requested, probe_setup.env, cwd, deadline=deadline,
         )
         return classify_missing_pytest_bootstrap(
             diagnostic, check, launch_eligibility=probe_setup.eligibility,
@@ -1362,7 +1542,7 @@ def _classify_missing_pytest_bootstrap(requested, probe_setup, diagnostic, cwd) 
 
 
 def _classify_pre_collection_run(
-    *, requested, probe_setup, returncode, scan, analysis, cwd,
+    *, requested, probe_setup, returncode, scan, analysis, cwd, deadline=None,
 ) -> str | None:
     """Classify one finished injected run; any error means not classified."""
     try:
@@ -1380,7 +1560,7 @@ def _classify_pre_collection_run(
             and not report.records
         ):
             check = run_independent_import_check(
-                probe_setup.eligibility, requested, probe_setup.env, cwd,
+                probe_setup.eligibility, requested, probe_setup.env, cwd, deadline=deadline,
             )
         return classify_pre_collection_launch_failure(
             requested, returncode, scan, report, check,
@@ -1391,13 +1571,21 @@ def _classify_pre_collection_run(
         return None
 
 
+class _HandshakeExpired(AgentLoopError):
+    """The held child could not be released inside the absolute deadline."""
+
+
+class _LauncherChangedBeforeRelease(AgentLoopError):
+    """The authenticated launcher identity changed before the held release."""
+
+
 def _terminate_process_group(proc: subprocess.Popen) -> None:
     try:
         os.killpg(proc.pid, 15)
     except ProcessLookupError:
         pass
     try:
-        proc.wait(timeout=2)
+        proc.wait(timeout=TERMINATION_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, 9)

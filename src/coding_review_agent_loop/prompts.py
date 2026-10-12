@@ -500,6 +500,13 @@ PRE_COLLECTION_CODER_GUIDANCE = (
     "failure at the current tracked digest needs that rerun; a failure recorded at an earlier "
     "tracked tree is labelled historical and is not an outstanding obligation."
 )
+FIXTURE_CODER_GUIDANCE = (
+    "When a suite needs long-lived helper processes, put them in a committed executable "
+    "fixture script and run `agent-loop run-tests --fixture <script> -- <recognized test "
+    "command>` (timeout at least 30s): the broker runs `<script> setup` and `<script> "
+    "teardown` around the unchanged test command, and only a clean fixture lifecycle is "
+    "citable; never wrap the test command in a script."
+)
 
 
 def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
@@ -524,7 +531,7 @@ def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
         "launch them in the background and end the turn saying you will wait for "
         "them; a turn that ends without a real terminal marker because required "
         "work is still running in the background cannot be validated. "
-        f"{PRE_COLLECTION_CODER_GUIDANCE}\n"
+        f"{PRE_COLLECTION_CODER_GUIDANCE} {FIXTURE_CODER_GUIDANCE}\n"
     )
 
 

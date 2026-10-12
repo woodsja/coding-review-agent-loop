@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -317,12 +318,14 @@ def module_launch_xdist_check(
 
 def prepare_lifecycle_probe(
     argv: Sequence[str], env: Mapping[str, str] | None, cwd: Path,
+    *, deadline: float | None = None,
 ) -> ProbeSetup | None:
     """Return the injected argv/env and report, or ``None`` for no injection.
 
     ``None`` leaves argv and environment byte-identical to the caller's.  Every
     failure (an unsupported launcher, a failed preflight, a report that cannot
-    be created) means no injection.
+    be created) means no injection.  ``deadline`` (issue #1326) is an absolute
+    monotonic bound on the preflight; an expired bound means no injection.
     """
     base = dict(os.environ) if env is None else {str(k): str(v) for k, v in env.items()}
     try:
@@ -335,7 +338,17 @@ def prepare_lifecycle_probe(
     child = _child_env(base)
     # Positive preflight through the same execution path the target will use:
     # a wrapper that drops PYTHONPATH (for example by adding -I) fails it.
-    if _run_check(eligibility.invocation, _PREFLIGHT_CODE, child, cwd, PREFLIGHT_TIMEOUT_SECONDS) != 0:
+    preflight_timeout = PREFLIGHT_TIMEOUT_SECONDS
+    if deadline is not None:
+        from .test_runtime import PROBE_CLEANUP_ALLOWANCE_SECONDS
+
+        # The probe tree's cleanup must also end by the deadline.
+        preflight_timeout = min(
+            preflight_timeout, deadline - time.monotonic() - PROBE_CLEANUP_ALLOWANCE_SECONDS,
+        )
+        if preflight_timeout <= 0:
+            return None
+    if _run_check(eligibility.invocation, _PREFLIGHT_CODE, child, cwd, preflight_timeout) != 0:
         return None
     report_dir: Path | None = None
     try:
@@ -458,11 +471,15 @@ def run_independent_import_check(
     argv: Sequence[str],
     env: Mapping[str, str] | None,
     cwd: Path,
+    *,
+    deadline: float | None = None,
 ) -> str:
     """Return ``pytest-absent`` or ``unavailable``; never runs tests.
 
     Only a ``-m pytest`` eligibility whose argv[0] still resolves to the very
-    file that was validated at launch is checked.
+    file that was validated at launch is checked.  ``deadline`` (issue #1326)
+    bounds the check and its process-tree cleanup; an exhausted allocation
+    skips this optional diagnostic.
     """
     if eligibility is None or eligibility.shape != "module" or not argv:
         return "unavailable"
@@ -474,5 +491,12 @@ def run_independent_import_check(
         return "unavailable"
     if validated != (eligibility.interpreter_path, eligibility.identity):
         return "unavailable"
-    code = _run_check(eligibility.invocation, _IMPORT_CHECK_CODE, base, cwd, IMPORT_CHECK_TIMEOUT_SECONDS)
+    timeout = IMPORT_CHECK_TIMEOUT_SECONDS
+    if deadline is not None:
+        from .test_runtime import PROBE_CLEANUP_ALLOWANCE_SECONDS
+
+        timeout = min(timeout, deadline - time.monotonic() - PROBE_CLEANUP_ALLOWANCE_SECONDS)
+        if timeout <= 0:
+            return "unavailable"
+    code = _run_check(eligibility.invocation, _IMPORT_CHECK_CODE, base, cwd, timeout)
     return "pytest-absent" if code == 3 else "unavailable"

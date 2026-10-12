@@ -3631,12 +3631,37 @@ def _observation_semantics(observation: object) -> tuple[dict[str, object], bool
         "wrapper_bootstrap": value("wrapper_bootstrap"),
         "inner_exec": value("inner_exec"),
         "suite_start": value("suite_start"),
+        # Issue #1326: absent for fixture-less rows; any present value must
+        # decode as a clean lifecycle before the row can be verified.
+        "fixture_present": (
+            getattr(observation, "fixture", None) is not None
+            or (projected_value is not None and "fixture" in projected_value)
+        ),
+        "fixture": value("fixture"),
     }
     rich = isinstance(attribution, (Mapping,)) or attribution is not None or any(
         name in (projected_value or {})
-        for name in ("environment", "superseded_by", "caveats", "wrapper_bootstrap", "inner_exec", "suite_start")
+        for name in (
+            "environment", "superseded_by", "caveats", "wrapper_bootstrap", "inner_exec",
+            "suite_start", "fixture",
+        )
     )
     return semantics, rich
+
+
+def _fixture_lifecycle_is_clean(value: object) -> bool:
+    """Whether a fixture record proves setup 0, teardown 0 and confirmed cleanup."""
+    from .local_test_evidence import FixtureRecord
+
+    if isinstance(value, FixtureRecord):
+        record = value
+    else:
+        try:
+            record = FixtureRecord.from_mapping(value)
+        except Exception:
+            # Fail closed on any malformed record, including overflow.
+            return False
+    return record.clean
 
 
 def _authoritative_receipt_passes(
@@ -3657,6 +3682,8 @@ def _authoritative_receipt_passes(
     if semantics["environment"] not in {None, "equivalent", "not-compared"}:
         return False
     if semantics["superseded_by"]:
+        return False
+    if semantics["fixture_present"] and not _fixture_lifecycle_is_clean(semantics["fixture"]):
         return False
     if (
         semantics["wrapper_bootstrap"] != "verified"
