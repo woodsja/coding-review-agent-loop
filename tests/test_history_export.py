@@ -41,7 +41,12 @@ from coding_review_agent_loop.pr_loop import render_pr_scheduling_diagnostic
 from coding_review_agent_loop.protocol import AgentUnavailable
 from coding_review_agent_loop.protocol_markers import named_reserved_marker_tokens
 from coding_review_agent_loop.review_step_back import render_step_back_human_decision
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+from coding_review_agent_loop.round_state import (
+    PostedRoundMetadata,
+    _approved_plan_hash,
+    _attach_round_metadata,
+)
 from coding_review_agent_loop.runner import CommandResult
 
 REPO = "OWNER/REPO"
@@ -139,10 +144,20 @@ def derive(hist, issue, prs=None, **kwargs):
     return derive_history_row(repo=REPO, history=hist, issue_view=issue, pr_views=prs or {}, **kwargs)
 
 
+def handoff(comment_id: int, plan: str = "Plan text.") -> AuthenticatedComment:
+    """The orchestrator's issue-to-PR handoff record for an accepted plan."""
+    return comment(comment_id, format_issue_pr_handoff_comment(
+        issue_number=ISSUE, pr_number=PR, pr_url=f"https://github.com/{REPO}/pull/{PR}",
+        pr_head_sha="a" * 40, flow="approved-plan-implementation",
+        plan_hash=_approved_plan_hash(plan),
+    ))
+
+
 def approved_plan_comments(start: int = 1, round_number: int = 1, **coder_fields):
     return (
         comment(start, plan_coder(round_number, **coder_fields)),
         comment(start + 1, plan_review(CODEX, round_number, "approved")),
+        handoff(start + 2),
     )
 
 
@@ -162,9 +177,9 @@ def test_foreign_copies_of_records_never_count():
         history(state="CLOSED", closed=at(30, 11)),
         issue_view(
             *approved_plan_comments(),
-            comment(3, plan_coder(2), author=FOREIGN),
-            comment(4, foreign_round, author=FOREIGN),
-            comment(5, render_plan_scheduling_diagnostic("round 2", step_back_stop_message()), author=FOREIGN),
+            comment(13, plan_coder(2), author=FOREIGN),
+            comment(14, foreign_round, author=FOREIGN),
+            comment(15, render_plan_scheduling_diagnostic("round 2", step_back_stop_message()), author=FOREIGN),
         ),
     )
     assert row["plan_rounds"] == {"value": 1, "evidence": "verified"}
@@ -429,6 +444,7 @@ def test_human_decision_stops_from_recognized_diagnostics():
             comment(2, plan_review(CODEX, 1, "blocking", step_back_entries=STEP_BACK)),
             comment(3, plan_coder(2)),
             comment(4, plan_review(CODEX, 2, "approved", step_back_entries=STEP_BACK)),
+            handoff(5),
         ),
     )
     assert converges["human_decision_stops"] == {"value": 0, "evidence": "verified"}
@@ -686,59 +702,88 @@ def _primary_scheduler(round_number: int, subject: str) -> str:
     )
 
 
-def test_parallel_publication_reviews_settle_plan_approval():
+def test_reviewer_votes_alone_are_not_plan_approval():
+    """Generalization: only the orchestrator's post-approval records settle a plan.
+
+    Each case is a set of authenticated votes the planning loop can still
+    reject; none is terminal without an acceptance record for the final plan.
+    """
     subject = "plan-subject-1"
-    row = derive(
-        history(),
-        issue_view(
-            comment(1, plan_coder(1, subject=subject)),
-            comment(2, _plan_subject_review(CODEX, 1, "approved", subject, phase="publication")),
-            comment(3, _plan_subject_review(CLAUDE, 1, "approved", subject, phase="publication")),
-            comment(4, record("plan", "summary", "Orchestrator", 1, subject=subject, phase="reconciliation")),
-        ),
+    publication = (
+        comment(1, plan_coder(1, subject=subject)),
+        comment(2, plan_review(CODEX, 1, "approved", subject=subject, phase="publication")),
+        comment(3, plan_review(CLAUDE, 1, "approved", subject=subject, phase="publication")),
     )
-    assert "plan-approved" in row["terminal_states"]
-    assert row["plan_rounds"] == {"value": 1, "evidence": "verified"}
-    assert row["human_decision_stops"] == {"value": 0, "evidence": "verified"}
-    assert row["outcome_complete"] is False
+    reconciled = (*publication, comment(4, record(
+        "plan", "summary", "Orchestrator", 1, subject=subject, phase="reconciliation",
+    )))
+    primary_only = (
+        comment(1, _primary_scheduler(1, subject)),
+        comment(2, plan_coder(1, subject=subject)),
+        comment(3, plan_review(CODEX, 1, "approved", subject=subject)),
+    )
+    secondary_without_opening = (*primary_only, comment(4, plan_review(CLAUDE, 2, "approved", subject=subject)))
+    outstanding_obligation = (
+        comment(1, plan_coder(1, subject=subject)),
+        comment(2, plan_review(CODEX, 1, "approved", subject=subject)),
+        comment(3, plan_review(CLAUDE, 1, "approved", subject=subject)),
+        comment(4, plan_coder(2, subject=subject, plan="Plan text, revised for the growth gate.")),
+    )
+    for case in (publication, reconciled, primary_only, secondary_without_opening, outstanding_obligation):
+        row = derive(history(), issue_view(*case))
+        assert "plan-approved" not in row["terminal_states"]
+        assert row["plan_rounds"] == {"value": None, "evidence": "unavailable"}
+        assert row["human_decision_stops"] == {"value": None, "evidence": "unavailable"}
+
+    stale = derive(history(), issue_view(*reconciled, handoff(9, plan="An older plan.")))
+    assert "plan-approved" not in stale["terminal_states"]
+
+    accepted = derive(history(), issue_view(*reconciled, handoff(9)))
+    assert "plan-approved" in accepted["terminal_states"]
+    assert accepted["plan_rounds"] == {"value": 1, "evidence": "verified"}
+    assert accepted["human_decision_stops"] == {"value": 0, "evidence": "verified"}
+    assert accepted["outcome_complete"] is False
 
 
-def test_primary_or_partial_approval_is_not_plan_approval():
-    subject = "plan-subject-1"
-    primary_only = derive(
-        history(),
-        issue_view(
-            comment(1, _primary_scheduler(1, subject)),
-            comment(2, plan_coder(1, subject=subject)),
-            comment(3, _plan_subject_review(CODEX, 1, "approved", subject)),
-        ),
-    )
-    assert "plan-approved" not in primary_only["terminal_states"]
-    assert primary_only["plan_rounds"] == {"value": None, "evidence": "unavailable"}
-    assert primary_only["human_decision_stops"]["evidence"] == "unavailable"
+def _board(*seats: str) -> dict:
+    return {
+        "policy": "all-reviewers", "primary": None, "broad_rules": [],
+        "seats": [{"id": seat, "backend": seat.lower(), "model_chain": None, "effort": None} for seat in seats],
+    }
 
-    missing_peer = derive(
-        history(),
-        issue_view(
-            comment(1, plan_coder(1, subject="s1")),
-            comment(2, _plan_subject_review(CODEX, 1, "blocking", "s1")),
-            comment(3, _plan_subject_review(CLAUDE, 1, "blocking", "s1")),
-            comment(4, plan_coder(2, subject="s2")),
-            comment(5, _plan_subject_review(CODEX, 2, "approved", "s2")),
-        ),
-    )
-    assert "plan-approved" not in missing_peer["terminal_states"]
 
-    full_board = derive(
-        history(),
-        issue_view(
-            comment(1, _primary_scheduler(1, subject)),
-            comment(2, plan_coder(1, subject=subject)),
-            comment(3, _plan_subject_review(CODEX, 1, "approved", subject)),
-            comment(4, _plan_subject_review(CLAUDE, 2, "approved", subject)),
-        ),
+def test_expected_seats_come_from_the_recorded_board():
+    board = _board(CODEX, CLAUDE)
+
+    def pr(role, agent, round_number, state=None):
+        return record("pr", role, agent, round_number, state=state, pr_board_root=board, pr_board_identity=board)
+
+    never_posted = derive(
+        history(state="CLOSED", closed=at(50, 12), linked=[merged_pr()]),
+        issue_view(),
+        {PR: pr_view(
+            pr_comment(20, pr("coder", "Claude", 1)),
+            pr_comment(21, pr("reviewer", CODEX, 1, "approved")),
+        )},
     )
-    assert "plan-approved" in full_board["terminal_states"]
+    assert never_posted["missing_reviewer_records"] == [
+        {"surface": f"pr#{PR}", "flow": "pr", "round": 1, "reviewer": CLAUDE, "cause": "unknown"},
+    ]
+    assert never_posted["infrastructure_coverage"] == "partial"
+
+    failed = derive(
+        history(state="CLOSED", closed=at(50, 12), linked=[merged_pr()]),
+        issue_view(),
+        {PR: pr_view(
+            pr_comment(20, pr("coder", "Claude", 1)),
+            pr_comment(21, pr("reviewer", CODEX, 1, "approved")),
+            pr_comment(22, _unavailable("Claude authentication expired.", "permissions")),
+        )},
+    )
+    assert failed["missing_reviewer_records"][0]["cause"] == "auth-expiry"
+    assert failed["infrastructure_rounds"] == [{"surface": f"pr#{PR}", "flow": "pr", "round": 1}]
+    assert failed["pr_rounds"] == {"value": 0, "evidence": "verified"}
+    assert failed["infrastructure_coverage"] == "complete"
 
 
 def _incomplete_review(round_number: int, failures: dict) -> str:

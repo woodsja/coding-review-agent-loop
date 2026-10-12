@@ -52,7 +52,9 @@ from .review_rounds import (
     INCOMPLETE_PR_REVIEW_MISSING_LINE,
 )
 from .review_step_back import PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
-from .round_state import PostedRoundRecord, _extract_round_metadata_records
+from .decomposition import find_decompositions_for_parent, find_phase_implementation_handoffs_for_parent
+from .issue_pr_handoff import resolve_issue_pr_handoff_lineage
+from .round_state import PostedRoundRecord, _approved_plan_hash, _extract_round_metadata_records
 from .round_transport import ROUND_RESUME_MARKER_RE
 from .transient import NON_RETRYABLE_AGENT_OUTPUT_RE, is_transient_agent_output
 
@@ -89,9 +91,6 @@ CAUSE_UNKNOWN = "unknown"
 CAUSE_PENDING = "pending"
 UNEXPLAINED_CAUSES = frozenset({CAUSE_UNKNOWN, CAUSE_PENDING})
 
-# Reviewer records that settle a reviewer's verdict for a round: ordinary
-# records and early-published parallel reviews, which settlement never reposts.
-_VERDICT_PHASES = frozenset({"authoritative", "publication"})
 
 # Records carrying any of these fields were written after plan step-back
 # entries (#1251) existed, so a plan history without entries is a verified
@@ -474,10 +473,43 @@ def _seats(records: Sequence[PostedRoundRecord], role: str = "reviewer") -> tupl
     ))
 
 
+def _recorded_board(records: Sequence[PostedRoundRecord], round_number: int) -> tuple[str, ...]:
+    """The board the authenticated records declare for a round.
+
+    The newest board identity stamped at or before the round (plan or PR board
+    lineage) wins; otherwise the newest valid scheduler contract's required
+    reviewers.  A seat that never posted successfully is still on the board.
+    """
+    board: tuple[str, ...] = ()
+    contract: tuple[str, ...] = ()
+    for record in records:
+        if record.metadata.round_number > round_number:
+            continue
+        identity = record.metadata.plan_board_identity or record.metadata.pr_board_identity
+        seats = identity.get("seats") if isinstance(identity, Mapping) else None
+        if isinstance(seats, list):
+            ids = tuple(
+                seat["id"] for seat in seats
+                if isinstance(seat, Mapping) and isinstance(seat.get("id"), str) and seat["id"]
+            )
+            if ids:
+                board = ids
+        scheduler = record.metadata.scheduler_contract
+        if record.metadata.scheduler_metadata_status == "valid" and isinstance(scheduler, Mapping):
+            required = scheduler.get("required_reviewers")
+            if isinstance(required, list) and required and all(isinstance(name, str) for name in required):
+                contract = tuple(required)
+    return board or contract
+
+
 def _expected_seats(
     records: Sequence[PostedRoundRecord], round_number: int, seats: tuple[str, ...]
 ) -> tuple[str, ...]:
-    """Scheduler-selected reviewers for the round, else every seen seat."""
+    """Reviewers expected in a round.
+
+    A valid scheduler checkpoint's selected reviewers for the round (paused
+    seats are not expected), else the recorded board, else every seen seat.
+    """
     selected = tuple(dict.fromkeys(
         reviewer
         for record in records
@@ -485,7 +517,7 @@ def _expected_seats(
         and record.metadata.scheduler_metadata_status == "valid"
         for reviewer in record.metadata.scheduler_selected_reviewers
     ))
-    return selected or seats
+    return selected or _recorded_board(records, round_number) or seats
 
 
 def _present_seats(
@@ -636,44 +668,38 @@ def _discuss_ledger(thread: _Thread, *, bounded: bool) -> tuple[list[dict], list
     return failures, missing
 
 
-def _plan_board_approved(records: Sequence[PostedRoundRecord]) -> bool:
-    """Whether the whole plan board approved the exact final candidate.
+def _plan_acceptance_hashes(comments: Sequence[AuthenticatedComment], *, issue_number: int, repo: str) -> set[str]:
+    """Plan hashes the orchestrator itself recorded as accepted on the issue.
 
-    The board is the scheduler contract's required reviewers when recorded,
-    otherwise every reviewer seat seen in the history.  Each board seat's
-    newest verdict on the newest planner candidate (``subject``) must be an
-    approval, carried approvals included, and no review in the newest round may
-    block.  A primary-only approval in primary-then-panel planning, or a peer
-    that never reviewed the candidate, is therefore not a plan approval.
+    Reviewer votes never settle a plan: the planning loop can still reject a
+    unanimous board (a missing panel opening, a stale carried key, the
+    plan-growth gate, an unsettled reconciliation).  Only the records the
+    orchestrator posts after its approval boundary completed count: the
+    issue-to-PR implementation handoff, a staged decomposition summary and a
+    phase implementation handoff.  Undecodable records count as nothing.
     """
-    coders = [record for record in records if record.metadata.role == "coder"]
-    reviews = [
-        record for record in records
-        if record.metadata.role == "reviewer" and record.metadata.phase in _VERDICT_PHASES
-    ]
-    if not coders or not reviews:
-        return False
-    candidate = coders[-1].metadata.subject
-    board: tuple[str, ...] = ()
-    for record in records:
-        contract = record.metadata.scheduler_contract
-        if record.metadata.scheduler_metadata_status == "valid" and isinstance(contract, Mapping):
-            required = contract.get("required_reviewers")
-            if isinstance(required, list) and all(isinstance(name, str) for name in required):
-                board = tuple(required)
-    board = board or _seats(reviews)
-    verdicts: dict[str, str | None] = {}
-    for record in reviews:
-        if record.metadata.subject == candidate:
-            verdicts[record.metadata.agent] = record.metadata.state
-    if any(verdicts.get(seat) != "approved" for seat in board):
-        return False
-    latest = max(record.metadata.round_number for record in records if record.metadata.role in _REVIEW_ROLES)
-    return all(
-        record.metadata.state == "approved"
-        for record in reviews
-        if record.metadata.round_number == latest
-    )
+    accepted: set[str] = set()
+    try:
+        lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=issue_number, repo=repo)
+    except AgentLoopError:
+        lineage = None
+    if lineage is not None and lineage.latest is not None and lineage.latest.plan_hash:
+        accepted.add(lineage.latest.plan_hash)
+    for finder in (find_decompositions_for_parent, find_phase_implementation_handoffs_for_parent):
+        try:
+            accepted.update(record.plan_hash for record in finder(comments, parent_issue=issue_number))
+        except AgentLoopError:
+            continue
+    return accepted
+
+
+def _final_candidate_hash(records: Sequence[PostedRoundRecord]) -> str | None:
+    for record in reversed(records):
+        if record.metadata.role != "coder":
+            continue
+        plan = record.metadata.canonical_plan or record.metadata.raw_structured_coder_response
+        return _approved_plan_hash(plan) if plan else None
+    return None
 
 
 _ERA_FIELDS = {"plan": _PLAN_STEP_BACK_ERA_FIELDS, "pr": _PR_STEP_BACK_ERA_FIELDS}
@@ -786,7 +812,10 @@ def derive_history_row(
     }
     latest_is_stop = bool(events) and (max(events)[2], max(events)[3]) in stop_indices
     linked_open = [pr.number for pr in history.linked_prs if (pr.state or "").upper() == "OPEN"]
-    plan_approved = bool(plan_records) and _plan_board_approved(plan_records)
+    final_hash = _final_candidate_hash(plan_records)
+    plan_approved = final_hash is not None and final_hash in _plan_acceptance_hashes(
+        issue.comments, issue_number=history.number, repo=repo
+    )
     discuss_final = any(record.metadata.is_final for record in discuss_records)
     merged_any = any(pr.merged_at is not None or pr.state.upper() == "MERGED" for pr in history.linked_prs)
     prs_settled = bool(history.linked_prs) and not linked_open

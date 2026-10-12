@@ -4735,16 +4735,23 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   (characters of the newest canonical plan), `pr_rounds`, `merged` and
   `tool_commit` as `{"value": ..., "evidence": "verified"|"unavailable"}`
   pairs. `verified` needs a recognized terminal state that bounds the history:
-  a plan approval by the whole board, settled (merged or closed) linked PRs, a
+  an accepted plan, settled (merged or closed) linked PRs, a
   closed issue, or a recognized stop as the newest workflow event (operator
   comments from the same account are not workflow events). Without one, the
   value is `null`, never a zero. Step-backs are also `unavailable` unless
   every counted round has a record written after step-back recording existed.
-- A plan approval needs every board seat (the scheduler contract's required
-  reviewers, otherwise every seat seen) to approve the newest planner
-  candidate, counting early-published parallel reviews and carried approvals,
-  with no blocking review in the newest round. A primary-only approval in
-  primary-then-panel planning is not a plan approval.
+- A plan counts as accepted only when the orchestrator recorded its own
+  post-approval record for the newest planner candidate: the issue-to-PR
+  implementation handoff, a staged decomposition summary or a phase
+  implementation handoff whose plan hash matches. Reviewer votes alone never
+  settle a plan, because the planning loop can still reject a unanimous board
+  (no panel opening, a stale carried approval, the plan-growth gate, an
+  unsettled reconciliation). A `plan-only` approval leaves no such record, so
+  its counts stay `unavailable` until the issue is closed.
+- Expected reviewer seats for a round are the seats a valid scheduler
+  checkpoint selected, otherwise the recorded plan or PR board identity (or
+  the scheduler contract's required reviewers), otherwise every seat seen; a
+  seat that never posted is still expected.
 - Human-decision stops are the planning scheduling diagnostics that carry the
   step-back or primary-stall human-decision text; step-back entries alone
   never count as stops.
