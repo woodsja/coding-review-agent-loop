@@ -901,16 +901,21 @@ def run_pr_loop(
                     entry_board.signed_authorizations if entry_board is not None else ()
                 ),
             )
-        # Operator evidence conversion (#1325) is validated read-only here,
-        # before the first PR write, so an invalid row list posts nothing.
-        preflight_operator_evidence_conversion(
-            runner,
-            config,
-            pr_number=pr_number,
-            comments=initial_pr_context.comments,
-            head_sha=initial_pr_context.metadata.head_sha,
-            approved_plan_context=approved_plan_context,
-        )
+        # Operator evidence conversion (#1325) is validated read-only before
+        # any PR write, so an invalid row list posts nothing.  A caller-supplied
+        # plan is checked here; otherwise the check runs right after the
+        # read-only plan recovery below, still before any comment or activation.
+        operator_conversion_preflighted = False
+        if config.pr_convert_evidence_rows and approved_plan_context is not None:
+            preflight_operator_evidence_conversion(
+                runner,
+                config,
+                pr_number=pr_number,
+                comments=initial_pr_context.comments,
+                head_sha=initial_pr_context.metadata.head_sha,
+                approved_plan_context=approved_plan_context,
+            )
+            operator_conversion_preflighted = True
         # A successful manual qualification retains the managed label on the
         # ready PR.  Release it before any managed-CI authentication so every
         # downstream path sees the ready/unlabeled state it already handles.
@@ -2115,6 +2120,17 @@ def run_pr_loop(
             pr_number=pr_number,
             handoff_authorizations=handoff_floor_authorizations,
         )
+        if config.pr_convert_evidence_rows and not operator_conversion_preflighted:
+            # The PR-bound plan is now recovered read-only (#1325).
+            preflight_operator_evidence_conversion(
+                runner,
+                config,
+                pr_number=pr_number,
+                comments=initial_pr_context.comments,
+                head_sha=initial_pr_context.metadata.head_sha,
+                approved_plan_context=approved_plan_context,
+            )
+            operator_conversion_preflighted = True
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(
@@ -2932,6 +2948,9 @@ def run_pr_loop(
         # the admitted history, on every terminal evidence record.
         pending_conversion_pass = False
         signed_evidence_references_state: list[SignedEvidenceReference] = []
+        # Conversion audits this process posted are trusted across rereads, so
+        # a failed identity read never removes a conversion it just made.
+        conversion_audits_state: list = []
         round_history_references: tuple[SignedEvidenceReference, ...] = ()
         operator_conversion_pending = bool(config.pr_convert_evidence_rows)
         matrix_applies = bool(
@@ -3310,7 +3329,7 @@ def run_pr_loop(
             # mergeability gate, the evidence response head, the carried-ledger
             # snapshot, reviewer context and item partitioning.
             if matrix_applies:
-                round_authority_records = round_evidence_authority_records(
+                round_authority_records, round_authority_complete = round_evidence_authority_records(
                     runner,
                     config,
                     pr_number=pr_number,
@@ -3330,6 +3349,8 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     in_process_references=signed_evidence_references_state,
                     records=round_authority_records,
+                    history_complete=round_authority_complete,
+                    in_process_audits=conversion_audits_state,
                 )
             if operator_conversion_pending:
                 # Operator conversion takes effect before any reviewer or coder;
@@ -3352,6 +3373,7 @@ def run_pr_loop(
                 if operator_conversion is not None:
                     unresolved_items = list(operator_conversion.ledger)
                     next_unresolved_item_number = operator_conversion.next_item_number
+                    conversion_audits_state.append(operator_conversion.audit)
                     # Earlier same-head approvals and resumed reviews never saw
                     # the converted ledger, so every reviewer reviews fresh.
                     conversion_pass = True
@@ -6065,6 +6087,7 @@ def run_pr_loop(
                         clearances=evidence_clearances,
                         signed_evidence_references=current_signed_references(),
                         approved_plan_context=approved_plan_context,
+                        in_process_audits=conversion_audits_state,
                     )
                     assert gate_outcome.context is not None
                     if gate_outcome.action == "head_changed":
@@ -6521,6 +6544,7 @@ def run_pr_loop(
                             clearances=evidence_clearances,
                             signed_evidence_references=current_signed_references(),
                             approved_plan_context=approved_plan_context,
+                            in_process_audits=conversion_audits_state,
                         )
                         assert gate_outcome.context is not None
                         if gate_outcome.action == "head_changed":
@@ -6791,6 +6815,7 @@ def run_pr_loop(
                                 clearances=evidence_clearances,
                                 signed_evidence_references=current_signed_references(),
                                 approved_plan_context=approved_plan_context,
+                                in_process_audits=conversion_audits_state,
                             )
                             assert gate_outcome.context is not None
                             if gate_outcome.action == "head_changed":
@@ -7422,6 +7447,7 @@ def run_pr_loop(
                                         clearances=evidence_clearances,
                                         signed_evidence_references=current_signed_references(),
                                         approved_plan_context=approved_plan_context,
+                                        in_process_audits=conversion_audits_state,
                                     )
                                     assert gate_outcome.context is not None
                                     if gate_outcome.action == "head_changed":
@@ -7602,6 +7628,7 @@ def run_pr_loop(
                                         clearances=evidence_clearances,
                                         signed_evidence_references=current_signed_references(),
                                         approved_plan_context=approved_plan_context,
+                                        in_process_audits=conversion_audits_state,
                                     )
                                     assert gate_outcome.context is not None
                                     if gate_outcome.action == "head_changed":
@@ -7897,6 +7924,7 @@ def run_pr_loop(
                                     clearances=evidence_clearances,
                                     signed_evidence_references=current_signed_references(),
                                     approved_plan_context=approved_plan_context,
+                                    in_process_audits=conversion_audits_state,
                                 )
                                 assert gate_outcome.context is not None
                                 if gate_outcome.action == "head_changed":
@@ -7959,6 +7987,7 @@ def run_pr_loop(
                                 clearances=evidence_clearances,
                                 signed_evidence_references=current_signed_references(),
                                 approved_plan_context=approved_plan_context,
+                                in_process_audits=conversion_audits_state,
                             )
                             assert gate_outcome.context is not None
                             if gate_outcome.action == "head_changed":
@@ -8146,6 +8175,7 @@ def run_pr_loop(
                 # board re-reviews this head with the converted ledger.
                 unresolved_items = list(evidence_stall_outcome.conversion.ledger)
                 next_unresolved_item_number = evidence_stall_outcome.conversion.next_item_number
+                conversion_audits_state.append(evidence_stall_outcome.conversion.audit)
                 stage_same_head_conversion_review(current_round=round_number)
                 continue
             if deferred_non_convergence:

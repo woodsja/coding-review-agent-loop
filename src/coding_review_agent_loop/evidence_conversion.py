@@ -493,6 +493,7 @@ def reconcile_converted_obligations(
     admitted_audits: Sequence[EvidenceConversionAudit] = (),
     admitted_references: Sequence[SignedEvidenceReference] = (),
     tool_verified_rows_at_live_head: Iterable[str] = (),
+    drop_unbacked: bool = True,
 ) -> list[UnresolvedReviewItem]:
     """Bind every row-converted obligation to the live head (#1325).
 
@@ -511,7 +512,13 @@ def reconcile_converted_obligations(
     """
     if not live_head or not matrix_identity:
         return list(ledger)
-    result = _drop_unbacked_conversions(ledger, admitted_audits, matrix_identity=matrix_identity)
+    # Unbacked conversion state is dropped only when the authority history
+    # was fully read; unavailable history keeps the established barrier.
+    result = (
+        _drop_unbacked_conversions(ledger, admitted_audits, matrix_identity=matrix_identity)
+        if drop_unbacked
+        else list(ledger)
+    )
     present_identities = {
         item.obligation_identity for item in result if item.obligation_identity
     }

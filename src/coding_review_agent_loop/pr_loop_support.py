@@ -1878,6 +1878,7 @@ def _evidence_freeze_gate(
     clearances: Sequence[tuple[str, str]] = (),
     signed_evidence_references: Sequence[SignedEvidenceReference] = (),
     approved_plan_context: ApprovedPlanContext | None = None,
+    in_process_audits: Sequence[EvidenceConversionAudit] = (),
 ) -> _EvidenceGateOutcome:
     """Final revalidation and, when evidence is pending, the single freeze write.
 
@@ -1912,6 +1913,7 @@ def _evidence_freeze_gate(
             approved_plan_context=approved_plan_context,
             comments=fresh.comments,
             in_process_references=signed_evidence_references,
+            in_process_audits=in_process_audits,
         )
     if not _pending_evidence_obligations(items):
         return _EvidenceGateOutcome("proceed", fresh)
@@ -4079,6 +4081,21 @@ def authenticated_pr_comments(
     comments: Sequence[object] | None = None,
     resume: bool = False,
 ) -> tuple[tuple[object, ...], tuple[str, int] | None]:
+    """Hydrated comments and the actor; see :func:`_authenticated_pr_comments_status`."""
+    hydrated, actor, _complete = _authenticated_pr_comments_status(
+        runner, config, pr_number=pr_number, comments=comments, resume=resume
+    )
+    return hydrated, actor
+
+
+def _authenticated_pr_comments_status(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object] | None = None,
+    resume: bool = False,
+) -> tuple[tuple[object, ...], tuple[str, int] | None, bool]:
     """PR comments with REST identities whenever evidence authority is present (#1325).
 
     The one accessor every consumer of conversion or signed-evidence authority
@@ -4088,6 +4105,11 @@ def authenticated_pr_comments(
     ``resume`` an incomplete REST read raises before any agent runs; in a
     mid-run reread an uncovered record simply stays unadmitted.  In dry-run
     nothing is fetched and history grants no authority.
+
+    The third value says whether every authority-carrying record was read
+    with a covered identity and a resolved actor.  ``False`` means history is
+    *unavailable*, not rejected: callers must keep any established evidence
+    barrier rather than treat the missing authority as absent (#1325).
     """
     if comments is None:
         comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
@@ -4097,14 +4119,14 @@ def authenticated_pr_comments(
     except AgentLoopError:
         if resume:
             raise
-        return comments, None
+        return comments, None, False
     authority_indexes = [
         record.index for record in records if record_carries_evidence_authority(record.metadata)
     ]
     if not authority_indexes:
-        return comments, _cached_trusted_actor(runner)
+        return comments, _cached_trusted_actor(runner), True
     if config.dry_run:
-        return comments, None
+        return comments, None, False
     try:
         merged = tuple(
             merge_pr_comment_transport_identity(
@@ -4116,7 +4138,7 @@ def authenticated_pr_comments(
         if resume:
             raise
         log(config, f"Evidence-conversion authority not admitted: identity read failed ({exc})")
-        return comments, None
+        return comments, None, False
     missing = [
         index for index in authority_indexes
         if index < len(merged) and getattr(merged[index], "author_id", None) is None
@@ -4134,7 +4156,7 @@ def authenticated_pr_comments(
             + ", ".join(map(str, missing))
             + " were not covered by the REST identity read and are not admitted",
         )
-    return merged, actor
+    return merged, actor, not missing
 
 
 def admitted_pr_records(
@@ -4146,12 +4168,27 @@ def admitted_pr_records(
     resume: bool = False,
 ) -> tuple[PostedRoundRecord, ...]:
     """PR round records with #1325 authority admitted only from the actor."""
-    hydrated, actor = authenticated_pr_comments(
+    records, _complete = admitted_pr_records_status(
+        runner, config, pr_number=pr_number, comments=comments, resume=resume
+    )
+    return records
+
+
+def admitted_pr_records_status(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object] | None = None,
+    resume: bool = False,
+) -> tuple[tuple[PostedRoundRecord, ...], bool]:
+    """Admitted records plus whether the authority history was fully available."""
+    hydrated, actor, complete = _authenticated_pr_comments_status(
         runner, config, pr_number=pr_number, comments=comments, resume=resume
     )
     return admit_evidence_authority_records(
         _extract_round_metadata_records(hydrated, flow="pr"), hydrated, actor
-    )
+    ), complete
 
 
 _EVIDENCE_AUTHORITY_PHASES = frozenset(
@@ -4220,12 +4257,21 @@ def _reconcile_converted_evidence(
     comments: Sequence[object] | None = None,
     in_process_references: Sequence[SignedEvidenceReference] = (),
     records: Sequence[PostedRoundRecord] | None = None,
+    history_complete: bool = True,
+    in_process_audits: Sequence[EvidenceConversionAudit] = (),
 ) -> list[UnresolvedReviewItem]:
     """Live-head reconciliation of row-converted obligations (#1325).
 
     Runs at round start after the authoritative ledger assignment and again
     inside the finalization gate.  Without any converted obligation or
     conversion record this is a no-op that performs no extra read.
+
+    Conversions this process posted (``in_process_audits``) are trusted
+    directly.  When the authority history is unavailable (a failed or
+    uncovered identity read, ``history_complete`` false) nothing is dropped
+    as unbacked: an established evidence barrier is kept, never removed for
+    want of a reread.  Tombstones still need an admitted reference, so they
+    reopen rather than satisfy, which is the fail-closed direction.
     """
     if not head_sha or not _matrix_applies(approved_plan_context):
         return list(ledger)
@@ -4245,16 +4291,25 @@ def _reconcile_converted_evidence(
         ):
             return list(ledger)
         try:
-            records = admitted_pr_records(runner, config, pr_number=pr_number, comments=comments)
+            records, history_complete = admitted_pr_records_status(
+                runner, config, pr_number=pr_number, comments=comments
+            )
         except AgentLoopError as exc:
             log(config, f"Converted-evidence reconciliation used no history ({exc})")
-            records = ()
+            records, history_complete = (), False
     references, audits = evidence_authority_from_records(records)
+    if not history_complete:
+        log(
+            config,
+            "Converted-evidence history is unavailable; keeping every converted obligation "
+            "already in the ledger",
+        )
     return _evidence_conversion.reconcile_converted_obligations(
         ledger,
         live_head=head_sha,
         matrix_identity=approved_plan_context.risk_test_matrix_identity,
-        admitted_audits=audits,
+        admitted_audits=(*audits, *in_process_audits),
+        drop_unbacked=history_complete,
         admitted_references=_cumulative_references((*references, *in_process_references)),
         tool_verified_rows_at_live_head=_tool_verified_rows_at_head(
             records, head_sha, approved_plan_context
@@ -4853,8 +4908,10 @@ def round_evidence_authority_records(
     comments: Sequence[object],
     ledger: Sequence[UnresolvedReviewItem],
     force: bool = False,
-) -> tuple[PostedRoundRecord, ...]:
+) -> tuple[tuple[PostedRoundRecord, ...], bool]:
     """Admitted records for round-start reconciliation and the review overlay.
+
+    Also returns whether the authority history was fully available.
 
     Reads identities only when a converted obligation, a conversion record,
     or a signed-evidence reference exists (or ``force``); otherwise there is
@@ -4863,7 +4920,7 @@ def round_evidence_authority_records(
     try:
         raw = _extract_round_metadata_records(comments, flow="pr")
     except AgentLoopError:
-        return ()
+        return (), False
     if not (
         force
         or any(_is_row_converted_obligation(item) for item in ledger)
@@ -4873,9 +4930,9 @@ def round_evidence_authority_records(
             for record in raw
         )
     ):
-        return ()
+        return (), True
     try:
-        return admitted_pr_records(runner, config, pr_number=pr_number, comments=comments)
+        return admitted_pr_records_status(runner, config, pr_number=pr_number, comments=comments)
     except AgentLoopError as exc:
         log(config, f"Evidence-conversion history not admitted this round ({exc})")
-        return ()
+        return (), False

@@ -1225,3 +1225,138 @@ def test_after_the_owner_leaves_the_board_every_current_reviewer_must_clear(tmp_
     assert [ref.clearing_reviewers for ref in release.metadata.signed_evidence_references] == [
         ("Antigravity", "Codex")
     ]
+
+
+# --- review round 2 regressions -------------------------------------------------
+
+
+def _issue_bound_plan(context):
+    """The issue-side plan record and PR handoff the plain `agent-loop pr` path recovers."""
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+
+    plan_record = _attach_round_metadata(
+        context.canonical_text,
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1,
+            subject=orchestrator._plan_subject(context.canonical_text),
+            canonical_plan=context.canonical_text,
+            raw_structured_coder_response=context.canonical_text,
+        ),
+    )
+    handoff = format_issue_pr_handoff_comment(
+        issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+        pr_head_sha=START_HEAD, flow="approved-plan-implementation", plan_hash=context.plan_hash,
+    )
+    return [
+        {"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-01-01T00:00:01Z", "body": plan_record},
+        {"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-01-01T00:00:02Z", "body": handoff},
+    ]
+
+
+def test_cli_operator_conversion_recovers_the_issue_bound_plan_before_validating(tmp_path, monkeypatch):
+    """item-8: ordinary `agent-loop pr N --pr-convert-evidence-rows` without an injected plan."""
+    context = _plan_context("row-a", "row-b")
+    plan = {"row-a": "failed", "row-b": "missing"}
+    runner = FakeRunner(
+        claude_outputs=[_coder(1)],
+        codex_outputs=[_review([_tagged("row-a")]), _review(carried=["item-1"])],
+        pr_payload={"body": "Fixes #56", "comments": [_implementation_record(context, plan)]},
+        issue_payloads_by_number={56: {"number": 56}},
+        issue_comments_by_number={56: _issue_bound_plan(context)},
+    )
+    _install_derivation(monkeypatch, context, [plan])
+    config = _config(tmp_path)
+    with pytest.raises(HumanDecisionRequiredError, match="stalled on evidence only"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    comments_before = len(runner.pr_payload["comments"])
+    commands_before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="rejected: row-z"):
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, pr_convert_evidence_rows=("row-b", "row-z")))
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert not any(cmd[:1] in (["codex"], ["claude"]) for cmd, _cwd in runner.commands[commands_before:])
+    # The valid row converts; row-a's failing finding then keeps the loop
+    # going, so the run is stopped once the next review is exhausted.
+    _install_derivation(monkeypatch, context, [plan])
+    runner.codex_outputs.append(_review(carried=["item-1"], kept=["item-2"]))
+    runner.claude_outputs.append(_coder(1))
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, pr_convert_evidence_rows=("row-b",)))
+    [conversion] = [r for r in _records(runner) if r.metadata.phase == "evidence-conversion"]
+    assert conversion.metadata.evidence_conversion.source == "operator"
+    assert conversion.metadata.evidence_conversion.row_ids == ("row-b",)
+
+
+def _untagged_operator_obligation(context):
+    from coding_review_agent_loop.evidence_conversion import ConversionAuditRow, EvidenceConversionAudit
+
+    _ledger, obligation, _ = _upsert_converted_evidence_obligation(
+        [], item_number=1, row_id="row-b", matrix_identity=context.risk_test_matrix_identity,
+        head_sha=START_HEAD, owners=("Codex",), source_round=1, explanation="",
+    )
+    audit = EvidenceConversionAudit(
+        source="operator", matrix_identity=context.risk_test_matrix_identity, head=START_HEAD,
+        rows=(ConversionAuditRow(
+            row_id="row-b", obligation_identity=obligation.obligation_identity,
+            obligation_item_id="item-1", owners=("Codex",), converted_item_ids=(),
+            attempt_record_rounds=(),
+        ),),
+    )
+    record = PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=1, subject=START_HEAD,
+        prior_items=(obligation,), state="blocking", phase="evidence-conversion",
+        evidence_conversion=audit,
+    )
+    return obligation, audit, _comment(_attach_round_metadata("Converted.", record))
+
+
+@pytest.mark.parametrize("failure", ["rest-unavailable", "uncovered-record"])
+def test_the_gate_keeps_an_untagged_conversion_when_authority_history_is_unavailable(tmp_path, failure):
+    """item-9: an unavailable reread never removes an established evidence barrier."""
+    from coding_review_agent_loop.pr_loop_support import _evidence_freeze_gate
+
+    context = _plan_context("row-a", "row-b")
+    obligation, _audit, comment = _untagged_operator_obligation(context)
+    if failure == "uncovered-record":
+        comment.pop("_rest_author_id")
+    runner = FakeRunner(
+        pr_payload={"comments": [comment]},
+        serve_rest_issue_comments=(False if failure == "rest-unavailable" else None),
+    )
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        _evidence_freeze_gate(
+            runner, config=_config(tmp_path), pr_number=77, round_number=2, head_sha=START_HEAD,
+            items=[obligation], surfaced_requirement_ids=(), collect_requirement_ids=lambda _ctx: (),
+            allowed_rounds=8, watch_failure_extension_used=False, watch_head_extension_used=False,
+            approved_plan_context=context,
+        )
+    [frozen] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-b")
+    assert frozen.lifecycle == "evidence_frozen"
+
+
+def test_a_failed_reread_after_an_untagged_operator_conversion_keeps_the_freeze(tmp_path, monkeypatch):
+    """item-9: PR-loop path; the run freezes instead of approving or merging."""
+    import coding_review_agent_loop.pr_loop_support as support
+
+    context = _plan_context("row-a", "row-b")
+    plan = {"row-a": "verified", "row-b": "missing"}
+    runner = FakeRunner(
+        codex_outputs=[_review(kept=["item-1"], state="blocking")],
+        pr_payload={"comments": [_implementation_record(context, plan)]},
+    )
+    real_apply = support._apply_evidence_conversion
+
+    def apply_then_break_identity_reads(*args, **kwargs):
+        outcome = real_apply(*args, **kwargs)
+        runner.serve_rest_issue_comments = False  # every later identity read fails
+        return outcome
+
+    monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_break_identity_reads)
+    config = dataclasses.replace(_config(tmp_path), pr_convert_evidence_rows=("row-b",))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    commands = [cmd for cmd, _cwd in runner.commands]
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd in commands)
+    assert not any(cmd[:3] == ["gh", "pr", "review"] and "--approve" in cmd for cmd in commands)
+    [frozen] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-b")
+    assert frozen.lifecycle == "evidence_frozen"
+    assert frozen.resolution_owners == ("Codex",)

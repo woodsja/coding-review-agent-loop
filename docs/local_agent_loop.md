@@ -961,7 +961,11 @@ head reaches a new freeze there with no coder turn. A converted obligation
 missing from the ledger but recorded in an admitted conversion audit is
 restored with its audit item ID and owners; conversion state that no admitted
 audit backs (for example a ledger adopted from a record whose audit was
-rejected) is dropped, so the row is treated as unconverted. A reviewer-board
+rejected) is dropped, so the row is treated as unconverted. That drop happens
+only when the authority history was fully read: when an identity read fails
+or leaves a record uncovered, every converted obligation already in the ledger
+is kept, and conversions this process posted are always trusted, so an
+unavailable reread can never remove an established evidence barrier. A reviewer-board
 change never reassigns a converted obligation's stored owners; the clearance
 rule above already falls back to the whole current board.
 
@@ -3938,9 +3942,11 @@ converts the named rows before any reviewer or coder runs in that invocation. Ev
 named row must be in the unsatisfied set derived from the coder record bound to the
 live head and not already converted (pending or cleared); any other ID, a duplicate, a
 missing applicable matrix, an unbound head or an active freeze fails the whole list.
-This validation is read-only and runs at entry, before any startup write (board-change
-link, plan-handoff audit, recovery handoff) and before any agent runs, so nothing is
-posted for an invalid list. The conversion is persisted in the same audit record
+This validation is read-only and runs before any startup comment or activation
+(board-change link, plan-handoff audit, recovery handoff) and before any agent runs, so
+nothing is posted for an invalid list. On the ordinary `agent-loop pr N` path it runs
+right after the PR-bound approved plan is recovered read-only from the linked issue's
+handoff. The conversion is persisted in the same audit record
 (`source: operator`), and every reviewer then reviews fresh. The flag is one-shot:
 rendered rerun commands never replay it.
 
