@@ -13,6 +13,7 @@ from coding_review_agent_loop.checks import (
 from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck
 from coding_review_agent_loop.cli import main
 from coding_review_agent_loop.comment_rendering import render_agent_unavailable_comment
+from coding_review_agent_loop.followups import _append_plan_approved_followups_marker
 from coding_review_agent_loop.github import (
     AuthenticatedComment,
     AuthenticatedCommentView,
@@ -150,6 +151,14 @@ def handoff(comment_id: int, plan: str = "Plan text.") -> AuthenticatedComment:
         issue_number=ISSUE, pr_number=PR, pr_url=f"https://github.com/{REPO}/pull/{PR}",
         pr_head_sha="a" * 40, flow="approved-plan-implementation",
         plan_hash=_approved_plan_hash(plan),
+    ))
+
+
+def approval_announcement(comment_id: int, plan: str = "Plan text.") -> AuthenticatedComment:
+    """The plan-approval announcement an approved plan-first round posts (plan-only too)."""
+    return comment(comment_id, _append_plan_approved_followups_marker(
+        f"Issue #{ISSUE} plan approved.\n-- coding-review-agent-loop",
+        issue_number=ISSUE, plan_hash=_approved_plan_hash(plan), mode="ignore",
     ))
 
 
@@ -738,11 +747,19 @@ def test_reviewer_votes_alone_are_not_plan_approval():
     stale = derive(history(), issue_view(*reconciled, handoff(9, plan="An older plan.")))
     assert "plan-approved" not in stale["terminal_states"]
 
-    accepted = derive(history(), issue_view(*reconciled, handoff(9)))
-    assert "plan-approved" in accepted["terminal_states"]
-    assert accepted["plan_rounds"] == {"value": 1, "evidence": "verified"}
-    assert accepted["human_decision_stops"] == {"value": 0, "evidence": "verified"}
-    assert accepted["outcome_complete"] is False
+    stale_announcement = derive(history(), issue_view(*reconciled, approval_announcement(9, plan="An older plan.")))
+    assert "plan-approved" not in stale_announcement["terminal_states"]
+    assert stale_announcement["plan_rounds"] == {"value": None, "evidence": "unavailable"}
+
+    # Each orchestrator acceptance record for the final candidate settles the
+    # plan: the plan-only approval announcement and the implementation handoff.
+    for acceptance in (approval_announcement(9), handoff(9)):
+        accepted = derive(history(), issue_view(*reconciled, acceptance))
+        assert "plan-approved" in accepted["terminal_states"]
+        assert accepted["plan_rounds"] == {"value": 1, "evidence": "verified"}
+        assert accepted["final_plan_size"] == {"value": len("Plan text."), "evidence": "verified"}
+        assert accepted["human_decision_stops"] == {"value": 0, "evidence": "verified"}
+        assert accepted["outcome_complete"] is False
 
 
 def _board(*seats: str) -> dict:

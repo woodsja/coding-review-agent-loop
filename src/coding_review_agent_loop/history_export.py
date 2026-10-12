@@ -53,6 +53,7 @@ from .review_rounds import (
 )
 from .review_step_back import PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
 from .decomposition import find_decompositions_for_parent, find_phase_implementation_handoffs_for_parent
+from .followups import approved_plan_hashes_for_issue
 from .issue_pr_handoff import resolve_issue_pr_handoff_lineage
 from .round_state import PostedRoundRecord, _approved_plan_hash, _extract_round_metadata_records
 from .round_transport import ROUND_RESUME_MARKER_RE
@@ -675,10 +676,12 @@ def _plan_acceptance_hashes(comments: Sequence[AuthenticatedComment], *, issue_n
     unanimous board (a missing panel opening, a stale carried key, the
     plan-growth gate, an unsettled reconciliation).  Only the records the
     orchestrator posts after its approval boundary completed count: the
-    issue-to-PR implementation handoff, a staged decomposition summary and a
-    phase implementation handoff.  Undecodable records count as nothing.
+    plan-approval announcement every approved plan-first round posts (plan-only
+    mode included), the issue-to-PR implementation handoff, a staged
+    decomposition summary and a phase implementation handoff.  Undecodable
+    records count as nothing.
     """
-    accepted: set[str] = set()
+    accepted: set[str] = set(approved_plan_hashes_for_issue(comments, issue_number=issue_number))
     try:
         lineage = resolve_issue_pr_handoff_lineage(comments, issue_number=issue_number, repo=repo)
     except AgentLoopError:

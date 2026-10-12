@@ -4741,13 +4741,13 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   value is `null`, never a zero. Step-backs are also `unavailable` unless
   every counted round has a record written after step-back recording existed.
 - A plan counts as accepted only when the orchestrator recorded its own
-  post-approval record for the newest planner candidate: the issue-to-PR
-  implementation handoff, a staged decomposition summary or a phase
-  implementation handoff whose plan hash matches. Reviewer votes alone never
-  settle a plan, because the planning loop can still reject a unanimous board
-  (no panel opening, a stale carried approval, the plan-growth gate, an
-  unsettled reconciliation). A `plan-only` approval leaves no such record, so
-  its counts stay `unavailable` until the issue is closed.
+  post-approval record for the newest planner candidate: the plan-approval
+  announcement every approved plan-first round posts (including `plan-only`
+  runs), the issue-to-PR implementation handoff, a staged decomposition
+  summary or a phase implementation handoff whose plan hash matches. Reviewer
+  votes alone never settle a plan, because the planning loop can still reject
+  a unanimous board (no panel opening, a stale carried approval, the
+  plan-growth gate, an unsettled reconciliation).
 - Expected reviewer seats for a round are the seats a valid scheduler
   checkpoint selected, otherwise the recorded plan or PR board identity (or
   the scheduler contract's required reviewers), otherwise every seat seen; a
