@@ -84,6 +84,7 @@ DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
 DEFAULT_PR_STEP_BACK_ROUNDS = 3
 DEFAULT_PR_EVIDENCE_STALL_ROUNDS = 2
 DEFAULT_PR_STEP_BACK_LINE_WINDOW = 40
+DEFAULT_PR_NON_CONVERGENCE_ROUNDS = 3
 DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
@@ -261,6 +262,7 @@ class AgentLoopConfig:
     pr_step_back_rounds: int = DEFAULT_PR_STEP_BACK_ROUNDS
     pr_evidence_stall_rounds: int = DEFAULT_PR_EVIDENCE_STALL_ROUNDS
     pr_step_back_line_window: int = DEFAULT_PR_STEP_BACK_LINE_WINDOW
+    pr_non_convergence_rounds: int = DEFAULT_PR_NON_CONVERGENCE_ROUNDS
     # One-shot operator retirement of the stall streak (#1112): the run's first
     # primary-phase checkpoint is stamped as a durable streak boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
@@ -787,13 +789,19 @@ class AgentLoopConfig:
             ("--pr-step-back-rounds", self.pr_step_back_rounds),
             ("--pr-step-back-line-window", self.pr_step_back_line_window),
             ("--pr-evidence-stall-rounds", self.pr_evidence_stall_rounds),
+            ("--pr-non-convergence-rounds", self.pr_non_convergence_rounds),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise AgentLoopError(
                     f"{flag} must be a non-negative integer"
                     + (
                         " (0 disables it)."
-                        if flag in {"--pr-step-back-rounds", "--pr-evidence-stall-rounds"}
+                        if flag
+                        in {
+                            "--pr-step-back-rounds",
+                            "--pr-evidence-stall-rounds",
+                            "--pr-non-convergence-rounds",
+                        }
                         else "."
                     )
                 )
@@ -2398,6 +2406,9 @@ def config_from_args(
         ),
         pr_evidence_stall_rounds=_arg_or_default(
             args, "pr_evidence_stall_rounds", DEFAULT_PR_EVIDENCE_STALL_ROUNDS
+        ),
+        pr_non_convergence_rounds=_arg_or_default(
+            args, "pr_non_convergence_rounds", DEFAULT_PR_NON_CONVERGENCE_ROUNDS
         ),
         plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
         plan_resume_keep_on_issue_edit=bool(

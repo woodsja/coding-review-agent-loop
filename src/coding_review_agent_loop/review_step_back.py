@@ -1774,3 +1774,281 @@ def render_pr_step_back_human_decision(
         "redesign the affected code (push the redesign and rerun). After a push, a rerun does "
         "not stop again on this round's sibling; only a new sibling in a later review does."
     )
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop non-convergence (#1372): the same tracked-reviewer items stay
+# blocking across K consecutive coder turns that each changed the head, wherever
+# the findings are.  Derived only from posted reviewer and coder records.
+# ---------------------------------------------------------------------------
+
+NON_CONVERGENCE_TEXT_LIMIT = 240
+_EVIDENCE_REQUEST_RE = re.compile(
+    r"\b(evidence|runner|real[- ]host|live run|hardware|platform)\b", re.IGNORECASE
+)
+
+
+@dataclass(frozen=True)
+class PersistingItem:
+    item_id: str
+    first_line: str
+    attempts: int
+    asks_for_evidence: bool = False
+
+
+@dataclass(frozen=True)
+class PrNonConvergence:
+    """A tracked reviewer's window of K code-changing turns that cleared nothing."""
+
+    reviewer: str
+    k: int
+    trigger_round: int
+    first_round: int
+    first_head: str
+    current_head: str
+    items: tuple[PersistingItem, ...]
+    coder_rounds: tuple[int, ...]
+
+
+def _pr_blocking_set(review: PrReviewRecord) -> dict | None:
+    """``{item_id: item}`` the reviewer still holds blocking after this review.
+
+    Only the reviewer's own dispositions apply, so another reviewer's vote never
+    extends the tracked reviewer's streak.  Machine and human exact-head evidence
+    obligations are already excluded, and evidence-only findings tagged with
+    risk-matrix rows are left to the evidence-stall gate.  ``None`` when the
+    review is not a resolvable block (approved, other, or an unresolvable
+    publication record).
+    """
+    if review.classification not in BLOCKING_CLASSES or review.new_items is None:
+        return None
+    if review.classification == CLASS_BLOCKING_UNRESOLVED:
+        return None
+    metadata = review.metadata
+    own = tuple(d for d in metadata.dispositions if d.reviewer == metadata.agent)
+    if len(own) != len(metadata.dispositions):
+        review = dataclasses.replace(
+            review, metadata=dataclasses.replace(metadata, dispositions=own)
+        )
+    return {
+        item.item_id: item
+        for item in _remaining_mandatory_items(review)
+        if not getattr(item, "evidence_row_ids", ())
+    }
+
+
+def _pr_coder_after(
+    records: Sequence["PostedRoundRecord"], round_number: int, after_index: int
+) -> "PostedRoundRecord | None":
+    """The latest PR coder record numbered ``round_number`` posted after ``after_index``."""
+    best = None
+    for record in records:
+        metadata = record.metadata
+        if (
+            metadata.flow == "pr"
+            and metadata.role == "coder"
+            and metadata.round_number == round_number
+            and record.index > after_index
+            and (best is None or record.index > best.index)
+        ):
+            best = record
+    return best
+
+
+def _pr_code_changing_join(
+    records: Sequence["PostedRoundRecord"],
+    review: PrReviewRecord,
+    next_review: PrReviewRecord,
+) -> "PostedRoundRecord | None":
+    """The coder record between two consecutive reviews, when it moved the head.
+
+    Production numbering: the loop posts review r and then the coder record
+    numbered r+1, whose subject is the head reviewed at round r+1.  A missing
+    record, an unchanged head (no-op turn) or a next-review head that differs
+    from the coder's subject (external push or rebase) yields ``None``.
+    """
+    if next_review.round_number != review.round_number + 1:
+        return None
+    coder = _pr_coder_after(records, review.round_number + 1, review.index)
+    if coder is None or coder.index > next_review.index:
+        return None
+    subject = str(coder.metadata.subject or "")
+    if not subject or subject == review.head or next_review.head != subject:
+        return None
+    return coder
+
+
+def _open_sub_items(item) -> int:
+    return sum(1 for sub in getattr(item, "sub_items", ()) if sub.status != "resolved")
+
+
+def _still_blocking_without_progress(earlier: dict, later: dict, item_id: str) -> bool:
+    """Whether the item stayed blocking from one review to the next with no progress.
+
+    Resolving at least one open sub-item is progress (the sub-item stall gate owns
+    sub-item pacing), so it breaks the item's chain.
+    """
+    if item_id not in earlier or item_id not in later:
+        return False
+    return _open_sub_items(later[item_id]) >= _open_sub_items(earlier[item_id])
+
+
+def _first_line(text: str) -> str:
+    return next((part.strip() for part in str(text).splitlines() if part.strip()), "")
+
+
+def find_pr_non_convergence(
+    records: Sequence["PostedRoundRecord"],
+    reviewer: str,
+    *,
+    k: int,
+    current_round: int,
+    current_head: str | None,
+) -> PrNonConvergence | None:
+    """The reviewer's persisting items after K code-changing coder turns, if any.
+
+    The window is the reviewer's reviews at rounds N-K..N (N = ``current_round``)
+    joined by the K coder records numbered N-K+1..N.  Every review must be a
+    resolvable block and every join must have moved the head with no external
+    push; the persisting items are the IDs blocking in all K+1 reviews whose
+    open sub-item count never dropped between two of them.  File spread and line
+    windows are ignored by design.
+    """
+    if k <= 0 or current_round - k < 1:
+        return None
+    ordered = sorted(records, key=lambda item: item.index)
+    by_round = {review.round_number: review for review in pr_reviews_for(ordered, reviewer)}
+    window = [by_round.get(n) for n in range(current_round - k, current_round + 1)]
+    if any(review is None for review in window):
+        return None
+    if current_head and window[-1].head != current_head:
+        return None
+    blocking_sets = [_pr_blocking_set(review) for review in window]
+    if any(found is None for found in blocking_sets):
+        return None
+    coders = [
+        _pr_code_changing_join(ordered, earlier, later)
+        for earlier, later in zip(window, window[1:])
+    ]
+    if any(coder is None for coder in coders):
+        return None
+    persisting = {
+        item_id
+        for item_id in blocking_sets[0]
+        if all(
+            _still_blocking_without_progress(earlier, later, item_id)
+            for earlier, later in zip(blocking_sets, blocking_sets[1:])
+        )
+    }
+    if not persisting:
+        return None
+    items = []
+    for item_id in sorted(persisting):
+        attempts = k
+        later, later_set = window[0], blocking_sets[0]
+        while True:
+            earlier = by_round.get(later.round_number - 1)
+            if earlier is None or _pr_code_changing_join(ordered, earlier, later) is None:
+                break
+            found = _pr_blocking_set(earlier)
+            if found is None or not _still_blocking_without_progress(found, later_set, item_id):
+                break
+            attempts += 1
+            later, later_set = earlier, found
+        item = blocking_sets[-1][item_id]
+        text = str(item.text)
+        items.append(
+            PersistingItem(
+                item_id=item_id,
+                first_line=_first_line(text),
+                attempts=attempts,
+                asks_for_evidence=_EVIDENCE_REQUEST_RE.search(text) is not None,
+            )
+        )
+    return PrNonConvergence(
+        reviewer=reviewer,
+        k=k,
+        trigger_round=current_round,
+        first_round=window[0].round_number,
+        first_head=window[0].head,
+        current_head=current_head or window[-1].head,
+        items=tuple(items),
+        coder_rounds=tuple(coder.metadata.round_number for coder in coders),
+    )
+
+
+def pr_non_convergence_may_matter(
+    records: Sequence["PostedRoundRecord"], reviewer: str, *, k: int, round_number: int
+) -> bool:
+    """Snapshot pre-check: could a non-convergence window qualify at this round?
+
+    A live dispatch snapshot predates the newest coder record (and the current
+    review), so only the reviewer's reviews N-K..N-1 are checked: present,
+    contiguous and all blocking.  Coder joins are verified on the fresh read.
+    """
+    if k <= 0 or round_number - k < 1:
+        return False
+    rounds = {
+        review.round_number: review
+        for review in pr_reviews_for(records, reviewer)
+        if review.round_number < round_number
+    }
+    for number in range(round_number - k, round_number):
+        review = rounds.get(number)
+        if review is None or review.classification not in BLOCKING_CLASSES:
+            return False
+    return True
+
+
+def _clean_decision_text(text: str) -> str:
+    text = " ".join(str(text).split()).replace("`", "'")
+    if len(text) > NON_CONVERGENCE_TEXT_LIMIT:
+        text = text[: NON_CONVERGENCE_TEXT_LIMIT - 1].rstrip() + "…"
+    return text
+
+
+def render_pr_non_convergence_decision(
+    pr_number: int,
+    result: PrNonConvergence,
+    *,
+    diff_growth: str | None,
+    pr_size: str | None,
+) -> str:
+    """Human-decision text for a non-converging PR fix loop (#1372)."""
+    item_lines = "\n".join(
+        f"- [{_clean_decision_text(item.item_id)}] (attempts: {item.attempts}) "
+        f"{_clean_decision_text(item.first_line) or '(no text recorded)'}"
+        for item in result.items
+    )
+    evidence = [item.item_id for item in result.items if item.asks_for_evidence]
+    evidence_note = (
+        "Possibly human-only evidence (these persisting items ask for evidence the "
+        "environment may be unable to produce; see option 4): "
+        + ", ".join(f"[{_clean_decision_text(item_id)}]" for item_id in evidence)
+        + "\n"
+        if evidence
+        else ""
+    )
+    return (
+        f"PR #{pr_number}: human decision required: {result.reviewer} kept the same "
+        f"item(s) blocking across {result.k} consecutive coder turns that each changed the "
+        f"head (reviews at rounds {result.first_round}-{result.trigger_round}, current head "
+        f"`{result.current_head}`), so the fix loop is not converging. No further coder "
+        "turn was invoked.\n"
+        f"Persisting items:\n{item_lines}\n"
+        f"Diff growth since the first attempt (`{result.first_head[:12]}` to "
+        f"`{result.current_head[:12]}`): {diff_growth or 'unavailable'}\n"
+        "Total PR size (a scope-growth signal; compare it with the issue's suggested "
+        f"direction): {pr_size or 'unavailable'}\n"
+        f"{evidence_note}"
+        "Decide how to proceed:\n"
+        "1. Continue: rerun with `--pr-non-convergence-rounds 0` (or a larger K).\n"
+        "2. Accept a stated limitation or narrow the scope with a signed human decision "
+        "through the existing signed-requirement path that resolves or defers these items, "
+        "then rerun the same command.\n"
+        "3. Redesign, or push a change yourself, and rerun: an external push breaks the "
+        "chain, so the rerun does not stop again on this window.\n"
+        "4. Convert evidence the environment cannot produce to the evidence freeze: have "
+        "the reviewer re-file that item as an exact-head evidence request instead of a "
+        "blocking finding."
+    )

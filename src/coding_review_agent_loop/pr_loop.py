@@ -7758,7 +7758,8 @@ def run_pr_loop(
                             + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
-            # A clustered sibling after a step-back stops for a human decision
+            # A clustered sibling after a step-back, or the same items blocking across
+            # K code-changing coder turns (#1372), stops for a human decision
             # here, before the round-limit exit and any coder invocation; K clustered blocks otherwise
             # turn this follow-up into one generalize-the-class step-back turn.
             step_back_decision = _pr_step_back_decision(
@@ -7769,6 +7770,7 @@ def run_pr_loop(
                 snapshot_comments=pr_comments,
                 tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
                 head_sha=pr_metadata.head_sha,
+                base_branch=pr_metadata.base_branch or config.base,
             )
             if round_number == allowed_rounds:
                 raise AgentLoopError(

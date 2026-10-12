@@ -1483,7 +1483,12 @@ session cannot produce but an approved contract requires at the exact reviewed
 head (for example an authenticated live-CLI run that only a human can perform).
 Never list missing human evidence in `blocking_items`, and never list a code
 defect in `exact_head_evidence_requests`: each concern belongs in exactly one
-field. The orchestrator defers these requests until every code finding and
+field. Evidence that no available agent session or configured CI runner can
+produce (for example a run on a platform or OS with no runner, a real external
+service, or specific hardware) is human-only: put it only in
+`exact_head_evidence_requests`, never in `blocking_items` and never folded into
+a code-fix request, even when other findings in the same review are code
+defects. The orchestrator defers these requests until every code finding and
 machine gate is clean, then publishes one evidence freeze at that head. When the
 carried items show a frozen evidence item you requested together with new signed
 human input, dispose it `resolved` only if that input supplies adequate evidence

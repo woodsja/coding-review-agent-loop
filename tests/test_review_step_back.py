@@ -1999,3 +1999,315 @@ def test_declaration_must_start_the_line(line):
 )
 def test_declaration_accepts_presentation_prefixes(line):
     assert declared_dissolution_reversals({"summary": f"intro\n{line}"}) == (("a", "why"),)
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop non-convergence (#1372)
+# ---------------------------------------------------------------------------
+
+import dataclasses  # noqa: E402
+
+from coding_review_agent_loop.pr_loop_support import (  # noqa: E402
+    _pr_step_back_records_may_matter,
+)
+
+OTHER_REVIEWER = "Google Antigravity"
+NC_A = "race: a same-UID attacker swaps the config at src/secure_git.py:10"
+NC_B = "race: the worktree path is reused at src/run_worktrees.py:900"
+
+
+def _nc_head(n):
+    return f"{n:040x}"
+
+
+def _nc_open(item_id, text, *, round_number=1, **kwargs):
+    return _pr_item(item_id, text, round_number=round_number, **kwargs)
+
+
+def _nc_history(reviews, *, coder_offset=1, coder_heads=None, review_heads=None, publication=False):
+    """Production numbering: review r on head r, then coder record r+1 whose subject
+    is the head reviewed at round r+1.
+
+    ``reviews`` maps each round to ``(new, prior, dispositions)``.
+    """
+    records = []
+    index = 0
+    rounds = sorted(reviews)
+    for position, n in enumerate(rounds):
+        new, prior, dispositions = reviews[n]
+        head = (review_heads or {}).get(n, _nc_head(n))
+        if publication:
+            records.append(
+                _pr_publication(index, n, head, prior=prior, dispositions=dispositions)
+            )
+            index += 1
+            if new is not None:
+                records.append(_pr_recon(index, n, head, new))
+                index += 1
+        else:
+            records.append(
+                _pr_review(index, n, head, new=new, prior=prior, dispositions=dispositions)
+            )
+            index += 1
+        if position + 1 < len(rounds):
+            subject = (coder_heads or {}).get(n + 1, _nc_head(n + 1))
+            records.append(_pr_coder(index, n + coder_offset, subject))
+            index += 1
+    return records
+
+
+def _nc_persisting_reviews(rounds=4, *, items=(("item-1", NC_A), ("item-2", NC_B))):
+    opened = [_nc_open(item_id, text) for item_id, text in items]
+    reviews = {1: (opened, (), ())}
+    for n in range(2, rounds + 1):
+        reviews[n] = ((), opened, ())
+    return reviews
+
+
+def _nc_find(records, *, k=3, current_round=4, current_head=None):
+    return sb.find_pr_non_convergence(
+        records, PR_REVIEWER, k=k, current_round=current_round,
+        current_head=current_head or _nc_head(current_round),
+    )
+
+
+def test_non_convergence_fires_on_items_persisting_across_files():
+    """`nc-persist-spread`: same two IDs blocking, findings in different files."""
+    records = _nc_history(_nc_persisting_reviews())
+    result = _nc_find(records)
+    assert result is not None
+    assert [(i.item_id, i.attempts) for i in result.items] == [("item-1", 3), ("item-2", 3)]
+    assert result.first_round == 1 and result.trigger_round == 4
+    assert result.first_head == _nc_head(1) and result.current_head == _nc_head(4)
+    assert result.coder_rounds == (2, 3, 4)
+    assert result.items[0].first_line == NC_A
+    # The clustered rule does not see it: the reviews after the first are repeat-only.
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=4, mapper=_identity_mapper
+    ) is None
+
+
+def test_non_convergence_attempts_extend_past_k():
+    records = _nc_history(_nc_persisting_reviews(rounds=6))
+    result = _nc_find(records, current_round=6)
+    assert result is not None and {i.attempts for i in result.items} == {5}
+
+
+def test_non_convergence_joins_review_r_to_coder_record_r_plus_one_only():
+    """`nc-production-numbering`: same-numbered coder records never qualify."""
+    assert _nc_find(_nc_history(_nc_persisting_reviews())) is not None
+    assert _nc_find(_nc_history(_nc_persisting_reviews(), coder_offset=0)) is None
+
+
+def test_resolved_items_replaced_by_new_findings_do_not_trigger():
+    """`nc-churn-no-trigger`."""
+    reviews = {}
+    previous = None
+    for n in range(1, 5):
+        new = [_nc_open(f"item-{n}", f"gap at src/f{n}.py:10", round_number=n)]
+        prior = [previous] if previous else []
+        dispositions = (
+            [ReviewItemDisposition(previous.item_id, PR_REVIEWER, "resolved")] if previous else []
+        )
+        reviews[n] = (new, prior, dispositions)
+        previous = new[0]
+    assert _nc_find(_nc_history(reviews)) is None
+
+
+def test_one_persisting_item_among_churn_still_triggers_and_lists_only_it():
+    persistent = _nc_open("item-1", NC_A)
+    reviews = {1: ([persistent], (), ())}
+    for n in range(2, 5):
+        reviews[n] = ([_nc_open(f"item-{n}", f"gap at src/f{n}.py:10", round_number=n)],
+                      [persistent], ())
+    result = _nc_find(_nc_history(reviews))
+    assert result is not None and [i.item_id for i in result.items] == ["item-1"]
+
+
+@pytest.mark.parametrize("case", ["no-op", "external-push", "missing-coder"])
+def test_a_no_op_turn_external_push_or_missing_coder_record_breaks_the_chain(case):
+    """`nc-chain-break`."""
+    reviews = _nc_persisting_reviews()
+    if case == "no-op":
+        # Coder record 3 left the head where review 2 saw it; review 3 is on that head.
+        records = _nc_history(
+            reviews, coder_heads={3: _nc_head(2)}, review_heads={3: _nc_head(2)}
+        )
+    elif case == "external-push":
+        records = _nc_history(reviews, review_heads={3: _nc_head(9)})
+    else:
+        records = [
+            r for r in _nc_history(reviews)
+            if not (r.metadata.role == "coder" and r.metadata.round_number == 3)
+        ]
+    assert _nc_find(records) is None
+
+
+def test_a_dispatch_head_past_the_newest_review_breaks_the_chain():
+    records = _nc_history(_nc_persisting_reviews())
+    assert _nc_find(records, current_head=_nc_head(9)) is None
+
+
+def test_machine_and_evidence_obligations_do_not_count():
+    """`nc-obligations-excluded`."""
+    machine = UnresolvedReviewItem(
+        item_id="ci-1", reviewer=PR_REVIEWER, source_round=1, text="checks failing",
+        status="blocking", authority="machine", obligation_kind="alembic-migration",
+        lifecycle="awaiting_current_head_review",
+    )
+    evidence = UnresolvedReviewItem(
+        item_id="evidence-1", reviewer=PR_REVIEWER, source_round=1,
+        text="a real Windows SSH fetch", status="blocking", authority="machine",
+        obligation_kind="human-exact-head-evidence", lifecycle="evidence_deferred",
+        obligation_identity="evidence-identity-1",
+    )
+    tagged = UnresolvedReviewItem(
+        item_id="item-7", reviewer=PR_REVIEWER, source_round=1,
+        text="cite a passing test for row-a", status="blocking", evidence_row_ids=("row-a",),
+    )
+    reviews = {1: ([tagged], [machine, evidence], ())}
+    for n in range(2, 5):
+        reviews[n] = ((), [machine, evidence, tagged], ())
+    assert _nc_find(_nc_history(reviews)) is None
+
+
+def test_completing_sub_item_disposition_clears_persistence():
+    """`nc-subitem-completion`."""
+    parent = _nc_open(
+        "item-1", NC_A,
+        sub_items=(ReviewSubItem("sub-1", "a at src/a.py:1"), ReviewSubItem("sub-2", "b at src/b.py:2")),
+    )
+    reviews = {1: ([parent], (), ())}
+    for n in range(2, 5):
+        churn = [_nc_open(f"item-{n}", f"gap at src/f{n}.py:10", round_number=n)]
+        dispositions = ()
+        if n == 4:
+            dispositions = [
+                ReviewItemDisposition(
+                    "item-1", PR_REVIEWER, "blocking",
+                    sub_item_dispositions=(("sub-1", "resolved"), ("sub-2", "resolved")),
+                )
+            ]
+        reviews[n] = (churn, [parent], dispositions)
+    records = _nc_history(reviews)
+    assert _nc_find(records) is None
+    # Without the completing disposition the parent persists.
+    reviews[4] = (reviews[4][0], [parent], ())
+    assert _nc_find(_nc_history(reviews)) is not None
+
+
+def test_another_reviewers_blocking_vote_does_not_extend_the_streak():
+    """`nc-parallel-conflicting-dispositions`."""
+    reviews = _nc_persisting_reviews(items=(("item-1", NC_A),))
+    opened = reviews[2][1]
+    # The tracked reviewer resolves item-1 at round 4; another reviewer's blocking
+    # disposition for the same item, listed later, must not count for it.
+    reviews[4] = (
+        [_nc_open("item-9", "unrelated at src/z.py:1", round_number=4)],
+        opened,
+        [
+            ReviewItemDisposition("item-1", PR_REVIEWER, "resolved"),
+            ReviewItemDisposition("item-1", OTHER_REVIEWER, "blocking"),
+        ],
+    )
+    assert _nc_find(_nc_history(reviews)) is None
+    assert _nc_find(_nc_history(reviews, publication=True)) is None
+
+
+def test_parallel_publication_records_resolve_through_reconciliation():
+    """`nc-review-parallel`."""
+    reviews = _nc_persisting_reviews()
+    # Repeat-only publication rounds still need a reconciliation to be resolvable.
+    reviews = {n: (new if new else [], prior, d) for n, (new, prior, d) in reviews.items()}
+    records = _nc_history(reviews, publication=True)
+    result = _nc_find(records)
+    assert result is not None and [i.item_id for i in result.items] == ["item-1", "item-2"]
+    # A publication with no later reconciliation is unresolvable and breaks the chain.
+    unresolved = [
+        r for r in records
+        if not (r.metadata.phase == "reconciliation" and r.metadata.round_number == 3)
+    ]
+    assert _nc_find(unresolved) is None
+
+
+def test_k_zero_or_too_few_rounds_disables_non_convergence():
+    records = _nc_history(_nc_persisting_reviews())
+    assert _nc_find(records, k=0) is None
+    assert _nc_find(records, k=4) is None
+
+
+def test_snapshot_pre_check_needs_only_the_preceding_contiguous_blocking_reviews():
+    """`nc-live-snapshot`: the live snapshot lacks coder record N (and review N)."""
+    records = _nc_history(_nc_persisting_reviews())
+    live = [
+        r for r in records
+        if not (r.metadata.round_number == 4)  # drops coder record 4 and review 4
+    ]
+    assert not any(r.metadata.role == "coder" and r.metadata.round_number == 4 for r in live)
+    for snapshot in (live, records, [r for r in live if r.metadata.role == "reviewer"]):
+        assert _pr_step_back_records_may_matter(
+            snapshot, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=3
+        )
+    # An approval or a gap in the preceding reviews skips the fresh read.
+    approved_records = [
+        PostedRoundRecord(
+            index=r.index, body=r.body,
+            metadata=dataclasses.replace(r.metadata, state="approved")
+            if r.metadata.role == "reviewer" and r.metadata.round_number == 2
+            else r.metadata,
+        )
+        for r in live
+    ]
+    assert not _pr_step_back_records_may_matter(
+        approved_records, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=3
+    )
+    gap = [r for r in live if not (r.metadata.role == "reviewer" and r.metadata.round_number == 2)]
+    assert not _pr_step_back_records_may_matter(
+        gap, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=3
+    )
+    # Disabled non-convergence keeps the pre-check to the step-back rules.
+    assert not _pr_step_back_records_may_matter(
+        live, [PR_REVIEWER], k=0, round_number=4, non_convergence_k=0
+    )
+
+
+def test_non_convergence_decision_text_lists_items_measurements_and_options():
+    evidence_text = "needs a real Windows SSH fetch: no `runner` exists"
+    reviews = _nc_persisting_reviews(items=(("item-1", NC_A), ("item-2", evidence_text)))
+    result = _nc_find(_nc_history(reviews))
+    text = sb.render_pr_non_convergence_decision(
+        77, result, diff_growth="3 files changed, 120 insertions(+)", pr_size="9 files changed"
+    )
+    assert "PR #77: human decision required" in text
+    assert f"[item-1] (attempts: 3) {NC_A}" in text
+    assert "[item-2] (attempts: 3) needs a real Windows SSH fetch: no 'runner' exists" in text
+    assert "3 files changed, 120 insertions(+)" in text and "9 files changed" in text
+    assert "Possibly human-only evidence" in text and "[item-2]" in text.split("Possibly", 1)[1]
+    assert "`--pr-non-convergence-rounds 0` (or a larger K)" in text
+    assert "signed human decision" in text
+    assert "push a change yourself" in text
+    assert "exact-head evidence request" in text
+    unavailable = sb.render_pr_non_convergence_decision(77, result, diff_growth=None, pr_size=None)
+    assert unavailable.count("unavailable") == 2
+    assert "AGENT_" not in text and "<!--" not in text
+
+
+def test_resolving_one_sub_item_per_turn_is_progress_not_non_convergence():
+    """A parent that loses an open sub-item each round is converging."""
+    subs = tuple(ReviewSubItem(f"item-1.s{n}", f"writer {n} at src/w{n}.py:1") for n in range(1, 5))
+    parent = _nc_open("item-1", "Four writer paths are unwired.", sub_items=subs)
+    reviews = {1: ([parent], (), ())}
+    resolved = []
+    for n in range(2, 5):
+        resolved.append((f"item-1.s{n - 1}", "resolved"))
+        reviews[n] = (
+            (), [parent],
+            [ReviewItemDisposition("item-1", PR_REVIEWER, "blocking",
+                                   sub_item_dispositions=tuple(resolved))],
+        )
+    assert _nc_find(_nc_history(reviews)) is None
+    # A turn that resolves nothing (the same open count) keeps the item persisting.
+    stuck = {n: ((), [parent], ()) for n in range(2, 5)}
+    stuck[1] = reviews[1]
+    result = _nc_find(_nc_history(stuck))
+    assert result is not None and [i.item_id for i in result.items] == ["item-1"]

@@ -954,6 +954,31 @@ episode open while it is a member. The episode closes on the reviewer's approval
 or when no unresolved mandatory item of theirs is a member. A malformed entry
 suppresses the trigger and the stop with a log line.
 
+**PR non-convergence stop** (#1372; `--pr-non-convergence-rounds` K, default 3,
+`0` disables, independent of `--pr-step-back-rounds`). The clustered trigger counts
+only new findings near one file span, so items that persist across files never
+fire it. `review_step_back.find_pr_non_convergence` therefore joins a tracked
+reviewer's reviews at rounds N-K..N with the coder records between them using the
+loop's numbering (review r, then coder record r+1 whose subject is the head
+reviewed at r+1). Every join must have moved the head and the next review must be
+on that head, so a no-op turn, a missing record, or an external push breaks the
+chain. Each review's blocking set is `_remaining_mandatory_items` with only the
+reviewer's own dispositions, which drops machine and human exact-head evidence
+obligations and items whose last sub-item a completing disposition resolved;
+evidence-tagged findings stay with the evidence-stall gate, and an unresolvable
+`--review-parallel` publication breaks the chain. An item persists when it is in
+all K+1 blocking sets and its open sub-item count never drops between two of them
+(resolving a sub-item is progress). Any persisting item raises `HumanDecisionRequiredError` (exit 4) inside
+`_pr_step_back_decision`, after a clustered-sibling escalation and before a fresh
+clustered step-back turn, the round-limit exit, and any coder invocation. The
+snapshot pre-check only needs the reviews N-K..N-1 to be contiguous blocks, because
+the live snapshot predates coder record N; the joins are verified on the fresh
+read. The decision text lists each item with its attempt count and first line, the
+`git diff --shortstat` growth since the first head and the PR size from the merge
+base (each `unavailable` when Git fails), flags items asking for evidence, and
+offers the override options. Nothing is persisted, so a resumed run stops with the
+same text.
+
 **PR evidence-only stall stop** (#1324; `--pr-evidence-stall-rounds` K, default 2,
 `0` disables). A `pr_review` blocking item may carry `evidence_row_ids`, parsed in
 `protocol.py` (blocking items only, bounded unique strings), validated against the

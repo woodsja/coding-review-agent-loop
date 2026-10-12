@@ -3661,6 +3661,54 @@ remains in the cluster. The orchestrator records the step-back as reviewer-owned
 rebuilds the sweep for any reviewer whose review of that head is unpublished and
 never re-requests a published one.
 
+#### PR non-convergence stop
+
+The clustered step-back counts only **new** findings near one file span, so a
+reviewer who keeps the same items blocking round after round, with findings spread
+across files, never triggers it. `--pr-non-convergence-rounds K` (default 3, `0`
+disables; a negative or boolean value is rejected like `--pr-step-back-rounds`)
+stops the PR fix loop at the human-decision boundary (exit code 4) before any
+further coder turn when the same item IDs of a tracked reviewer (each configured
+reviewer, or only the primary under `primary-then-panel`) stayed blocking across K
+consecutive coder turns that each changed the head. File spread and
+`--pr-step-back-line-window` do not matter. The two flags are independent:
+`--pr-step-back-rounds 0` keeps this stop, and `--pr-non-convergence-rounds 0`
+keeps the step-back.
+
+A coder turn counts only when it moved the head and the next review was taken on
+that head, so a no-op turn or an external push breaks the chain. An item whose
+reviewer resolved at least one of its open sub-items in a review made progress, so
+that item's chain restarts (`--sub-item-stall-rounds` governs sub-item pacing). Machine
+obligations, human exact-head evidence requests, and evidence-only findings tagged
+with risk-matrix rows do not count (the evidence freeze and the evidence-stall stop
+govern them). Under `--review-parallel` the reviewer's blocking set is resolved
+through the round's reconciliation, and only the reviewer's own dispositions apply.
+The stop is derived from posted round records only and persists nothing, so a
+resumed run reaches the same decision with the same text.
+
+**Precedence.** A clustered-sibling escalation stops first; otherwise this stop
+wins over a fresh clustered step-back turn, and both run before the round-limit
+exit.
+
+**Stop message.** It names the reviewer, K, the round range and the current head,
+lists each persisting item with its attempt count and first line, and reports the
+diff growth since the first attempt and the total PR size from the merge base with
+the base branch (a scope-growth signal; either reads `unavailable` when Git cannot
+measure it). Items whose text asks for evidence are listed separately as possibly
+human-only. It then offers: (1) continue (rerun with `--pr-non-convergence-rounds 0`
+or a larger K); (2) accept a stated limitation or narrow the scope with a signed
+human decision that resolves or defers the items, then rerun; (3) redesign or push
+a change yourself and rerun (the push breaks the chain); (4) convert evidence the
+environment cannot produce to the evidence freeze by having the reviewer re-file it
+as an exact-head evidence request.
+
+**Unattainable evidence.** Both PR review prompts tell reviewers that evidence no
+available agent session or configured CI runner can produce (for example a run on a
+platform with no runner, a real external service, or specific hardware) is
+human-only: it belongs only in `exact_head_evidence_requests`, never in
+`blocking_items`, even when the same review also has code findings. The evidence
+freeze then routes it to a human instead of the coder.
+
 #### PR evidence-only stall stop
 
 A risk-matrix citation obligation can only be satisfied by tool-captured test

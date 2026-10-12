@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from collections.abc import (
     Callable,
@@ -3472,15 +3473,29 @@ def _git_anchor_mapper(
 
 
 def _pr_step_back_records_may_matter(
-    records: Sequence[PostedRoundRecord], tracked: Sequence[str], *, k: int, round_number: int
+    records: Sequence[PostedRoundRecord],
+    tracked: Sequence[str],
+    *,
+    k: int,
+    round_number: int,
+    non_convergence_k: int = 0,
 ) -> bool:
     """Cheap pre-check on the round-start snapshot: could this dispatch step back?
 
     The snapshot lacks at most the current round's review, so a trigger needs the
     previous K-1 reviews to already be consecutive new findings, and an episode
-    needs a recorded entry.  Anything else skips the fresh read entirely.
+    needs a recorded entry.  A non-convergence window needs the previous
+    ``non_convergence_k`` reviews to be contiguous blocks; its coder joins are
+    checked only on the fresh read, because a live snapshot predates the newest
+    coder record.  Anything else skips the fresh read entirely.
     """
     for reviewer in tracked:
+        if _step_back.pr_non_convergence_may_matter(
+            records, reviewer, k=non_convergence_k, round_number=round_number
+        ):
+            return True
+        if k <= 0:
+            continue
         entries, degraded = _step_back.pr_step_back_history(records, reviewer)
         if degraded or entries:
             return True
@@ -3502,6 +3517,55 @@ def _pr_step_back_records_may_matter(
     return False
 
 
+_SHORTSTAT_RE = re.compile(r"^\s*\d+ files? changed")
+
+
+def _pr_non_convergence_measurements(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    first_head: str,
+    current_head: str,
+    base_branch: str | None,
+) -> tuple[str | None, str | None]:
+    """``(diff growth since first_head, total PR size)``; ``None`` when unavailable.
+
+    Each Git call is wrapped like the anchor mapper's: a non-zero exit,
+    unparseable output or a runner error makes that measurement unavailable and
+    never raises.
+    """
+    checkout = active_workdir(config)
+
+    def run_git(args: Sequence[str]) -> str | None:
+        try:
+            result = runner.run(["git", *args], cwd=checkout, check=False)
+        except (OSError, AttributeError, TypeError, AgentLoopError):
+            return None
+        if getattr(result, "returncode", 1) != 0 or not isinstance(result.stdout, str):
+            return None
+        return result.stdout
+
+    def shortstat(from_rev: str) -> str | None:
+        output = run_git(["diff", "--shortstat", from_rev, current_head])
+        if output is None:
+            return None
+        text = output.strip()
+        if not text:
+            return "no change"
+        return text if _SHORTSTAT_RE.match(text) else None
+
+    growth = shortstat(first_head)
+    size = None
+    if base_branch:
+        for base_ref in (f"origin/{base_branch}", base_branch):
+            merge_base = run_git(["merge-base", base_ref, current_head])
+            merge_base = (merge_base or "").strip()
+            if merge_base and _is_followup_dispatch_head(merge_base):
+                size = shortstat(merge_base)
+                break
+    return growth, size
+
+
 def _pr_step_back_decision(
     runner: Runner,
     config: AgentLoopConfig,
@@ -3511,23 +3575,32 @@ def _pr_step_back_decision(
     snapshot_comments: Sequence[object],
     tracked: Sequence[str],
     head_sha: str | None,
+    base_branch: str | None = None,
 ) -> PrStepBackDecision:
-    """Escalate on a clustered sibling, else name the clusters that trigger now.
+    """Escalate on a clustered sibling or non-convergence, else name the clusters.
 
     Evaluated at the coder dispatch from freshly read history so a live run and
     a resumed run agree.  Raises ``AgentLoopError`` (a human-decision stop) before
-    any coder invocation when a reviewer's step-back still produced a sibling.
+    any coder invocation when a reviewer's step-back still produced a sibling,
+    and ``HumanDecisionRequiredError`` (exit 4) when a tracked reviewer kept the
+    same items blocking across ``--pr-non-convergence-rounds`` code-changing
+    coder turns (#1372).  Each gate keeps its own K, so disabling one never
+    disables the other.
     """
     k = config.pr_step_back_rounds
+    non_convergence_k = config.pr_non_convergence_rounds
     window = config.pr_step_back_line_window
-    if k <= 0 or not tracked or not head_sha:
+    if (k <= 0 and non_convergence_k <= 0) or not tracked or not head_sha:
         return PrStepBackDecision()
     try:
         snapshot = _extract_round_metadata_records(snapshot_comments, flow="pr")
     except AgentLoopError:
         log(config, "PR step-back suppressed: round history could not be decoded")
         return PrStepBackDecision()
-    if not _pr_step_back_records_may_matter(snapshot, tracked, k=k, round_number=round_number):
+    if not _pr_step_back_records_may_matter(
+        snapshot, tracked, k=k, round_number=round_number,
+        non_convergence_k=non_convergence_k,
+    ):
         return PrStepBackDecision()
     try:
         fresh = _extract_round_metadata_records(
@@ -3538,8 +3611,9 @@ def _pr_step_back_decision(
         log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
     mapper = _git_anchor_mapper(runner, config, checkout=active_workdir(config), window=window)
-    triggers: list[_step_back.PrClusterTrigger] = []
-    for reviewer in tracked:
+    # (1) A clustered sibling after a step-back escalates first.
+    trigger_candidates: list[str] = []
+    for reviewer in tracked if k > 0 else ():
         _entries, degraded = _step_back.pr_step_back_history(fresh, reviewer)
         if degraded:
             log(config, f"PR step-back suppressed for {reviewer}: malformed step-back history")
@@ -3568,8 +3642,34 @@ def _pr_step_back_decision(
                     sibling_round=episode.sibling_round,
                 )
             )
-        if episode.entry is not None:
+        if episode.entry is None:
+            trigger_candidates.append(reviewer)
+    # (2) Non-convergence wins over a fresh clustered step-back turn.
+    for reviewer in tracked if non_convergence_k > 0 else ():
+        stalled = _step_back.find_pr_non_convergence(
+            fresh, reviewer, k=non_convergence_k, current_round=round_number,
+            current_head=head_sha,
+        )
+        if stalled is None:
             continue
+        log(
+            config,
+            f"Round {round_number}: {reviewer} kept "
+            f"{', '.join(item.item_id for item in stalled.items)} blocking across "
+            f"{non_convergence_k} code-changing coder turns; stopping for a human decision",
+        )
+        diff_growth, pr_size = _pr_non_convergence_measurements(
+            runner, config, first_head=stalled.first_head, current_head=stalled.current_head,
+            base_branch=base_branch,
+        )
+        raise HumanDecisionRequiredError(
+            _step_back.render_pr_non_convergence_decision(
+                pr_number, stalled, diff_growth=diff_growth, pr_size=pr_size
+            )
+        )
+    # (3) The clustered trigger opens a step-back turn.
+    triggers: list[_step_back.PrClusterTrigger] = []
+    for reviewer in trigger_candidates:
         trigger = _step_back.find_pr_cluster_trigger(
             fresh, reviewer, k=k, window=window, current_round=round_number, mapper=mapper,
             current_head=head_sha,
