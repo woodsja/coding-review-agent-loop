@@ -325,3 +325,70 @@ def test_true_resume_omits_a_map_whose_coder_response_names_the_heading(tmp_path
     assert "deadbeef" not in map_field
     # The stored comment's origin cannot be established, so nothing is restored.
     assert "risk_matrix_coverage_map" not in prompt
+
+
+def test_managed_implementation_rejected_during_correction_still_publishes_dispatch_audit(
+    tmp_path, monkeypatch,
+):
+    """#1366 item-11: once the managed draft is authenticated, a checkout
+    failure re-raised from the semantic correction still publishes the
+    dispatch audit once, and the original error propagates."""
+    import datetime
+
+    import coding_review_agent_loop.orchestrator as orchestrator_module
+    from coding_review_agent_loop import github as github_module
+    from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
+
+    h = CoverageHarness(
+        tmp_path, monkeypatch, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce="opening-nonce",
+    )
+    handoff = orchestrator_module.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha=h.head, branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
+        trusted_actor_id=1, protection_mode="voluntary", override_nonce="opening-nonce",
+    )
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(orchestrator_module, "publish_issue_created_authorization", lambda *_a, **_k: handoff)
+    guarded = []
+
+    def correction_fails(parsed, **kwargs):
+        # The correction resumes the guarded coder session, then the checkout
+        # is found corrupted: response_validation re-raises this error.
+        guarded.append(kwargs["config"].coder_ci_dispatch_guard)
+        raise CheckoutVerificationError("assigned checkout corrupted during correction")
+
+    monkeypatch.setattr(orchestrator_module_ref(), "_derive_authenticated_risk_evidence_for_coder", correction_fails)
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bypass = {
+        "id": 9001, "name": "CI", "display_title": "CI", "event": "workflow_dispatch",
+        "head_sha": "correction-head", "head_branch": "agent-loop/managed-56", "created_at": now,
+        "html_url": "https://github.com/OWNER/REPO/actions/runs/9001",
+        "repository": {"full_name": "OWNER/REPO"},
+    }
+    queries = []
+    monkeypatch.setattr(
+        github_module, "_list_dispatch_runs",
+        lambda runner, *, config, query: queries.append(query) or ([bypass], None),
+    )
+    h.script = [h.response(response_text(claims=complete_claims()))]
+
+    with pytest.raises(CheckoutVerificationError, match="corrupted during correction"):
+        h.run()
+
+    assert guarded == [True]
+    assert any("branch=agent-loop%2Fmanaged-56" in query for query in queries)
+    notes = [
+        item["body"] for item in h.runner.pr_payload.get("comments", [])
+        if "Coder-turn CI dispatch audit" in item.get("body", "")
+    ]
+    assert len(notes) == 1
+    assert "run 9001 on `correction-head`" in notes[0]
+    assert "non-authoritative diagnostic, not qualification" in notes[0]
+    assert "coder response for this turn was rejected" in notes[0]
+    assert h.run_pr_calls == []  # no review, qualification or dispatch follows

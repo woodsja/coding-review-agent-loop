@@ -741,6 +741,28 @@ def _coder_ci_wait_guidance() -> str:
     )
 
 
+def _coder_managed_ci_dispatch_guidance(active: bool) -> str:
+    """Managed-CI dispatch prohibition (#1366); empty for unmanaged turns.
+
+    ``active`` is the same invocation-scoped flag that installs the coder
+    ``gh`` guard, so the prompt and the guard cannot diverge.
+    """
+    if not active:
+        return ""
+    return (
+        "This pull request uses managed CI. A skipped or neutral `pull_request`/`synchronize` "
+        "CI check on this managed draft is the expected approval-gated state, not a failure "
+        "to fix. Never trigger GitHub Actions yourself to get a green check: do not run "
+        "`gh workflow run`, `gh run rerun`, or `gh api` POSTs to `.../dispatches` or "
+        "`.../rerun` endpoints, do not use the web UI, and do not remove the managed label. "
+        "Your managed `agent-loop run-tests` receipt is the evidence before approval; once "
+        "every required reviewer approves the current head, the orchestrator dispatches the "
+        "correlated exact-head qualification itself. CI-triggering `gh` commands are refused "
+        "in this turn. If you believe early GitHub CI is needed, record that in "
+        "`remaining_items`/notes (or the equivalent prose) so a human operator can decide.\n"
+    )
+
+
 def _coder_documentation_guidance() -> str:
     return (
         "If your implementation adds or changes a user-facing subcommand, flag, "
@@ -3062,7 +3084,7 @@ Use this local checkout as your workspace. Create a branch, implement the fix,
 run relevant tests, commit, push, and open a pull request against {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
@@ -4262,7 +4284,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {config.base}.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {pr_reference_guidance}
 {provenance_guidance}
 {managed_creation_guidance}
@@ -4340,7 +4362,7 @@ task-output file. If you know its process ID, terminate it once (a single
 foreground under the bounded timeout below, waiting for it to finish; launch
 nothing new in the background. Then commit, push, and open the pull request if
 that is not already done, or continue exactly where you left off.
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {human_requirements_context.block}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, format_approved_plan_context(approved_plan_context, max_chars=None)))}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
@@ -4387,7 +4409,7 @@ Use this local checkout as your workspace. Decide between two paths:
     its sole PR value and `clarification` is its sole question value. Include
     the complete `architecture_impact` object in every fresh result.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
 (b) If the task is genuinely ambiguous or missing information that would change
     the implementation, do NOT write code. Instead, ask focused clarifying
@@ -4469,7 +4491,7 @@ Follow each envelope immediately with `<!-- AGENT_STATE: blocking -->` and
 `-- <signature>`. Do not add an `AGENT_PR` or `AGENT_CLARIFY` marker to a
 structured result; `pr_number` and `clarification` are the sole outcome data.
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=False)}{_coder_local_test_scope_guidance(config, structured=False)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 
 {_agent_unavailable_guidance(coder_signature)}
 If you cannot safely proceed and cannot create a PR, use the structured no-PR
@@ -5408,7 +5430,7 @@ needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
 {_proactive_generalization_block(_HISTORY_PHASE_PR, generalization_guidance, finding_history)}{step_back_context}{_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
@@ -5477,7 +5499,7 @@ branch if needed, implement fixes, run relevant tests, commit, and push to the
 same PR. Do not create a new PR.
 {_coder_workdir_guidance(config)}
 {_proactive_generalization_block(_HISTORY_PHASE_PR, generalization_guidance, finding_history)}{scope_framing}{_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
@@ -5544,7 +5566,7 @@ or wait for CI runs in this round -- CI and reviews are re-evaluated automatical
 against the new head after your push.
 {_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
-{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_managed_ci_dispatch_guidance(getattr(config, "coder_ci_dispatch_guard", False))}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}

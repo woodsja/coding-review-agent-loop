@@ -14,6 +14,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal
+from urllib.parse import quote
 
 from .ci_health import (
     CiInfrastructureStall,
@@ -1796,6 +1797,233 @@ def _fetch_head_dispatch_runs(
             return {}, [prefix + f"check suite {suite_id} was claimed by more than one run"]
         mapping[suite_id] = (run_id, any(n.startswith(V2_RUN_NAME_PREFIX) for n in names))
     return mapping, []
+
+
+CODER_DISPATCH_AUDIT_SKEW_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class CoderTurnDispatchRun:
+    run_id: int
+    head_sha: str
+    url: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class CoderTurnDispatchAudit:
+    """Non-managed workflow_dispatch runs created during one coder turn (#1366).
+
+    Purely diagnostic: these runs are never qualification, and gating keeps
+    excluding them through :func:`_fetch_head_dispatch_runs`.
+    """
+
+    runs: tuple[CoderTurnDispatchRun, ...] = ()
+    lookup_notes: tuple[str, ...] = ()
+
+
+def _parse_github_timestamp(value: object) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def _list_dispatch_runs(
+    runner: Runner, *, config: AgentLoopConfig, query: str
+) -> tuple[list[dict] | None, str | None]:
+    """Every workflow_dispatch run for one listing query, or None plus a reason."""
+    result = run_gh_read(
+        runner,
+        [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/actions/runs?{query}&per_page=100"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None, "query failed" + _failure_detail(result)
+    pages = decode_concatenated_json_objects(result.stdout or "")
+    if pages is None:
+        return None, "response was not valid JSON"
+    totals: set[int] = set()
+    runs: list[dict] = []
+    for page in pages:
+        total = page.get("total_count")
+        page_runs = page.get("workflow_runs")
+        if isinstance(total, bool) or not isinstance(total, int) or not isinstance(page_runs, list):
+            return None, "response had no workflow_runs list"
+        totals.add(total)
+        runs.extend(run for run in page_runs if isinstance(run, dict))
+    if len(totals) > 1 or (totals and totals.pop() != len(runs)):
+        return None, "listing was truncated or inconsistent"
+    return runs, None
+
+
+def audit_coder_turn_dispatches(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    branch: str | None,
+    head_shas: Sequence[str | None],
+    turn_started_at: datetime.datetime,
+) -> CoderTurnDispatchAudit:
+    """Find non-managed workflow_dispatch runs created since a coder turn started.
+
+    Discovery is branch-scoped and time-bounded, so a dispatch on an
+    intermediate head that a later push superseded is still found; it is
+    unioned with the per-SHA listing of every known head and deduplicated by
+    run id.  A lookup failure yields only a note and never raises.
+    """
+    since = turn_started_at - datetime.timedelta(seconds=CODER_DISPATCH_AUDIT_SKEW_SECONDS)
+    since_text = since.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    known_heads = tuple(dict.fromkeys(sha for sha in head_shas if sha))
+    queries: list[tuple[str, str]] = []
+    if branch:
+        queries.append((
+            f"branch `{branch}`",
+            "event=workflow_dispatch"
+            f"&branch={quote(branch, safe='')}&created={quote('>=' + since_text, safe='')}",
+        ))
+    queries.extend(
+        (f"head `{sha}`", f"event=workflow_dispatch&head_sha={quote(sha, safe='')}")
+        for sha in known_heads
+    )
+    found: dict[int, CoderTurnDispatchRun] = {}
+    notes: list[str] = []
+    for scope, query in queries:
+        try:
+            runs, problem = _list_dispatch_runs(runner, config=config, query=query)
+        except Exception as exc:  # diagnostic only: never block the round
+            runs, problem = None, f"lookup raised {type(exc).__name__}"
+        if runs is None:
+            notes.append(f"workflow_dispatch audit for {scope} unavailable: {problem}")
+            continue
+        for run in runs:
+            run_id = run.get("id")
+            repo = run.get("repository")
+            full_name = repo.get("full_name") if isinstance(repo, dict) else None
+            names = [n for n in (run.get("name"), run.get("display_title")) if isinstance(n, str)]
+            head_sha = run.get("head_sha")
+            created = _parse_github_timestamp(run.get("created_at"))
+            if (
+                run.get("event") != "workflow_dispatch"
+                or isinstance(run_id, bool)
+                or not isinstance(run_id, int)
+                or not isinstance(full_name, str)
+                or full_name.lower() != config.repo.lower()
+                or not names
+                or any(n.startswith(V2_RUN_NAME_PREFIX) for n in names)
+                or not isinstance(head_sha, str)
+                or created is None
+                or created < since
+            ):
+                continue
+            if branch and run.get("head_branch") != branch and head_sha not in known_heads:
+                continue
+            found.setdefault(run_id, CoderTurnDispatchRun(
+                run_id=run_id,
+                head_sha=head_sha,
+                url=_optional_str(run.get("html_url")),
+                created_at=str(run.get("created_at")),
+            ))
+    return CoderTurnDispatchAudit(
+        runs=tuple(sorted(found.values(), key=lambda r: r.run_id)),
+        lookup_notes=tuple(notes),
+    )
+
+
+def render_coder_dispatch_audit_note(audit: CoderTurnDispatchAudit) -> str:
+    """The visible round audit note, or "" when there is nothing to report."""
+    lines: list[str] = []
+    if audit.runs:
+        lines.append(
+            "**Coder-turn CI dispatch audit:** ordinary workflow_dispatch created during coder "
+            "turn before managed approval; non-authoritative diagnostic, not qualification."
+        )
+        for run in audit.runs:
+            where = f" ({run.url})" if run.url else ""
+            lines.append(f"- run {run.run_id} on `{run.head_sha}`{where}")
+    if audit.lookup_notes:
+        lines.append(
+            "**Coder-turn CI dispatch audit (diagnostic only, does not block this round):** "
+            + "; ".join(audit.lookup_notes)
+        )
+    return "\n".join(lines)
+
+
+def coder_turn_dispatch_audit_note(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    branch: str | None,
+    head_shas: Sequence[str | None],
+    turn_started_at: datetime.datetime,
+) -> str:
+    """Run the post-turn audit, log its outcome, and return the visible note."""
+    audit = audit_coder_turn_dispatches(
+        runner, config, branch=branch, head_shas=head_shas, turn_started_at=turn_started_at,
+    )
+    for run in audit.runs:
+        log(
+            config,
+            f"Ordinary workflow_dispatch run {run.run_id} on {run.head_sha} was created during "
+            "a guarded coder turn; non-authoritative diagnostic, not qualification",
+        )
+    for note in audit.lookup_notes:
+        log(config, f"Coder-turn dispatch audit: {note}")
+    return render_coder_dispatch_audit_note(audit)
+
+
+def publish_rejected_coder_turn_dispatch_audit(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    branch: str | None,
+    head_shas: Sequence[str | None],
+    turn_started_at: datetime.datetime,
+) -> str:
+    """Audit a guarded coder turn whose response was rejected (#1366).
+
+    A rejected turn posts no coder comment, so any non-managed dispatch is
+    published as its own visible orchestrator comment; a lookup failure is
+    only logged.  Diagnostic only:
+    this never raises, so the caller's original rejection is never masked.
+    """
+    try:
+        live_head: str | None = None
+        try:
+            live_head = (get_pr_head_sha(runner, config, pr_number) or "").strip() or None
+        except Exception:  # noqa: BLE001 - the branch query still covers it
+            live_head = None
+        audit = audit_coder_turn_dispatches(
+            runner, config, branch=branch, head_shas=(*head_shas, live_head),
+            turn_started_at=turn_started_at,
+        )
+        for problem in audit.lookup_notes:
+            log(config, f"Coder-turn dispatch audit: {problem}")
+        # Only a found run is published: a lookup failure on a rejected turn
+        # stays a logged diagnostic, so a rejection adds no PR noise.
+        note = render_coder_dispatch_audit_note(CoderTurnDispatchAudit(runs=audit.runs))
+        for run in audit.runs:
+            log(
+                config,
+                f"Ordinary workflow_dispatch run {run.run_id} on {run.head_sha} was created during "
+                "a rejected guarded coder turn; non-authoritative diagnostic, not qualification",
+            )
+        if note:
+            post_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=f"{note}\n\nThe coder response for this turn was rejected.\n\n-- Orchestrator",
+            )
+        return note
+    except Exception as exc:  # noqa: BLE001 - never mask the rejection
+        log(config, f"PR #{pr_number}: rejected coder-turn dispatch audit failed ({exc})")
+        return ""
 
 
 def _classify_dispatch_observation(

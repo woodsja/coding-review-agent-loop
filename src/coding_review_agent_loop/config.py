@@ -392,6 +392,12 @@ class AgentLoopConfig:
     # merge. `auto_merge` remains an implicit managed-CI eligibility signal so
     # existing invocations retain their behavior.
     managed_ci: bool = False
+    # Invocation-scoped coder/repair CI-dispatch guard (#1366).  Never set from
+    # the CLI or derived from ``managed_ci``: each loop sets it on a replaced
+    # config passed only to coder turns, from the live managed-CI decision or
+    # the managed creation intent.  It drives both the coder prompt guidance
+    # and the ``gh`` guard, so the two cannot diverge.
+    coder_ci_dispatch_guard: bool = False
     # Optional v2 managed-CI identity. A repository must independently opt in
     # with its Actions variable before this can suppress any automatic matrix.
     managed_ci_trusted_actor: str | None = None

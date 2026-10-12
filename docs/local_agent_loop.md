@@ -4762,6 +4762,79 @@ authorization fails before a target exists, and publishes failure when
 checkout or tests fail. Pushes to `main` and ordinary manual dispatch remain
 full-suite paths.
 
+#### Coder turns cannot dispatch CI before approval (#1366)
+
+While a managed draft waits for review, its skipped or neutral
+`pull_request`/`synchronize` check is the expected approval-gated state. Coder
+and format-repair turns on that PR therefore cannot dispatch ordinary CI to get
+a green check:
+
+- **Prompt.** Every coder prompt says that a skipped check is expected, that
+  the managed `agent-loop run-tests` receipt is the evidence before approval,
+  that the orchestrator dispatches correlated exact-head qualification after
+  every required reviewer approves the current head, and that a wish for early
+  CI belongs in `remaining_items` for a human operator to decide.
+- **`gh` guard.** For those turns agent-loop puts a guard executable named `gh`
+  first on the agent's `PATH`. It refuses `gh workflow run`, `gh run rerun`, and
+  `gh api` POSTs to `.../dispatches`, `.../rerun`, `.../rerun-failed-jobs`, or
+  `.../jobs/<id>/rerun`. A POST counts whether it is explicit (`-X POST`,
+  `--method POST`) or implicit through `-f`, `-F`, `--field`, `--raw-field`, or
+  `--input`. Arguments are decoded the way `gh` itself parses them, so
+  attached (`-XPOST`), equals (`-X=POST`, `--method=POST`) and grouped
+  (`-iX POST`, `-if ref=main`) shorthand spellings are refused too. A refused command exits non-zero with an explanation and never
+  reaches the real `gh`. Every other command, including `gh pr checks`,
+  `gh run view`, and GET `gh api`, is executed unchanged by the configured `gh`
+  (`--gh-cmd`).
+- **Post-turn audit.** After a guarded turn's last coder continuation
+  (format repair or the semantic-evidence correction) the orchestrator lists
+  `workflow_dispatch` runs on the PR branch created since the turn started, and
+  every known head. This also covers the direct-issue first turn, once the
+  created PR is authenticated. A non-managed run found there, for example one
+  started through an absolute `gh` path, `curl`, or the web UI, is prepended to
+  the coder's round comment as a non-authoritative diagnostic. It is never
+  qualification and never cancelled. If the turn is rejected (for example,
+  format repair fails, a report is invalid, or the checkout fails during
+  semantic correction), the same audit still runs and posts its note as a
+  separate orchestrator comment before the rejection is raised. In issue and
+  approved-plan implementation this applies once the created managed draft is
+  authenticated. On a rejected turn a lookup failure is only logged. A
+  lookup failure adds only a diagnostic note and never blocks the round.
+
+The guard and the prompt text share one invocation-scoped decision. In the PR
+loop that decision is the live managed-CI state for the turn: explicit managed
+CI, or implicit `--auto-merge` with an activated contract. Activation fallback
+and a revalidation drop turn it off. In issue and approved-plan implementation
+the decision is the managed creation intent. Validated-agent retries, format
+repair, and the semantic-evidence correction that resumes that coder session
+inherit the decision, prompt guidance included. Reviewer, planner, and
+step-back launches, and their repairs, never carry it. Orchestrator-owned
+GitHub calls, including the post-approval managed dispatch, never pass through
+the guard.
+
+The guard is defense in depth, not a sandbox. If the launcher cannot be
+installed, the turn continues with prompt-only protection. The guard sets these
+variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `AGENT_LOOP_CODER_CI_DISPATCH_GUARD=managed` | The guard refuses CI triggers. |
+| `AGENT_LOOP_CODER_GUARD_TARGET_GH` | The downstream `gh`, resolved against the `PATH` from before the guard was added. |
+| `AGENT_LOOP_CODER_GUARD_DIR` | The guard's private directory. The guard removes it from `PATH` before `exec`, so nothing downstream can resolve back into the guard. |
+
+When the downstream target is the `agent-loop-gh` REST shim, an ambient
+`AGENT_LOOP_REAL_GH` is preserved unchanged. Without one, agent-loop sets it to
+the real `gh` found on the pre-guard `PATH`. The shim therefore keeps its own
+real-gh resolution, and read-only passthrough and emulated reads such as
+`gh pr view --json` keep working.
+
+**Operator early-CI path.** A human who wants GitHub CI before approval runs
+`gh workflow run ci.yml --ref <branch>` with empty inputs from their own shell.
+agent-loop reports that run under "Excluded ad hoc workflow_dispatch checks
+(operator diagnostics, not PR checks)" and never counts it as final
+qualification. Final qualification remains the orchestrator's correlated
+exact-head dispatch after approval. The workflow and its `unlabeled` recovery
+event are unchanged.
+
 #### Split layout: validate, caller-owned test jobs, publish
 
 The single-job `managed-ci.yml` and `managed-ci-ordinary.yml` workflows above

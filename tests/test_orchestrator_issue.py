@@ -20233,3 +20233,157 @@ def test_m1390_staged_budget_exhausts_with_a_pending_phase_advance_at_the_scope_
     assert _m1103_agent_calls(runner).count("claude") == max_rounds
     assert "gemini" not in _m1103_agent_calls(runner)
     assert not any("phase advance to round" in c["body"] for c in runner.issue_comments)
+
+
+@pytest.mark.parametrize("reject", [False, True])
+def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
+    tmp_path, monkeypatch, reject,
+):
+    """#1366: the creation intent guards the first coder turn, and a bypass
+    ordinary dispatch on the reserved branch is reported after the created PR
+    is authenticated, never as qualification -- also when the report is
+    rejected after that authentication (item-11)."""
+    import datetime
+    import os
+    import shutil
+    import subprocess
+
+    from coding_review_agent_loop import scratch
+    from coding_review_agent_loop.runner import CommandResult
+
+    bin_dir = tmp_path / "real-gh-bin"
+    bin_dir.mkdir()
+    record = bin_dir / "calls.txt"
+    (bin_dir / "gh").write_text(f"#!/bin/sh\necho \"$@\" >> '{record}'\n", encoding="utf-8")
+    (bin_dir / "gh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(scratch, "scratch_root", lambda: tmp_path / "scratch")
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bypass = {
+        "id": 4242, "name": "CI", "display_title": "CI", "event": "workflow_dispatch",
+        "head_sha": "abc123", "head_branch": "agent-loop/managed-56", "created_at": now,
+        "html_url": "https://github.com/OWNER/REPO/actions/runs/4242",
+        "repository": {"full_name": "OWNER/REPO"},
+    }
+
+    class IssueRunner(FakeRunner):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.attempts = []
+            self.audit_queries = []
+            self.launch_envs = []
+
+        def run_with_log(self, args, *, cwd, env=None, **kwargs):
+            self.launch_envs.append((str(args[0]), dict(env or {})))
+            if str(args[0]) == "claude":
+                merged = {**os.environ, **(env or {})}
+                gh = shutil.which("gh", path=merged["PATH"])
+                self.attempts.append(subprocess.run(
+                    [gh, "workflow", "run", "ci.yml"], env=merged,
+                    capture_output=True, text=True, timeout=60,
+                ))
+            return super().run_with_log(args, cwd=cwd, env=env, **kwargs)
+
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            cmd = [str(arg) for arg in args]
+            if cmd[:3] == ["gh", "api", "--paginate"] and "/actions/runs?" in cmd[3]:
+                self.audit_queries.append(cmd[3])
+                cmd, cwd_path = self._record_command(cmd, cwd)
+                return CommandResult(
+                    cmd, cwd_path, json.dumps({"total_count": 1, "workflow_runs": [bypass]}), "", 0
+                )
+            return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+    nonce = "direct-managed-nonce"
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce=nonce,
+    )
+    handoff = _managed_issue_handoff(nonce=nonce)
+    runner = IssueRunner(
+        claude_outputs=[
+            # A report citing an out-of-checkout receipt is rejected only after
+            # the managed draft has been authenticated.
+            structured_issue_implementation(
+                pr_number=77,
+                tests_run=["python3 -m pytest"],
+                test_observations=[{
+                    "command": "cd /outside && python -m pytest",
+                    "receipt_id": "outside-receipt",
+                    "claim": "current-result",
+                }],
+            )
+            if reject else
+            "Implemented the issue.\n<!-- AGENT_PR: 77 -->\n"
+            "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+        codex_outputs=[structured_pr_review(state="approved", summary="Approved managed draft.")],
+        pr_payload={
+            "body": f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}",
+            "headRefName": "agent-loop/managed-56",
+            "headRefOid": "abc123",
+        },
+    )
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    dispatches = []
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(orchestrator_module, "publish_issue_created_authorization", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(orchestrator_module, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(
+        orchestrator_module, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator_module, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator_module, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator_module, "publish_round_readiness", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        orchestrator_module, "dispatch_final_qualification",
+        lambda *_a, **kwargs: dispatches.append(kwargs),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "wait_for_final_qualification",
+        lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(orchestrator_module, "prepare_v2_merge", lambda *_a, **_k: None)
+    monkeypatch.setattr(orchestrator_module, "merge_pr", lambda *_a, **_k: None)
+
+    if reject:
+        with pytest.raises(AgentLoopError) as rejected:
+            run_issue_loop(runner, issue_number=56, config=config)
+        notes = [
+            comment["body"] for comment in runner.pr_payload.get("comments", [])
+            if "Coder-turn CI dispatch audit" in comment["body"]
+        ]
+        assert len(notes) == 1
+        assert "run 4242 on `abc123`" in notes[0]
+        assert "non-authoritative diagnostic, not qualification" in notes[0]
+        assert "coder response for this turn was rejected" in notes[0]
+        assert "Coder-turn" not in str(rejected.value)
+        assert dispatches == []
+        assert [attempt.returncode for attempt in runner.attempts] == [3]
+        assert not record.exists()
+        return
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+
+    # The guard refused the coder's gh trigger; the real gh was never reached.
+    assert [attempt.returncode for attempt in runner.attempts] == [3]
+    assert not record.exists()
+    coder_env = next(env for name, env in runner.launch_envs if name == "claude")
+    assert coder_env["AGENT_LOOP_CODER_CI_DISPATCH_GUARD"] == "managed"
+    assert not any(
+        "AGENT_LOOP_CODER_GUARD_DIR" in env for name, env in runner.launch_envs if name == "codex"
+    )
+    coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "This pull request uses managed CI." in coder_prompt
+    # The bypass run on the reserved branch is reported once, as a diagnostic.
+    assert any("branch=agent-loop%2Fmanaged-56" in query for query in runner.audit_queries)
+    bodies = [comment["body"] for comment in runner.pr_payload.get("comments", [])]
+    noted = [body for body in bodies if "run 4242 on `abc123`" in body]
+    assert len(noted) == 1
+    assert "non-authoritative diagnostic, not qualification" in noted[0]
+    # Never qualification: the orchestrator's exact-head dispatch still runs once.
+    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]

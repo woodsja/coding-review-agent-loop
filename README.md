@@ -128,6 +128,16 @@ as for a ready/unlabeled PR. If a qualified PR is converted back to draft and
 pushed by hand, the label suppresses ordinary CI for that push. Remove the label
 to restore it.
 
+While a managed draft waits for review, coder and format-repair turns cannot
+dispatch ordinary CI themselves. Their prompts say that a skipped
+`pull_request` check is expected. A per-turn `gh` guard refuses
+`gh workflow run`, `gh run rerun`, and `gh api` dispatch or rerun POSTs. A
+post-turn audit reports any bypass as a non-authoritative diagnostic. To get
+early CI as an operator, run `gh workflow run ci.yml --ref <branch>` from your
+own shell. agent-loop reports that run as an excluded ad hoc diagnostic and
+never as final qualification. See
+[Coder turns cannot dispatch CI before approval](docs/local_agent_loop.md#coder-turns-cannot-dispatch-ci-before-approval-1366).
+
 After the workflow change is merged, the sole-maintainer rollout is ordered:
 
 1. Set the repository Actions variable to the trusted actor:

@@ -125,7 +125,7 @@ Source paths below are relative to
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier, which tolerates exactly one known host comment footer (#1043). |
 | Workflow transaction model (#827, stage A) | `workflow_transaction.py` | Typed transition intent whose canonical hash is the transaction ID; append-only prepared/terminal transaction record codec (PR-comment-only); version-2 handoff and PR contract derivation; lineage, era, approved-plan anchor, scheduler-checkpoint, and legacy-root resolvers. Every resolver accepts only the author-authenticated comment view read by `github.read_authenticated_protocol_comments`. Model only: no writer emits these records and no orchestration call site consumes them yet; the version-1 reader entry points are unchanged and still reject version 2. |
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
-| CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
+| CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py`, `coder_ci_guard.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. `coder_ci_guard.py` is the turn-scoped `gh` guard that stops managed-CI coder and repair turns from dispatching CI before approval (#1366). |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
 | Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. `test_runtime.run_exit_code_probe` bounds every interpreter probe and tears down its process tree on every exit path; `run-tests` prints a pre-launch foreground-budget notice (suppressed only by the orchestrator-authored `AGENT_LOOP_SHELL_CAP_MS`), a pre-admission missing-xdist advisory for module launches and a timeout advisory, none of which is evidence. |
 
@@ -1328,6 +1328,31 @@ A head advance carrying none of an ordered blocking-review/coder pair, the
 merge-conflict obligation, a CI obligation bound to exactly that transition, or
 the exact rejected-coder recovery chain still fails closed, and every reviewer must still approve the exact final head
 before qualification or merge.
+
+Coder and format-repair turns on a managed PR cannot dispatch CI before
+approval (#1366). `pr_loop.py` evaluates `managed_ci_active` once per coder
+turn. Issue and approved-plan implementation use the managed creation intent
+instead. That boolean travels as `coder_ci_dispatch_guard` on a
+`dataclasses.replace`d config that is passed only to the coder prompt builder
+and the coder `_run_validated_agent` call. Retries, format repair and the semantic-evidence correction
+inherit it, and reviewers never see it. The same flag emits the prompt guidance and
+installs `coder_ci_guard.py`'s `gh` guard. Every coder or repair launch site
+calls `coder_ci_guard_environment`: the four backends, `run_cli_repair`, and the
+Gemini repair subprocess. The guard refuses `gh workflow run`, `gh run rerun`,
+and dispatch/rerun POSTs. It `exec`s everything else through
+`AGENT_LOOP_CODER_GUARD_TARGET_GH` with its own directory removed from `PATH`,
+and preserves the REST shim's `AGENT_LOOP_REAL_GH`. After the turn,
+`github.audit_coder_turn_dispatches` lists `workflow_dispatch` runs on the PR
+branch created since the turn started, and every known head, so intermediate
+heads are covered. Any non-managed run it finds is prepended to the coder
+comment as a non-authoritative diagnostic. The audit runs after the turn's
+last coder continuation. On a rejected guarded turn,
+`publish_rejected_coder_turn_dispatch_audit` posts the note on its own and
+never masks the rejection. The classifier decodes arguments with one
+pflag-style tokenizer, so grouped and equals shorthands cannot slip past
+it. Gating keeps excluding such runs as
+ad hoc diagnostics, and the workflow and its `unlabeled` recovery are
+unchanged.
 
 ## State and Recovery
 

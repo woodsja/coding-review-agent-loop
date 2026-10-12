@@ -18,6 +18,7 @@ from .base import (
 )
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
+from ..coder_ci_guard import coder_ci_guard_environment
 from ..test_runtime import agent_shell_environment
 from ..usage import UsageMetadata, coerce_int, first_present
 from ..workdir_guard import (
@@ -292,6 +293,8 @@ class ClaudeBackend:
                 # foreground lifetime; every role: the shell-cap fact (#1343).
                 **agent_shell_environment(config, "claude", role),
                 **role_permission_env(config, "claude", role),
+                # Managed-CI coder/repair turns: refuse CI-triggering gh (#1366).
+                **coder_ci_guard_environment(config, "claude", role),
             },
             input_text=input_text,
             timeout_seconds=timeout_seconds,

@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+import datetime
 import sys
 from dataclasses import replace as dataclasses_replace
 from .agents.registry import agent_display_name
@@ -31,6 +32,8 @@ from .expected_closure import (
     resolve_issue_contract,
 )
 from .github import (
+    coder_turn_dispatch_audit_note,
+    publish_rejected_coder_turn_dispatch_audit,
     deduplicate_human_requirements,
     get_issue_context,
     get_pr_review_context,
@@ -818,6 +821,11 @@ def run_issue_loop(
             )
             if managed_ci_creation_intent is not None and managed_ci_creation_intent.audit_nonce:
                 _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
+        # The creation intent is this turn's managed decision: it drives the
+        # coder prompt guidance and the gh CI-dispatch guard together (#1366).
+        coder_config = dataclasses_replace(
+            config, coder_ci_dispatch_guard=managed_ci_creation_intent is not None
+        )
         assigned_head_before = _read_assigned_workdir_head(runner, config)
         salvage_summary = latest_salvage_context(
             config.log_dir,
@@ -826,13 +834,14 @@ def run_issue_loop(
             issue_number=issue_number,
             scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
         )
+        coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
         coder_response = _run_validated_agent(
             runner,
             agent=config.coder,
-            config=config,
+            config=coder_config,
             prompt=build_issue_prompt(
                 issue_number,
-                config,
+                coder_config,
                 memory,
                 issue_context=issue_context,
                 salvage_summary=salvage_summary,
@@ -940,130 +949,166 @@ def run_issue_loop(
         log(config, f"{agent_display_name(config.coder)} reported PR #{pr_number}; validating it is open")
         validate_open_pr(runner, config=config, pr_number=pr_number)
         initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
-        managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
-        if managed_ci_creation_intent is not None:
-            managed_ci_handoff = authenticate_issue_created_handoff(
-                runner,
-                config=config,
-                intent=managed_ci_creation_intent,
-                issue_number=issue_number,
-                pr_number=pr_number,
-                metadata=initial_pr_context.metadata,
-            )
-            if managed_ci_handoff.override_nonce is not None:
-                config = dataclasses_replace(
-                    config,
-                    managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
+        # Once the managed draft is authenticated, a rejection of this turn
+        # (for example a failed report validation or a checkout failure during
+        # semantic correction) still publishes the dispatch audit (#1366).
+        managed_pr_authenticated = False
+        try:
+            managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
+            if managed_ci_creation_intent is not None:
+                managed_ci_handoff = authenticate_issue_created_handoff(
+                    runner,
+                    config=config,
+                    intent=managed_ci_creation_intent,
+                    issue_number=issue_number,
+                    pr_number=pr_number,
+                    metadata=initial_pr_context.metadata,
                 )
-            managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                managed_pr_authenticated = True
+                if managed_ci_handoff.override_nonce is not None:
+                    config = dataclasses_replace(
+                        config,
+                        managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
+                    )
+                managed_ci_handoff = _publish_issue_authorization_with_recovery(
+                    runner,
+                    config=config,
+                    handoff=managed_ci_handoff,
+                    metadata=initial_pr_context.metadata,
+                    issue_number=issue_number,
+                )
+            else:
+                reject_forged_protocol_markers(
+                    initial_pr_context.metadata.body or "",
+                    surface=f"pull-request #{pr_number} body",
+                )
+            if isinstance(implementation_result, StructuredIssueImplementation):
+                implementation_result = _validate_structured_response_tests_with_post_pr_context(
+                    implementation_result,
+                    runner=runner,
+                    config=config,
+                    pr_number=pr_number,
+                )
+                _validate_structured_response_observations_with_post_pr_context(
+                    implementation_result.test_observations,
+                    runner=runner,
+                    config=config,
+                    pr_number=pr_number,
+                )
+            initial_pr_metadata = initial_pr_context.metadata
+            validate_pr_references_issue(
                 runner,
                 config=config,
-                handoff=managed_ci_handoff,
-                metadata=initial_pr_context.metadata,
+                pr_number=pr_number,
                 issue_number=issue_number,
+                staged_parent_issue=staged_parent_issue,
+                body=initial_pr_metadata.body,
             )
-        else:
-            reject_forged_protocol_markers(
-                initial_pr_context.metadata.body or "",
-                surface=f"pull-request #{pr_number} body",
-            )
-        if isinstance(implementation_result, StructuredIssueImplementation):
-            implementation_result = _validate_structured_response_tests_with_post_pr_context(
-                implementation_result,
-                runner=runner,
+            validate_pr_expected_closing_issues(
+                runner,
                 config=config,
                 pr_number=pr_number,
+                expected_issue_ids=closing_contract.issue_ids,
+                body=initial_pr_metadata.body,
             )
-            _validate_structured_response_observations_with_post_pr_context(
-                implementation_result.test_observations,
-                runner=runner,
+            _advisory_issue_pr_provenance(
+                runner,
                 config=config,
                 pr_number=pr_number,
+                expected_scope=IssuePrProvenanceScope(
+                    repository=config.repo,
+                    issue_number=issue_number,
+                    flow="direct",
+                ),
             )
-        initial_pr_metadata = initial_pr_context.metadata
-        validate_pr_references_issue(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            issue_number=issue_number,
-            staged_parent_issue=staged_parent_issue,
-            body=initial_pr_metadata.body,
-        )
-        validate_pr_expected_closing_issues(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            expected_issue_ids=closing_contract.issue_ids,
-            body=initial_pr_metadata.body,
-        )
-        _advisory_issue_pr_provenance(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            expected_scope=IssuePrProvenanceScope(
+            initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
+            pr_contract = make_pr_contract(
                 repository=config.repo,
-                issue_number=issue_number,
-                flow="direct",
-            ),
-        )
-        initial_pr_url, initial_pr_head_sha = require_pr_metadata_for_handoff(initial_pr_metadata)
-        pr_contract = make_pr_contract(
-            repository=config.repo,
-            pr_number=pr_number,
-            origin_flow="issue-implementation",
-            primary_issue_number=issue_number,
-            expected_closing_issue_ids=closing_contract.issue_ids,
-        )
-        post_trusted_pr_contract_record(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            body=TrustedBody.canonical(
-                format_pr_contract_comment(pr_contract),
-                expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
-            ),
-        )
-        post_issue_pr_handoff_comment(
-            runner,
-            config=config,
-            issue_number=issue_number,
-            pr_number=pr_number,
-            pr_url=initial_pr_url,
-            pr_head_sha=initial_pr_head_sha,
-            flow="issue-implementation",
-            plan_hash=None,
-            expected_closing_issue_ids=closing_contract.issue_ids,
-        )
-        implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
-            implementation_result,
-            approved_plan_context=None,
-            runner=runner,
-            assigned_workdir=active_workdir(config),
-            head_sha=initial_pr_metadata.head_sha,
-            config=config,
-            session_id=coder_response.session_id,
-            invocation_id=coder_response.acquisition_test_turn_id,
-            _closed_execution_catalog=coder_response.acquisition_test_observations,
-            _journal_observations=coder_response.acquisition_test_observations,
-            reauthenticate_head=lambda: get_pr_review_context(
-                runner, config=config, pr_number=pr_number
-            ).metadata.head_sha,
-        )
-        initial_local_test_evidence = runner.render_local_test_evidence(
-            current_head=initial_pr_metadata.head_sha,
-            legacy_tests_run=implementation_result.tests_run,
-            cwd=active_workdir(config),
-        )
-        initial_coder_body = _attach_round_metadata(
-            render_public_agent_comment(
-                kind="issue_implementation",
-                parsed=implementation_result,
-                agent=config.coder,
+                pr_number=pr_number,
+                origin_flow="issue-implementation",
+                primary_issue_number=issue_number,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+            )
+            post_trusted_pr_contract_record(
+                runner,
                 config=config,
-                model_used=coder_response.model_used,
-                local_test_evidence=initial_local_test_evidence,
-                current_test_turn_id=coder_response.acquisition_test_turn_id,
-            ),
+                pr_number=pr_number,
+                body=TrustedBody.canonical(
+                    format_pr_contract_comment(pr_contract),
+                    expected_tokens=("AGENT_PR_EXPECTED_CLOSING_ISSUES",),
+                ),
+            )
+            post_issue_pr_handoff_comment(
+                runner,
+                config=config,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                pr_url=initial_pr_url,
+                pr_head_sha=initial_pr_head_sha,
+                flow="issue-implementation",
+                plan_hash=None,
+                expected_closing_issue_ids=closing_contract.issue_ids,
+            )
+            implementation_result, _initial_derived_risk_evidence = _derive_authenticated_risk_evidence_for_coder(
+                implementation_result,
+                approved_plan_context=None,
+                runner=runner,
+                assigned_workdir=active_workdir(config),
+                head_sha=initial_pr_metadata.head_sha,
+                # A semantic correction resumes this coder turn, so it carries
+                # the same guard (#1366).
+                config=dataclasses_replace(
+                    config, coder_ci_dispatch_guard=managed_ci_creation_intent is not None
+                ),
+                session_id=coder_response.session_id,
+                invocation_id=coder_response.acquisition_test_turn_id,
+                _closed_execution_catalog=coder_response.acquisition_test_observations,
+                _journal_observations=coder_response.acquisition_test_observations,
+                reauthenticate_head=lambda: get_pr_review_context(
+                    runner, config=config, pr_number=pr_number
+                ).metadata.head_sha,
+            )
+            initial_local_test_evidence = runner.render_local_test_evidence(
+                current_head=initial_pr_metadata.head_sha,
+                legacy_tests_run=implementation_result.tests_run,
+                cwd=active_workdir(config),
+            )
+        except AgentLoopError:
+            if managed_pr_authenticated and managed_ci_creation_intent is not None:
+                publish_rejected_coder_turn_dispatch_audit(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    branch=managed_ci_creation_intent.branch,
+                    head_shas=(initial_pr_context.metadata.head_sha,),
+                    turn_started_at=coder_turn_started_at,
+                )
+            raise
+        coder_dispatch_audit_note = ""
+        if managed_ci_creation_intent is not None:
+            # Audit after the created PR is authenticated and after the turn's
+            # last coder continuation (semantic correction): the reserved
+            # branch and turn start bound discovery (#1366).
+            coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
+                runner,
+                config,
+                branch=managed_ci_creation_intent.branch,
+                head_shas=(initial_pr_context.metadata.head_sha, initial_pr_metadata.head_sha),
+                turn_started_at=coder_turn_started_at,
+            )
+        initial_coder_public = render_public_agent_comment(
+            kind="issue_implementation",
+            parsed=implementation_result,
+            agent=config.coder,
+            config=config,
+            model_used=coder_response.model_used,
+            local_test_evidence=initial_local_test_evidence,
+            current_test_turn_id=coder_response.acquisition_test_turn_id,
+        )
+        if coder_dispatch_audit_note:
+            initial_coder_public = f"{coder_dispatch_audit_note}\n\n{initial_coder_public}"
+        initial_coder_body = _attach_round_metadata(
+            initial_coder_public,
             PostedRoundMetadata(
                 flow="pr",
                 role="coder",

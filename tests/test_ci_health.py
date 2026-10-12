@@ -973,3 +973,25 @@ def test_default_listing_conflict_is_noted_when_history_falls_back(tmp_path):
     )
     assert any("different dispatch run" in n for n in checks.exclusion_notes)
     assert any("non-authoritative" in n for n in checks.exclusion_notes)
+
+
+def test_operator_early_ci_dispatch_stays_diagnostic_and_never_qualifies(tmp_path):
+    """#1366: a human's empty-input dispatch of the ordinary workflow on an
+    active managed draft is an ad hoc diagnostic, never final qualification."""
+    from coding_review_agent_loop.checks import _pr_check_details
+
+    early = _cr(3, "ci", "success", suite=SUITE_DISPATCH, run=7000)
+    checks, _ = _fetch(
+        tmp_path,
+        check_runs_payload=_listing(early),
+        branch_protection_payload={"contexts": ["ci"]},
+        dispatch_payload=_dispatch(name="CI"),
+        history_stdout=_history(early),
+    )
+    assert [c.name for c in checks.excluded] == ["ci"]
+    assert not checks.passing
+    assert checks.missing_required == ("ci",)
+    assert checks.state != "passing"
+    details = "\n".join(_pr_check_details(checks))
+    assert "Excluded ad hoc workflow_dispatch checks (operator diagnostics, not PR checks)" in details
+    assert "7000" in details

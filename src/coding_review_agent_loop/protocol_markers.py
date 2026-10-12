@@ -475,6 +475,10 @@ EXCLUDED_PROTOCOL_LITERALS = frozenset(
         "AGENT_LOOP_WORKER_RESERVATION",
         "AGENT_LOOP_GH_TRANSPORT",
         "AGENT_LOOP_REAL_GH",
+        # Coder-turn CI-dispatch guard environment (#1366).
+        "AGENT_LOOP_CODER_CI_DISPATCH_GUARD",
+        "AGENT_LOOP_CODER_GUARD_TARGET_GH",
+        "AGENT_LOOP_CODER_GUARD_DIR",
         "AGENT_STATE",
         "AGENT_PLAN_STATE",
         "AGENT_PR",

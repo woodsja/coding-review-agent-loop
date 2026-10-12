@@ -19,6 +19,7 @@ from .base import (
 )
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
+from ..coder_ci_guard import coder_ci_guard_environment
 from ..test_runtime import agent_shell_environment
 from ..usage import UsageMetadata, coerce_int, first_present
 
@@ -361,6 +362,8 @@ class CodexBackend:
             ),
             **agent_shell_environment(config, "codex", role),
             **role_permission_env(config, "codex", role),
+            # Managed-CI coder/repair turns: refuse CI-triggering gh (#1366).
+            **coder_ci_guard_environment(config, "codex", role),
         }
         # Always deliver the prompt on stdin via `codex exec -` (#870): argv is
         # capped per argument by exec and is visible to every local user
