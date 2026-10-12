@@ -7758,7 +7758,8 @@ def run_pr_loop(
                             + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
-            # A clustered sibling after a step-back stops for a human decision
+            # A clustered sibling after a step-back, or the same items blocking across
+            # K code-changing coder turns (#1372), stops for a human decision
             # here, before the round-limit exit and any coder invocation; K clustered blocks otherwise
             # turn this follow-up into one generalize-the-class step-back turn.
             step_back_decision = _pr_step_back_decision(
@@ -7769,7 +7770,18 @@ def run_pr_loop(
                 snapshot_comments=pr_comments,
                 tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
                 head_sha=pr_metadata.head_sha,
+                base_branch=pr_metadata.base_branch or config.base,
+                approved_plan_context=approved_plan_context,
             )
+            # A deferred non-convergence stop (#1372) waits for the evidence-stall
+            # decision below; on paths where that decision is not evaluated (the
+            # final allowed round, a merge-conflict round) it stops here instead.
+            deferred_non_convergence = step_back_decision.deferred_stop
+            if deferred_non_convergence and (
+                round_number == allowed_rounds
+                or any(item.item_id == MERGE_CONFLICT_ITEM_ID for item in unresolved_items)
+            ):
+                raise HumanDecisionRequiredError(deferred_non_convergence)
             if round_number == allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -7896,6 +7908,10 @@ def run_pr_loop(
                     pr_checks=pr_checks,
                 )
             )
+            if deferred_non_convergence:
+                # The evidence stall did not stop at this dispatch, so it cannot own
+                # the window: the non-convergence stop fires before any coder turn.
+                raise HumanDecisionRequiredError(deferred_non_convergence)
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)

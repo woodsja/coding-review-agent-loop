@@ -1051,6 +1051,18 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--pr-non-convergence-rounds",
+            type=int,
+            default=None,
+            metavar="K",
+            help=(
+                "In the PR fix loop, stop for a human decision (exit 4) before the next "
+                "coder turn once the same tracked-reviewer items stayed blocking across K "
+                "consecutive coder turns that each changed the head, wherever the findings "
+                "are (default: 3; 0 disables). Independent of --pr-step-back-rounds."
+            ),
+        )
+        subparser.add_argument(
             "--plan-reset-stall-streak",
             dest="plan_reset_stall_streak",
             action="store_true",

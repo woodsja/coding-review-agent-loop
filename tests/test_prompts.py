@@ -5100,6 +5100,24 @@ def test_review_prompt_explains_human_only_exact_head_evidence_requests(tmp_path
         assert "Do not re-emit a request you just resolved" in normalized
 
 
+def test_pr_review_prompts_route_unattainable_evidence_to_exact_head_requests(tmp_path):
+    # #1372: evidence no agent session or runner can produce is human-only.
+    config = make_config(tmp_path)
+    for prompt in (
+        build_review_prompt(77, 1, config, reviewer="codex"),
+        build_review_prompt(77, 1, config, reviewer="codex", compact_context=True),
+    ):
+        normalized = " ".join(prompt.split())
+        assert (
+            "Evidence that no available agent session or configured CI runner can produce"
+            in normalized
+        )
+        assert (
+            "is human-only: put it only in `exact_head_evidence_requests`, never in "
+            "`blocking_items` and never folded into a code-fix request" in normalized
+        )
+
+
 def _trust_requirement(verification):
     return HumanReviewRequirement(
         source_type="PR comment",

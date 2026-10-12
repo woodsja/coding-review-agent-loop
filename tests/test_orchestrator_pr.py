@@ -21009,3 +21009,300 @@ def test_m1390_approval_recovery_and_strict_qualification_read_the_current_scope
             runner, config=config, issue_context=forged_issue, comments=forged_comments,
             trusted_actor=forged_actor, error_message="not approved",
         )
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop non-convergence stop (#1372)
+# ---------------------------------------------------------------------------
+
+NC_A_TEXT = "race: a same-UID attacker swaps the config at src/secure_git.py:10"
+NC_B_TEXT = "race: the worktree path is reused at src/run_worktrees.py:900"
+NC_MERGE_BASE = "e" * 40
+
+
+class _NonConvergenceRunner(_StepBackRunner):
+    """Step-back runner with scripted ``git diff --shortstat`` and ``git merge-base``."""
+
+    def __init__(
+        self, *, shortstat=" 3 files changed, 120 insertions(+), 4 deletions(-)\n",
+        git_returncode=0, git_error=None, **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.shortstat = shortstat
+        self.git_returncode = git_returncode
+        self.git_error = git_error
+        self.measurement_calls = []
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(arg) for arg in args]
+        shortstat = cmd[:3] == ["git", "diff", "--shortstat"]
+        # Only the measurement's ``origin/<base>`` lookup is scripted; the plain-base
+        # fallback and unrelated merge-base calls keep the fake's empty default.
+        merge_base = cmd[:2] == ["git", "merge-base"] and cmd[2:3] == ["origin/main"]
+        if shortstat or merge_base:
+            self.measurement_calls.append(cmd)
+            if self.git_error is not None:
+                raise self.git_error
+            cmd, cwd_path = self._record_command(cmd, cwd)
+            stdout = self.shortstat if shortstat else f"{NC_MERGE_BASE}\n"
+            return CommandResult(cmd, cwd_path, stdout, "", self.git_returncode)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _nc_reviews(rounds=4, *, review=_sb_review):
+    return [review([NC_A_TEXT, NC_B_TEXT])] + [
+        review(carried=["item-1", "item-2"]) for _ in range(rounds - 1)
+    ]
+
+
+def _nc_coders(count=3):
+    return [structured_coder_followup(addressed_items=["item-1", "item-2"]) for _ in range(count)]
+
+
+def _nc_records(runner, config):
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    return _extract_round_metadata_records(
+        get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+    )
+
+
+def _nc_stop(runner, config):
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    return str(excinfo.value)
+
+
+def test_items_persisting_across_files_stop_before_a_fourth_coder_turn(tmp_path):
+    """`nc-persist-spread`, `nc-production-numbering`."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    config = _sb_config(tmp_path)
+    message = _nc_stop(runner, config)
+    assert "human decision required: Codex kept the same item(s) blocking across 3" in message
+    assert "not converging" in message and "No further coder turn was invoked" in message
+    assert f"[item-1] (attempts: 3) {NC_A_TEXT}" in message
+    assert f"[item-2] (attempts: 3) {NC_B_TEXT}" in message
+    assert "reviews at rounds 1-4" in message
+    assert "3 files changed, 120 insertions(+), 4 deletions(-)" in message
+    assert "unavailable" not in message
+    assert "`--pr-non-convergence-rounds 0`" in message
+    assert len(_sb_coder_prompts(runner)) == 3  # no fourth coder turn
+    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner))
+    records = _nc_records(runner, config)
+    assert [r.metadata.round_number for r in records if r.metadata.role == "reviewer"] == [1, 2, 3, 4]
+    coder_records = [r for r in records if r.metadata.role == "coder"]
+    # Production numbering: review r is followed by coder record r+1.
+    assert [r.metadata.round_number for r in coder_records] == [2, 3, 4]
+    assert not any(r.metadata.step_back_entries for r in coder_records)
+    # The growth is measured from the first reviewed head, the size from the merge base.
+    diffs = [c for c in runner.measurement_calls if c[:3] == ["git", "diff", "--shortstat"]]
+    assert diffs[0][3] == SB_HEAD and diffs[-1][3] == NC_MERGE_BASE
+
+
+def test_the_live_dispatch_snapshot_lacks_the_newest_coder_record_and_still_stops(
+    tmp_path, monkeypatch
+):
+    """`nc-live-snapshot`: the pre-check passes on the snapshot's reviews alone."""
+    import coding_review_agent_loop.pr_loop_support as support
+
+    seen = []
+    original = support._pr_step_back_records_may_matter
+
+    def spy(records, tracked, **kwargs):
+        result = original(records, tracked, **kwargs)
+        seen.append(
+            (
+                kwargs["round_number"],
+                sorted(r.metadata.round_number for r in records if r.metadata.role == "coder"),
+                result,
+            )
+        )
+        return result
+
+    monkeypatch.setattr(support, "_pr_step_back_records_may_matter", spy)
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    _nc_stop(runner, _sb_config(tmp_path, pr_step_back_rounds=0))
+    round_four = [entry for entry in seen if entry[0] == 4]
+    assert round_four and round_four[-1][2] is True
+    assert 4 not in round_four[-1][1]  # coder record 4 was posted after the snapshot
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_a_rerun_after_the_stop_stops_again_with_identical_text_and_no_new_state(tmp_path):
+    """`nc-resume`."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    config = _sb_config(tmp_path)
+    first = _nc_stop(runner, config)
+    comments_before = len(_nc_records(runner, config))
+    second = _nc_stop(runner, config)
+    assert second == first
+    assert len(_nc_records(runner, config)) == comments_before
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_resume_after_an_interrupted_kth_review_reaches_the_same_stop(tmp_path):
+    """`nc-resume`: the run is interrupted before the K-th review, then rerun."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews(3))
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_sb_coder_prompts(runner)) == 3
+    runner.codex_outputs.extend(_nc_reviews(4)[3:])
+    resumed = _nc_stop(runner, config)
+    live_runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    live = _nc_stop(live_runner, _sb_config(tmp_path / "live"))
+    assert resumed == live
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_disabling_step_back_keeps_the_non_convergence_stop(tmp_path):
+    """`nc-flag-independence`."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    message = _nc_stop(runner, _sb_config(tmp_path, pr_step_back_rounds=0))
+    assert "not converging" in message
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_disabling_non_convergence_restores_the_prior_behaviour(tmp_path):
+    """`nc-flag-independence`: the loop keeps dispatching the coder."""
+    runner = _NonConvergenceRunner(
+        claude_outputs=_nc_coders(4),
+        codex_outputs=[*_nc_reviews(), _sb_review(resolved=["item-1", "item-2"])],
+    )
+    config = _sb_config(tmp_path, pr_non_convergence_rounds=0)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_sb_coder_prompts(runner)) == 4
+    assert not runner.measurement_calls
+
+
+def test_non_convergence_stops_under_review_parallel(tmp_path):
+    """`nc-review-parallel`: publication records resolve through reconciliation."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    config = _sb_config(tmp_path, review_parallel=True)
+    message = _nc_stop(runner, config)
+    assert "[item-1] (attempts: 3)" in message and "[item-2] (attempts: 3)" in message
+    assert any(
+        r.metadata.phase == "publication" for r in _nc_records(runner, config)
+        if r.metadata.role == "reviewer"
+    )
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_primary_then_panel_tracks_only_the_primary(tmp_path):
+    """`nc-primary-then-panel`: the paused panel is not needed to trigger."""
+    runner = _NonConvergenceRunner(
+        claude_outputs=_nc_coders(),
+        codex_outputs=_nc_reviews(),
+        gemini_outputs=[_gemini_review(resolved=["item-1", "item-2"])],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=8,
+        pr_review_policy="primary-then-panel", primary_reviewer="codex",
+    )
+    message = _nc_stop(runner, config)
+    assert "Codex kept the same item(s) blocking" in message
+    assert not _sb_gemini_prompts(runner)
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_non_convergence_wins_over_a_fresh_clustered_step_back(tmp_path):
+    """`nc-precedence`: both qualify at round 3; no step-back entry is recorded."""
+    runner = _NonConvergenceRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-1", "item-2"]),
+        ],
+        codex_outputs=[
+            _sb_review(["gap one at src/spool.py:124-131"]),
+            _sb_review(["gap two at src/spool.py:131-136"], carried=["item-1"]),
+            _sb_review(["gap three at src/spool.py:140"], carried=["item-1", "item-2"]),
+        ],
+    )
+    config = _sb_config(tmp_path, pr_non_convergence_rounds=2)
+    message = _nc_stop(runner, config)
+    assert "[item-1] (attempts: 2)" in message and "item-3" not in message
+    assert len(_sb_coder_prompts(runner)) == 2
+    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner))
+    assert not any(
+        r.metadata.step_back_entries for r in _nc_records(runner, config)
+        if r.metadata.role == "coder"
+    )
+
+
+def test_a_clustered_sibling_escalation_stops_before_non_convergence(tmp_path):
+    """`nc-precedence`: a pending sibling escalation is reported first."""
+    runner = _NonConvergenceRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(["another branch at src/spool.py:134"], carried=["item-3"]),
+        ],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=1))
+    message = str(excinfo.value)
+    assert "still raised a new sibling finding" in message
+    assert "not converging" not in message
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+@pytest.mark.parametrize(
+    "runner_kwargs",
+    [
+        {"git_returncode": 128},
+        {"shortstat": "fatal: bad revision\n"},
+        {"git_error": OSError("git is missing")},
+        {"git_error": AgentLoopError("runner refused")},
+    ],
+    ids=["non-zero", "unparseable", "oserror", "agent-loop-error"],
+)
+def test_diff_measurement_failures_render_unavailable_and_still_stop(tmp_path, runner_kwargs):
+    """`nc-diff-failure`: the runner glue never raises a non-decision error."""
+    runner = _NonConvergenceRunner(
+        claude_outputs=_nc_coders(), codex_outputs=_nc_reviews(), **runner_kwargs
+    )
+    message = _nc_stop(runner, _sb_config(tmp_path))
+    assert "Diff growth since the first attempt" in message
+    growth = message.split("Diff growth since the first attempt", 1)[1].splitlines()[0]
+    size = message.split("Total PR size", 1)[1].splitlines()[0]
+    assert growth.endswith("unavailable") and size.endswith("unavailable")
+    assert runner.measurement_calls
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_diff_measurement_failure_through_the_dispatch_decision_directly(tmp_path):
+    """`nc-diff-failure`: drive ``_pr_step_back_decision`` with a failing runner."""
+    import coding_review_agent_loop.pr_loop_support as support
+    from coding_review_agent_loop.github import get_pr_review_context
+
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    config = _sb_config(tmp_path)
+    _nc_stop(runner, config)
+    comments = get_pr_review_context(runner, config=config, pr_number=77).comments
+    head = runner.pr_payload["headRefOid"]
+    for failure in ({"git_returncode": 1}, {"git_error": OSError("boom")}):
+        runner.git_returncode = failure.get("git_returncode", 0)
+        runner.git_error = failure.get("git_error")
+        with pytest.raises(HumanDecisionRequiredError) as excinfo:
+            support._pr_step_back_decision(
+                runner, config, pr_number=77, round_number=4, snapshot_comments=comments,
+                tracked=("Codex",), head_sha=head, base_branch="main",
+            )
+        assert str(excinfo.value).count("unavailable") == 2
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_enabling_the_gate_on_longer_history_measures_growth_from_the_first_attempt(tmp_path):
+    """The attempt scan reaches past K, and the growth baseline follows it."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(4), codex_outputs=_nc_reviews(5))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=0))
+    assert len(_sb_coder_prompts(runner)) == 5  # the fifth dispatch ran out of script
+    runner.measurement_calls.clear()
+    message = _nc_stop(runner, _sb_config(tmp_path, pr_non_convergence_rounds=3))
+    assert "[item-1] (attempts: 4)" in message and "reviews at rounds 1-5" in message
+    assert f"(`{SB_HEAD[:12]}` to" in message
+    growth = [c for c in runner.measurement_calls if c[:3] == ["git", "diff", "--shortstat"]][0]
+    assert growth[3] == SB_HEAD and growth[4] == runner.pr_payload["headRefOid"]
+    assert len(_sb_coder_prompts(runner)) == 5

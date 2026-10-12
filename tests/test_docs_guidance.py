@@ -1222,3 +1222,22 @@ def test_transport_smoke_workflow_is_optional_read_only_and_pinned():
     assert not re.search(r"(^|[\s;|&])gh\s", run) and "GH_TOKEN" not in text and "GITHUB_TOKEN" not in text
     # ci.yml's literal managed-CI gates are untouched by this optional job.
     assert "transport" not in (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
+def test_operator_docs_document_the_pr_non_convergence_stop():
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = (root / "ARCHITECTURE.md").read_text()
+
+    assert "#### PR non-convergence stop" in text
+    for document in (text, readme, architecture):
+        assert "--pr-non-convergence-rounds" in document
+        assert "default 3" in document
+    for term in ("**Precedence.**", "**Stop message.**", "**Unattainable evidence.**",
+                 "`exact_head_evidence_requests`", "or a larger K", "signed"):
+        assert term in text
+    assert "`exact_head_evidence_requests`" in readme
+    assert "find_pr_non_convergence" in architecture
