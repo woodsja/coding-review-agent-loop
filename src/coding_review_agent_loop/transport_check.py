@@ -124,9 +124,20 @@ def _isolated_output() -> Iterator[SimpleNamespace]:
     for stream in (old_stdout, old_stderr):
         with contextlib.suppress(Exception):
             stream.flush()
-    saved = (os.dup(1), os.dup(2))
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    sink = open(os.devnull, "w", encoding="utf-8")
+    opened: list[int] = []
+    try:
+        opened.append(os.dup(1))
+        opened.append(os.dup(2))
+        opened.append(os.open(os.devnull, os.O_WRONLY))
+        sink = open(os.devnull, "w", encoding="utf-8")
+    except BaseException:
+        # Nothing is redirected yet; release what was opened and let the
+        # caller report a fixed class.
+        for fd in opened:
+            os.close(fd)
+        git_transport._EMITTED_WARNINGS = original_warnings
+        raise
+    saved, devnull_fd = (opened[0], opened[1]), opened[2]
     try:
         os.dup2(devnull_fd, 1)
         os.dup2(devnull_fd, 2)
@@ -191,8 +202,19 @@ def _default_branch(repo: str, *, gh_cmd: str, runner: Any, cwd: Path) -> str:
 
 def _check(repo: str, *, base: str | None, protocol: str, ssh_identity_arg: Path | None,
            gh_cmd: str, runner: Any) -> str:
-    root = Path(tempfile.mkdtemp(prefix="agent-loop-transport-check-"))
+    """Every step runs inside a fixed-class boundary; nothing escapes."""
+    root: Path | None = None
     try:
+        try:
+            # Local setup (runner, private scratch directory) is part of the
+            # no-network configuration phase.
+            if runner is None:
+                from .runner import Runner
+
+                runner = Runner()
+            root = Path(tempfile.mkdtemp(prefix="agent-loop-transport-check-"))
+        except Exception:  # noqa: BLE001
+            return CONFIGURATION
         scratch = root / "repo"
         try:
             identity = _preflight(repo, base=base, protocol=protocol,
@@ -214,17 +236,14 @@ def _check(repo: str, *, base: str | None, protocol: str, ssh_identity_arg: Path
     except Exception:  # noqa: BLE001
         return UNCLASSIFIED
     finally:
-        shutil.rmtree(root, ignore_errors=True)
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def run_transport_check(repo: str, *, base: str | None = None, protocol: str = "https",
                         ssh_identity_arg: Path | None = None, gh_cmd: str = "gh",
                         runner: Any = None) -> tuple[str, bool]:
     """Run all phases with output silenced; return ``(class, warned)``."""
-    if runner is None:
-        from .runner import Runner
-
-        runner = Runner()
     with _isolated_output() as state:
         result = _check(repo, base=base, protocol=protocol, ssh_identity_arg=ssh_identity_arg,
                         gh_cmd=gh_cmd, runner=runner)
@@ -242,9 +261,12 @@ def main(argv: Sequence[str], *, runner: Any = None) -> int:
     except (_ArgumentError, argparse.ArgumentError):
         print(render(CONFIGURATION))
         return 1
-    result, warned = run_transport_check(
-        args.repo, base=args.base, protocol=args.trusted_origin_protocol,
-        ssh_identity_arg=args.git_ssh_identity, gh_cmd=args.gh_cmd, runner=runner,
-    )
+    try:
+        result, warned = run_transport_check(
+            args.repo, base=args.base, protocol=args.trusted_origin_protocol,
+            ssh_identity_arg=args.git_ssh_identity, gh_cmd=args.gh_cmd, runner=runner,
+        )
+    except Exception:  # noqa: BLE001 - e.g. output isolation could not be set up
+        result, warned = UNCLASSIFIED, False
     print(render(result, warned))
     return 0 if result == PASS else 1

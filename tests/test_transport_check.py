@@ -374,6 +374,47 @@ def test_other_subcommands_keep_argparse_behaviour(capfd):
     assert "transport-check" in cli.build_parser().format_help()
 
 
+@pytest.mark.parametrize("failure", ["mkdtemp", "runner", "output-isolation"])
+def test_local_setup_failures_print_only_a_fixed_class(env, monkeypatch, capfd, failure):
+    """No setup step runs outside a fixed-class boundary (review item-1)."""
+    _patch_import(monkeypatch, env)
+    original_set = git_transport._EMITTED_WARNINGS
+    fds_before = sorted(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+
+    def refuse(*_args, **_kwargs):
+        raise OSError(f"No space left on device: {env.tmp}/{SECRET}")
+
+    if failure == "mkdtemp":
+        monkeypatch.setattr(tempfile, "mkdtemp", refuse)
+        expected = "configuration"
+    elif failure == "runner":
+        from coding_review_agent_loop import runner as runner_module
+
+        monkeypatch.setattr(runner_module, "Runner", refuse)
+        expected = "configuration"
+    else:
+        class FailingDevnull:
+            def __getattr__(self, name):
+                return getattr(os, name)
+
+            @staticmethod
+            def open(path, flags, *args):
+                if path == os.devnull:
+                    refuse()
+                return os.open(path, flags, *args)
+
+        monkeypatch.setattr(transport_check, "os", FailingDevnull())
+        expected = "unclassified"
+    code, out, err = _run(capfd, "--repo", REPO)
+    assert code == 1
+    _assert_clean(env, out, err, f"transport-check: fail ({expected})")
+    assert str(env.tmp) not in out and "Traceback" not in out + err
+    assert env.calls == {"lookup": [], "import": []}
+    assert git_transport._EMITTED_WARNINGS is original_set
+    if fds_before is not None:
+        assert sorted(os.listdir("/proc/self/fd")) == fds_before
+
+
 # -- output silencing and warning-state isolation --------------------------
 
 
