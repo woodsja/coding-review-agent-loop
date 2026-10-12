@@ -80,31 +80,37 @@ def admitted_issue_comments(
 ) -> tuple[tuple[object, ...], tuple[str, int] | None]:
     """Issue comments with REST author identities, plus the actor, when plan links exist.
 
-    Plan board-change links are admitted only from the authenticated
-    orchestrator actor, so an issue carrying any plan link record needs both.
-    An incomplete REST read fails closed rather than reading as an empty
-    history.  Without plan link records nothing is read and no actor is needed.
+    Plan board-change links and planning-scope boundary records (#1390) are
+    admitted only from the authenticated orchestrator actor, so an issue
+    carrying either record needs both.  An incomplete REST read fails closed
+    rather than reading as an empty history.  Without such records nothing is
+    read and no actor is needed.
     """
     from .github import (
         _merge_transport_comments,
         read_rest_issue_comments,
         resolve_authenticated_github_actor,
     )
+    from .plan_issue_scope import comments_bear_scope_boundary
     from .pr_loop_support import _cached_trusted_actor
 
     comments = tuple(comments)
-    if not comments_bear_board_change_links(comments, surface=PLAN_SURFACE):
+    links = comments_bear_board_change_links(comments, surface=PLAN_SURFACE)
+    if not links and not comments_bear_scope_boundary(comments):
         return comments, None
+    records = (
+        "plan reviewer-board change records" if links else "planning-scope boundary records"
+    )
     if runner is None:
         raise AgentLoopError(
-            f"Issue #{issue_number} carries plan reviewer-board change records, but no "
+            f"Issue #{issue_number} carries {records}, but no "
             "authenticated GitHub read is available to admit them."
         )
     if getattr(config, "dry_run", False):
         actor = _cached_trusted_actor(runner)
         if actor is None:
             raise AgentLoopError(
-                f"Issue #{issue_number} carries plan reviewer-board change records, but the "
+                f"Issue #{issue_number} carries {records}, but the "
                 "authenticated GitHub actor is unavailable in dry-run mode, so they cannot be "
                 "admitted."
             )
@@ -116,7 +122,7 @@ def admitted_issue_comments(
             runner,  # type: ignore[arg-type]
             config=config,  # type: ignore[arg-type]
             issue_number=issue_number,
-            purpose="plan reviewer-board change records cannot be authenticated",
+            purpose=f"{records} cannot be authenticated",
             reject_empty_output=True,
         )
         merged = _merge_transport_comments(
@@ -306,16 +312,30 @@ def plan_floor_refusal_hint(
     return hint
 
 
-def plan_resume_round(comments: Sequence[object], config: object) -> int:
-    """The round a plan resume of ``comments`` re-enters under ``config``'s board."""
+def plan_resume_round(
+    comments: Sequence[object], config: object, *, min_round_number: int | None = None,
+    trusted_actor: tuple[str, int] | None = None,
+) -> int:
+    """The round a plan resume of ``comments`` re-enters under ``config``'s board.
+
+    ``min_round_number`` is the planning scope start (#1390); when omitted it
+    is derived from the admitted scope-boundary record.  A scope with no plan
+    round of its own re-enters at its start round.
+    """
     from .board_change import board_reentry_round
     from .config import reviewers
+    from .plan_issue_scope import resolve_plan_scope
     from .round_state import _resume_plan_round
 
-    resumed = _resume_plan_round(comments, configured_reviewers=reviewers(config))
-    return board_reentry_round(
+    if min_round_number is None:
+        min_round_number = resolve_plan_scope(comments, trusted_actor)
+    resumed = _resume_plan_round(
+        comments, configured_reviewers=reviewers(config), min_round_number=min_round_number,
+    )
+    reentry = board_reentry_round(
         comments,
         resumed[1].round_number if resumed is not None else None,
         signed_amendment=True,
         surface=PLAN_SURFACE,
     )
+    return reentry if resumed is not None else max(reentry, min_round_number)

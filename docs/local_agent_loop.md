@@ -3271,6 +3271,61 @@ the calls avoided by selective scheduling after same-head carries, recovery
 skips, and unavailable reviewers have been removed from eligibility, so the
 example does not double-count the paused approvals.
 
+### Edited issues during planning (#1390)
+
+A plan-first resume checks whether the issue title or body changed since the
+current plan was written. Every planner round record carries a digest of the
+normalized issue title and body it was planned against. Comments never count,
+so a new comment, including a signed human requirement, is not an edit: the
+plan resumes and the requirement is handled as before.
+
+When the issue was edited and the plan is not yet approved, the run logs:
+
+```text
+Planning issue #N: issue title/body changed since plan round R (recorded digest A, current digest B)
+```
+
+By default it then starts a fresh plan in a new planning scope:
+
+- It first checks the plan reviewer board floor at the new scope start, so a
+  refused board posts nothing.
+- It posts one orchestrator-authored planning-scope boundary comment that names
+  both digests, the archived round R and the new scope start round R+1.
+- It starts a fresh plan at round R+1, with no prior plan and no carried
+  findings. Round numbers keep increasing, so the earlier rounds and their board
+  history stay valid.
+- The `--max-rounds` budget restarts at the scope start. With `--max-rounds 5`
+  and a scope starting at round 4, planning stops after round 8.
+- The earlier plan and its reviews stay in the issue history, but they no longer
+  feed the planner or reviewer prompts. They also no longer feed resume, the
+  stall streak, step-back state, force-full replay or approval checks.
+  Reviewer-board changes and signed board amendments still apply.
+
+Only a boundary comment written by the authenticated orchestrator account
+counts. A lookalike from any other account is ignored and logged. If the run
+stops after posting the boundary but before the fresh plan is published, the
+next run reopens the same scope without posting a second boundary. An approved
+plan is never reopened by an edit, and neither is a plan already handed off for
+implementation: a signed child-plan supersession re-plans that plan in place.
+
+For a typo-level edit, pass `--plan-resume-keep-on-issue-edit` to keep the
+existing plan:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first --plan-resume-keep-on-issue-edit
+```
+
+The run still logs both digests, then logs `keeping the existing plan` and
+resumes the recorded round with its carried findings. The flag applies to that
+invocation only. Child planning and rendered recovery commands never carry it.
+The next planner record stores the new digest, so a later run without the flag
+does not see the edit again.
+
+Planning histories written before this release carry an issue digest only on
+`primary-then-panel` scheduler checkpoints. An all-reviewers history from before
+the upgrade has no recorded digest, so an edit to it cannot be detected; the
+run logs that and resumes as before.
+
 ### Staged issue plan review
 
 Issue plan review has its own scheduling policy, selected independently of
@@ -3399,7 +3454,11 @@ for any round whose planning history is degraded (`absent`, `invalid`, or
 `contradictory-key`), so the conservative primary-only fallback runs
 unchanged. The panel is never convened automatically. To continue:
 
-- edit the issue title or body to narrow it (#1112): each primary-phase
+- edit the issue title or body to narrow it. By default the next run starts a
+  fresh plan in a new planning scope (see
+  [Edited issues during planning](#edited-issues-during-planning-1390)), which
+  leaves the stalled rounds behind. Under `--plan-resume-keep-on-issue-edit` the
+  plan is kept and the streak rule of #1112 applies: each primary-phase
   scheduler checkpoint records a digest of the issue title and body the run
   loaded, and the count stops at the newest round whose digest differs from the
   current issue text, so rounds reviewed against earlier text stop counting.

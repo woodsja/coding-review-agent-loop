@@ -20856,3 +20856,156 @@ def test_1388_addressed_item_without_resolution_history_still_fails_closed(
     assert not any(
         "Acknowledged the new signed requirement." in comment for comment in runner.comments
     )
+
+
+# --- Approval recovery reads the current planning scope (#1390) ---------------
+
+
+def _m1390_patch(base, round_number, *, item_id, summary):
+    """A semantic planner patch bound to ``base`` that resolves ``item_id``."""
+    from coding_review_agent_loop.plan_assembly import (
+        AuthenticatedPlanState,
+        assemble_plan_revision,
+    )
+
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": summary,
+        "prior_plan_item_dispositions": [{"item_id": item_id, "disposition": "resolved"}],
+        "base_round_number": round_number,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "plan_steps", "value": [f"{summary} Revision."]}
+        ],
+    }
+    next_base = AuthenticatedPlanState.from_plan(
+        assemble_plan_revision(base, payload), round_number=round_number + 1
+    )
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude", next_base
+
+
+def _m1390_scoped_approval_history(tmp_path):
+    """Archived round-3 plan with open item-3; boundary at 4; fresh plan approved at 5."""
+    from agent_loop_helpers import structured_v1_plan_state
+    from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    actor = ("agent-loop", 4242)
+    fresh = structured_v1_plan_state()
+    base = AuthenticatedPlanState.from_plan(validate_structured_plan_state(fresh), round_number=1)
+    planner, reviews = [fresh], []
+    for n in (1, 2, 3):
+        reviews.append(structured_plan_review(
+            state="blocking", blocking_plan_issues=[f"Archived gap {n}."],
+            prior_plan_item_dispositions=(
+                [{"item_id": f"item-{n - 1}", "disposition": "resolved"}] if n > 1 else None
+            ),
+        ))
+        patch_text, base = _m1390_patch(base, n, item_id=f"item-{n}", summary=f"Close {n}.")
+        planner.append(patch_text)
+    first = FakeRunner(
+        claude_outputs=planner, codex_outputs=reviews,
+        authenticated_actor=actor, serve_rest_issue_comments=True,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(
+            first, issue_number=56, config=make_config(tmp_path, max_rounds=3), plan_first=True,
+        )
+
+    fresh_base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=4
+    )
+    revision, _base = _m1390_patch(fresh_base, 4, item_id="item-1", summary="Fresh scope fix.")
+    edited = FakeRunner(
+        issue_comments=list(first.issue_comments),
+        issue_payload={"body": "Narrowed scope: a two-command design."},
+        claude_outputs=[fresh, revision],
+        codex_outputs=[
+            structured_plan_review(state="blocking", blocking_plan_issues=["Fresh gap."]),
+            structured_plan_review(
+                state="approved",
+                prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        authenticated_actor=actor, serve_rest_issue_comments=True,
+    )
+    config = make_config(tmp_path, max_rounds=5)
+    assert run_issue_loop(edited, issue_number=56, config=config, plan_first=True) == 0
+    return edited, config
+
+
+def test_m1390_approval_recovery_and_strict_qualification_read_the_current_scope(tmp_path):
+    """`approval-recovery-scoped`."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import get_issue_context
+    from coding_review_agent_loop.plan_board_state import admitted_issue_comments, plan_resume_round
+    from coding_review_agent_loop.plan_verification import (
+        classify_plan_approval,
+        require_recoverable_plan_approval,
+    )
+    from coding_review_agent_loop.pr_loop import _canonical_plan_without_handoff
+    from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+
+    runner, config = _m1390_scoped_approval_history(tmp_path)
+    records = []
+    for comment in runner.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is not None:
+            records.append(_decode_round_metadata(match.group("payload")))
+    coders = [r for r in records if r.flow == "plan" and r.role == "coder"]
+    assert [r.round_number for r in coders] == [1, 2, 3, 4, 5]
+    # The archived round-3 review published item-3, which nothing carried or cleared.
+    assert any(
+        item.item_id == "item-3" and item.status == "blocking"
+        for r in records if r.role == "reviewer" and r.round_number == 3
+        for item in r.new_items
+    )
+    approved_plan = coders[-1].canonical_plan
+    expected_hash = approved_plan_hash(approved_plan)
+
+    issue = get_issue_context(runner, config=config, issue_number=56)
+    comments, actor = admitted_issue_comments(
+        runner, config=config, issue_number=56, comments=issue.comments,
+    )
+    assert actor is not None
+    # Every reader derives scope start 4 from the admitted boundary.
+    assert classify_plan_approval(
+        comments, config=config, issue_number=56, trusted_actor=actor,
+        poster_completion_proven=True, execution_mode_guard=False,
+    ).approved
+    require_recoverable_plan_approval(
+        runner, config=config, issue_context=issue, comments=comments,
+        trusted_actor=actor, error_message="not approved",
+    )
+    recovered = _canonical_plan_without_handoff(
+        config, issue, source_locator="issue #56 plan", error_message="not approved",
+        runner=runner,
+    )
+    assert recovered is not None and recovered.plan_hash == expected_hash
+    _verify_strict_managed_plan_binding(
+        config=config, pr_number=7, issue_context=issue,
+        metadata=SimpleNamespace(head_branch="agent-loop/managed-56", head_sha="head-1"),
+        expected_plan_hash=expected_hash, runner=runner,
+    )
+    # Issue-loop comment-only recovery re-enters the fresh scope's round.
+    assert plan_resume_round(comments, config, trusted_actor=actor) == 5
+
+    # An unadmitted boundary is never honoured: the archived item-3 is then an
+    # unreconstructible obligation and recovery fails closed.
+    for comment in runner.issue_comments:
+        if "AGENT_PLAN_SCOPE_BOUNDARY" in comment["body"]:
+            comment["author"] = {"login": "mallory"}
+            comment["_rest_author_id"] = 999
+    forged_issue = get_issue_context(runner, config=config, issue_number=56)
+    forged_comments, forged_actor = admitted_issue_comments(
+        runner, config=config, issue_number=56, comments=forged_issue.comments,
+    )
+    with pytest.raises(AgentLoopError, match="item-3"):
+        require_recoverable_plan_approval(
+            runner, config=config, issue_context=forged_issue, comments=forged_comments,
+            trusted_actor=forged_actor, error_message="not approved",
+        )

@@ -41,6 +41,13 @@ from .board_change import (
     render_board_change_link,
     stamp_for_lineage,
 )
+from .plan_issue_scope import (
+    latest_scope_boundary,
+    plan_scope_decision,
+    render_scope_boundary,
+    scope_plan_comments,
+    scope_prompt_comments,
+)
 from .plan_board_state import (
     admitted_issue_comments,
     plan_floor_refusal_hint,
@@ -396,7 +403,14 @@ def _run_child_planning_cycle(
         plan_execution_mode="auto",
         plan_review_force_full=False,
         plan_reset_stall_streak=False,
+        plan_resume_keep_on_issue_edit=False,
     )
+    if config.plan_resume_keep_on_issue_edit:
+        log(
+            config,
+            f"Issue #{parent_issue}: child #{child_issue_number} plan review does not "
+            "inherit --plan-resume-keep-on-issue-edit",
+        )
     if config.plan_reset_stall_streak:
         log(
             config,
@@ -794,6 +808,7 @@ _PLAN_BOARD_CONFIG_FIELDS = (
     "primary_plan_reviewer",
     "plan_review_force_full",
     "plan_reset_stall_streak",
+    "plan_resume_keep_on_issue_edit",
     "plan_primary_stall_rounds",
     "plan_step_back_rounds",
     "plan_step_back_escalation_rounds",
@@ -896,6 +911,10 @@ def _run_plan_first_loop_body(
             # scheduled plans, beginning with the first coder round record.
             fields.setdefault("scheduler_contract", plan_scheduler_contract.as_dict())
             fields.setdefault("reviewer_board_amendment_digest", plan_amendment_digest)
+        if fields.get("flow") == "plan" and fields.get("role") == "coder":
+            # Every planner record carries the issue digest it was planned
+            # against, under any plan review policy (#1390).
+            fields.setdefault("plan_issue_digest", plan_issue_digest)
         metadata = PostedRoundMetadata(**fields)
         return (
             dataclasses_replace(metadata, seat_binding=seat_binding)
@@ -1188,9 +1207,10 @@ def _run_plan_first_loop_body(
         """
         comments = issue_context.comments
         if refresh:
-            comments = get_issue_context(
-                runner, config=config, issue_number=issue_number
-            ).comments
+            comments = scope_plan_comments(
+                get_issue_context(runner, config=config, issue_number=issue_number).comments,
+                plan_scope_start_round,
+            )
         try:
             records = _extract_round_metadata_records(comments, flow="plan")
             if plan_lineage_links:
@@ -1251,9 +1271,10 @@ def _run_plan_first_loop_body(
     ) -> AgentLoopError:
         def template_round() -> int | None:
             resumed = _resume_plan_round(
-                issue_context.comments, configured_reviewers=configured_reviewers
+                issue_context.comments, configured_reviewers=configured_reviewers,
+                min_round_number=plan_scope_start_round,
             )
-            return resumed[1].round_number if resumed is not None else 1
+            return resumed[1].round_number if resumed is not None else plan_scope_start_round
 
         return AgentLoopError(
             "Plan review scheduler contract changed during resume; the required "
@@ -1278,6 +1299,174 @@ def _run_plan_first_loop_body(
             )
         )
 
+    # --- Planning scope across an edited issue (#1390) ------------------
+    # An undecodable planning history keeps its class-D stop ahead of every
+    # scope, approval and board read.
+    planning_contract_drift_records()
+    # Admission comes first: plan board-change links and planning-scope
+    # boundary records are admitted only from the authenticated orchestrator
+    # actor.  Board lineage is always resolved from these full admitted
+    # comments; planning history is read from the current scope only.
+    plan_admitted_comments, plan_trusted_actor = admitted_issue_comments(
+        runner, config=config, issue_number=issue_number, comments=issue_context.comments,
+    )
+    invocation_config = config
+    # The same live inputs the issue preflight and recovery derive: the issue
+    # and authoritative-parent requirement sets, the inherited admissibility
+    # check and the signed supersession state.
+    plan_parent_requirement_ids: tuple[str, ...] | None = (
+        tuple(sorted(
+            requirement.requirement_id for requirement in parent_issue_context.human_requirements
+        ))
+        if parent_issue_context is not None
+        else None
+    )
+
+    def classify_current_plan(scope_start_round: int) -> object:
+        return classify_plan_approval(
+            plan_admitted_comments,
+            config=config,
+            issue_number=issue_number,
+            human_requirements=issue_context.human_requirements,
+            trusted_actor=plan_trusted_actor,
+            inherited_check=(
+                (lambda plan_text: inherited_review_context(plan_text)[1])
+                if inherited_matrix_binding is not None
+                else None
+            ),
+            supersession_pending=plan_supersession is not None,
+            parent_requirement_ids=plan_parent_requirement_ids,
+            scope_start_round=scope_start_round,
+        )
+
+    plan_scope_diagnostics: list[str] = []
+    plan_scope_boundary = latest_scope_boundary(
+        plan_admitted_comments, plan_trusted_actor, issue_number=issue_number,
+        ignored_sink=plan_scope_diagnostics,
+    )
+    for diagnostic in plan_scope_diagnostics:
+        log(config, f"Planning issue #{issue_number}: {diagnostic}")
+    plan_scope_start_round = (
+        plan_scope_boundary.scope_start_round if plan_scope_boundary is not None else 1
+    )
+    plan_approval = classify_current_plan(plan_scope_start_round)
+    plan_scope = plan_scope_decision(
+        plan_admitted_comments,
+        plan_trusted_actor,
+        plan_issue_digest,
+        bool(config.plan_resume_keep_on_issue_edit),
+        # An approved or handed-off plan is never reopened; the decision is
+        # shared verbatim with the issue floor preflight.
+        plan_approved=plan_approval.approved,
+        issue_number=issue_number,
+        repo=config.repo,
+    )
+    if (
+        plan_scope.recorded_digest is None
+        and plan_approval.state not in {"no-plan", "empty-scope"}
+        and not plan_approval.approved
+    ):
+        log(
+            config,
+            f"Planning issue #{issue_number}: no recorded issue digest is available for "
+            "comparison, so an issue title/body edit cannot be detected; resuming the "
+            "recorded plan",
+        )
+    if plan_scope.edited:
+        log(
+            config,
+            f"Planning issue #{issue_number}: issue title/body changed since plan round "
+            f"{plan_scope.archived_round} (recorded digest {plan_scope.recorded_digest}, "
+            f"current digest {plan_scope.current_digest})",
+        )
+    if plan_scope.kept:
+        log(
+            config,
+            f"Planning issue #{issue_number}: keeping the existing plan "
+            + (
+                "(it was already handed off for implementation)"
+                if plan_scope.handed_off
+                else "(--plan-resume-keep-on-issue-edit)"
+            ),
+        )
+    if plan_scope.reset_required:
+        fresh_scope_start = plan_scope.scope_start_round
+        # The same read-only plan board floor check the issue preflight runs
+        # at this scope start: a refusal stops before anything is posted.
+        resolve_plan_board_state(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            comments=plan_admitted_comments,
+            admitted=(plan_admitted_comments, plan_trusted_actor),
+            drift_error=plan_contract_drift_error,
+            floor_context=f"Issue #{issue_number} plan reviewer board",
+            resume_round=lambda _config, _lineage: fresh_scope_start,
+            floor_refusal_hint=plan_floor_refusal_hint(
+                issue_number, lambda: fresh_scope_start,
+            ),
+        )
+        log(
+            config,
+            f"Planning issue #{issue_number}: starting a fresh plan at round "
+            f"{fresh_scope_start} (planning scope restarted; round "
+            f"{plan_scope.archived_round} plan archived in issue history)",
+        )
+        post_issue_comment(
+            runner,
+            config=config,
+            issue_number=issue_number,
+            body=render_scope_boundary(plan_scope.boundary_payload(issue_number)),
+        )
+        issue_context = _with_planning_requirements(
+            get_issue_context(runner, config=config, issue_number=issue_number),
+            parent_issue_context,
+        )
+        plan_admitted_comments, plan_trusted_actor = admitted_issue_comments(
+            runner, config=config, issue_number=issue_number, comments=issue_context.comments,
+        )
+        refreshed_boundary = latest_scope_boundary(
+            plan_admitted_comments, plan_trusted_actor, issue_number=issue_number,
+        )
+        if (
+            refreshed_boundary is None
+            or refreshed_boundary.scope_start_round != fresh_scope_start
+        ):
+            raise AgentLoopError(
+                f"Planning issue #{issue_number}: the planning-scope boundary record posted "
+                f"for round {fresh_scope_start} is not visible as an admitted record; no "
+                "agent was invoked. Rerun once the record is readable."
+            )
+        plan_scope_start_round = fresh_scope_start
+        plan_approval = classify_current_plan(plan_scope_start_round)
+    if plan_scope_start_round > 1:
+        # Every planning-history reader below sees only the current scope.
+        # Archived records are blanked in place, never removed, so comment
+        # indices stay comparable with the full-history board lineage.
+        issue_context = dataclasses_replace(
+            issue_context,
+            comments=scope_plan_comments(issue_context.comments, plan_scope_start_round),
+        )
+    # The planning round budget restarts at the scope start (#1390).
+    plan_round_limit = plan_scope_start_round + config.max_rounds - 1
+
+    def plan_budget_label() -> str:
+        if plan_scope_start_round <= 1:
+            return str(config.max_rounds)
+        return (
+            f"{config.max_rounds}, counted from planning-scope start round "
+            f"{plan_scope_start_round}"
+        )
+
+    def plan_prompt_issue_context(context: IssueContext) -> IssueContext:
+        """Planner and reviewer prompt context without archived planning discussion."""
+        if plan_scope_start_round <= 1:
+            return context
+        return dataclasses_replace(
+            context,
+            comments=scope_prompt_comments(context.comments, plan_scope_start_round),
+        )
+
     # Signed reviewer-board amendments (#943) are read from the same issue
     # comment list the plan round records live in, so comment order is
     # always comparable.
@@ -1300,34 +1489,6 @@ def _run_plan_first_loop_body(
     # orchestrator-authored links and signed plan amendments); a configured
     # board that differs from the effective one is recorded as one link,
     # floor-checked before it is posted and before any agent invocation.
-    plan_admitted_comments, plan_trusted_actor = admitted_issue_comments(
-        runner, config=config, issue_number=issue_number, comments=issue_context.comments,
-    )
-    invocation_config = config
-    # The same live inputs the issue preflight and recovery derive: the issue
-    # and authoritative-parent requirement sets, the inherited admissibility
-    # check and the signed supersession state.
-    plan_parent_requirement_ids: tuple[str, ...] | None = (
-        tuple(sorted(
-            requirement.requirement_id for requirement in parent_issue_context.human_requirements
-        ))
-        if parent_issue_context is not None
-        else None
-    )
-    plan_approval = classify_plan_approval(
-        plan_admitted_comments,
-        config=config,
-        issue_number=issue_number,
-        human_requirements=issue_context.human_requirements,
-        trusted_actor=plan_trusted_actor,
-        inherited_check=(
-            (lambda plan_text: inherited_review_context(plan_text)[1])
-            if inherited_matrix_binding is not None
-            else None
-        ),
-        supersession_pending=plan_supersession is not None,
-        parent_requirement_ids=plan_parent_requirement_ids,
-    )
     plan_approved_shortcut = False
     plan_board_state = None
     if plan_approval.approved:
@@ -1392,7 +1553,10 @@ def _run_plan_first_loop_body(
             )
 
         def plan_lineage_resume_round(effective_config: object, _lineage: object) -> int:
-            return plan_resume_round(plan_admitted_comments, effective_config)
+            return plan_resume_round(
+                plan_admitted_comments, effective_config,
+                min_round_number=plan_scope_start_round, trusted_actor=plan_trusted_actor,
+            )
 
         plan_board_state = resolve_plan_board_state(
             runner,
@@ -1552,11 +1716,20 @@ def _run_plan_first_loop_body(
     # once the run itself has accounted for that item, which is what a resumed
     # run does for every item the resumed round carried.
     plan_accounted_item_ids: set[str] = set()
-    resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
+    resume_state = _resume_plan_round(
+        issue_context.comments, configured_reviewers=configured_reviewers,
+        min_round_number=plan_scope_start_round,
+    )
     plan_board_reentry: int | None = None
     plan_board_anchor_state = None
+    # A fresh planning scope with no planner record yet (just opened, or a
+    # restart before its first planner record) never re-enters an anchor
+    # round: that round is archived, and the governing board applies from the
+    # scope start (#1390).
+    plan_scope_fresh = plan_scope_start_round > 1 and resume_state is None
     if (
-        plan_board_activation is not None
+        not plan_scope_fresh
+        and plan_board_activation is not None
         and plan_board_activation.link is not None
         and plan_board_activation.link.advance
     ):
@@ -1568,7 +1741,8 @@ def _run_plan_first_loop_body(
         predecessor = plan_board_state.predecessor_board
         assert predecessor is not None
         plan_board_anchor_state = _resume_plan_round(
-            issue_context.comments, configured_reviewers=identity_agents(predecessor)
+            issue_context.comments, configured_reviewers=identity_agents(predecessor),
+            min_round_number=plan_scope_start_round,
         )
         anchor_number = (
             plan_board_anchor_state[1].round_number
@@ -1583,7 +1757,8 @@ def _run_plan_first_loop_body(
             )
         plan_board_reentry = plan_board_activation.effective_from_round
     elif (
-        not plan_approved_shortcut
+        not plan_scope_fresh
+        and not plan_approved_shortcut
         and plan_contract_lineage.pending_amendments
         and plan_lineage_links
         and plan_drift_records
@@ -1593,6 +1768,7 @@ def _run_plan_first_loop_body(
         plan_board_anchor_state = _resume_plan_round(
             issue_context.comments,
             configured_reviewers=name_agents(tuple(plan_contract_lineage.last_seen)),
+            min_round_number=plan_scope_start_round,
         )
         if plan_board_anchor_state is not None:
             plan_board_reentry = board_anchor(plan_drift_records).round_number + 1
@@ -1633,7 +1809,9 @@ def _run_plan_first_loop_body(
     # before any agent invocation or comment post: an amendment no
     # digest-bound record has used must start at the round this resume
     # re-enters.
-    plan_amendment_start_round = resume_state[1].round_number if resume_state is not None else 1
+    plan_amendment_start_round = (
+        resume_state[1].round_number if resume_state is not None else plan_scope_start_round
+    )
     require_amendment_activation(
         plan_contract_lineage,
         start_round_number=plan_amendment_start_round,
@@ -1776,7 +1954,7 @@ def _run_plan_first_loop_body(
             config=config,
             issue_context=issue_context,
             issue_number=issue_number,
-            target_coder_round=1,
+            target_coder_round=plan_scope_start_round,
             prior_plan_subject=None,
             candidate_kind="plan_state",
             require_execution_strategy_contract=require_fresh_execution_contract,
@@ -1797,7 +1975,7 @@ def _run_plan_first_loop_body(
                     issue_number,
                     config,
                     memory,
-                    issue_context=issue_context,
+                    issue_context=plan_prompt_issue_context(issue_context),
                     plan_validation_diagnostic=turn_diagnostic,
                     inherited_matrix_binding=inherited_matrix_binding,
                 ),
@@ -1837,7 +2015,7 @@ def _run_plan_first_loop_body(
                     issue_number=issue_number,
                     original_error=error,
                     exhaustion=exhaustion,
-                    target_coder_round=1,
+                    target_coder_round=plan_scope_start_round,
                     prior_plan_subject=None,
                     candidate_kind="plan_state",
                     require_execution_strategy_contract=require_fresh_execution_contract,
@@ -1865,7 +2043,7 @@ def _run_plan_first_loop_body(
                         else response.text
                     ),
                     prior_payload=None,
-                    target_round=1,
+                    target_round=plan_scope_start_round,
                 )
             return getattr(candidate, "risk_test_matrix", None)
 
@@ -1874,7 +2052,7 @@ def _run_plan_first_loop_body(
             derive_matrix=fresh_candidate_matrix,
             initial_diagnostic=plan_validation_diagnostic,
             candidate_kind="plan_state",
-            target_coder_round=1,
+            target_coder_round=plan_scope_start_round,
             prior_plan_subject=None,
         )
         plan_output = plan_response.text
@@ -1926,7 +2104,7 @@ def _run_plan_first_loop_body(
             # or a model-echoed copy of the plan.
             current_plan_sidecar = make_assembled_plan_sidecar(
                 structured_plan,
-                round_number=1,
+                round_number=plan_scope_start_round,
                 response_form="fresh-plan-state",
                 rendered_plan=canonical_plan,
             )
@@ -1937,7 +2115,7 @@ def _run_plan_first_loop_body(
                     role="coder",
                     plan_execution_mode=config.plan_execution_mode,
                     agent=coder_name,
-                    round_number=1,
+                    round_number=plan_scope_start_round,
                     subject=_plan_subject(current_plan),
                     prior_plan_subject=None,
                     prior_items=(),
@@ -2008,7 +2186,8 @@ def _run_plan_first_loop_body(
             # A contradictory metadata record must not escape as a bare
             # dataclass ValueError with no diagnostic (#879).
             raise AgentLoopError(
-                "Could not record the plan round metadata for round 1 "
+                "Could not record the plan round metadata for round "
+                f"{plan_scope_start_round} "
                 f"(response form {current_response_form or 'free-form'}): {exc}"
             ) from exc
         if isinstance(structured_plan, StructuredPlanState):
@@ -2035,7 +2214,7 @@ def _run_plan_first_loop_body(
             issue_number=issue_number,
             body=plan_round_body,
             diagnostic=plan_validation_diagnostic,
-            target_coder_round=1,
+            target_coder_round=plan_scope_start_round,
             prior_plan_subject=None,
             candidate_kind="plan_state",
             require_execution_strategy_contract=require_fresh_execution_contract,
@@ -2043,8 +2222,8 @@ def _run_plan_first_loop_body(
         ):
             plan_validation_diagnostic = None
         if current_plan_sidecar is not None:
-            planner_candidate_rounds.add(1)
-        start_round_number = 1
+            planner_candidate_rounds.add(plan_scope_start_round)
+        start_round_number = plan_scope_start_round
         resumed_round: ResumedReviewRound | None = None
         current_coder_output = plan_output
     else:
@@ -2126,7 +2305,7 @@ def _run_plan_first_loop_body(
             f"{config.plan_execution_mode} since the last recorded round",
         )
 
-    for round_number in range(start_round_number, config.max_rounds + 1):
+    for round_number in range(start_round_number, plan_round_limit + 1):
         if plan_approved_shortcut and round_number != start_round_number:
             # The approval classification and the live approval boundary
             # disagree; never revise an approved plan under its old board.
@@ -2887,7 +3066,7 @@ def _run_plan_first_loop_body(
                 config,
                 reviewer=reviewer,
                 memory=memory,
-                issue_context=issue_context,
+                issue_context=plan_prompt_issue_context(issue_context),
                 unresolved_items=prior_unresolved_items,
                 compact_context=use_compact_context,
                 compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
@@ -3035,9 +3214,12 @@ def _run_plan_first_loop_body(
                 # whether or not its author was selected again, including
                 # records resume stripped as unqualified pre-opening.
                 try:
-                    plan_fresh_comments = get_issue_context(
-                        runner, config=config, issue_number=issue_number
-                    ).comments
+                    plan_fresh_comments = scope_plan_comments(
+                        get_issue_context(
+                            runner, config=config, issue_number=issue_number
+                        ).comments,
+                        plan_scope_start_round,
+                    )
                 except AgentLoopError:
                     plan_fresh_records = None
                 else:
@@ -3088,12 +3270,16 @@ def _run_plan_first_loop_body(
                 context=plan_recovery_context,
                 reviewer_names=[agent_display_name(r) for r in configured_reviewers],
                 resume=lambda remaining: _resume_plan_round(
-                    remaining, configured_reviewers=configured_reviewers
+                    remaining, configured_reviewers=configured_reviewers,
+                    min_round_number=plan_scope_start_round,
                 ),
                 # The resumed plan subject must not shift after deletion.
                 fingerprint=lambda remaining: (
                     lambda resumed: resumed[0] if resumed is not None else None
-                )(_resume_plan_round(remaining, configured_reviewers=configured_reviewers)),
+                )(_resume_plan_round(
+                    remaining, configured_reviewers=configured_reviewers,
+                    min_round_number=plan_scope_start_round,
+                )),
             )
 
         if not plan_round_parallel:
@@ -3896,11 +4082,11 @@ def _run_plan_first_loop_body(
             # check can reach this guard.  It is revised through the enforced
             # replan path instead of dead-ending the run (#936).
             inadmissible_hash = approved_plan_hash(current_plan)
-            if round_number == config.max_rounds:
+            if round_number == plan_round_limit:
                 raise AgentLoopError(
                     f"Approved child plan {inadmissible_hash} on issue #{issue_number} is "
                     "inadmissible under the inherited-matrix contract and must be revised, but "
-                    f"the planning round budget ({config.max_rounds}) is exhausted. Raise "
+                    f"the planning round budget ({plan_budget_label()}) is exhausted. Raise "
                     "--max-rounds and rerun; re-planning continues the existing round "
                     f"numbering.\n{inherited_review_failure}"
                 )
@@ -3934,11 +4120,11 @@ def _run_plan_first_loop_body(
             # approval of the superseded plan is not approval of its
             # replacement, so the authorized revision runs instead of
             # approving and rebinding the plan the human asked to replace.
-            if round_number == config.max_rounds:
+            if round_number == plan_round_limit:
                 raise AgentLoopError(
                     f"Approved child plan {plan_supersession.superseded_hash} on issue "
                     f"#{issue_number} must be re-planned under its signed supersession, but "
-                    f"the planning round budget ({config.max_rounds}) is exhausted. Raise "
+                    f"the planning round budget ({plan_budget_label()}) is exhausted. Raise "
                     "--max-rounds and rerun; re-planning continues the existing round "
                     "numbering."
                 )
@@ -3983,8 +4169,13 @@ def _run_plan_first_loop_body(
             # cleared fails closed instead of being approved over.
             # The complete history: the epoch and binding filters of
             # plan_history_records select approval evidence, never obligations.
+            # A planning-scope boundary retires the archived plan's
+            # obligations (#1390): only the current scope is reconstructed.
             lost_obligations = plan_ledger_unreconstructible_items(
-                _extract_round_metadata_records(refreshed_issue_context.comments, flow="plan"),
+                _extract_round_metadata_records(
+                    scope_plan_comments(refreshed_issue_context.comments, plan_scope_start_round),
+                    flow="plan",
+                ),
                 SimpleNamespace(
                     prior_items=(*prior_unresolved_items, *unresolved_items),
                     current_round_new_items=tuple(round_new_unresolved_items),
@@ -4647,10 +4838,10 @@ def _run_plan_first_loop_body(
                     # Before the planner turn, so no further planner turn runs.
                     stop_plan_pre_panel(step_back_stop, round_number=round_number)
 
-        if round_number == config.max_rounds:
+        if round_number == plan_round_limit:
             if growth_guard_revision is not None:
                 raise AgentLoopError(
-                    f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number} "
+                    f"Reached max planning rounds ({plan_budget_label()}) for issue #{issue_number} "
                     "while the plan-growth gate still blocked approval: the one-shot plan "
                     f"crosses plan-growth threshold(s) without a covering justification "
                     f"({plan_growth_violation}). Raise --max-rounds and rerun so a revision "
@@ -4662,7 +4853,7 @@ def _run_plan_first_loop_body(
                 # reported a blocker, the run simply ran out of rounds while a
                 # reviewer-only phase advance was still outstanding.
                 raise AgentLoopError(
-                    f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number} "
+                    f"Reached max planning rounds ({plan_budget_label()}) for issue #{issue_number} "
                     "while a reviewer-only plan phase advance was still pending. Outstanding "
                     f"phase: {plan_outstanding_phase or 'secondary-audit'}; "
                     "reviewer(s) still missing an exact-plan approval: "
@@ -4672,7 +4863,13 @@ def _run_plan_first_loop_body(
                 )
             raise AgentLoopError(
                 f"One or more reviewers still reported blocking plan issues after "
-                f"round {round_number}; human review required."
+                f"round {round_number}"
+                + (
+                    f" (planning round budget {plan_budget_label()})"
+                    if plan_scope_start_round > 1
+                    else ""
+                )
+                + "; human review required."
             )
 
         if plan_phase_advance_pending:
@@ -4869,7 +5066,7 @@ def _run_plan_first_loop_body(
                     combined_review,
                     config,
                     memory,
-                    issue_context=issue_context,
+                    issue_context=plan_prompt_issue_context(issue_context),
                     unresolved_items=must_fix_items,
                     compact_context=use_compact_context,
                     compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
@@ -5306,6 +5503,6 @@ def _run_plan_first_loop_body(
         resumed_round = None
 
     raise AgentLoopError(
-        f"Reached max planning rounds ({config.max_rounds}) for issue #{issue_number}; "
+        f"Reached max planning rounds ({plan_budget_label()}) for issue #{issue_number}; "
         "human review required."
     )

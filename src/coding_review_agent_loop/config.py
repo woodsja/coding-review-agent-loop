@@ -265,6 +265,10 @@ class AgentLoopConfig:
     # primary-phase checkpoint is stamped as a durable streak boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
     plan_reset_stall_streak: bool = False
+    # Per-invocation opt-out (#1390): keep resuming an unapproved plan after
+    # the issue title/body changed, instead of opening a fresh planning scope.
+    # Never inherited by child planning or recovery commands.
+    plan_resume_keep_on_issue_edit: bool = False
     plan_narrow_staged: bool = False
     # Plan-growth gate (#886): structural thresholds above which a one-shot
     # plan needs a reviewed justification or a staged restructure.
@@ -2396,6 +2400,9 @@ def config_from_args(
             args, "pr_evidence_stall_rounds", DEFAULT_PR_EVIDENCE_STALL_ROUNDS
         ),
         plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
+        plan_resume_keep_on_issue_edit=bool(
+            getattr(args, "plan_resume_keep_on_issue_edit", False)
+        ),
         plan_narrow_staged=bool(getattr(args, "plan_narrow_staged", False)),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
         plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),

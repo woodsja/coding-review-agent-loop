@@ -527,6 +527,16 @@ agent-loop issue 123 \
   --implement-after-approval
 ```
 
+If you edit the issue title or body while its plan is still under review, the
+next plan-first run starts a fresh plan instead of patching the old one. It
+logs both issue digests and posts a planning-scope boundary record. The fresh
+plan starts at the next round number, and the `--max-rounds` budget restarts
+there. The old plan stays in the issue history but no longer binds the new
+plan. A comment alone, including a signed requirement, is not an issue edit.
+For a typo-level edit, pass `--plan-resume-keep-on-issue-edit` to keep the
+existing plan for that invocation. See
+[edited issues during planning](docs/local_agent_loop.md#edited-issues-during-planning-1390).
+
 ### Implement a task without an issue
 
 ```bash
@@ -1421,7 +1431,9 @@ cannot recover an unreadable planning history. `--plan-primary-stall-rounds N`
 (default 8, `0` disables) stops the run with a diagnostic once the primary has
 blocked N consecutive completed primary-phase rounds with no exact-plan
 approval, instead of spending the rest of `--max-rounds`; the panel is never
-convened automatically. Editing the issue title or body retires rounds reviewed
+convened automatically. Editing the issue title or body starts a fresh plan in a
+new planning scope by default, which leaves the stalled rounds behind. Under
+`--plan-resume-keep-on-issue-edit` the edit instead retires rounds reviewed
 against earlier text (a comment alone does not, and rounds recorded before
 issue-text tracking carry no digest, so an edit cannot retire them), and the one-shot
 `--plan-reset-stall-streak` durably retires the counted rounds; otherwise rerun
