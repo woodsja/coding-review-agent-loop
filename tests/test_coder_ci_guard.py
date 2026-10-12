@@ -31,6 +31,54 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="POSIX launcher")
 
 
+# Every pflag spelling of a dispatch/rerun POST (#1366 item-1/item-2): one
+# table drives both the classifier and the real launcher, so a new spelling
+# is covered at both layers at once.
+_RERUN = "repos/o/r/actions/runs/42/rerun"
+_DISPATCH = "repos/o/r/actions/workflows/ci.yml/dispatches"
+API_TRIGGER_SPELLINGS = [
+    ("api", _RERUN, "-X", "POST"),
+    ("api", _RERUN, "-XPOST"),
+    ("api", _RERUN, "-X=POST"),
+    ("api", _RERUN, "-X=post"),
+    ("api", _RERUN, "--method", "POST"),
+    ("api", _RERUN, "--method=POST"),
+    ("api", _RERUN, "-iX", "POST"),
+    ("api", _RERUN, "-iXPOST"),
+    ("api", _RERUN, "-iX=POST"),
+    ("api", _DISPATCH, "-f", "ref=main"),
+    ("api", _DISPATCH, "-fref=main"),
+    ("api", _DISPATCH, "-f=ref=main"),
+    ("api", _DISPATCH, "-if", "ref=branch"),
+    ("api", _DISPATCH, "-iFref=branch"),
+    ("api", _DISPATCH, "--field=ref=main"),
+    ("api", _DISPATCH, "--raw-field", "ref=main"),
+    ("api", _DISPATCH, "--input=body.json"),
+    ("api", "-H", "Accept: x", _DISPATCH, "-f", "ref=main"),
+    ("-R", "api", "api", _RERUN, "-X", "POST"),
+    ("api", "-X", "POST", "--", _RERUN),
+]
+API_NON_TRIGGER_SPELLINGS = [
+    ("api", _RERUN),
+    ("api", _RERUN, "-i"),
+    ("api", _RERUN, "-X=GET"),
+    ("api", _RERUN, "-iX", "GET"),
+    ("api", _DISPATCH, "-X", "GET", "-f", "ref=main"),
+    ("api", _DISPATCH, "--method=GET", "-fref=main"),
+    ("api", "repos/o/r/actions/runs", "-X=POST"),
+]
+
+
+@pytest.mark.parametrize("argv", API_TRIGGER_SPELLINGS)
+def test_every_pflag_spelling_of_an_api_trigger_is_classified(argv):
+    assert classify_ci_trigger(argv) is not None
+
+
+@pytest.mark.parametrize("argv", API_NON_TRIGGER_SPELLINGS)
+def test_get_spellings_of_trigger_endpoints_are_not_triggers(argv):
+    assert classify_ci_trigger(argv) is None
+
+
 @pytest.mark.parametrize(
     "argv, expected",
     [
@@ -132,6 +180,7 @@ def test_guard_refuses_trigger_without_reaching_real_gh(tmp_path):
         ("api", "repos/o/r/actions/workflows/ci.yml/dispatches", "-f", "ref=x"),
         ("run", "rerun", "42"),
         ("api", "-X", "POST", "repos/o/r/actions/runs/42/rerun-failed-jobs"),
+        *API_TRIGGER_SPELLINGS,
     ],
 )
 def test_guard_refuses_api_and_rerun_forms(tmp_path, argv):

@@ -4779,7 +4779,9 @@ a green check:
   `gh api` POSTs to `.../dispatches`, `.../rerun`, `.../rerun-failed-jobs`, or
   `.../jobs/<id>/rerun`. A POST counts whether it is explicit (`-X POST`,
   `--method POST`) or implicit through `-f`, `-F`, `--field`, `--raw-field`, or
-  `--input`. A refused command exits non-zero with an explanation and never
+  `--input`. Arguments are decoded the way `gh` itself parses them, so
+  attached (`-XPOST`), equals (`-X=POST`, `--method=POST`) and grouped
+  (`-iX POST`, `-if ref=main`) shorthand spellings are refused too. A refused command exits non-zero with an explanation and never
   reaches the real `gh`. Every other command, including `gh pr checks`,
   `gh run view`, and GET `gh api`, is executed unchanged by the configured `gh`
   (`--gh-cmd`).
@@ -4789,8 +4791,10 @@ a green check:
   created PR is authenticated. A non-managed run found there, for example one
   started through an absolute `gh` path, `curl`, or the web UI, is prepended to
   the coder's round comment as a non-authoritative diagnostic. It is never
-  qualification and never cancelled. A lookup failure adds only a diagnostic
-  note and never blocks the round.
+  qualification and never cancelled. If the coder's response is rejected
+  (for example, format repair fails), the same audit still runs and posts its
+  note as a separate orchestrator comment before the rejection is raised. A
+  lookup failure adds only a diagnostic note and never blocks the round.
 
 The guard and the prompt text share one invocation-scoped decision. In the PR
 loop that decision is the live managed-CI state for the turn: explicit managed

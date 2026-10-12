@@ -53,14 +53,22 @@ REFUSAL_MESSAGE = (
     "still run the workflow from their own shell as a non-authoritative diagnostic.\n"
 )
 
-# Flags (outside ``gh api``) whose value is the next token.
-_VALUE_FLAGS = frozenset({"-R", "--repo"})
-# ``gh api`` flags whose value is the next token.
-_API_VALUE_FLAGS = frozenset({
-    "-X", "--method", "-f", "--raw-field", "-F", "--field", "-H", "--header",
-    "--input", "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview",
+# gh parses flags with spf13/pflag: long flags as ``--name value`` or
+# ``--name=value``; shorthands may be grouped (``-iX POST``), and a value
+# shorthand takes the rest of its token (``-XPOST``, ``-X=POST``) or the next
+# token.  Every form below is decoded by one tokenizer so no spelling of a
+# method or body flag slips past the classifier (#1366).
+# Persistent value flags outside ``gh api`` (shorthand chars, long names).
+_SHORT_VALUE = frozenset("R")
+_LONG_VALUE = frozenset({"repo"})
+# ``gh api`` value flags.
+_API_SHORT_VALUE = frozenset("XfFHqtp")
+_API_LONG_VALUE = frozenset({
+    "method", "raw-field", "field", "header", "input", "jq", "template",
+    "hostname", "cache", "preview",
 })
-_API_BODY_FLAGS = frozenset({"-f", "--raw-field", "-F", "--field", "--input"})
+_API_SHORT_BODY = frozenset("fF")
+_API_LONG_BODY = frozenset({"raw-field", "field", "input"})
 _TRIGGER_ENDPOINT = re.compile(
     r"(?:^|/)repos/[^/]+/[^/]+/actions/"
     r"(?:workflows/[^/]+/dispatches|runs/[^/]+/(?:rerun|rerun-failed-jobs)|jobs/[^/]+/rerun)"
@@ -68,55 +76,67 @@ _TRIGGER_ENDPOINT = re.compile(
 )
 
 
-def _positionals(argv: Sequence[str]) -> list[str]:
+def _parse_flags(
+    argv: Sequence[str], short_value: frozenset[str], long_value: frozenset[str]
+) -> tuple[list[str], list[tuple[str, str | None]], list[int]]:
+    """Split ``argv`` like pflag into positionals and ``(flag, value)`` pairs.
+
+    Short flags are reported as their single character, long flags as their
+    name without dashes; boolean flags carry ``None``.  The third element is
+    each positional's index in ``argv``.
+    """
     positionals: list[str] = []
-    skip = False
-    for token in argv:
-        if skip:
-            skip = False
-            continue
-        if token == "--":
-            continue
-        if token.startswith("-"):
-            skip = token in _VALUE_FLAGS
-            continue
-        positionals.append(token)
-    return positionals
-
-
-def _classify_api(argv: Sequence[str]) -> str | None:
-    method: str | None = None
-    has_body = False
-    endpoint: str | None = None
+    positional_indexes: list[int] = []
+    flags: list[tuple[str, str | None]] = []
     index = 0
     while index < len(argv):
         token = argv[index]
         index += 1
-        name, eq, attached = token.partition("=")
-        if token.startswith("--") and eq:
-            if name == "--method":
-                method = attached
-            elif name in _API_BODY_FLAGS:
-                has_body = True
+        if token == "--":
+            positional_indexes.extend(range(index, len(argv)))
+            positionals.extend(argv[index:])
+            break
+        if token.startswith("--"):
+            name, eq, value = token[2:].partition("=")
+            if eq:
+                flags.append((name, value))
+            elif name in long_value:
+                flags.append((name, argv[index] if index < len(argv) else ""))
+                index += 1
+            else:
+                flags.append((name, None))
             continue
-        if token in _API_VALUE_FLAGS:
-            value = argv[index] if index < len(argv) else ""
-            index += 1
-            if token in {"-X", "--method"}:
-                method = value
-            elif token in _API_BODY_FLAGS:
-                has_body = True
+        if token.startswith("-") and len(token) > 1:
+            group = token[1:]
+            while group:
+                char, group = group[0], group[1:]
+                if char not in short_value:
+                    flags.append((char, None))
+                    continue
+                if group.startswith("="):
+                    group = group[1:]
+                if group:
+                    flags.append((char, group))
+                else:
+                    flags.append((char, argv[index] if index < len(argv) else ""))
+                    index += 1
+                break
             continue
-        if token.startswith("-X") and len(token) > 2:
-            method = token[2:]
-            continue
-        if token[:2] in {"-f", "-F"} and len(token) > 2:
+        positional_indexes.append(index - 1)
+        positionals.append(token)
+    return positionals, flags, positional_indexes
+
+
+def _classify_api(argv: Sequence[str]) -> str | None:
+    positionals, flags, _ = _parse_flags(argv, _API_SHORT_VALUE, _API_LONG_VALUE)
+    method: str | None = None
+    has_body = False
+    for name, value in flags:
+        if name in {"X", "method"}:
+            method = value or ""
+        elif name in _API_SHORT_BODY or name in _API_LONG_BODY:
             has_body = True
-            continue
-        if token.startswith("-"):
-            continue
-        if endpoint is None:
-            endpoint = token
+    endpoint = positionals[0] if positionals else None
     if endpoint is None or not _TRIGGER_ENDPOINT.search(endpoint):
         return None
     effective = (method or ("POST" if has_body else "GET")).upper()
@@ -128,7 +148,7 @@ def _classify_api(argv: Sequence[str]) -> str | None:
 def classify_ci_trigger(argv: Sequence[str]) -> str | None:
     """Name the CI-triggering ``gh`` form in ``argv`` (program name excluded), or None."""
     args = list(argv)
-    positionals = _positionals(args)
+    positionals, _, indexes = _parse_flags(args, _SHORT_VALUE, _LONG_VALUE)
     if not positionals:
         return None
     if positionals[:2] == ["workflow", "run"]:
@@ -136,7 +156,9 @@ def classify_ci_trigger(argv: Sequence[str]) -> str | None:
     if positionals[:2] == ["run", "rerun"]:
         return "gh run rerun"
     if positionals[0] == "api":
-        return _classify_api(args[args.index("api") + 1:])
+        # ``api`` is the first positional, so everything after it is the
+        # api command's own argv (persistent flags before it carry no body).
+        return _classify_api(args[indexes[0] + 1:])
     return None
 
 

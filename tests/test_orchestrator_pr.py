@@ -21319,15 +21319,21 @@ _GUARD_DIR_ENV = "AGENT_LOOP_CODER_GUARD_DIR"
 
 class _GuardedCoderRunner(FakeRunner):
     """Records launch envs, has the coder try an empty-input ordinary dispatch
-    through whatever ``gh`` its env installs, and scripts the dispatch audit."""
+    through whatever ``gh`` its env installs, seeds the coder turn's managed
+    full-suite receipt, records orchestrator dispatches, and scripts the
+    dispatch audit."""
 
-    def __init__(self, *, audit_runs=(), audit_returncode=0, **kwargs):
+    def __init__(self, *, audit_runs=(), audit_returncode=0, seed_receipt=True, **kwargs):
         super().__init__(**kwargs)
         self.launch_envs = []
         self.coder_dispatch_attempts = []
+        self.coder_turn_receipts = []
         self.audit_queries = []
+        self.orchestrator_dispatches = []
         self.audit_runs = list(audit_runs)
         self.audit_returncode = audit_returncode
+        self.seed_receipt = seed_receipt
+        self._coder_turns = 0
 
     def run_with_log(self, args, *, cwd, log_path, label, progress_interval_seconds,
                      check=True, env=None, input_text=None, use_pty=False,
@@ -21336,6 +21342,22 @@ class _GuardedCoderRunner(FakeRunner):
         merged = {**os.environ, **(env or {})}
         self.launch_envs.append((cmd[0], dict(env or {})))
         if cmd[:1] == ["claude"]:
+            if self.seed_receipt:
+                # The coder's managed `agent-loop run-tests` full suite passed
+                # in this turn: a real broker receipt in the turn catalog.
+                self._coder_turns += 1
+                turn_id = f"coder-turn-{self._coder_turns}"
+                self._latest_test_turn_id = turn_id
+                self._local_test_observations.append(LocalTestObservation(
+                    command=("python", "-m", "pytest", "tests/", "-q"),
+                    outcome="passed",
+                    provenance="parent-observed",
+                    receipt_id=f"full-suite-{turn_id}",
+                    turn_id=turn_id,
+                    timestamp="2026-10-11T22:00:00+00:00",
+                    cwd=str(cwd),
+                ))
+            self.coder_turn_receipts.append(tuple(self.current_test_turn_observations()))
             # The coder follow-up: a skipped synchronize check, a local
             # full-suite receipt, and no GitHub green check -- it reaches for
             # `gh workflow run` with empty inputs, as on PR #1364.
@@ -21359,6 +21381,11 @@ class _GuardedCoderRunner(FakeRunner):
                 return CommandResult(cmd, cwd_path, "", "HTTP 502", self.audit_returncode)
             payload = {"total_count": len(self.audit_runs), "workflow_runs": self.audit_runs}
             return CommandResult(cmd, cwd_path, json.dumps(payload), "", 0)
+        if cmd[:2] == ["gh", "api"] and any(part.endswith("/dispatches") for part in cmd):
+            # The orchestrator's real exact-head dispatch, at the GitHub boundary.
+            self.orchestrator_dispatches.append((cmd, dict(env or {})))
+            cmd, cwd_path = self._record_command(cmd, cwd)
+            return CommandResult(cmd, cwd_path, "", "", 0)
         return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 
 
@@ -21378,7 +21405,7 @@ def _fake_real_gh(tmp_path, monkeypatch):
 
 def _managed_guard_loop(
     tmp_path, monkeypatch, *, managed=True, mode="implicit", audit_runs=(), audit_returncode=0,
-    claude_outputs=None,
+    claude_outputs=None, antigravity_outputs=None, real_repair=False, expect_error=None,
 ):
     record = _fake_real_gh(tmp_path, monkeypatch)
     runner = _GuardedCoderRunner(
@@ -21396,15 +21423,22 @@ def _managed_guard_loop(
         claude_outputs=claude_outputs or [structured_coder_followup(
             addressed_items=["item-1"], tests_run=["python -m pytest tests/ -q"],
         )],
+        antigravity_outputs=antigravity_outputs or [],
         pr_payload={"headRefName": "agent-loop/managed-77", "headRefOid": "abc123", "baseRefName": "main"},
         pr_check_runs_payload={"total_count": 1, "check_runs": [{
             "id": 1, "name": "ci", "status": "completed", "conclusion": "skipped",
             "app": {"slug": "github-actions"}, "check_suite": {"id": 5},
         }]},
     )
-    dispatches = []
+    if real_repair:
+        # Undo the autouse repair stub so the configured repair chain runs.
+        from coding_review_agent_loop import validated_agent
+        from coding_review_agent_loop.agents import antigravity as agy_mod
+
+        monkeypatch.setattr(orchestrator, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+        monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "agy-settings.json")
     contract = None
-    if managed and mode == "implicit":
+    if managed and mode in {"implicit", "explicit"}:
         contract = ManagedCiContract()
     elif managed and mode == "revalidation-drop":
         contract = ManagedCiContract(adopted_existing_pr=True, base_ref="main")
@@ -21412,27 +21446,23 @@ def _managed_guard_loop(
         monkeypatch.setattr(orchestrator, "release_adopted_managed_ci", lambda *_a, **_k: True)
     monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *_a, **_k: contract)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification",
-        lambda *_a, **kwargs: dispatches.append(kwargs),
-    )
-    monkeypatch.setattr(
         orchestrator, "wait_for_final_qualification",
         lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha=runner.pr_payload["headRefOid"]),
     )
     monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
-    config = make_config(tmp_path, auto_merge=managed, reviewer=("codex",), max_rounds=2)
+    explicit = {"managed_ci": True, "managed_ci_trusted_actor": "agent-loop"} if mode == "explicit" else {}
+    config = make_config(
+        tmp_path, auto_merge=managed, reviewer=("codex",), max_rounds=2, **explicit,
+    )
     started = datetime.datetime.now(datetime.timezone.utc)
-    if contract is None and managed:
+    if expect_error is not None or (managed and contract is None) or mode == "revalidation-drop":
         # Activation fallback / revalidation drop end in the ordinary watcher,
         # which this fake board never satisfies; the coder turn already ran.
         with pytest.raises(AgentLoopError):
             run_pr_loop(runner, pr_number=77, config=config)
-    elif mode == "revalidation-drop":
-        with pytest.raises(AgentLoopError):
-            run_pr_loop(runner, pr_number=77, config=config)
     else:
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    return runner, record, dispatches, started
+    return runner, record, runner.orchestrator_dispatches, started
 
 
 def _coder_comment(runner):
@@ -21442,13 +21472,41 @@ def _coder_comment(runner):
     )
 
 
-def test_managed_coder_dispatch_is_refused_before_approval_and_orchestrator_dispatches_after(
-    tmp_path, monkeypatch,
-):
-    runner, record, dispatches, _ = _managed_guard_loop(tmp_path, monkeypatch)
+def _assert_single_correlated_dispatch(runner, dispatches, head):
+    """The real v1 dispatcher posted exactly one exact-head workflow dispatch,
+    correlated by PR number and expected head, outside every agent env."""
+    assert len(dispatches) == 1
+    cmd, env = dispatches[0]
+    assert cmd[:4] == ["gh", "api", "--method", "POST"]
+    assert cmd[4].endswith("/dispatches")
+    assert f"inputs[expected_head_sha]={head}" in cmd
+    assert "inputs[pr_number]=77" in cmd
+    assert "ref=agent-loop/managed-77" in cmd
+    assert "AGENT_LOOP_CODER_CI_DISPATCH_GUARD" not in env
+    # Dispatched only after the approving review of that head.
+    names = [cmd[0] if cmd[:2] != ["codex", "exec"] else "review" for cmd, _cwd in runner.commands]
+    last_review = max(index for index, name in enumerate(names) if name == "review")
+    dispatch_index = next(
+        index for index, (cmd, _cwd) in enumerate(runner.commands)
+        if cmd[:2] == ["gh", "api"] and cmd[4:5] and cmd[4].endswith("/dispatches")
+    )
+    assert dispatch_index > last_review
 
-    # The coder's empty-input ordinary dispatch was refused by the guard and
-    # never reached the real gh: no workflow_dispatch before approval.
+
+@pytest.mark.parametrize("mode", ["implicit", "explicit"])
+def test_managed_coder_dispatch_is_refused_before_approval_and_orchestrator_dispatches_after(
+    tmp_path, monkeypatch, mode,
+):
+    runner, record, dispatches, _ = _managed_guard_loop(tmp_path, monkeypatch, mode=mode)
+
+    # The coder held a passing managed full-suite receipt in its turn catalog
+    # while the only GitHub check was the skipped synchronize run.
+    [receipts] = runner.coder_turn_receipts
+    assert [(obs.command, obs.outcome) for obs in receipts] == [
+        (("python", "-m", "pytest", "tests/", "-q"), "passed")
+    ]
+    # Its empty-input ordinary dispatch was refused by the guard and never
+    # reached the real gh: no workflow_dispatch before approval.
     [attempt] = runner.coder_dispatch_attempts
     assert attempt.returncode == 3
     assert "refused `gh workflow run`" in attempt.stderr
@@ -21462,11 +21520,10 @@ def test_managed_coder_dispatch_is_refused_before_approval_and_orchestrator_disp
     # The coder prompt carries the matching guidance.
     coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "This pull request uses managed CI." in coder_prompt
-    # After every reviewer approves, the orchestrator's correlated exact-head
-    # dispatch still happens exactly once.
-    assert len(dispatches) == 1
-    assert dispatches[0]["expected_head_sha"] == "abc123-coder-1"
-    # Nothing was dispatched, so the audit adds no note.
+    # After every reviewer approves, the orchestrator's real correlated
+    # exact-head dispatch still happens exactly once.
+    _assert_single_correlated_dispatch(runner, dispatches, "abc123-coder-1")
+    # Nothing was dispatched by the coder, so the audit adds no note.
     assert runner.audit_queries
     assert "Coder-turn CI dispatch audit" not in _coder_comment(runner)
 
@@ -21514,7 +21571,7 @@ def test_bypass_dispatch_on_intermediate_head_is_reported_once_as_diagnostic(tmp
     assert any("branch=agent-loop%2Fmanaged-77" in query and "created=%3E%3D" in query
                for query in runner.audit_queries)
     # Never treated as qualification: the managed dispatch still runs after approval.
-    assert len(dispatches) == 1
+    _assert_single_correlated_dispatch(runner, dispatches, "abc123-coder-1")
 
 
 def test_dispatch_audit_lookup_failure_is_only_a_diagnostic_note(tmp_path, monkeypatch):
@@ -21590,3 +21647,59 @@ def test_coder_retry_inherits_the_guard_and_reviewer_stays_unguarded(tmp_path, m
     after = [env for name, env in runner.launch_envs[last_coder + 1:] if name == "codex"]
     assert after and not any(_GUARD_DIR_ENV in env for env in after)
     assert len(dispatches) == 1
+
+
+def _prose_before_footer(response):
+    """Markdown between the JSON object and the footer needs format repair."""
+    head, footer, tail = response.partition("<!-- AGENT_STATE:")
+    return f"{head.rstrip()}\n## Changes made\nProse the envelope forbids.\n{footer}{tail}"
+
+
+def test_loop_driven_format_repair_of_guarded_coder_inherits_the_guard(tmp_path, monkeypatch):
+    """A malformed guarded coder response reaches the real repair chain; the
+    repair subprocess launch carries the guard, the next reviewer does not."""
+    malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
+    repaired = structured_coder_followup(addressed_items=["item-1"])
+    runner, record, dispatches, _ = _managed_guard_loop(
+        tmp_path, monkeypatch, claude_outputs=[malformed], antigravity_outputs=[repaired],
+        real_repair=True,
+    )
+
+    names = [name for name, _env in runner.launch_envs]
+    repair_indexes = [
+        index for index, (name, env) in enumerate(runner.launch_envs)
+        # The `agy models` catalog probe has no role and runs no tools.
+        if name == "agy" and "agy-catalog-" not in env.get("AGENT_LOOP_WORKDIR", "")
+    ]
+    assert repair_indexes, names
+    for index in repair_indexes:
+        env = runner.launch_envs[index][1]
+        assert env.get("AGENT_LOOP_CODER_CI_DISPATCH_GUARD") == "managed"
+        assert env["PATH"].split(os.pathsep)[0] == env[_GUARD_DIR_ENV]
+    after = [env for name, env in runner.launch_envs[max(repair_indexes) + 1:] if name == "codex"]
+    assert after and not any(_GUARD_DIR_ENV in env for env in after)
+    assert not record.exists()
+    _assert_single_correlated_dispatch(runner, dispatches, runner.pr_payload["headRefOid"])
+
+
+def test_rejected_guarded_coder_turn_still_publishes_dispatch_audit(tmp_path, monkeypatch):
+    """#1366 item-3: a bypass dispatch followed by a response that fails
+    validation and repair is still surfaced, without masking the rejection."""
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
+    runner, _record, dispatches, _ = _managed_guard_loop(
+        tmp_path, monkeypatch, claude_outputs=[malformed],
+        antigravity_outputs=["still not a response"] * 12, real_repair=True,
+        audit_runs=[_dispatch_run(38032663783, "abc123-coder-1", created_at=now)],
+        expect_error=True,
+    )
+
+    notes = [
+        comment["body"] for comment in runner.pr_payload.get("comments", [])
+        if "Coder-turn CI dispatch audit" in comment["body"]
+    ]
+    assert len(notes) == 1
+    assert "run 38032663783 on `abc123-coder-1`" in notes[0]
+    assert "non-authoritative diagnostic, not qualification" in notes[0]
+    assert "coder response for this turn was rejected" in notes[0]
+    assert dispatches == []

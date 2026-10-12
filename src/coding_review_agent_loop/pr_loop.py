@@ -106,6 +106,7 @@ from .expected_closure import (
 )
 from .github import (
     coder_turn_dispatch_audit_note,
+    publish_rejected_coder_turn_dispatch_audit,
     IssueContext,
     PullRequestMetadata,
     PullRequestChecks,
@@ -8214,6 +8215,7 @@ def run_pr_loop(
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
             coder_dispatch_audit_note = ""
+            coder_dispatch_audited = False
             try:
                 coder_response = _run_validated_agent(
                     runner,
@@ -8337,6 +8339,7 @@ def run_pr_loop(
                     # Backstop for a dispatch that bypassed the gh guard: a
                     # visible, non-authoritative diagnostic, never
                     # qualification, and never a round blocker (#1366).
+                    coder_dispatch_audited = True
                     coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
                         runner,
                         config,
@@ -8594,6 +8597,17 @@ def run_pr_loop(
                     ),
                 )
             except AgentLoopError as coder_followup_error:
+                if coder_ci_guarded and not coder_dispatch_audited:
+                    # A rejected guarded turn (including a failed format
+                    # repair) still gets the dispatch backstop (#1366).
+                    publish_rejected_coder_turn_dispatch_audit(
+                        runner,
+                        config,
+                        pr_number=pr_number,
+                        branch=pr_metadata.head_branch,
+                        head_shas=(pre_turn_head,),
+                        turn_started_at=coder_turn_started_at,
+                    )
                 # A coder that pushed and was then rejected leaves a head with no
                 # coder or reviewer record; persist why, then surface the original
                 # error unchanged.

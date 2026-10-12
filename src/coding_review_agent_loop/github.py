@@ -1976,6 +1976,44 @@ def coder_turn_dispatch_audit_note(
     return render_coder_dispatch_audit_note(audit)
 
 
+def publish_rejected_coder_turn_dispatch_audit(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    branch: str | None,
+    head_shas: Sequence[str | None],
+    turn_started_at: datetime.datetime,
+) -> str:
+    """Audit a guarded coder turn whose response was rejected (#1366).
+
+    A rejected turn posts no coder comment, so any non-managed dispatch is
+    published as its own visible orchestrator comment.  Diagnostic only:
+    this never raises, so the caller's original rejection is never masked.
+    """
+    try:
+        live_head: str | None = None
+        try:
+            live_head = (get_pr_head_sha(runner, config, pr_number) or "").strip() or None
+        except Exception:  # noqa: BLE001 - the branch query still covers it
+            live_head = None
+        note = coder_turn_dispatch_audit_note(
+            runner, config, branch=branch, head_shas=(*head_shas, live_head),
+            turn_started_at=turn_started_at,
+        )
+        if note:
+            post_pr_comment(
+                runner,
+                config=config,
+                pr_number=pr_number,
+                body=f"{note}\n\nThe coder response for this turn was rejected.\n\n-- Orchestrator",
+            )
+        return note
+    except Exception as exc:  # noqa: BLE001 - never mask the rejection
+        log(config, f"PR #{pr_number}: rejected coder-turn dispatch audit failed ({exc})")
+        return ""
+
+
 def _classify_dispatch_observation(
     check: PullRequestCheck, dispatch_map: dict[int, tuple[int, bool]]
 ) -> Literal["excluded", "conflict", "counted"]:

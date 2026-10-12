@@ -1345,7 +1345,11 @@ and preserves the REST shim's `AGENT_LOOP_REAL_GH`. After the turn,
 `github.audit_coder_turn_dispatches` lists `workflow_dispatch` runs on the PR
 branch created since the turn started, and every known head, so intermediate
 heads are covered. Any non-managed run it finds is prepended to the coder
-comment as a non-authoritative diagnostic. Gating keeps excluding such runs as
+comment as a non-authoritative diagnostic. On a rejected guarded turn,
+`publish_rejected_coder_turn_dispatch_audit` posts the note on its own and
+never masks the rejection. The classifier decodes arguments with one
+pflag-style tokenizer, so grouped and equals shorthands cannot slip past
+it. Gating keeps excluding such runs as
 ad hoc diagnostics, and the workflow and its `unlabeled` recovery are
 unchanged.
 
