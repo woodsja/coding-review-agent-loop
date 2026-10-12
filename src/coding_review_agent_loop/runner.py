@@ -1100,13 +1100,26 @@ def _run_foreground_test_body(
             os.close(ready_write)
             os.close(release_read)
             handshake_cancelled = False
+            handshake_expired = False
+            # Issue #1326: with an absolute deadline the held target may only be
+            # released while its termination allowance still fits before it.
+            release_by = (
+                absolute_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+                if absolute_deadline is not None else None
+            )
             try:
                 ready = []
                 handshake_deadline = time.monotonic() + 5.0
+                if release_by is not None:
+                    handshake_deadline = min(handshake_deadline, release_by)
                 while not ready and time.monotonic() < handshake_deadline:
                     if host_wait_cancel is not None and host_wait_cancel.is_set():
                         break
-                    ready, _, _ = select.select([ready_read], [], [], 0.05)
+                    ready, _, _ = select.select(
+                        [ready_read], [], [], max(0.0, min(0.05, handshake_deadline - time.monotonic())),
+                    )
+                if not ready and release_by is not None and time.monotonic() >= release_by:
+                    raise _HandshakeExpired("held child was not ready before the request deadline")
                 if not ready or os.read(ready_read, 1) != b"1":
                     raise AgentLoopError("broker test child did not reach the containment handshake")
                 (parent_cgroup_path / "cgroup.procs").write_text(str(proc.pid), encoding="ascii")
@@ -1120,12 +1133,16 @@ def _run_foreground_test_body(
                 with (host_launch_guard() if host_launch_guard is not None else contextlib.nullcontext()):
                     if host_wait_cancel is not None and host_wait_cancel.is_set():
                         raise AgentLoopError("broker shutdown before the held child was released")
+                    if release_by is not None and time.monotonic() >= release_by:
+                        raise _HandshakeExpired("held child release would pass the request deadline")
                     os.write(release_write, b"1")
             except BaseException as handshake_error:
                 _terminate_process_group(proc)
                 # A broker stop that ended the held child before its release
                 # means the target never executed: complete as cancelled.
-                if (
+                if isinstance(handshake_error, _HandshakeExpired):
+                    handshake_expired = True
+                elif (
                     isinstance(handshake_error, (OSError, AgentLoopError))
                     and host_wait_cancel is not None
                     and host_wait_cancel.is_set()
@@ -1136,6 +1153,19 @@ def _run_foreground_test_body(
             finally:
                 os.close(ready_read)
                 os.close(release_write)
+            if handshake_expired:
+                # The target was never released: no execution, no evidence.
+                if handle is not None:
+                    handle.close()
+                if process_finished is not None:
+                    process_finished(proc)
+                lane_lock.close()
+                reason = "held test child not released before the request deadline"
+                return ForegroundTestResult(
+                    cmd, cwd, "timed_out", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+                )
             if handshake_cancelled:
                 if handle is not None:
                     handle.close()
@@ -1485,6 +1515,10 @@ def _classify_pre_collection_run(
         )
     except Exception:
         return None
+
+
+class _HandshakeExpired(AgentLoopError):
+    """The held child could not be released inside the absolute deadline."""
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:

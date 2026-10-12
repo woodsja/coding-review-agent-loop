@@ -340,7 +340,12 @@ def prepare_lifecycle_probe(
     # a wrapper that drops PYTHONPATH (for example by adding -I) fails it.
     preflight_timeout = PREFLIGHT_TIMEOUT_SECONDS
     if deadline is not None:
-        preflight_timeout = min(preflight_timeout, deadline - time.monotonic())
+        from .test_runtime import PROBE_CLEANUP_ALLOWANCE_SECONDS
+
+        # The probe tree's cleanup must also end by the deadline.
+        preflight_timeout = min(
+            preflight_timeout, deadline - time.monotonic() - PROBE_CLEANUP_ALLOWANCE_SECONDS,
+        )
         if preflight_timeout <= 0:
             return None
     if _run_check(eligibility.invocation, _PREFLIGHT_CODE, child, cwd, preflight_timeout) != 0:

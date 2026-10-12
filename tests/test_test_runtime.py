@@ -5188,6 +5188,11 @@ def test_every_fixture_process_is_reachable():
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)  # only SIGKILL ends it
         modes.append("inner-block")
+    if "inner-noisy" in modes:
+        (markers / "inner-noisy").write_text("1")
+        chunk = "x" * 8192
+        while True:
+            print(chunk, flush=True)
     if "inner-block" in modes:
         (markers / "inner-blocking").write_text("1")
         time.sleep(600)
@@ -5231,6 +5236,9 @@ def _fx_repo(tmp_path: Path, *, modes: str = "", extra: dict[str, str] | None = 
 
 
 def _fx_server(root: Path, turn: str = "turn-fixture"):
+    if not sys.platform.startswith("linux"):
+        # The broker pins the checkout with Linux-only primitives (#1326).
+        pytest.skip("a real test broker requires Linux")
     return fx_evidence.TestBrokerServer(root=root, turn_id=turn).start()
 
 
@@ -5452,6 +5460,7 @@ def test_fixture_setup_cancellation_runs_teardown_and_never_spawns_the_inner_com
     assert killed == []
 
 
+@_FX_LINUX
 def test_fixture_stop_before_the_guarded_supervisor_launch_starts_nothing(tmp_path, monkeypatch):
     root, markers = _fx_repo(tmp_path)
     server = _fx_server(root)
@@ -5627,6 +5636,7 @@ def test_fixture_that_edits_a_tracked_file_is_not_citable_after_teardown(tmp_pat
     assert code == 0 or code != 0  # the exit folds the inner lifecycle; citation is what is gated
 
 
+@_FX_LINUX
 def test_fixture_absent_requests_projections_and_memory_are_unchanged(tmp_path, monkeypatch):
     sent: list[dict] = []
 
@@ -5737,6 +5747,7 @@ def test_fixture_pre_dispatch_connect_failure_is_a_nothing_ran_refusal(tmp_path,
     assert not memory.exists()
 
 
+@_FX_LINUX
 def test_fixture_post_dispatch_response_loss_is_an_unknown_broker_owned_result(tmp_path, monkeypatch, capsys):
     import socket as socket_module
 
@@ -5828,6 +5839,7 @@ def test_fixture_timeouts_below_the_floor_are_refused_before_dispatch(tmp_path, 
     assert "--fixture requires a timeout of at least 30s" in capsys.readouterr().err
 
 
+@_FX_LINUX
 @pytest.mark.parametrize("timeout", [1, 0.5, 29.9], ids=["one", "fractional", "just-below"])
 def test_fixture_timeouts_below_the_floor_get_a_broker_error_frame(tmp_path, monkeypatch, timeout):
     root, markers = _fx_repo(tmp_path)
@@ -6057,9 +6069,10 @@ def test_fixture_prelaunch_deadline_real_probe_is_truncated_and_torn_down(tmp_pa
     result = runtime.probe_inner_launcher(
         [sys.executable, "-m", "pytest", "-q"], cwd=tmp_path,
         environment={**os.environ, "AGENT_LOOP_INVOCATION_ID": "turn-probe-deadline"},
-        environment_is_complete=True, deadline=time.monotonic() + 1.0, use_cache=False,
+        environment_is_complete=True, deadline=started + 2.5, use_cache=False,
     )
-    assert time.monotonic() - started < 4.0
+    # Execution and probe-tree cleanup both end by the deadline.
+    assert time.monotonic() - started <= 2.6
     assert result.state == "unknown" and result.diagnostic == runtime.PROBE_DEADLINE_DIAGNOSTIC
     for line in (tmp_path / "probe.pid").read_text().split():
         spawned.append(int(line))
@@ -6739,3 +6752,202 @@ def test_fixture_modules_import_without_fcntl_and_refuse_off_linux(monkeypatch):
         monkeypatch.undo()
         importlib.reload(fx_supervisor)
         importlib.reload(fx_runtime)
+
+
+def _fx_raw_request(server, root, argv, *, timeout, fixture="fixture.py"):
+    raw = os.urandom(16).hex()
+    return {
+        "turn_id": server.turn_id, "nonce": raw + "." + hmac_new(server.capability, raw),
+        "argv": list(argv), "timeout_seconds": timeout, "cwd": str(root),
+        "environment": {k: v for k, v in os.environ.items() if not k.startswith("AGENT_LOOP_TEST_BROKER")},
+        "fixture": fixture,
+    }
+
+
+@_FX_HOST
+def test_fixture_setup_never_starts_when_the_go_ahead_arrives_after_its_deadline(tmp_path, monkeypatch):
+    root, markers = _fx_repo(tmp_path)
+    monkeypatch.setattr(fx_runtime, "reserve_seconds", lambda timeout: 5.0)
+    deadlines: dict[str, float] = {}
+    original_start = fx_runtime.FixtureSupervisor.start_setup
+    original_send = fx_runtime.FixtureSupervisor._send
+
+    def recording_start(self, parent_cgroup, *, setup_deadline):
+        deadlines["setup"] = setup_deadline
+        return original_start(self, parent_cgroup, setup_deadline=setup_deadline)
+
+    def late_send(self, line):
+        if line == "start":
+            # The broker released setup in time, but the supervisor consumes
+            # the go-ahead only after the setup deadline (descheduling).
+            time.sleep(max(0.0, deadlines["setup"] - time.monotonic()) + 0.3)
+        return original_send(self, line)
+
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "start_setup", recording_start)
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "_send", late_send)
+    server = _fx_server(root)
+    try:
+        fx_evidence.TestBrokerClient(_fx_env(server)).run(
+            list(_FX_PYTEST), timeout_seconds=30, cwd=root, fixture="fixture.py",
+        )
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    assert not (markers / "setup-started").exists() and not (markers / "inner-ran").exists()
+    assert row.fixture.setup_status == "timed_out" and row.fixture.setup_log_digest == ""
+    assert row.fixture.teardown_status == "not-run"
+    assert row.inner_exec == "not-attempted" and row.outcome in {"failed", "timed_out"}
+    assert not _authoritative_receipt_passes(row, claim="current-result")
+
+
+@_FX_HOST
+def test_fixture_non_reading_client_never_holds_the_run_past_its_deadline(tmp_path, monkeypatch):
+    import socket as socket_module
+
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "inner-noisy")
+    forced: list[int] = []
+    original_force = fx_runtime.FixtureSupervisor.force_terminate
+
+    def spy_force(self):
+        forced.append(self.process.pid)
+        return original_force(self)
+
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "force_terminate", spy_force)
+    server = _fx_server(root)
+    noisy = (sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", "test_fx.py")
+    try:
+        with socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM) as connection:
+            connection.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_RCVBUF, 4096)
+            connection.connect(server.endpoint)
+            started = time.monotonic()
+            fx_evidence._send_frame(connection, _fx_raw_request(server, root, noisy, timeout=30))
+            # Never read a single frame: the broker's sends block.
+            deadline = time.monotonic() + 30 + 2 * fx_evidence.MAX_SNAPSHOT_SECONDS + 10
+            while time.monotonic() < deadline and not [r for r in server.journal if r.fixture is not None]:
+                time.sleep(0.1)
+            journaled_after = time.monotonic() - started
+            row = _fx_row(server)
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))
+    assert (markers / "inner-noisy").exists() and (markers / "teardown-done").exists()
+    assert row.outcome == "timed_out"
+    assert row.fixture.teardown_status == 0
+    assert forced == []
+    # Termination, teardown, the sweep and the after snapshot all finished
+    # by the 30 s request deadline plus snapshot overhead.
+    assert journaled_after < 30 + 3.0, journaled_after
+
+
+_FX_TERM_RESISTANT = (
+    "import os, pathlib, signal, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "pathlib.Path(%r).open('a').write(str(os.getpid()) + '\\n')\n"
+    "time.sleep(600)\n"
+)
+
+
+@_FX_LINUX
+def test_fixture_resistant_launcher_probe_cleanup_ends_by_the_deadline(tmp_path, monkeypatch):
+    pid_file = tmp_path / "probe.pid"
+    original = runtime._run_bounded_probe
+
+    def resistant(argv, **kwargs):
+        return original([sys.executable, "-c", _FX_TERM_RESISTANT % str(pid_file)], **kwargs)
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", resistant)
+    deadline = time.monotonic() + 3.0
+    result = runtime.probe_inner_launcher(
+        [sys.executable, "-m", "pytest", "-q"], cwd=tmp_path, environment=dict(os.environ),
+        environment_is_complete=True, deadline=deadline, use_cache=False,
+    )
+    assert time.monotonic() <= deadline + 0.1
+    assert result.state == "unknown" and result.diagnostic == runtime.PROBE_DEADLINE_DIAGNOSTIC
+    _fx_assert_gone([int(line) for line in pid_file.read_text().split()])
+
+
+@_FX_LINUX
+def test_fixture_resistant_lifecycle_preflight_cleanup_ends_by_the_deadline(tmp_path, monkeypatch):
+    from coding_review_agent_loop import lifecycle_probe
+
+    pid_file = tmp_path / "preflight.pid"
+    monkeypatch.setattr(lifecycle_probe, "_PREFLIGHT_CODE", _FX_TERM_RESISTANT % str(pid_file))
+    eligible = lifecycle_probe.launch_eligibility_for([sys.executable, "-m", "pytest"], dict(os.environ), tmp_path)
+    if eligible is None:
+        pytest.skip("this interpreter is not an eligible pytest launcher")
+    deadline = time.monotonic() + 3.0
+    assert lifecycle_probe.prepare_lifecycle_probe(
+        [sys.executable, "-m", "pytest"], dict(os.environ), tmp_path, deadline=deadline,
+    ) is None
+    assert time.monotonic() <= deadline + 0.1
+    _fx_assert_gone([int(line) for line in pid_file.read_text().split()])
+
+
+@_FX_HOST
+def test_fixture_resistant_post_setup_probe_through_the_broker_keeps_the_reserve(tmp_path, monkeypatch):
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "setup-slow", fx_setup_seconds="15")
+    pid_file = tmp_path / "probe.pid"
+    inner_deadlines: list[float] = []
+    returned_at: list[float] = []
+    original_init = fx_evidence._FixtureRun.__init__
+    original = runtime._run_bounded_probe
+
+    def recording_init(self, **kwargs):
+        original_init(self, **kwargs)
+        inner_deadlines.append(self.inner_deadline)
+
+    def resistant(argv, **kwargs):
+        try:
+            return original([sys.executable, "-c", _FX_TERM_RESISTANT % str(pid_file)], **kwargs)
+        finally:
+            returned_at.append(time.monotonic())
+
+    monkeypatch.setattr(fx_evidence._FixtureRun, "__init__", recording_init)
+    monkeypatch.setattr(runtime, "_run_bounded_probe", resistant)
+    server = _fx_server(root)
+    try:
+        fx_evidence.TestBrokerClient(_fx_env(server)).run(
+            list(_FX_PYTEST), timeout_seconds=30, cwd=root, fixture="fixture.py",
+        )
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    _fx_assert_gone([*_fx_pids(markers), *(int(line) for line in pid_file.read_text().split())])
+    assert returned_at and returned_at[-1] <= inner_deadlines[0]
+    assert not (markers / "inner-ran").exists() and (markers / "teardown-done").exists()
+    assert row.outcome == "timed_out" and row.inner_exec == "not-attempted"
+    assert row.fixture.setup_status == 0 and row.fixture.teardown_status == 0
+
+
+@_FX_LINUX
+def test_fixture_deadline_bounds_the_held_child_handshake(tmp_path, monkeypatch):
+    marker = tmp_path / "released"
+    original_popen = runner_module.subprocess.Popen
+
+    def delayed_shim(cmd, *args, **kwargs):
+        cmd = list(cmd)
+        if cmd[1:3] == ["-m", "coding_review_agent_loop.containment"]:
+            # A managed-scope shim whose readiness arrives far too late.
+            delay = (
+                "import os, sys, time; time.sleep(30); "
+                "os.execv(sys.executable, [sys.executable, '-m', 'coding_review_agent_loop.containment', *sys.argv[1:]])"
+            )
+            cmd = [cmd[0], "-c", delay, *cmd[3:]]
+        return original_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", delayed_shim)
+    (tmp_path / "cgroup").mkdir()
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [_SRC, os.environ.get("PYTHONPATH")]))}
+    started = time.monotonic()
+    deadline = started + 5.0
+    result = run_foreground_test(
+        [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('1')"],
+        cwd=tmp_path, timeout_seconds=60, env=env, environment_is_complete=True,
+        parent_cgroup_path=tmp_path / "cgroup", absolute_deadline=deadline, echo_output=False,
+    )
+    assert time.monotonic() <= deadline + 0.1
+    assert result.outcome == "timed_out" and result.inner_exec == "not-attempted"
+    assert not marker.exists()
+    assert not (tmp_path / "cgroup" / "cgroup.procs").exists()

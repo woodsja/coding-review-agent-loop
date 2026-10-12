@@ -3154,6 +3154,9 @@ def _recognized_inner_probe_tokens(
 
 
 PROBE_DEADLINE_DIAGNOSTIC = "inner probe truncated at the request deadline"
+# ``_terminate_probe_tree`` waits up to 2 × 0.5 s after the watchdog; with an
+# absolute deadline (#1326) that cleanup must also end by the deadline.
+PROBE_CLEANUP_ALLOWANCE_SECONDS = 1.25
 
 
 def _inner_probe_identity(
@@ -3262,7 +3265,9 @@ def probe_inner_launcher(
     cache_key = (invocation, identity_key) if invocation and use_cache else None
     probe_timeout = LAUNCHER_PROBE_TIMEOUT_SECONDS
     if deadline is not None:
-        probe_timeout = min(probe_timeout, deadline - time.monotonic())
+        probe_timeout = min(
+            probe_timeout, deadline - time.monotonic() - PROBE_CLEANUP_ALLOWANCE_SECONDS,
+        )
         if probe_timeout <= 0:
             return LauncherProbeResult(reported, "unknown", PROBE_DEADLINE_DIAGNOSTIC, identity_key)
     flight: threading.Event | None = None

@@ -3211,13 +3211,25 @@ class TestBrokerServer:
                 )
                 environment[FIXTURE_STATE_DIR_ENV] = str(fixture_run.state_dir)
 
+            def bounded_grace(grace: float) -> float:
+                # Issue #1326: in a fixture run no send may outlive the inner
+                # watchdog cutoff, so a client that stopped reading can never
+                # push termination, teardown or the sweep past the deadline.
+                if fixture_run is None:
+                    return grace
+                from .runner import DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+
+                cutoff = fixture_run.inner_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS
+                return max(0.0, min(grace, cutoff - time.monotonic()))
+
             def stream(chunk: str) -> None:
                 safe = chunk.encode("utf-8", errors="replace")[:16 * 1024].decode("utf-8", errors="ignore")
                 try:
                     # A disconnected or non-reading client never stops the
                     # target; the evidence result is still returned.
                     sender.send(
-                        {"type": "output", "data": safe}, grace=BROKER_STREAM_SEND_GRACE_SECONDS,
+                        {"type": "output", "data": safe},
+                        grace=bounded_grace(BROKER_STREAM_SEND_GRACE_SECONDS),
                     )
                 except OSError:
                     pass
@@ -3225,12 +3237,13 @@ class TestBrokerServer:
             def heartbeat() -> None:
                 sender.send(
                     {"type": "output", "data": ""},
-                    grace=_host_heartbeat_grace(), skip_if_busy=True,
+                    grace=bounded_grace(_host_heartbeat_grace()), skip_if_busy=True,
                 )
 
             def wait_notice(text: str) -> None:
                 sender.send(
-                    {"type": "output", "data": text + "\n"}, grace=_host_heartbeat_grace(),
+                    {"type": "output", "data": text + "\n"},
+                    grace=bounded_grace(_host_heartbeat_grace()),
                 )
 
             parent_cgroup = None

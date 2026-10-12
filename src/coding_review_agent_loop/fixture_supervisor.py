@@ -438,6 +438,8 @@ class _Supervisor:
     def run_phase(self, phase: str, deadline: float, *, interruptible: bool) -> tuple[object, float, str]:
         """Run one phase until it exits, ``deadline`` (absolute) or teardown."""
         started = time.monotonic()
+        if started >= deadline:
+            return "timed_out", 0.0, ""
         tail: deque[bytes] = deque()
         tail_size = 0
         try:
@@ -600,6 +602,12 @@ class _Supervisor:
             if line.strip() == b"start":
                 setup_status = None
                 break
+        if setup_status is None and time.monotonic() >= self.setup_deadline:
+            # The go-ahead was consumed after the absolute setup deadline
+            # (for example the supervisor was descheduled): never start setup.
+            _emit({"event": "setup", "status": "timed_out", "duration": 0.0, "log": "", "ran": False})
+            self.teardown_requested = True
+            setup_status = "timed_out"
         if setup_status is None:
             setup_status, duration, log = self.run_phase("setup", self.setup_deadline, interruptible=True)
             _emit({"event": "setup", "status": setup_status, "duration": round(duration, 3), "log": log, "ran": True})

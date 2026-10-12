@@ -1740,8 +1740,14 @@ otherwise the row is `timed_out` with setup `not-run`. The supervisor gets
 absolute monotonic deadlines. Setup is stopped 2.5 s before the inner deadline
 so that its termination grace still ends by that deadline. If the supervisor
 becomes ready only after that point, setup never starts and the row is
-`timed_out` with setup `timed_out`. The inner watchdog fires early enough that
-the SIGTERM grace, SIGKILL and the output drain also end by the inner deadline.
+`timed_out` with setup `timed_out`. The supervisor itself rechecks the setup deadline
+when it receives the go-ahead, so a late go-ahead never starts setup either.
+The inner watchdog fires early enough that the SIGTERM grace, SIGKILL and the
+output drain also end by the inner deadline. The same cutoff bounds every
+other blocking step: probe and lifecycle-preflight timeouts leave room for
+their process-tree cleanup, a held managed-scope child is released only while
+its termination allowance still fits, and forwarding output to a client that
+stopped reading never blocks past the cutoff.
 Teardown is bounded so that the sweep allowance still fits before the request
 deadline, but it always keeps a positive bound. The broker waits for cleanup
 only until the request deadline plus 1 s of reporting slack, then forces
