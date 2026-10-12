@@ -1072,6 +1072,10 @@ def test_transport_failure_class_is_fixed_and_nonsecret(monkeypatch, capsys, std
                                    cwd=Path("/"), env={}, ssh=ssh)
     message = str(raised.value)
     assert message.startswith(f"Trusted Git transport failed with exit 128 ({label}).")
+    # #1383: the same fixed class is structured data on a TransportFailure.
+    assert isinstance(raised.value, git_transport.TransportFailure)
+    assert raised.value.label == label
+    assert _SECRET not in repr(vars(raised.value))
     assert _SECRET not in message and "fetch" not in message and "Connection" not in message
     assert ("--git-ssh-identity" in message) == (ssh and label == "authentication failure")
     assert ("known_hosts" in message) == (ssh and label == "host-key failure")
@@ -1090,6 +1094,9 @@ def test_transport_timeout_reports_network_class(monkeypatch):
     with pytest.raises(AgentLoopError, match=_re.escape("timed out (network or timeout)")) as raised:
         git_transport._private_git(("fetch",), cwd=Path("/"), env={}, ssh=True)
     assert _SECRET not in str(raised.value)
+    assert isinstance(raised.value, git_transport.TransportFailure)
+    assert raised.value.label == "network or timeout"
+    assert str(raised.value) == "Trusted Git transport timed out (network or timeout)."
 
 
 def test_https_auth_failure_still_retries_with_gh_token(repositories, monkeypatch):

@@ -569,6 +569,19 @@ _SSH_FAILURE_HINTS = {
 }
 
 
+class TransportFailure(AgentLoopError):
+    """A failed or timed-out transport Git command.
+
+    ``label`` is the fixed, non-secret failure class (``remote not found``,
+    ``host-key failure``, ``network or timeout``, ``authentication failure``
+    or ``unclassified``), so callers need not parse the message (#1383).
+    """
+
+    def __init__(self, message: str, *, label: str):
+        super().__init__(message)
+        self.label = label
+
+
 def _classify_transport_failure(stderr: bytes) -> str:
     text = stderr.decode("utf-8", "replace").lower()
     for label, needles in _FAILURE_EVIDENCE:
@@ -591,14 +604,16 @@ def _private_git(args: tuple[str, ...], *, cwd: Path, env: dict[str, str],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 check=False, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise AgentLoopError("Trusted Git transport timed out (network or timeout).") from exc
+        raise TransportFailure("Trusted Git transport timed out (network or timeout).",
+                               label="network or timeout") from exc
     if result.returncode:
         # Do not expose command arguments or errors: either may contain a
         # credential returned by a remote server.  Only a fixed class is shown.
         label = _classify_transport_failure(result.stderr or b"")
         hint = _SSH_FAILURE_HINTS.get(label, "") if ssh else ""
-        raise AgentLoopError(
-            f"Trusted Git transport failed with exit {result.returncode} ({label}).{hint}"
+        raise TransportFailure(
+            f"Trusted Git transport failed with exit {result.returncode} ({label}).{hint}",
+            label=label,
         )
     return result.stdout
 

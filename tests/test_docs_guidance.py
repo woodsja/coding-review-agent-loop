@@ -1162,3 +1162,63 @@ def test_ssh_transport_identity_contract_is_documented():
     readme = re.sub(r"\s+", " ", README.read_text(encoding="utf-8"))
     assert "single `UserKnownHostsFile`" in readme
     assert "`A-Z a-z 0-9 . _ / + , : @ -`" in readme
+
+
+TRANSPORT_SMOKE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "transport-smoke.yml"
+
+
+def _transport_smoke_section() -> str:
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    start = text.index("### Pre-merge transport smoke check")
+    return text[start:text.index("\n## ", start)]
+
+
+def test_transport_smoke_check_is_documented_as_required_before_merge():
+    section = _transport_smoke_section()
+    flat = " ".join(section.split())
+    assert ("Required before merging any change to `git_transport.py`, `secure_git.py` "
+            "or the checkout sync path") in flat
+    for name in ("scripts/transport_smoke.sh", "agent-loop transport-check",
+                 "`https`", "`ssh`", "--git-ssh-identity", "--base"):
+        assert name in flat
+    for label in ("transport-check: pass", "transport-check: fail (<class>)", "`configuration`",
+                  "`remote not found`", "`host-key failure`", "`network or timeout`",
+                  "`authentication failure`", "`local import`", "`unclassified`",
+                  "[ssh-config-warning]", "transport-smoke: build failed"):
+        assert label in flat
+    assert "AGENT_LOOP_TRANSPORT_DEPLOY_KEY" in flat and "transport-smoke.yml" in flat
+    # CI coverage never replaces the operator's local check.
+    assert "does not replace the local check" in flat
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert "docs/local_agent_loop.md#pre-merge-transport-smoke-check" in readme
+    assert _github_anchor("Pre-merge transport smoke check") == "pre-merge-transport-smoke-check"
+
+
+def test_transport_smoke_workflow_is_optional_read_only_and_pinned():
+    import yaml
+
+    text = TRANSPORT_SMOKE_WORKFLOW.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    triggers = workflow[True]
+    assert triggers["push"] == {"branches": ["main"]}
+    assert "pull_request" in triggers and "workflow_dispatch" in triggers
+    assert workflow["permissions"] == {"contents": "read"}
+    steps = workflow["jobs"]["transport-smoke"]["steps"]
+    assert "permissions" not in workflow["jobs"]["transport-smoke"]
+    gate, *rest = steps
+    assert gate["env"]["DEPLOY_KEY"] == "${{ secrets.AGENT_LOOP_TRANSPORT_DEPLOY_KEY }}"
+    assert 'if [ -z "$DEPLOY_KEY" ]' in gate["run"] and "skipped" in gate["run"]
+    assert "exit 1" not in gate["run"]
+    assert all(step.get("if") == "steps.secret.outputs.present == 'true'" for step in rest)
+    run = rest[-1]["run"]
+    assert rest[-1]["env"]["DEFAULT_BRANCH"] == "${{ github.event.repository.default_branch }}"
+    assert "scripts/transport_smoke.sh" in run
+    assert "--trusted-origin-protocol ssh" in run and '--base "$DEFAULT_BRANCH"' in run
+    assert "chmod 600" in run and "IdentityFile ~/.ssh/transport_deploy_key" in run
+    assert "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" in run
+    # No trust on first use, no key echo, no API authentication before the fetch.
+    assert "ssh-keyscan" not in text
+    assert "echo \"$DEPLOY_KEY\"" not in text and "set -x" not in text
+    assert not re.search(r"(^|[\s;|&])gh\s", run) and "GH_TOKEN" not in text and "GITHUB_TOKEN" not in text
+    # ci.yml's literal managed-CI gates are untouched by this optional job.
+    assert "transport" not in (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

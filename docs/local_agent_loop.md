@@ -6324,6 +6324,77 @@ runs the real Claude and Codex CLIs against these grants when
 
 Providing any `--claude-arg`, `--codex-arg`, or `--gemini-arg` replaces that agent's default entirely. Claude and Gemini prompts include a tool-owned response-file path under `/tmp/coding-review-agent-loop/responses/`; when the file exists and is non-empty, the loop validates and posts that file instead of stdout so CLI diagnostics and tool narration do not leak into GitHub comments. Gemini still supports stdout marker filtering as a fallback. If you pass `--gemini-arg=--output-format --gemini-arg=json`, the loop extracts the JSON `response` field before parsing markers when no response file was written. Fallback stdout is never posted unless the required protocol marker validates.
 
+### Pre-merge transport smoke check
+
+**Required before merging any change to `git_transport.py`, `secure_git.py`
+or the checkout sync path** (`config._sync_base_branch`, `ensure_temp_checkout`
+and the `run_worktrees` import paths). Run it with your real protocol and
+credentials against the PR head:
+
+```bash
+scripts/transport_smoke.sh --repo OWNER/REPO [--trusted-origin-protocol ssh] \
+    [--git-ssh-identity PATH] [--base BRANCH] [--gh-cmd GH]
+```
+
+Why it exists (#1383): the #1380 regression from PR #1364, where the trusted
+SSH transport ignored the `IdentityFile` in `~/.ssh/config`, reached `main`
+because the network tests wrapped `_transport_env` with a fixture that supplied
+the key, CI checks out over HTTPS, and the agent-loop release driving the PR
+predated the new transport. The new code therefore first ran for real after
+merge. `tests/test_git_transport_network.py` now also drives the unwrapped
+`_transport_env` against a local `sshd` with a config-selected, non-default key.
+That test still cannot cover your real host, keys and remote.
+
+The script builds the checkout it lives in (override with
+`AGENT_LOOP_SMOKE_SOURCE`) non-editably into a temporary venv (`mktemp -d`,
+removed on exit), using `AGENT_LOOP_SMOKE_PYTHON` or `python3`. It then runs
+that build's `agent-loop transport-check` with your arguments. That subcommand
+fetches the default branch once through the production `import_ref` path
+into a fresh scratch repository in a private temporary directory, which is
+removed afterwards; your checkouts are never touched. `--trusted-origin-protocol`
+accepts `https` (default) and `ssh`. `--git-ssh-identity` and
+`AGENT_LOOP_GIT_SSH_IDENTITY` work as in the loop commands.
+
+Output is exactly one line, and the exit status is 0 on pass and 1 on fail:
+
+- `transport-check: pass`
+- `transport-check: fail (<class>)`, where the class is one of `configuration`,
+  `remote not found`, `host-key failure`, `network or timeout`,
+  `authentication failure`, `local import` or `unclassified`.
+
+Either line may end with ` [ssh-config-warning]` when the transport ignored a
+refused `~/.ssh/config` value during this check. Run any loop command to read
+the fixed warning text; the check itself prints no warnings, Git or SSH
+output, usage text, tracebacks, URLs, key paths or tokens.
+
+- `configuration` means a local preflight failed before any network access
+  (repository identity, `--base`, SSH identity, scratch repository, SSH client),
+  or the default-branch lookup through `gh` failed. Bad arguments also report
+  `configuration` without echoing them. Without `--base`, the check makes one
+  GitHub metadata request through `gh` before fetching, so pass `--base` where
+  `gh` is not authenticated.
+- `local import` means the fetch succeeded and only the local pack import into
+  the scratch repository failed.
+- An HTTPS fetch whose `gh` token retry is unavailable reports the original
+  fetch class, typically `authentication failure`, not `local import`.
+
+The script itself prints `transport-smoke: build failed` and exits 3 when the
+venv or the install fails, with their diagnostics suppressed. It exits 2,
+creating nothing, when `--repo` is missing.
+
+**Optional CI job.** `.github/workflows/transport-smoke.yml` runs the same
+script with `--trusted-origin-protocol ssh` and `--base` set to the
+repository's default branch. It uses a read-only deploy key stored in the
+`AGENT_LOOP_TRANSPORT_DEPLOY_KEY` Actions secret, selected through a fresh
+`~/.ssh/config`, and GitHub's SSH host keys pinned in the workflow (no
+`ssh-keyscan`). It has `contents: read` only. Without the secret (forks,
+unconfigured repositories) it logs a skip and succeeds. To enable it, a
+repository admin adds a read-only deploy key and the secret. If GitHub rotates
+its host keys, update the pinned keys; until then the job fails closed with
+`host-key failure`. The CI job covers only SSH with a deploy key. It does not
+replace the local check for operators who use HTTPS with a `gh` token or their
+own SSH configuration.
+
 ## Protocol
 
 Agent responses are parsed using HTML comment markers:
