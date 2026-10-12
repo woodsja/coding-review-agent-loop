@@ -471,11 +471,15 @@ def run_independent_import_check(
     argv: Sequence[str],
     env: Mapping[str, str] | None,
     cwd: Path,
+    *,
+    deadline: float | None = None,
 ) -> str:
     """Return ``pytest-absent`` or ``unavailable``; never runs tests.
 
     Only a ``-m pytest`` eligibility whose argv[0] still resolves to the very
-    file that was validated at launch is checked.
+    file that was validated at launch is checked.  ``deadline`` (issue #1326)
+    bounds the check and its process-tree cleanup; an exhausted allocation
+    skips this optional diagnostic.
     """
     if eligibility is None or eligibility.shape != "module" or not argv:
         return "unavailable"
@@ -487,5 +491,12 @@ def run_independent_import_check(
         return "unavailable"
     if validated != (eligibility.interpreter_path, eligibility.identity):
         return "unavailable"
-    code = _run_check(eligibility.invocation, _IMPORT_CHECK_CODE, base, cwd, IMPORT_CHECK_TIMEOUT_SECONDS)
+    timeout = IMPORT_CHECK_TIMEOUT_SECONDS
+    if deadline is not None:
+        from .test_runtime import PROBE_CLEANUP_ALLOWANCE_SECONDS
+
+        timeout = min(timeout, deadline - time.monotonic() - PROBE_CLEANUP_ALLOWANCE_SECONDS)
+        if timeout <= 0:
+            return "unavailable"
+    code = _run_check(eligibility.invocation, _IMPORT_CHECK_CODE, base, cwd, timeout)
     return "pytest-absent" if code == 3 else "unavailable"

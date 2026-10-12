@@ -1746,7 +1746,10 @@ The inner watchdog fires early enough that the SIGTERM grace, SIGKILL and the
 output drain also end by the inner deadline. The same cutoff bounds every
 other blocking step: probe and lifecycle-preflight timeouts leave room for
 their process-tree cleanup, a held managed-scope child is released only while
-its termination allowance still fits, and forwarding output to a client that
+its termination allowance still fits and after the launcher identity is
+re-checked once more, a directly spawned target is never launched once its
+termination allowance no longer fits, the optional pytest import check used
+for pre-collection classification is skipped when it cannot fit, and forwarding output to a client that
 stopped reading never blocks past the cutoff.
 Teardown is bounded so that the sweep allowance still fits before the request
 deadline, but it always keeps a positive bound. The broker waits for cleanup

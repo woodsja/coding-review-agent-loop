@@ -6951,3 +6951,133 @@ def test_fixture_deadline_bounds_the_held_child_handshake(tmp_path, monkeypatch)
     assert result.outcome == "timed_out" and result.inner_exec == "not-attempted"
     assert not marker.exists()
     assert not (tmp_path / "cgroup" / "cgroup.procs").exists()
+
+
+def _fx_proceed(deadline):
+    return fx_runtime.SetupDecision("proceed")
+
+
+@_FX_LINUX
+def test_fixture_launcher_retargeted_during_held_child_readiness_is_never_released(tmp_path, monkeypatch):
+    venv_bin = tmp_path / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    shim = venv_bin / "python"
+    shim.symlink_to(sys.executable)
+    fake = tmp_path / "not-python"
+    fake.write_text("#!/bin/sh\nexit 3\n")
+    fake.chmod(0o755)
+    marker = tmp_path / "inner-ran"
+    (tmp_path / "test_ok.py").write_text(
+        "import pathlib\ndef test_ok():\n    pathlib.Path(%r).write_text('1')\n" % str(marker)
+    )
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    original_popen = runner_module.subprocess.Popen
+
+    def retarget():
+        shim.unlink()
+        shim.symlink_to(fake)
+
+    def delayed_shim(cmd, *args, **kwargs):
+        cmd = list(cmd)
+        if cmd[1:3] == ["-m", "coding_review_agent_loop.containment"]:
+            # A fixture process retargets the shim while the held child is
+            # still on its way to the readiness handshake.
+            threading.Timer(0.5, retarget).start()
+            delay = (
+                "import os, sys, time; time.sleep(2); "
+                "os.execv(sys.executable, [sys.executable, '-m', 'coding_review_agent_loop.containment', *sys.argv[1:]])"
+            )
+            cmd = [cmd[0], "-c", delay, *cmd[3:]]
+        return original_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", delayed_shim)
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", lambda pid: cgroup)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [_SRC, os.environ.get("PYTHONPATH")]))}
+    result = run_foreground_test(
+        [".venv/bin/python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_ok.py"],
+        cwd=tmp_path, timeout_seconds=60, env=env, environment_is_complete=True,
+        parent_cgroup_path=cgroup, absolute_deadline=time.monotonic() + 60,
+        post_admission_setup=_fx_proceed, echo_output=False,
+    )
+    assert result.outcome == "launch-failed" and result.inner_exec == "not-attempted"
+    assert result.diagnostic == fx_runtime.LAUNCHER_CHANGED_CAVEAT
+    assert (cgroup / "cgroup.procs").exists()  # the child reached the handshake
+    assert not marker.exists()
+
+
+@_FX_LINUX
+def test_fixture_late_successful_probe_never_launches_a_target_it_cannot_terminate(tmp_path, monkeypatch):
+    marker = tmp_path / "target-ran"
+    argv = [sys.executable, "-c", (
+        "import pathlib, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "pathlib.Path(%r).write_text('1')\n"
+        "time.sleep(600)\n" % str(marker)
+    )]
+    deadline = time.monotonic() + 6.0
+
+    def late_verified_probe(probe_argv, **kwargs):
+        # Authentication succeeds, but only 2 s before the inner deadline,
+        # less than the target's termination allowance.
+        time.sleep(max(0.0, deadline - 2.0 - time.monotonic()))
+        return runtime.LauncherProbeResult(tuple(probe_argv), "verified", "ok", "", tuple(probe_argv))
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", late_verified_probe)
+    result = run_foreground_test(
+        argv, cwd=tmp_path, timeout_seconds=60, env=dict(os.environ), environment_is_complete=True,
+        absolute_deadline=deadline, post_admission_setup=_fx_proceed, echo_output=False,
+    )
+    assert time.monotonic() <= deadline + 0.1
+    assert result.outcome == "timed_out" and result.inner_exec == "not-attempted"
+    assert not marker.exists()
+
+
+@_FX_LINUX
+def test_fixture_independent_import_check_is_bounded_by_the_deadline(tmp_path, monkeypatch):
+    from coding_review_agent_loop import lifecycle_probe
+
+    pid_file = tmp_path / "import-check.pid"
+    monkeypatch.setattr(lifecycle_probe, "_IMPORT_CHECK_CODE", _FX_TERM_RESISTANT % str(pid_file))
+    argv = [sys.executable, "-m", "pytest"]
+    eligibility = lifecycle_probe.launch_eligibility_for(argv, dict(os.environ), tmp_path)
+    if eligibility is None or eligibility.shape != "module":
+        pytest.skip("this interpreter is not an eligible module pytest launcher")
+    deadline = time.monotonic() + 3.0
+    assert lifecycle_probe.run_independent_import_check(
+        eligibility, argv, dict(os.environ), tmp_path, deadline=deadline,
+    ) == "unavailable"
+    assert time.monotonic() <= deadline + 0.1
+    _fx_assert_gone([int(line) for line in pid_file.read_text().split()])
+    # An exhausted allocation skips the optional diagnostic without spawning.
+    pid_file.unlink()
+    assert lifecycle_probe.run_independent_import_check(
+        eligibility, argv, dict(os.environ), tmp_path, deadline=time.monotonic() + 0.5,
+    ) == "unavailable"
+    assert not pid_file.exists()
+
+
+@pytest.mark.parametrize("path", ["failed-bootstrap", "post-run"])
+def test_fixture_deadline_reaches_both_import_check_classification_paths(monkeypatch, tmp_path, path):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import lifecycle_probe
+
+    seen: list[object] = []
+
+    def spy(eligibility, argv, env, cwd, *, deadline=None):
+        seen.append(deadline)
+        return "unavailable"
+
+    monkeypatch.setattr(lifecycle_probe, "run_independent_import_check", spy)
+    monkeypatch.setattr(lifecycle_probe, "read_probe_report", lambda *a: SimpleNamespace(records=()))
+    setup = SimpleNamespace(eligibility=None, env={}, report_path=tmp_path / "r", nonce="n")
+    deadline = time.monotonic() + 42
+    if path == "failed-bootstrap":
+        runner_module._classify_missing_pytest_bootstrap(["python", "-m", "pytest"], setup, "x", tmp_path, deadline)
+    else:
+        runner_module._classify_pre_collection_run(
+            requested=["python", "-m", "pytest"], probe_setup=setup, returncode=1,
+            scan=SimpleNamespace(no_module_pytest=True), analysis=None, cwd=tmp_path, deadline=deadline,
+        )
+    assert seen == [deadline]
