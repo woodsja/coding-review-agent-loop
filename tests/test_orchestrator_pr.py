@@ -22232,6 +22232,18 @@ def test_named_pr_adopts_the_legacy_coder_record_only_at_its_exact_head(tmp_path
 
     reviews = [r.metadata for r in _records_1365(runner) if r.metadata.role == "reviewer"]
     assert {m.subject for m in reviews} == {head}
+    # Live PR review footers name the seat, backend, model and effort, while
+    # the records keep the bare seat IDs (#1363).
+    assert sorted(m.agent for m in reviews) == ["flash", "opus-low", "sol"]
+    footers = [
+        c["body"].rstrip().splitlines()[-1] for c in runner.pr_payload["comments"]
+        if "**Review verdict:**" in c["body"]
+    ]
+    assert footers == [
+        "-- sol (OpenAI Codex: gpt-6.1-sol (medium))",
+        "-- flash (Google Antigravity: Gemini 3.8 Flash (High))",
+        "-- opus-low (Google Antigravity: Claude Opus 5.5 (Low))",
+    ]
     prompts = [cmd[-1] for cmd, _cwd in runner.commands[start:] if cmd[0] in {"codex", "agy"}]
     assert len(prompts) == 3
     # Only the exact-head coder record reaches the reviewers as the round's

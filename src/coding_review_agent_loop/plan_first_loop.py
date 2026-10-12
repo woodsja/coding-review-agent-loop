@@ -3884,7 +3884,9 @@ def _run_plan_first_loop_body(
                                     reviewer_name,
                                     repaired_parsed,
                                     review_output=repaired_text,
-                                    model_used=None,
+                                    # The repair re-renders a completed review;
+                                    # keep the model that produced it (#1363).
+                                    model_used=round_review_models.get(reviewer_name),
                                 )
                             continue
                         if repaired_parsed.state == "blocking":
