@@ -2635,7 +2635,9 @@ class _M936World:
     sees the durable state the previous one left behind.
     """
 
-    def __init__(self, tmp_path, monkeypatch, *, weak=True, signed=True, staged=False):
+    def __init__(
+        self, tmp_path, monkeypatch, *, weak=True, signed=True, staged=False, history_board=None,
+    ):
         self.tmp_path = tmp_path
         row = _m936_inherited_row(entry_path_or_mode="pr mode") if weak else _m936_inherited_row()
         self.old_state = _m936_child_state(row)
@@ -2643,10 +2645,16 @@ class _M936World:
             claude_outputs=[self.old_state],
             codex_outputs=[structured_plan_review(state="approved")],
             gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+            antigravity_outputs=[
+                structured_plan_review(state="approved", reviewer="Google Antigravity")
+            ],
         )
         # ``staged`` plans the history under primary-then-panel, so its panel
-        # opening and scheduler contract are already durable.
-        history_config = _plan_config(tmp_path, **(_M936_STAGED if staged else {}))
+        # opening and scheduler contract are already durable; ``history_board``
+        # overrides the planning board the history was approved by.
+        history_config = _plan_config(
+            tmp_path, **(history_board or (_M936_STAGED if staged else {}))
+        )
         assert orchestrator.run_issue_loop(
             history, issue_number=56, config=history_config, plan_first=True
         ) == 0
@@ -5037,3 +5045,69 @@ def test_m1390_edited_child_under_signed_supersession_keeps_its_plan_in_prefligh
     ]
     assert coder_rounds == [1, 2]
     assert "Reduce scope to the seam writers." in world.agent_calls("claude")[0]
+
+
+def test_m1390_edited_supersession_child_activates_a_pending_amendment_at_the_retained_round(
+    tmp_path, monkeypatch
+):
+    """#1390 review item-1 (combined transition): an edited child under a signed
+    supersession, with the opt-out off and the board floor on, and a pending signed
+    amendment effective at the retained resume round.  The preflight accepts it,
+    startup activates it at that same round, and no scope boundary is posted."""
+    from coding_review_agent_loop.board_amendment import (
+        format_reviewer_board_amendment_comment,
+    )
+    from coding_review_agent_loop.panel_evidence import plan_issue_text_digest
+
+    board = dict(
+        reviewer=("codex", "gemini", "antigravity"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    world = _M936World(tmp_path, monkeypatch, weak=False, history_board=board)
+    world.comments[-1] = comment(world.signed_record(rationale="Reduce scope to the seam writers."))
+    recorded = {
+        record.metadata.plan_issue_digest
+        for record in _extract_round_metadata_records(world.comments, flow="plan")
+        if record.metadata.role == "coder"
+    }
+    assert plan_issue_text_digest(world.child) not in recorded  # edited by construction
+    retained_round = max(
+        record.metadata.round_number
+        for record in _extract_round_metadata_records(world.comments, flow="plan")
+    )
+    world.comments.append(comment(format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini", "Antigravity"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("Antigravity",), effective_from_round=retained_round,
+        rationale="Antigravity weekly quota exhausted.",
+    )))
+    reduced = world.config(
+        reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex", max_rounds=8,
+        plan_resume_keep_on_issue_edit=False, min_reviewers=2,
+    )
+    patch_text = _m936_patch(
+        world.old_state, None, summary="Reduced scope plan.", base_round=1,
+    )
+    result = world.run_issue(
+        config=reduced,
+        claude_outputs=[patch_text],
+        codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+        gemini_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Gemini"),
+            PR_APPROVAL.replace("OpenAI Codex", "Google Gemini"),
+        ],
+    )
+    posted = world.posted()
+    assert result == 0
+    assert not any("AGENT_PLAN_SCOPE_BOUNDARY" in body for body in posted)
+    audits = [body for body in posted if "Reviewer board amendment applied." in body]
+    assert len(audits) == 1 and f"Activation round: {retained_round}" in audits[0]
+    amended = [
+        record.metadata
+        for record in _extract_round_metadata_records(world.all_comments(), flow="plan")
+        if record.metadata.reviewer_board_amendment_digest is not None
+    ]
+    assert amended and min(r.round_number for r in amended) == retained_round
+    assert not world.agent_calls("agy")
