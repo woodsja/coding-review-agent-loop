@@ -2402,7 +2402,11 @@ Round numbers stay monotonic, so board lineage, freshness and primary epochs
 keep their meaning. Old plan comments are never edited or deleted.
 `--plan-resume-keep-on-issue-edit` (per invocation, never inherited by child
 planning, isolated providers or rendered recovery commands) keeps today's
-resume instead. An approved plan is never reopened.
+resume instead. An approved plan is never reopened, nor is one the issue's
+handoff record already hands to implementation (`plan_issue_scope.plan_handed_off`),
+so a signed child-plan supersession re-plans it in place. The issue floor
+preflight and plan startup call the same decision function, so they always
+agree on the scope.
 
 **Admission.** `plan_board_state.admitted_issue_comments` reads REST author
 identities and the authenticated actor whenever a boundary or a plan

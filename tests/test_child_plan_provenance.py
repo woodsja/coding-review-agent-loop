@@ -4977,3 +4977,63 @@ def test_child_planning_cycle_does_not_inherit_the_keep_on_issue_edit_opt_out(
 
     assert child_config.plan_resume_keep_on_issue_edit is False
     assert err.count("does not inherit --plan-resume-keep-on-issue-edit") == 1
+
+
+def test_m1390_edited_child_under_signed_supersession_keeps_its_plan_in_preflight_and_startup(
+    tmp_path, monkeypatch
+):
+    """#1390 review item-1: the issue floor preflight and plan startup share one
+    scope decision.  The world's plan history was written under other issue text,
+    so the child reads as edited; its handed-off plan under a pending signed
+    supersession is re-planned in place, never rescoped, by both paths."""
+    from unittest.mock import patch
+
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
+    import coding_review_agent_loop.plan_issue_scope as plan_issue_scope_module
+    from coding_review_agent_loop.panel_evidence import plan_issue_text_digest
+
+    world = _M936World(tmp_path, monkeypatch, weak=False)
+    world.comments[-1] = comment(world.signed_record(rationale="Reduce scope to the seam writers."))
+    history = list(world.comments)
+    recorded = {
+        record.metadata.plan_issue_digest
+        for record in _extract_round_metadata_records(history, flow="plan")
+        if record.metadata.role == "coder"
+    }
+    assert plan_issue_text_digest(world.child) not in recorded  # edited by construction
+
+    decisions = []
+    real_decision = plan_issue_scope_module.plan_scope_decision
+
+    def spy(*args, **kwargs):
+        decision = real_decision(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(plan_issue_scope_module, "plan_scope_decision", spy)
+    monkeypatch.setattr(plan_first_loop_module, "plan_scope_decision", spy)
+    patch_text = _m936_patch(world.old_state, None, summary="Reduced scope plan.")
+    with patch.object(plan_first_loop_module, "log", wraps=plan_first_loop_module.log) as logged:
+        assert world.run_issue(
+            # The board floor is enabled, so the entry preflight decides too.
+            config=world.config(plan_resume_keep_on_issue_edit=False, min_reviewers=1),
+            claude_outputs=[patch_text],
+            codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+        ) == 0
+    # Preflight and startup each made the shared decision, and they agree.
+    assert len(decisions) == 2
+    assert {(d.scope_start_round, d.reset_required, d.handed_off) for d in decisions} == {
+        (1, False, True)
+    }
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    assert any("issue title/body changed since plan round 1" in m for m in messages)
+    assert any("already handed off for implementation" in m for m in messages)
+    assert not any("AGENT_PLAN_SCOPE_BOUNDARY" in body for body in world.posted())
+    # The authorized re-plan revised the superseded plan in place (round 2).
+    coder_rounds = [
+        record.metadata.round_number
+        for record in _extract_round_metadata_records(world.all_comments(), flow="plan")
+        if record.metadata.role == "coder"
+    ]
+    assert coder_rounds == [1, 2]
+    assert "Reduce scope to the seam writers." in world.agent_calls("claude")[0]

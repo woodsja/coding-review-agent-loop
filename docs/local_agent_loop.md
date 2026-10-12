@@ -3305,7 +3305,8 @@ Only a boundary comment written by the authenticated orchestrator account
 counts. A lookalike from any other account is ignored and logged. If the run
 stops after posting the boundary but before the fresh plan is published, the
 next run reopens the same scope without posting a second boundary. An approved
-plan is never reopened by an edit.
+plan is never reopened by an edit, and neither is a plan already handed off for
+implementation: a signed child-plan supersession re-plans that plan in place.
 
 For a typo-level edit, pass `--plan-resume-keep-on-issue-edit` to keep the
 existing plan:

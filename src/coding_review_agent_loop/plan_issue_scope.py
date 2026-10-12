@@ -102,6 +102,10 @@ class PlanScopeDecision:
     edited: bool = False
     # ``--plan-resume-keep-on-issue-edit`` kept the existing plan.
     kept: bool = False
+    # The plan was already handed off for implementation, so it is kept: an
+    # authorized signed re-plan of a handed-off child plan (#936) revises that
+    # plan, and a fresh scope would orphan it.
+    handed_off: bool = False
     boundary: PlanScopeBoundary | None = None
 
     def boundary_payload(self, issue_number: int) -> dict[str, object]:
@@ -433,6 +437,22 @@ def recorded_plan_issue_digest(
     return boundary.current_issue_digest if boundary is not None else None
 
 
+def plan_handed_off(
+    comments: Sequence[object], *, issue_number: int | None, repo: str | None
+) -> bool:
+    """Whether the issue's latest handoff record hands an approved plan to implementation."""
+    if issue_number is None or not repo:
+        return False
+    from .issue_pr_handoff import find_latest_issue_pr_handoff
+
+    handoff = find_latest_issue_pr_handoff(comments, issue_number=issue_number, repo=repo)
+    return bool(
+        handoff is not None
+        and handoff.flow == "approved-plan-implementation"
+        and handoff.plan_hash
+    )
+
+
 def plan_scope_decision(
     admitted_comments: Sequence[object],
     trusted_actor: tuple[str, int] | None,
@@ -441,12 +461,17 @@ def plan_scope_decision(
     *,
     plan_approved: bool = False,
     issue_number: int | None = None,
+    repo: str | None = None,
     ignored_sink: list[str] | None = None,
 ) -> PlanScopeDecision:
     """Decide, read-only, whether an edited issue opens a new planning scope.
 
     ``plan_approved`` is the approval classification of the plan in the scope
     derived from the current boundary: an approved plan is never reopened.
+    Neither is a plan the issue has already handed off for implementation
+    (read from the issue's own handoff record when ``issue_number`` and
+    ``repo`` are given).  The issue floor preflight and plan startup both call
+    this one function, so they always agree on the scope.
     """
     from .round_state import _extract_round_metadata_records
 
@@ -480,10 +505,10 @@ def plan_scope_decision(
     archived_subject = latest_coder.metadata.subject if latest_coder is not None else None
     if archived_subject is not None and not _HEX64.match(archived_subject):
         archived_subject = None
-    if keep_on_edit:
+    if keep_on_edit or plan_handed_off(admitted_comments, issue_number=issue_number, repo=repo):
         return dataclasses.replace(
-            unchanged, edited=True, kept=True, archived_round=archived_round,
-            archived_subject=archived_subject,
+            unchanged, edited=True, kept=True, handed_off=not keep_on_edit,
+            archived_round=archived_round, archived_subject=archived_subject,
         )
     return PlanScopeDecision(
         scope_start_round=archived_round + 1,

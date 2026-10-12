@@ -19907,3 +19907,272 @@ def test_m1390_fresh_scope_prompt_keeps_human_discussion_and_signed_requirements
     assert "Please keep the CLI output stable for scripts." in prompt
     assert "Also preserve the audit trail." in prompt
     assert "Planning scope restarted." in prompt
+
+
+def _m1390_staged_fresh_approvals(*, panel=("gemini",)):
+    outputs = {
+        "claude_outputs": [structured_v1_plan_state()],
+        "codex_outputs": [structured_plan_review(state="approved")],
+    }
+    if "gemini" in panel:
+        outputs["gemini_outputs"] = [
+            structured_plan_review(state="approved", reviewer="Google Gemini")
+        ]
+    if "antigravity" in panel:
+        outputs["antigravity_outputs"] = [
+            structured_plan_review(state="approved", reviewer="Google Antigravity")
+        ]
+    return outputs
+
+
+def test_m1390_rescope_never_inherits_an_archived_panel_opening(tmp_path):
+    """`boundary-filters-staged-history` (panel opening): the archived scope opened
+    the panel and a secondary blocked; the fresh scope starts in the primary phase
+    and opens its own panel only after its own exact-plan primary approval."""
+    history = list(_m943_interrupted_history(tmp_path).issue_comments)
+    archived = _plan_round_records(SimpleNamespace(issue_comments=history))
+    assert any(
+        record.phase == "scheduler-prelaunch" and record.scheduler_phase != "primary"
+        for record in archived
+    ), "the archived history must carry a panel opening"
+    assert any(
+        record.role == "reviewer" and record.agent == "Antigravity" and record.state == "blocking"
+        for record in archived
+    )
+    config = _staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8)
+
+    runner, result, _messages = _m1390_rerun(
+        tmp_path, history, config=config, issue_payload=_M1390_EDIT,
+        **_m1390_staged_fresh_approvals(panel=("gemini", "antigravity")),
+    )
+
+    assert result == 0
+    assert len(_m1390_boundaries(runner)) == 1
+    fresh = _plan_round_records(SimpleNamespace(issue_comments=runner.issue_comments[len(history):]))
+    checkpoints = [r for r in fresh if r.phase == "scheduler-prelaunch"]
+    assert [(r.round_number, r.scheduler_phase) for r in checkpoints][:2] == [
+        (4, "primary"), (5, "secondary-audit"),
+    ]
+    # Only the primary reviews round 4; the panel convenes at round 5.
+    assert _m943_reviewer_calls(runner) == ["codex", "gemini", "agy"]
+    assert {r.agent for r in fresh if r.role == "reviewer" and r.round_number == 4} == {"Codex"}
+    # The archived Antigravity finding is not carried into the fresh scope.
+    assert all(item.reviewer != "Antigravity" for r in fresh for item in r.prior_items)
+
+
+def test_m1390_rescope_never_inherits_archived_step_back_stall_or_growth_count(tmp_path):
+    """`boundary-filters-staged-history` (step-back, stall streak, growth count)."""
+    first, _error = _m1251_run(
+        tmp_path, last_round=5, max_rounds=5, plan_step_back_escalation_rounds=5
+    )
+    history = list(first.issue_comments)
+    archived = _plan_round_records(SimpleNamespace(issue_comments=history))
+    assert any(record.step_back_entries for record in archived)
+    archived_candidates = [r for r in archived if r.role == "coder"]
+    assert len(archived_candidates) == 5
+    # Tight thresholds every archived signal would trip: an escalation after one
+    # rejected step-back, a three-round stall streak, and three planner revisions.
+    config = _staged_plan_config(
+        tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+        plan_step_back_escalation_rounds=1, plan_primary_stall_rounds=3,
+    )
+    stopped, error, _messages = _m1390_rerun(tmp_path, history, config=config)
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+
+    runner, result, _messages = _m1390_rerun(
+        tmp_path, history, config=config, issue_payload=_M1390_EDIT,
+        **_m1390_staged_fresh_approvals(),
+    )
+
+    assert result == 0
+    assert len(_m1390_boundaries(runner)) == 1
+    fresh = _plan_round_records(SimpleNamespace(issue_comments=runner.issue_comments[len(history):]))
+    assert [r.round_number for r in fresh if r.role == "coder"] == [6]
+    assert not any(r.step_back_entries for r in fresh)
+    assert _m1103_agent_calls(runner) == ["claude", "codex", "gemini"]
+    planner_prompt = _m1251_prompts(runner, "claude")[0]
+    assert _STEP_BACK_MARKER not in planner_prompt
+    assert _STEP_BACK_ANCHOR_PLANNER not in planner_prompt
+    # With five archived candidates counted, the fresh one-shot plan would cross
+    # the three-revision growth signal and fail validation without a justification.
+    assert not any(
+        "AGENT_PLAN_VALIDATION_DIAGNOSTIC" in comment["body"]
+        for comment in runner.issue_comments
+    )
+
+
+def _m1390_amendment_audits(runner):
+    return [c["body"] for c in runner.issue_comments if "Reviewer board amendment applied." in c["body"]]
+
+
+def test_m1390_pending_amendment_activates_at_the_fresh_scope_start(tmp_path):
+    """`edit-with-board-change` (pending signed amendment) and the preflight: the
+    amendment must name the scope start, activates there once, and a restart
+    after the boundary and its audit duplicates neither."""
+    from dataclasses import replace as dc_replace
+
+    history_runner = _m943_interrupted_history(tmp_path)
+    reduced = dc_replace(_m943_reduced_config(tmp_path), min_reviewers=2)
+
+    # An amendment naming the archived re-entry round is refused by the shared
+    # preflight decision before any boundary is published.
+    stale = _m1390_runner(list(history_runner.issue_comments))
+    _m943_post_amendment(stale, effective_from_round=3)
+    stale_runner, result, _messages = _m1390_rerun(
+        tmp_path, stale.issue_comments, config=reduced, issue_payload=_M1390_EDIT,
+    )
+    assert isinstance(result, AgentLoopError) and "re-enters round 4" in str(result)
+    assert '"effective_from_round": 4' in str(result)
+    assert _m1390_boundaries(stale_runner) == [] and _m943_reviewer_calls(stale_runner) == []
+
+    pending = _m1390_runner(list(history_runner.issue_comments))
+    _m943_post_amendment(pending, effective_from_round=4)
+    history = list(pending.issue_comments)
+    real_post = orchestrator_module.post_issue_comment
+
+    def stop_after_audit(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if "Reviewer board amendment applied." in str(kwargs["body"]):
+            raise KeyboardInterrupt
+        return result
+
+    crashed = _m1390_runner(history, issue_payload=_M1390_EDIT)
+    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_audit):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(crashed, issue_number=56, config=reduced, plan_first=True)
+    assert len(_m1390_boundaries(crashed)) == 1
+    (audit,) = _m1390_amendment_audits(crashed)
+    assert "Activation round: 4" in audit
+    assert _m943_reviewer_calls(crashed) == []
+
+    runner, result, _messages = _m1390_rerun(
+        tmp_path, crashed.issue_comments, config=reduced, issue_payload=_M1390_EDIT,
+        **_m1390_staged_fresh_approvals(),
+    )
+    assert result == 0
+    assert len(_m1390_boundaries(runner)) == 1
+    assert len(_m1390_amendment_audits(runner)) == 1
+    fresh = _plan_round_records(
+        SimpleNamespace(issue_comments=runner.issue_comments[len(crashed.issue_comments):])
+    )
+    assert [r.round_number for r in fresh if r.role == "coder"] == [4]
+    checkpoints = [r for r in fresh if r.phase == "scheduler-prelaunch"]
+    assert checkpoints and all(r.reviewer_board_amendment_digest is not None for r in checkpoints)
+    assert all(
+        tuple(r.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini")
+        for r in checkpoints
+    )
+    assert _m943_reviewer_calls(runner) == ["codex", "gemini"]
+
+
+def test_m1390_amendment_used_before_the_edit_stays_active_and_is_not_pending(tmp_path):
+    """`board-lineage-survives` (active signed amendment)."""
+    runner = _m943_interrupted_history(tmp_path)
+    _m943_post_amendment(runner, effective_from_round=3)
+    real_post = orchestrator_module.post_issue_comment
+
+    def stop_after_amended_checkpoint(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        metadata = _m943_decoded(kwargs["body"])
+        if metadata is not None and metadata.reviewer_board_amendment_digest is not None:
+            raise KeyboardInterrupt
+        return result
+
+    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_amended_checkpoint):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
+    history = list(runner.issue_comments)
+    (audit,) = _m1390_amendment_audits(runner)
+    used = {
+        r.reviewer_board_amendment_digest
+        for r in _plan_round_records(runner) if r.reviewer_board_amendment_digest
+    }
+    assert len(used) == 1
+
+    fresh_runner, result, messages = _m1390_rerun(
+        tmp_path, history, config=_m943_reduced_config(tmp_path), issue_payload=_M1390_EDIT,
+        **_m1390_staged_fresh_approvals(),
+    )
+
+    assert result == 0
+    assert len(_m1390_boundaries(fresh_runner)) == 1
+    # The used amendment is neither re-activated nor reported pending again.
+    assert _m1390_amendment_audits(fresh_runner) == [audit]
+    assert not any("re-enters round" in m for m in messages)
+    fresh = _plan_round_records(SimpleNamespace(issue_comments=fresh_runner.issue_comments[len(history):]))
+    assert [r.round_number for r in fresh if r.role == "coder"] == [4]
+    checkpoints = [r for r in fresh if r.phase == "scheduler-prelaunch"]
+    assert checkpoints and {r.reviewer_board_amendment_digest for r in checkpoints} == used
+    assert all(
+        tuple(r.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini")
+        for r in checkpoints
+    )
+    # Antigravity, removed by the amendment, never reviews the fresh scope.
+    assert _m943_reviewer_calls(fresh_runner) == ["codex", "gemini"]
+
+
+def test_m1390_active_primary_changing_link_governs_the_fresh_scope(tmp_path):
+    """`board-lineage-survives` (active primary-changing board link)."""
+    import base64
+
+    from coding_review_agent_loop.board_change import PLAN_SURFACE, board_change_link_digest
+
+    history, config = _m1390_staged_stalled_history(tmp_path)
+    swapped = replace(config, primary_plan_reviewer="gemini")
+    changed = _m1390_runner(
+        history,
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking", reviewer="Google Gemini",
+                blocking_plan_issues=["Name the migration owner."],
+                prior_plan_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+            )
+        ],
+    )
+    real_post = orchestrator_module.post_issue_comment
+
+    def stop_after_new_primary_review(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        metadata = _m943_decoded(str(kwargs["body"]))
+        if metadata is not None and metadata.role == "reviewer" and metadata.agent == "Gemini":
+            raise KeyboardInterrupt
+        return result
+
+    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_new_primary_review):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(changed, issue_number=56, config=swapped, plan_first=True)
+    links = _m1390_link_comments(changed)
+    assert len(links) == 1
+    link_payload = json.loads(
+        base64.urlsafe_b64decode(PLAN_SURFACE.link_re.search(links[0]["body"]).group("payload"))
+    )
+    assert link_payload["old_board"]["primary"] == "Codex"
+    assert link_payload["new_board"]["primary"] == "Gemini"
+    digest = board_change_link_digest(link_payload)
+    history = list(changed.issue_comments)
+    governed = [
+        r for r in _plan_round_records(SimpleNamespace(issue_comments=history))
+        if r.reviewer_board_change_digest == digest
+    ]
+    assert any(r.role == "reviewer" and r.agent == "Gemini" for r in governed)
+    start = max(r.round_number for r in _plan_round_records(SimpleNamespace(issue_comments=history))) + 1
+
+    runner, result, _messages = _m1390_rerun(
+        tmp_path, history, config=replace(swapped, max_rounds=8), issue_payload=_M1390_EDIT,
+        claude_outputs=[structured_v1_plan_state()],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+
+    assert result == 0
+    assert len(_m1390_boundaries(runner)) == 1
+    assert len(_m1390_link_comments(runner)) == 1
+    fresh = _plan_round_records(SimpleNamespace(issue_comments=runner.issue_comments[len(history):]))
+    assert [r.round_number for r in fresh if r.role == "coder"] == [start]
+    assert {r.reviewer_board_change_digest for r in fresh} == {digest}
+    checkpoints = [r for r in fresh if r.phase == "scheduler-prelaunch"]
+    assert checkpoints[0].round_number == start
+    assert checkpoints[0].scheduler_phase == "primary"
+    assert checkpoints[0].scheduler_primary_reviewer == "Gemini"
+    # The changed primary reviews first; Codex audits only as the panel.
+    assert _m1103_agent_calls(runner) == ["claude", "gemini", "codex"]

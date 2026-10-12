@@ -1393,6 +1393,7 @@ def enforce_issue_board_floor(
                 bool(getattr(config, "plan_resume_keep_on_issue_edit", False)),
                 plan_approved=classification.approved,
                 issue_number=issue_number,
+                repo=getattr(config, "repo", None),
             )
             if decision.reset_required:
                 # The plan loop is about to open this scope: judge it as the

@@ -1355,11 +1355,11 @@ def _run_plan_first_loop_body(
         plan_trusted_actor,
         plan_issue_digest,
         bool(config.plan_resume_keep_on_issue_edit),
-        # An approved plan is never reopened.  A pending signed supersession
-        # is its own authorized re-plan of the superseded plan (#936), which
-        # a fresh scope would orphan, so it keeps that plan too.
-        plan_approved=plan_approval.approved or plan_supersession is not None,
+        # An approved or handed-off plan is never reopened; the decision is
+        # shared verbatim with the issue floor preflight.
+        plan_approved=plan_approval.approved,
         issue_number=issue_number,
+        repo=config.repo,
     )
     if (
         plan_scope.recorded_digest is None
@@ -1383,7 +1383,11 @@ def _run_plan_first_loop_body(
         log(
             config,
             f"Planning issue #{issue_number}: keeping the existing plan "
-            "(--plan-resume-keep-on-issue-edit)",
+            + (
+                "(it was already handed off for implementation)"
+                if plan_scope.handed_off
+                else "(--plan-resume-keep-on-issue-edit)"
+            ),
         )
     if plan_scope.reset_required:
         fresh_scope_start = plan_scope.scope_start_round
