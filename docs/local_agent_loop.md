@@ -3679,9 +3679,12 @@ A coder turn counts only when it moved the head and the next review was taken on
 that head, so a no-op turn or an external push breaks the chain. An item whose
 reviewer resolved at least one of its open sub-items in a review made progress, so
 that item's chain restarts (`--sub-item-stall-rounds` governs sub-item pacing). Machine
-obligations, human exact-head evidence requests, and evidence-only findings tagged
-with risk-matrix rows do not count (the evidence freeze and the evidence-stall stop
-govern them). Under `--review-parallel` the reviewer's blocking set is resolved
+obligations and human exact-head evidence requests do not count (the evidence freeze
+governs them). A review whose open items are all findings tagged with risk-matrix
+rows that are still unsatisfied at the dispatch head is evidence-only and is left to
+the evidence-stall stop. A tagged finding counts like any other when the same review
+also has an untagged finding, when its tag names a row that is already satisfied, or
+when no usable row set exists, because the evidence stall can never qualify then. Under `--review-parallel` the reviewer's blocking set is resolved
 through the round's reconciliation, and only the reviewer's own dispositions apply.
 The stop is derived from posted round records only and persists nothing, so a
 resumed run reaches the same decision with the same text.
@@ -3692,9 +3695,10 @@ exit.
 
 **Stop message.** It names the reviewer, K, the round range and the current head,
 lists each persisting item with its attempt count and first line, and reports the
-diff growth since the first attempt and the total PR size from the merge base with
+diff growth since the first counted attempt (which may predate the K-turn window)
+and the total PR size from the merge base with
 the base branch (a scope-growth signal; either reads `unavailable` when Git cannot
-measure it). Items whose text asks for evidence are listed separately as possibly
+measure it). Items that are tagged or whose text asks for evidence are listed separately as possibly
 human-only. It then offers: (1) continue (rerun with `--pr-non-convergence-rounds 0`
 or a larger K); (2) accept a stated limitation or narrow the scope with a signed
 human decision that resolves or defers the items, then rerun; (3) redesign or push

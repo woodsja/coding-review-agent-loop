@@ -3576,6 +3576,7 @@ def _pr_step_back_decision(
     tracked: Sequence[str],
     head_sha: str | None,
     base_branch: str | None = None,
+    approved_plan_context: ApprovedPlanContext | None = None,
 ) -> PrStepBackDecision:
     """Escalate on a clustered sibling or non-convergence, else name the clusters.
 
@@ -3644,11 +3645,17 @@ def _pr_step_back_decision(
             )
         if episode.entry is None:
             trigger_candidates.append(reviewer)
-    # (2) Non-convergence wins over a fresh clustered step-back turn.
+    # (2) Non-convergence wins over a fresh clustered step-back turn.  Evidence-only
+    # reviews the evidence-stall gate can own are left to it.
+    evidence_owned_rows = (
+        _non_convergence_evidence_owned_rows(fresh, head_sha, approved_plan_context)
+        if non_convergence_k > 0
+        else None
+    )
     for reviewer in tracked if non_convergence_k > 0 else ():
         stalled = _step_back.find_pr_non_convergence(
             fresh, reviewer, k=non_convergence_k, current_round=round_number,
-            current_head=head_sha,
+            current_head=head_sha, evidence_owned_rows=evidence_owned_rows,
         )
         if stalled is None:
             continue
@@ -3852,6 +3859,62 @@ def _evidence_stall_citation_rows(
     return frozenset(row for row in rows if isinstance(row, str) and row)
 
 
+def _head_bound_unsatisfied_rows(
+    records: Sequence[PostedRoundRecord],
+    head_sha: str,
+    approved_plan_context: ApprovedPlanContext,
+) -> "_evidence_stall.UnsatisfiedRows | None":
+    """Unsatisfied rows from the newest coder record bound to ``head_sha``.
+
+    ``None`` when no coder record produced that head.
+    """
+    bound = next(
+        (
+            record
+            for record in reversed(
+                [
+                    record
+                    for record in records
+                    if record.metadata.flow == "pr" and record.metadata.role == "coder"
+                ]
+            )
+            if record.metadata.subject == head_sha
+        ),
+        None,
+    )
+    if bound is None:
+        return None
+    return _evidence_stall.unsatisfied_rows(
+        bound.metadata.risk_test_matrix_evidence,
+        bound.metadata.risk_test_matrix_diagnostics,
+        approved_plan_context.risk_test_matrix_expected_row_ids or (),
+        approved_plan_context.risk_test_matrix_identity,
+    )
+
+
+def _non_convergence_evidence_owned_rows(
+    records: Sequence[PostedRoundRecord],
+    head_sha: str,
+    approved_plan_context: ApprovedPlanContext | None,
+) -> frozenset[str] | None:
+    """Rows whose evidence-only reviews the evidence-stall gate can own (#1372).
+
+    Only a usable unsatisfied-row set at the dispatch head qualifies; absent or
+    mismatched evidence, or no applicable matrix, leaves tagged findings to the
+    non-convergence stop like any other finding.
+    """
+    if (
+        approved_plan_context is None
+        or not approved_plan_context.matrix_available
+        or not approved_plan_context.risk_test_matrix_identity
+    ):
+        return None
+    unsatisfied = _head_bound_unsatisfied_rows(records, head_sha, approved_plan_context)
+    if unsatisfied is None or unsatisfied.reason is not None or not unsatisfied.rows:
+        return None
+    return frozenset(unsatisfied.rows)
+
+
 def _pr_evidence_stall_decision(
     runner: Runner,
     config: AgentLoopConfig,
@@ -3882,7 +3945,6 @@ def _pr_evidence_stall_decision(
     ):
         return None
     identity = approved_plan_context.risk_test_matrix_identity
-    enforceable = approved_plan_context.risk_test_matrix_expected_row_ids or ()
     try:
         records = _extract_round_metadata_records(
             get_pr_review_context(runner, config=config, pr_number=pr_number).comments,
@@ -3896,20 +3958,7 @@ def _pr_evidence_stall_decision(
         for record in records
         if record.metadata.flow == "pr" and record.metadata.role == "coder"
     ]
-    bound = next(
-        (record for record in reversed(coder_records) if record.metadata.subject == head_sha),
-        None,
-    )
-    unsatisfied = (
-        None
-        if bound is None
-        else _evidence_stall.unsatisfied_rows(
-            bound.metadata.risk_test_matrix_evidence,
-            bound.metadata.risk_test_matrix_diagnostics,
-            enforceable,
-            identity,
-        )
-    )
+    unsatisfied = _head_bound_unsatisfied_rows(records, head_sha, approved_plan_context)
     snapshot = _evidence_stall.classify_round(
         review_round=round_number,
         review_head=head_sha,

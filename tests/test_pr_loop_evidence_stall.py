@@ -551,16 +551,22 @@ def test_changed_canonical_row_set_resets_the_window(tmp_path, monkeypatch):
 
 
 def test_tag_naming_a_row_that_became_verified_is_an_ordinary_finding(tmp_path, monkeypatch):
-    """`tag-verified-row`: on the dispatch path the tag cannot hide the finding."""
+    """`tag-verified-row`: on the dispatch path the tag cannot hide the finding.
+
+    The evidence stall never qualifies, so the persisting finding is caught by the
+    non-convergence stop (#1372) instead of running to the round limit.
+    """
     _shape_evidence(monkeypatch, [{"row-a": ("verified", ()), "row-b": ("stale/unverified", ())}] * 3)
     calls = _spy_classifier(monkeypatch)
     runner = _evidence_only_runner(4, 3)
-    with pytest.raises(AgentLoopError) as raised:
+    with pytest.raises(HumanDecisionRequiredError) as raised:
         run_pr_loop(
             runner, pr_number=77, config=_config(tmp_path, max_rounds=4),
             approved_plan_context=_plan_context("row-a", "row-b"),
         )
-    assert not isinstance(raised.value, HumanDecisionRequiredError)
+    message = str(raised.value)
+    assert "not converging" in message and "[item-1] (attempts: 3)" in message
+    assert "is stalled on evidence only" not in message
     assert _coder_count(runner) == 3
     later = [snap for kwargs, snap in calls if kwargs["review_round"] >= 2]
     assert later and all(
@@ -576,9 +582,12 @@ def test_head_matched_record_without_matrix_evidence_never_qualifies(tmp_path, m
     calls = _spy_classifier(monkeypatch)
     runner = _evidence_only_runner(4, 3)
     config = _config(tmp_path, max_rounds=4)
-    with pytest.raises(AgentLoopError) as raised:
+    with pytest.raises(HumanDecisionRequiredError) as raised:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
-    assert not isinstance(raised.value, HumanDecisionRequiredError)
+    # No usable row set: the stall cannot own the tagged finding, so the
+    # non-convergence stop (#1372) does, never the evidence stall.
+    message = str(raised.value)
+    assert "not converging" in message and "is stalled on evidence only" not in message
     assert _coder_count(runner) == 3
     later = [snap for kwargs, snap in calls if kwargs["review_round"] >= 2]
     assert len(later) == 2 and all(
@@ -1348,3 +1357,38 @@ def test_cited_historical_failure_keeps_its_historical_label(monkeypatch, tmp_pa
     (pass_line,) = [line for line in comment.splitlines() if "receipt `pass-b`" in line]
     assert _HISTORICAL_LINE not in pass_line
     assert "uncited authoritative" not in comment
+
+
+def test_persistent_tagged_finding_mixed_with_churning_code_findings_stops_for_non_convergence(
+    tmp_path,
+):
+    """#1372: a mixed review never qualifies for the evidence stall, so the
+    persisting tagged finding must stay visible to the non-convergence stop."""
+    runner = FakeRunner(
+        claude_outputs=[_coder(1, 2), _coder(1, 3), _coder(1, 4)],
+        codex_outputs=[
+            _review([_tagged(), "code gap at src/a.py:10"]),
+            _review(["code gap at src/b.py:20"], carried=["item-1"], resolved=["item-2"]),
+            _review(["code gap at src/c.py:30"], carried=["item-1"], resolved=["item-3"]),
+            _review(["code gap at src/d.py:40"], carried=["item-1"], resolved=["item-4"]),
+        ],
+    )
+    config = _config(tmp_path)
+    with pytest.raises(HumanDecisionRequiredError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
+    message = str(raised.value)
+    assert "not converging" in message
+    assert "[item-1] (attempts: 3)" in message
+    assert "[item-5]" not in message and "is stalled on evidence only" not in message
+    assert _coder_count(runner) == 3
+
+
+def test_evidence_only_window_stays_with_the_evidence_stall_not_non_convergence(tmp_path):
+    """#1372: evidence-only reviews whose rows are unsatisfied belong to the stall."""
+    runner = _evidence_only_runner(4, 3)
+    config = _config(tmp_path, pr_evidence_stall_rounds=0)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
+    # Neither gate stops: the stall is disabled and non-convergence defers to it,
+    # so the fourth coder turn is dispatched (and exhausts the script).
+    assert _coder_count(runner) == 4

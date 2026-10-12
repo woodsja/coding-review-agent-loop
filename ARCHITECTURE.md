@@ -965,7 +965,11 @@ on that head, so a no-op turn, a missing record, or an external push breaks the
 chain. Each review's blocking set is `_remaining_mandatory_items` with only the
 reviewer's own dispositions, which drops machine and human exact-head evidence
 obligations and items whose last sub-item a completing disposition resolved;
-evidence-tagged findings stay with the evidence-stall gate, and an unresolvable
+a review whose open items are all tagged with rows that are unsatisfied at the
+dispatch head (the set the evidence-stall gate reads from the head-bound coder
+record) is evidence-only and contributes nothing, so the stall keeps precedence,
+while tagged findings in mixed reviews, tags naming satisfied rows, and tags with no
+usable row set count like any finding; an unresolvable
 `--review-parallel` publication breaks the chain. An item persists when it is in
 all K+1 blocking sets and its open sub-item count never drops between two of them
 (resolving a sub-item is progress). Any persisting item raises `HumanDecisionRequiredError` (exit 4) inside
@@ -974,7 +978,8 @@ clustered step-back turn, the round-limit exit, and any coder invocation. The
 snapshot pre-check only needs the reviews N-K..N-1 to be contiguous blocks, because
 the live snapshot predates coder record N; the joins are verified on the fresh
 read. The decision text lists each item with its attempt count and first line, the
-`git diff --shortstat` growth since the first head and the PR size from the merge
+`git diff --shortstat` growth since the head of the earliest counted attempt (the
+attempt scan may reach past the K window) and the PR size from the merge
 base (each `unavailable` when Git fails), flags items asking for evidence, and
 offers the override options. Nothing is persisted, so a resumed run stops with the
 same text.

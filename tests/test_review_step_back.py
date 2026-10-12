@@ -2087,10 +2087,24 @@ def test_non_convergence_fires_on_items_persisting_across_files():
     ) is None
 
 
-def test_non_convergence_attempts_extend_past_k():
+def test_non_convergence_attempts_extend_past_k_and_growth_starts_at_the_first_attempt():
     records = _nc_history(_nc_persisting_reviews(rounds=6))
     result = _nc_find(records, current_round=6)
     assert result is not None and {i.attempts for i in result.items} == {5}
+    # The baseline is the earliest counted review, not the start of the K window.
+    assert result.first_round == 1 and result.first_head == _nc_head(1)
+    text = sb.render_pr_non_convergence_decision(77, result, diff_growth="g", pr_size="s")
+    assert "reviews at rounds 1-6" in text
+    assert f"(`{_nc_head(1)[:12]}` to `{_nc_head(6)[:12]}`)" in text
+    # Different streak lengths: the baseline follows the longest one.
+    reviews = _nc_persisting_reviews(rounds=6, items=(("item-1", NC_A),))
+    late = _nc_open("item-2", NC_B, round_number=3)
+    reviews[3] = ([late], reviews[3][1], ())
+    for n in (4, 5, 6):
+        reviews[n] = ((), [*reviews[n][1], late], ())
+    mixed = _nc_find(_nc_history(reviews), current_round=6)
+    assert {(i.item_id, i.attempts) for i in mixed.items} == {("item-1", 5), ("item-2", 3)}
+    assert mixed.first_round == 1
 
 
 def test_non_convergence_joins_review_r_to_coder_record_r_plus_one_only():
@@ -2168,7 +2182,60 @@ def test_machine_and_evidence_obligations_do_not_count():
     reviews = {1: ([tagged], [machine, evidence], ())}
     for n in range(2, 5):
         reviews[n] = ((), [machine, evidence, tagged], ())
-    assert _nc_find(_nc_history(reviews)) is None
+    records = _nc_history(reviews)
+    # Evidence-only reviews whose rows are unsatisfied belong to the evidence stall.
+    assert sb.find_pr_non_convergence(
+        records, PR_REVIEWER, k=3, current_round=4, current_head=_nc_head(4),
+        evidence_owned_rows=frozenset({"row-a"}),
+    ) is None
+    # Machine and evidence obligations alone never count.
+    obligations_only = {n: ((), [machine, evidence], ()) for n in range(1, 5)}
+    assert _nc_find(_nc_history(obligations_only)) is None
+
+
+def _nc_tagged(item_id="item-7", rows=("row-a",)):
+    return UnresolvedReviewItem(
+        item_id=item_id, reviewer=PR_REVIEWER, source_round=1,
+        text="cite a passing test for the row", status="blocking", evidence_row_ids=tuple(rows),
+    )
+
+
+@pytest.mark.parametrize(
+    "case, owned, mixed, stops",
+    [
+        ("evidence-only, unsatisfied rows", {"row-a"}, False, False),
+        ("evidence-only, tag names a satisfied row", {"row-b"}, False, True),
+        ("evidence-only, no usable row set", None, False, True),
+        ("mixed with churning code findings", {"row-a"}, True, True),
+    ],
+)
+def test_tagged_findings_count_unless_the_evidence_stall_can_own_the_review(case, owned, mixed, stops):
+    """Generalization: a tagged finding is left to the evidence stall only when the
+    whole review is evidence-only on unsatisfied rows; otherwise it persists."""
+    tagged = _nc_tagged()
+    reviews = {}
+    previous = None
+    for n in range(1, 5):
+        new = [tagged] if n == 1 else []
+        prior = [tagged] if n > 1 else []
+        dispositions = []
+        if mixed:
+            code = _nc_open(f"item-{20 + n}", f"gap at src/f{n}.py:10", round_number=n)
+            new = [*new, code]
+            if previous is not None:
+                prior = [*prior, previous]
+                dispositions = [ReviewItemDisposition(previous.item_id, PR_REVIEWER, "resolved")]
+            previous = code
+        reviews[n] = (new, prior, dispositions)
+    result = sb.find_pr_non_convergence(
+        _nc_history(reviews), PR_REVIEWER, k=3, current_round=4, current_head=_nc_head(4),
+        evidence_owned_rows=None if owned is None else frozenset(owned),
+    )
+    if stops:
+        assert result is not None and [i.item_id for i in result.items] == ["item-7"]
+        assert result.items[0].asks_for_evidence
+    else:
+        assert result is None
 
 
 def test_completing_sub_item_disposition_clears_persistence():

@@ -7771,6 +7771,7 @@ def run_pr_loop(
                 tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
                 head_sha=pr_metadata.head_sha,
                 base_branch=pr_metadata.base_branch or config.base,
+                approved_plan_context=approved_plan_context,
             )
             if round_number == allowed_rounds:
                 raise AgentLoopError(

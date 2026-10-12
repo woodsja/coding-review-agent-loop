@@ -21291,3 +21291,18 @@ def test_diff_measurement_failure_through_the_dispatch_decision_directly(tmp_pat
             )
         assert str(excinfo.value).count("unavailable") == 2
     assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_enabling_the_gate_on_longer_history_measures_growth_from_the_first_attempt(tmp_path):
+    """The attempt scan reaches past K, and the growth baseline follows it."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(4), codex_outputs=_nc_reviews(5))
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=0))
+    assert len(_sb_coder_prompts(runner)) == 5  # the fifth dispatch ran out of script
+    runner.measurement_calls.clear()
+    message = _nc_stop(runner, _sb_config(tmp_path, pr_non_convergence_rounds=3))
+    assert "[item-1] (attempts: 4)" in message and "reviews at rounds 1-5" in message
+    assert f"(`{SB_HEAD[:12]}` to" in message
+    growth = [c for c in runner.measurement_calls if c[:3] == ["git", "diff", "--shortstat"]][0]
+    assert growth[3] == SB_HEAD and growth[4] == runner.pr_payload["headRefOid"]
+    assert len(_sb_coder_prompts(runner)) == 5
