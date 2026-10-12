@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
-import fcntl
 import json
 import os
 import select
@@ -36,6 +35,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
+
+try:  # Linux-only; importing this module must still work elsewhere (#1326).
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by a simulated import
+    fcntl = None  # type: ignore[assignment]
 
 # The kernel's fixed inode for the initial PID namespace (PROC_PID_INIT_INO).
 PROC_PID_INIT_INO = 0xEFFFFFFC
@@ -52,6 +56,11 @@ MAX_ESCAPED_REPORTED = 16
 MAX_CENSUS_ENTRIES = 1_000_000
 CENSUS_SECONDS = 3.0
 TERM_GRACE_SECONDS = 1.0
+# Reads per drain call: continuous output can never starve the deadline,
+# teardown-command or inventory checks of a phase loop.
+MAX_DRAIN_READS = 4
+MIN_TEARDOWN_SECONDS = 1.0
+MIN_SWEEP_SECONDS = 1.0
 
 
 class HostAuthorityError(Exception):
@@ -77,6 +86,8 @@ class AuthorityProbes:
 
 
 def _ns_get_parent(path: str) -> None:
+    if fcntl is None:
+        raise OSError(errno.ENOSYS, "ioctl is unavailable")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
     try:
         fcntl.ioctl(fd, NS_GET_PARENT)
@@ -261,11 +272,7 @@ class CensusResult:
     reason: str = ""
 
 
-def _status_uid(pid: int, proc_root: Path) -> int | None:
-    try:
-        text = (proc_root / str(pid) / "status").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+def _uid_from_status(text: str) -> int | None:
     for line in text.splitlines():
         if line.startswith("Uid:"):
             parts = line.split()
@@ -324,6 +331,16 @@ def census(
             if not (proc_root / name).exists():
                 continue
             return CensusResult("unconfirmed", reason=f"/proc entry {name} is unparsable")
+        # Both stat and status are read for every process: an unreadable
+        # status of a live entry means the census cannot vouch for it.
+        try:
+            status_text = (proc_root / name / "status").read_text(encoding="utf-8", errors="replace")
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # exited mid-scan
+        except OSError:
+            if not (proc_root / name).exists():
+                continue
+            return CensusResult("unconfirmed", reason=f"/proc entry {name} status is unreadable")
         if is_kernel_thread(entry):
             continue
         if entry.start < window_start:
@@ -334,7 +351,7 @@ def census(
         escaped.append(
             {
                 "pid": entry.pid,
-                "uid": _status_uid(entry.pid, proc_root),
+                "uid": _uid_from_status(status_text),
                 "comm": entry.comm,
                 "cgroup": _cgroup(entry.pid, proc_root),
             }
@@ -359,7 +376,9 @@ def _emit(payload: dict[str, object]) -> None:
 class _Supervisor:
     def __init__(self, args: argparse.Namespace) -> None:
         self.fixture = args.fixture
-        self.setup_timeout = max(0.0, float(args.setup_timeout))
+        # Absolute CLOCK_MONOTONIC deadlines shared with the broker process.
+        self.setup_deadline = float(args.setup_deadline)
+        self.request_deadline = float(args.request_deadline)
         self.teardown_timeout = max(0.1, float(args.teardown_timeout))
         self.sweep_allowance = max(1.0, float(args.sweep_allowance))
         self.mount_id = args.mount_id
@@ -372,6 +391,7 @@ class _Supervisor:
         self.teardown_requested = False
         self.stdin_closed = False
         self._stdin_buffer = b""
+        self._last_inventory = 0.0
 
     # -- commands
     def poll_commands(self, timeout: float = 0.0) -> None:
@@ -415,7 +435,8 @@ class _Supervisor:
                 return
 
     # -- phases
-    def run_phase(self, phase: str, timeout: float, *, interruptible: bool) -> tuple[object, float, str]:
+    def run_phase(self, phase: str, deadline: float, *, interruptible: bool) -> tuple[object, float, str]:
+        """Run one phase until it exits, ``deadline`` (absolute) or teardown."""
         started = time.monotonic()
         tail: deque[bytes] = deque()
         tail_size = 0
@@ -432,13 +453,14 @@ class _Supervisor:
         assert proc.stdout is not None
         fd = proc.stdout.fileno()
         os.set_blocking(fd, False)
-        deadline = started + timeout
         status: object = None
         stream_open = True
 
         def drain() -> None:
             nonlocal tail_size, stream_open
-            while stream_open:
+            for _ in range(MAX_DRAIN_READS):
+                if not stream_open:
+                    return
                 try:
                     chunk = os.read(fd, 65536)
                 except BlockingIOError:
@@ -469,12 +491,14 @@ class _Supervisor:
                 self._terminate(proc)
                 status = "timed_out"
                 break
-            self.refresh_inventory()
+            if time.monotonic() - self._last_inventory >= POLL_SECONDS:
+                self.refresh_inventory()
+                self._last_inventory = time.monotonic()
             try:
                 select.select([fd] if stream_open else [], [], [], POLL_SECONDS)
             except (OSError, ValueError):
                 time.sleep(POLL_SECONDS)
-        # A daemonized child may still hold the pipe; drain only what is ready.
+        # A daemonized child may still hold the pipe; drain one bounded batch.
         drain()
         proc.stdout.close()
         self.refresh_inventory()
@@ -558,21 +582,27 @@ class _Supervisor:
             except OSError:
                 line = b""
             if not line:
-                _emit({"event": "setup", "status": "cancelled", "duration": 0.0, "log": ""})
+                _emit({"event": "setup", "status": "cancelled", "duration": 0.0, "log": "", "ran": False})
                 self.teardown_requested = True
                 setup_status: object = "cancelled"
                 break
             if line.strip() == b"teardown":
-                _emit({"event": "setup", "status": "cancelled", "duration": 0.0, "log": ""})
+                _emit({"event": "setup", "status": "cancelled", "duration": 0.0, "log": "", "ran": False})
                 self.teardown_requested = True
                 setup_status = "cancelled"
+                break
+            if line.strip() == b"expire":
+                # The setup budget ran out before the go-ahead: never started.
+                _emit({"event": "setup", "status": "timed_out", "duration": 0.0, "log": "", "ran": False})
+                self.teardown_requested = True
+                setup_status = "timed_out"
                 break
             if line.strip() == b"start":
                 setup_status = None
                 break
         if setup_status is None:
-            setup_status, duration, log = self.run_phase("setup", self.setup_timeout, interruptible=True)
-            _emit({"event": "setup", "status": setup_status, "duration": round(duration, 3), "log": log})
+            setup_status, duration, log = self.run_phase("setup", self.setup_deadline, interruptible=True)
+            _emit({"event": "setup", "status": setup_status, "duration": round(duration, 3), "log": log, "ran": True})
             setup_ran = True
         else:
             setup_ran = False
@@ -581,13 +611,21 @@ class _Supervisor:
             self.refresh_inventory()
             self.reap()
         if setup_ran:
+            # Teardown ends early enough for the sweep allowance before the
+            # request deadline, but always keeps a positive bound.
+            now = time.monotonic()
+            bound = min(self.teardown_timeout, self.request_deadline - self.sweep_allowance - now)
             teardown_status, duration, log = self.run_phase(
-                "teardown", self.teardown_timeout, interruptible=False
+                "teardown", now + max(MIN_TEARDOWN_SECONDS, bound), interruptible=False
             )
         else:
             teardown_status, duration, log = "not-run", 0.0, ""
-        _emit({"event": "teardown", "status": teardown_status, "duration": round(duration, 3), "log": log})
-        sweep_deadline = time.monotonic() + self.sweep_allowance
+        _emit({
+            "event": "teardown", "status": teardown_status, "duration": round(duration, 3), "log": log,
+            "ran": setup_ran,
+        })
+        now = time.monotonic()
+        sweep_deadline = now + max(MIN_SWEEP_SECONDS, min(self.sweep_allowance, self.request_deadline - now))
         census_reserve = min(CENSUS_SECONDS, self.sweep_allowance / 2)
         swept, empty = self.sweep(sweep_deadline - census_reserve)
         if not empty:
@@ -629,7 +667,8 @@ class _Supervisor:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="fixture_supervisor")
     parser.add_argument("--fixture", required=True)
-    parser.add_argument("--setup-timeout", required=True, type=float)
+    parser.add_argument("--setup-deadline", required=True, type=float)
+    parser.add_argument("--request-deadline", required=True, type=float)
     parser.add_argument("--teardown-timeout", required=True, type=float)
     parser.add_argument("--sweep-allowance", required=True, type=float)
     parser.add_argument("--mount-id", required=True)

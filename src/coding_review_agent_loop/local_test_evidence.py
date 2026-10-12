@@ -382,10 +382,10 @@ def _fixture_status(value: object) -> int | str:
 def _fixture_duration(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("fixture duration is not a number")
-    value = float(value)
-    if not math.isfinite(value) or value < 0 or value > 86_400:
+    # Range-check before float(): an arbitrarily large int would overflow.
+    if not 0 <= value <= 86_400:
         raise ValueError("fixture duration is out of range")
-    return round(value, 3)
+    return round(float(value), 3)
 
 
 def _fixture_count(value: object) -> int:
@@ -510,7 +510,8 @@ def decode_fixture_record(value: object) -> tuple[FixtureRecord, tuple[str, ...]
     """Decode defensively: a bad value is unconfirmed with a caveat, never raises."""
     try:
         return FixtureRecord.from_mapping(value), ()
-    except (ValueError, TypeError, KeyError):
+    except Exception:
+        # Any malformed value (including arithmetic overflow) fails closed.
         return unreadable_fixture_record(value), (FIXTURE_UNREADABLE_CAVEAT,)
 
 
@@ -2683,7 +2684,8 @@ class _FixtureRun:
         self._finished = True
         try:
             if self.supervisor is not None:
-                self.supervisor.finish(budget=self.reserve)
+                # Bounded by the original request deadline, not a fresh reserve.
+                self.supervisor.finish()
                 with server._journal_lock:
                     server._active_fixtures.pop(id(self.supervisor), None)
         finally:
@@ -3368,6 +3370,7 @@ class TestBrokerServer:
         """The runner's post-admission hook: launch the supervisor, run setup."""
         from .fixture_runtime import (
             MIN_SETUP_AND_INNER_SECONDS,
+            SETUP_TERMINATION_MARGIN_SECONDS,
             FixtureSupervisor,
             SetupDecision,
             teardown_budget_seconds,
@@ -3387,9 +3390,13 @@ class TestBrokerServer:
                         "cancel", "broker stopping before the fixture launch",
                     )
                     return fixture_run.decision
+                # Setup stops early enough for its termination grace to end
+                # by the inner deadline; both deadlines are absolute.
+                setup_deadline = deadline - SETUP_TERMINATION_MARGIN_SECONDS
                 supervisor = FixtureSupervisor.launch(
                     fixture_run.provenance, cwd=cwd, cwd_fd=cwd_fd, environment=environment,
-                    setup_seconds=deadline - time.monotonic(),
+                    setup_deadline=setup_deadline,
+                    request_deadline=fixture_run.request_deadline,
                     teardown_seconds=teardown_budget_seconds(fixture_run.timeout_seconds),
                     mount_id=fixture_run.mount_id,
                 )
@@ -3397,15 +3404,20 @@ class TestBrokerServer:
                 with self._journal_lock:
                     self._active_fixtures[id(supervisor)] = (supervisor, fixture_run.reserve)
             try:
-                supervisor.start_setup(parent_cgroup)
+                released = supervisor.start_setup(parent_cgroup, setup_deadline=setup_deadline)
             except (AgentLoopError, OSError) as exc:
                 fixture_run.decision = SetupDecision(
                     "skip", f"fixture supervisor failed: {_safe_text(exc)}",
                 )
                 return fixture_run.decision
-            # The supervisor enforces the setup bound itself; the margin only
-            # covers reporting latency.
-            event = supervisor.wait_setup(deadline + 2.0)
+            if not released:
+                fixture_run.decision = SetupDecision(
+                    "timed_out", "fixture setup budget expired before the supervisor was ready",
+                )
+                return fixture_run.decision
+            # The supervisor stops setup at its deadline; the report must
+            # arrive by the inner deadline, never inside the teardown reserve.
+            event = supervisor.wait_setup(deadline)
             status = event.get("status") if event is not None else None
             if self._stop_event.is_set() or status == "cancelled":
                 fixture_run.decision = SetupDecision("cancel", "broker stopping during fixture setup")

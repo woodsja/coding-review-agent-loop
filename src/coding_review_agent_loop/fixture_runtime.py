@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import signal
 import subprocess
@@ -47,6 +48,11 @@ MAX_TEARDOWN_BUDGET_SECONDS = 55.0
 MIN_TEARDOWN_BUDGET_SECONDS = 5.0
 LOG_EXCERPT_BYTES = 1024
 SUPERVISOR_START_SECONDS = 10.0
+# The supervisor stops setup this long before the inner deadline, so its
+# SIGTERM/SIGKILL grace still ends by that deadline.
+SETUP_TERMINATION_MARGIN_SECONDS = 2.5
+# Reporting slack after the request deadline before the broker forces cleanup.
+FINISH_SLACK_SECONDS = 1.0
 
 FIXTURE_SETUP_FAILED_CAVEAT = "fixture setup failed"
 FIXTURE_TEARDOWN_FAILED_CAVEAT = "fixture teardown failed"
@@ -170,7 +176,9 @@ def validate_fixture_path(root: Path, cwd: Path, fixture: str) -> FixtureProvena
     except AgentLoopError as exc:
         raise FixtureRefused("fixture-not-in-head") from exc
     try:
-        worktree_blob = _run_git(root, ("hash-object", "--", rel)).decode().strip()
+        # Raw bytes: clean/smudge, EOL and ident attributes must never make a
+        # transformed worktree file hash like the HEAD blob.
+        worktree_blob = _run_git(root, ("hash-object", "--no-filters", "--", rel)).decode().strip()
     except AgentLoopError as exc:
         raise FixtureRefused("fixture-unreadable") from exc
     if not head_blob or worktree_blob != head_blob:
@@ -272,7 +280,8 @@ def redact_log_tail(text: str, *, cwd: Path | None) -> str:
 
 
 def log_digest(redacted: str) -> str:
-    return hashlib.sha256(redacted.encode("utf-8", errors="replace")).hexdigest() if redacted else ""
+    """sha256 of a completed phase's redacted tail, including an empty one."""
+    return hashlib.sha256(redacted.encode("utf-8", errors="replace")).hexdigest()
 
 
 def log_excerpt(redacted: str) -> str:
@@ -315,6 +324,7 @@ class FixtureSupervisor:
     _changed: threading.Condition | None = None
     _reader: threading.Thread | None = None
     _teardown_sent: bool = False
+    request_deadline: float | None = None
 
     @classmethod
     def launch(
@@ -324,10 +334,16 @@ class FixtureSupervisor:
         cwd: Path,
         cwd_fd: int | None,
         environment: Mapping[str, str],
-        setup_seconds: float,
+        setup_deadline: float,
+        request_deadline: float,
         teardown_seconds: float,
         mount_id: str,
     ) -> "FixtureSupervisor":
+        """Spawn the supervisor; deadlines are absolute ``time.monotonic()`` values.
+
+        CLOCK_MONOTONIC is system-wide on Linux, so the supervisor enforces
+        the same absolute deadlines as the broker.
+        """
         spawn_cwd: str | Path = cwd
         preexec: Callable[[], None] | None = None
         if cwd_fd is not None:
@@ -337,7 +353,8 @@ class FixtureSupervisor:
             [
                 sys.executable, "-I", str(SUPERVISOR_PATH),
                 "--fixture", str(provenance.absolute_path),
-                "--setup-timeout", f"{max(0.0, setup_seconds):.3f}",
+                "--setup-deadline", f"{setup_deadline:.6f}",
+                "--request-deadline", f"{request_deadline:.6f}",
                 "--teardown-timeout", f"{max(0.1, teardown_seconds):.3f}",
                 "--sweep-allowance", f"{SWEEP_ALLOWANCE_SECONDS:.3f}",
                 "--mount-id", mount_id,
@@ -351,6 +368,7 @@ class FixtureSupervisor:
             start_new_session=True,
         )
         handle = cls(provenance, process, float(teardown_seconds), cwd)
+        handle.request_deadline = float(request_deadline)
         handle._changed = threading.Condition(handle._lock)
         handle._reader = threading.Thread(target=handle._read, name="agent-loop-fixture-supervisor", daemon=True)
         handle._reader.start()
@@ -409,16 +427,28 @@ class FixtureSupervisor:
         except (OSError, ValueError):
             pass
 
-    def start_setup(self, parent_cgroup: Path | None) -> None:
-        if not self._wait_for(lambda: self.ready_event is not None or self.fatal is not None,
-                              time.monotonic() + SUPERVISOR_START_SECONDS):
+    def start_setup(self, parent_cgroup: Path | None, *, setup_deadline: float) -> bool:
+        """Release setup unless its absolute deadline already passed.
+
+        Returns ``False`` (and tells the supervisor its setup expired, so it
+        never starts) when readiness consumed the setup budget.
+        """
+        ready_by = min(time.monotonic() + SUPERVISOR_START_SECONDS, setup_deadline)
+        if not self._wait_for(lambda: self.ready_event is not None or self.fatal is not None, ready_by):
+            if time.monotonic() >= setup_deadline:
+                self._send("expire")
+                return False
             raise AgentLoopError("fixture supervisor did not become ready")
         if self.fatal is not None:
             raise FixtureRefused("fixture-scope-unsupported", self.fatal)
         if parent_cgroup is not None:
             (parent_cgroup / "cgroup.procs").write_text(str(self.process.pid), encoding="ascii")
+        if time.monotonic() >= setup_deadline:
+            self._send("expire")
+            return False
         self.setup_started = True
         self._send("start")
+        return True
 
     def wait_setup(self, deadline: float) -> dict[str, object] | None:
         self._wait_for(lambda: self.setup_event is not None, deadline)
@@ -437,10 +467,20 @@ class FixtureSupervisor:
             pass
 
     def finish(self, *, budget: float | None = None) -> None:
-        """Request teardown, wait for the reserve, then force termination."""
+        """Request teardown, wait for cleanup, then force termination.
+
+        Without ``budget`` (the request path) the wait ends at the request
+        deadline plus reporting slack; a broker stop passes the fixture's
+        reserve as a budget from the moment of the stop.
+        """
         self.request_teardown()
-        bound = (budget if budget is not None else self.teardown_seconds + SWEEP_ALLOWANCE_SECONDS) + 2.0
-        self._wait_for(lambda: self.cleanup_event is not None, time.monotonic() + bound)
+        if budget is not None:
+            wait_until = time.monotonic() + budget + FINISH_SLACK_SECONDS
+        elif self.request_deadline is not None:
+            wait_until = self.request_deadline + FINISH_SLACK_SECONDS
+        else:
+            wait_until = time.monotonic() + self.teardown_seconds + SWEEP_ALLOWANCE_SECONDS + FINISH_SLACK_SECONDS
+        self._wait_for(lambda: self.cleanup_event is not None, wait_until)
         if self.cleanup_event is None:
             self.force_terminate()
         try:
@@ -479,9 +519,17 @@ class FixtureSupervisor:
         if isinstance(status, bool) or not (isinstance(status, int) or status in {"timed_out", "cancelled", "not-run"}):
             status = "not-run"
         duration = event.get("duration")
-        duration = float(duration) if isinstance(duration, (int, float)) and not isinstance(duration, bool) else 0.0
+        duration = (
+            float(duration)
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool)
+            and 0 <= duration <= 86_400 and math.isfinite(float(duration))
+            else 0.0
+        )
+        if event.get("ran") is False:
+            # Never started: no log, so no digest.
+            return status, 0.0, "", ""
         redacted = redact_log_tail(str(event.get("log") or ""), cwd=self.cwd)
-        return status, max(0.0, round(duration, 3)), log_digest(redacted), log_excerpt(redacted)
+        return status, round(duration, 3), log_digest(redacted), log_excerpt(redacted)
 
     def record(self) -> tuple[FixtureRecord, str]:
         """The bounded record and the private (never projected) excerpts."""

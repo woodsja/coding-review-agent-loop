@@ -5038,7 +5038,8 @@ def test_fixture_restart_decode_round_trips_the_record():
 @pytest.mark.parametrize(
     "mutation",
     ["missing-field", "extra-field", "bad-status", "boolean-status", "bad-cleanup", "oversized-path",
-     "absolute-path", "bad-digest", "not-a-mapping", "null"],
+     "absolute-path", "bad-digest", "not-a-mapping", "null", "overflowing-setup-duration",
+     "overflowing-teardown-duration", "negative-duration"],
 )
 def test_fixture_restart_decode_malformed_records_are_never_citable(mutation):
     value = _clean_fixture().to_dict()
@@ -5058,6 +5059,12 @@ def test_fixture_restart_decode_malformed_records_are_never_citable(mutation):
         value["path"] = "/etc/fixture"
     elif mutation == "bad-digest":
         value["digest"] = "sha:nothex"
+    elif mutation == "overflowing-setup-duration":
+        value["setup_duration_seconds"] = 10 ** 400
+    elif mutation == "overflowing-teardown-duration":
+        value["teardown_duration_seconds"] = 10 ** 400
+    elif mutation == "negative-duration":
+        value["setup_duration_seconds"] = -1
     elif mutation == "not-a-mapping":
         value = ["fixture"]
     else:

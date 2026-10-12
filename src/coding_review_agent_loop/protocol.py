@@ -3658,7 +3658,8 @@ def _fixture_lifecycle_is_clean(value: object) -> bool:
     else:
         try:
             record = FixtureRecord.from_mapping(value)
-        except (ValueError, TypeError, KeyError):
+        except Exception:
+            # Fail closed on any malformed record, including overflow.
             return False
     return record.clean
 

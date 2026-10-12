@@ -269,6 +269,11 @@ class ForegroundTestResult:
 
 
 TEST_OUTPUT_DRAIN_GRACE_SECONDS = 0.25
+# ``_terminate_process_group`` waits this long after SIGTERM before SIGKILL.
+TERMINATION_GRACE_SECONDS = 2.0
+# With an absolute deadline (#1326) the watchdog fires early enough that the
+# SIGTERM grace, SIGKILL and the output drain all end by the deadline.
+DEADLINE_TERMINATION_ALLOWANCE_SECONDS = TERMINATION_GRACE_SECONDS + TEST_OUTPUT_DRAIN_GRACE_SECONDS + 0.25
 
 
 def _drain_nonblocking_test_output(
@@ -889,6 +894,20 @@ def _run_foreground_test_body(
                 wrapper_bootstrap, "not-attempted", "not-started", PROBE_DEADLINE_DIAGNOSTIC,
                 health_provenance,
             )
+        if post_admission_setup is not None and inner_probe.state != "verified" and inner_probe.state != "failed":
+            # Issue #1326: a fixture target runs only after the post-setup
+            # context was authenticated; any unknown verdict (unrecognized
+            # launcher, unavailable probe containment, a cancelled follower)
+            # skips the target and leaves teardown to the caller.
+            if handle is not None:
+                handle.close()
+            lane_lock.close()
+            reason = f"fixture inner launcher not authenticated after setup: {inner_probe.diagnostic}"
+            return ForegroundTestResult(
+                cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                timeout_seconds, reason, None, False,
+                wrapper_bootstrap, "not-attempted", "not-started", reason, health_provenance,
+            )
         if inner_probe.state == "failed":
             missing_pytest = None
             if probe_setup is not None:
@@ -1189,7 +1208,9 @@ def _run_foreground_test_body(
     interrupted = False
     watchdog_deadline = started + timeout_seconds
     if absolute_deadline is not None:
-        watchdog_deadline = min(watchdog_deadline, absolute_deadline)
+        watchdog_deadline = min(
+            watchdog_deadline, absolute_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS,
+        )
     post_termination_deadline: float | None = None
     try:
         # A selector keeps output flowing to the terminal while allowing the
@@ -1472,7 +1493,7 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     except ProcessLookupError:
         pass
     try:
-        proc.wait(timeout=2)
+        proc.wait(timeout=TERMINATION_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(proc.pid, 9)

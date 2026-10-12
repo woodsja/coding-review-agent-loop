@@ -5117,8 +5117,23 @@ def daemon(index):
 
 
 phase = sys.argv[1]
+def noisy_descendant(name):
+    # A descendant that keeps the phase's output pipe open and floods it.
+    if os.fork() == 0:
+        (MARKERS / ("noisy-%s" % name)).write_text(str(os.getpid()))
+        chunk = b"x" * 65536
+        while True:
+            try:
+                os.write(1, chunk)
+            except OSError:
+                time.sleep(0.01)
+    return
+
+
 if phase == "setup":
     (MARKERS / "setup-started").write_text("1")
+    if mode("setup-noisy"):
+        noisy_descendant("setup")
     started = COUNT if not mode("setup-fail") else 2
     for index in range(started):
         daemon(index)
@@ -5138,6 +5153,8 @@ if phase == "setup":
     print("setup ready with %d servers" % started, flush=True)
 elif phase == "teardown":
     (MARKERS / "teardown-started").write_text("1")
+    if mode("teardown-noisy"):
+        noisy_descendant("teardown")
     if mode("teardown-slow"):
         time.sleep(float((HERE / "fx_teardown_seconds").read_text()))
     servers = sorted(STATE.glob("server*.json"))
@@ -5166,7 +5183,12 @@ def test_every_fixture_process_is_reachable():
             assert connection.recv(2) == b"ok"
     markers = pathlib.Path((HERE / "fx_markers").read_text().strip())
     (markers / "inner-ran").write_text("1")
-    if (HERE / "fx_mode").exists() and "inner-block" in (HERE / "fx_mode").read_text().split():
+    modes = (HERE / "fx_mode").read_text().split() if (HERE / "fx_mode").exists() else []
+    if "inner-block-hard" in modes:
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # only SIGKILL ends it
+        modes.append("inner-block")
+    if "inner-block" in modes:
         (markers / "inner-blocking").write_text("1")
         time.sleep(600)
 '''
@@ -5217,7 +5239,7 @@ def _fx_env(server) -> dict[str, str]:
 
 
 def _fx_pids(markers: Path) -> list[int]:
-    return [int(path.read_text()) for path in sorted(markers.glob("pid*"))]
+    return [int(path.read_text()) for path in sorted([*markers.glob("pid*"), *markers.glob("noisy-*")])]
 
 
 def _fx_assert_gone(pids) -> None:
@@ -5294,6 +5316,10 @@ def _fixture_pass_scenario(tmp_path, monkeypatch, capsys):
     assert record["path"] == "fixture.py"
     assert record["digest"] == "100755:" + _fx_git(root, "rev-parse", "HEAD:fixture.py").strip()
     assert len(record["setup_log_digest"]) == 64
+    # The teardown printed nothing: a completed empty tail still has a digest.
+    import hashlib
+
+    assert record["teardown_log_digest"] == hashlib.sha256(b"").hexdigest()
     assert record["setup_duration_seconds"] >= 0 and record["teardown_duration_seconds"] >= 0
     assert _receipt_expected_status(row, claim="current-result") == "verified"
     assert "agent-loop fixture: setup=0 teardown=0 cleanup=confirmed" in err
@@ -5391,14 +5417,13 @@ def test_fixture_setup_cancellation_runs_teardown_and_never_spawns_the_inner_com
     server = _fx_server(root)
     result: dict[str, int] = {}
     killed: list[int] = []
-    original_killpg = os.killpg
+    original_force = fx_runtime.FixtureSupervisor.force_terminate
 
-    def spy_killpg(pid, sig):
-        if sig == signal.SIGKILL:
-            killed.append(pid)
-        return original_killpg(pid, sig)
+    def spy_force(self):
+        killed.append(self.process.pid)
+        return original_force(self)
 
-    monkeypatch.setattr(fx_runtime.os, "killpg", spy_killpg)
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "force_terminate", spy_force)
     try:
         thread = threading.Thread(
             target=lambda: result.setdefault("code", _fx_cli(monkeypatch, server, root, _FX_PYTEST)),
@@ -5506,6 +5531,7 @@ def test_fixture_stop_after_an_inner_pass_is_interrupted_and_exits_130(tmp_path,
     [
         "untracked", "ignored", "symlink-out-of-tree", "gitlink", "dirty-tree",
         "outside-checkout", "symlinked-directory", "differs-from-head", "not-executable",
+        "filter-transformed",
     ],
 )
 def test_fixture_provenance_refusals_launch_nothing(tmp_path, monkeypatch, case):
@@ -5549,6 +5575,17 @@ def test_fixture_provenance_refusals_launch_nothing(tmp_path, monkeypatch, case)
         fixture = "dirlink/f.py"
     elif case == "differs-from-head":
         (root / "fixture.py").write_text((root / "fixture.py").read_text() + "\n# local edit\n")
+    elif case == "filter-transformed":
+        # A committed ident attribute expands $Id$ on checkout: the worktree
+        # bytes differ from the HEAD blob while git status stays clean.
+        (root / ".gitattributes").write_text("fixture.py ident\n")
+        (root / "fixture.py").write_text((root / "fixture.py").read_text() + "\n# $Id$\n")
+        _fx_git(root, "add", "-A")
+        _fx_git(root, "commit", "-qm", "ident fixture")
+        (root / "fixture.py").unlink()
+        _fx_git(root, "checkout", "--", "fixture.py")
+        assert "$Id: " in (root / "fixture.py").read_text()
+        assert _fx_git(root, "status", "--porcelain") == ""
     elif case == "not-executable":
         (root / "plain.py").write_text((root / "fixture.py").read_text())
         _fx_git(root, "add", "plain.py")
@@ -5893,18 +5930,9 @@ def test_fixture_cli_rejects_preflight_and_an_empty_inner_command(tmp_path, monk
     assert "non-empty command" in capsys.readouterr().err
 
 
-def _fx_blocking_inner(markers: Path) -> list[str]:
-    """An inner command that asks for the full worker budget (so it waits for
-    host admission), proves the fixture is reachable, then blocks."""
-    return [sys.executable, "-c", (
-        "import json, os, pathlib, socket, time\n"
-        "state = pathlib.Path(os.environ['AGENT_LOOP_FIXTURE_STATE_DIR'])\n"
-        "for path in sorted(state.glob('server*.json')):\n"
-        "    with socket.create_connection(('127.0.0.1', json.loads(path.read_text())['port']), timeout=5) as c:\n"
-        "        assert c.recv(2) == b'ok'\n"
-        "pathlib.Path(%r).write_text('1')\n"
-        "time.sleep(600)\n" % str(markers / "inner-blocking")
-    )]
+# A recognized launcher that asks for worker-budget slots, so it waits for
+# host admission like a real parallel suite.
+_FX_PYTEST_PARALLEL = (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-n", "2", "test_fx.py")
 
 
 @_FX_HOST
@@ -5933,7 +5961,7 @@ def test_fixture_deadline_admission_exhausts_the_setup_budget_and_launches_nothi
         env = {**_fx_env(server), ENV_HOST_WAIT: "600", "AGENT_LOOP_TEST_WORKER_HOST_SHARING": "on"}
         started = time.monotonic()
         result = fx_evidence.TestBrokerClient(env).run(
-            _fx_blocking_inner(markers), timeout_seconds=30, cwd=root, fixture="fixture.py",
+            list(_FX_PYTEST_PARALLEL), timeout_seconds=30, cwd=root, fixture="fixture.py",
         )
         elapsed = time.monotonic() - started
         row = _fx_row(server)
@@ -5955,6 +5983,7 @@ def test_fixture_deadline_inner_cut_off_after_admission_keeps_the_teardown_reser
     from coding_review_agent_loop.test_workers import ENV_HOST_WAIT, HostCapacity, WorkerBudget
 
     root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "inner-block")
     server = _fx_server(root)
     locks = tmp_path / "locks"
     server._worker_lock_root = locks
@@ -5968,7 +5997,7 @@ def test_fixture_deadline_inner_cut_off_after_admission_keeps_the_teardown_reser
         env = {**_fx_env(server), ENV_HOST_WAIT: "2", "AGENT_LOOP_TEST_WORKER_HOST_SHARING": "on"}
         started = time.monotonic()
         result = fx_evidence.TestBrokerClient(env).run(
-            _fx_blocking_inner(markers), timeout_seconds=30, cwd=root, fixture="fixture.py",
+            list(_FX_PYTEST_PARALLEL), timeout_seconds=30, cwd=root, fixture="fixture.py",
         )
         elapsed = time.monotonic() - started
         row = _fx_row(server)
@@ -5982,6 +6011,7 @@ def test_fixture_deadline_inner_cut_off_after_admission_keeps_the_teardown_reser
     _fx_assert_gone(_fx_pids(markers))
     assert (markers / "inner-blocking").exists() and (markers / "teardown-done").exists()
     assert row.outcome == "timed_out" and result.outcome == "timed_out"
+    assert row.suite_start == "verified"  # a recognized launcher really ran
     assert row.fixture.teardown_status == 0
     assert elapsed < 30 + 2 * fx_evidence.MAX_SNAPSHOT_SECONDS + 10
     assert plain.outcome == "passed" and plain.fixture is None
@@ -6214,16 +6244,19 @@ def test_fixture_cleanup_escape_is_flagged_without_exemption(tmp_path, monkeypat
         _fx_git(root, "commit", "-qm", "delegating fixture")
     inner = _FX_PYTEST
     if case == "coder-scope-leftover":
+        # A recognized inner pytest whose test leaves a daemon behind.
         leftover = tmp_path / "leftover.pid"
-        inner = (sys.executable, "-c", (
+        _fx_set_mode(root, "", **{"test_leftover.py": (
             "import os, time\n"
-            "if os.fork() == 0:\n"
-            "    os.setsid()\n"
+            "def test_leaves_a_daemon():\n"
             "    if os.fork() == 0:\n"
-            "        open(%r, 'w').write(str(os.getpid())); time.sleep(600)\n"
-            "    os._exit(0)\n"
-            "time.sleep(1)\n" % str(leftover)
-        ))
+            "        os.setsid()\n"
+            "        if os.fork() == 0:\n"
+            "            open(%r, 'w').write(str(os.getpid())); time.sleep(600)\n"
+            "        os._exit(0)\n"
+            "    time.sleep(1)\n" % str(leftover)
+        )})
+        inner = (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_leftover.py")
         marker_files = [str(leftover)]
     server = _fx_server(root)
     try:
@@ -6527,3 +6560,182 @@ def test_fixture_census_time_authority_loss_is_unconfirmed(tmp_path, monkeypatch
     assert row.outcome == "failed" and fx_runtime.FIXTURE_CLEANUP_UNCONFIRMED_CAVEAT in row.caveats
     assert code == 1
     assert not _authoritative_receipt_passes(row, claim="current-result")
+
+
+@_FX_HOST
+@pytest.mark.parametrize("phase", ["setup", "teardown"])
+def test_fixture_noisy_phase_output_never_starves_teardown_or_the_deadline(tmp_path, monkeypatch, phase):
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "setup-noisy setup-block" if phase == "setup" else "teardown-noisy")
+    killed: list[int] = []
+    original_force = fx_runtime.FixtureSupervisor.force_terminate
+
+    def spy_force(self):
+        killed.append(self.process.pid)
+        return original_force(self)
+
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "force_terminate", spy_force)
+    server = _fx_server(root)
+    result: dict[str, int] = {}
+    started = time.monotonic()
+    try:
+        if phase == "setup":
+            thread = threading.Thread(
+                target=lambda: result.setdefault("code", _fx_cli(monkeypatch, server, root, _FX_PYTEST)),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.monotonic() + 60
+            while not (markers / "setup-blocking").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert (markers / "setup-blocking").exists()
+            server.stop()
+            thread.join(timeout=60)
+        else:
+            result["code"] = _fx_cli(monkeypatch, server, root, _FX_PYTEST)
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    elapsed = time.monotonic() - started
+    pids = _fx_pids(markers)
+    assert any(path.name.startswith("noisy-") for path in markers.iterdir())
+    _fx_assert_gone(pids)
+    # The flooding descendant was inventoried and the teardown command was
+    # processed gracefully: the supervisor was never force-killed.
+    assert (markers / "teardown-done").exists()
+    assert killed == [], (killed, row.fixture, pids)
+    assert row.fixture.cleanup in {"confirmed", "escaped"}
+    assert row.fixture.inventoried >= 1
+    assert elapsed < 40 + 2 * fx_evidence.MAX_SNAPSHOT_SECONDS + 10
+    if phase == "setup":
+        assert result["code"] == 130 and row.fixture.setup_status == "cancelled"
+        assert not (markers / "inner-ran").exists()
+    else:
+        assert row.fixture.teardown_status == 0 and (markers / "inner-ran").exists()
+
+
+@_FX_HOST
+def test_fixture_delayed_readiness_never_starts_setup_after_its_deadline(tmp_path, monkeypatch):
+    root, markers = _fx_repo(tmp_path)
+    monkeypatch.setattr(fx_runtime, "reserve_seconds", lambda timeout: 5.0)
+    launch_args: list[list[str]] = []
+    original_launch = fx_runtime.FixtureSupervisor.launch.__func__
+    original_start = fx_runtime.FixtureSupervisor.start_setup
+
+    def launch(cls, *args, **kwargs):
+        handle = original_launch(cls, *args, **kwargs)
+        launch_args.append(list(handle.process.args))
+        return handle
+
+    def slow_start(self, parent_cgroup, *, setup_deadline):
+        # Readiness is delayed past the setup deadline.
+        time.sleep(max(0.0, setup_deadline - time.monotonic()) + 0.2)
+        return original_start(self, parent_cgroup, setup_deadline=setup_deadline)
+
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "launch", classmethod(launch))
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "start_setup", slow_start)
+    server = _fx_server(root)
+    started = time.monotonic()
+    try:
+        result = fx_evidence.TestBrokerClient(_fx_env(server)).run(
+            list(_FX_PYTEST), timeout_seconds=30, cwd=root, fixture="fixture.py",
+        )
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    elapsed = time.monotonic() - started
+    (argv,) = launch_args
+    setup_deadline = float(argv[argv.index("--setup-deadline") + 1])
+    request_deadline = float(argv[argv.index("--request-deadline") + 1])
+    # Absolute deadlines: setup ends before the inner deadline (request - reserve).
+    assert setup_deadline <= request_deadline - 5.0 - fx_runtime.SETUP_TERMINATION_MARGIN_SECONDS + 0.01
+    assert not (markers / "setup-started").exists() and not (markers / "inner-ran").exists()
+    assert row.outcome == "timed_out" and row.inner_exec == "not-attempted"
+    assert row.fixture.setup_status == "timed_out" and row.fixture.setup_log_digest == ""
+    assert result.outcome == "timed_out"
+    assert elapsed < 30 + 2 * fx_evidence.MAX_SNAPSHOT_SECONDS + 2
+
+
+@_FX_HOST
+def test_fixture_sigterm_resistant_inner_and_slow_teardown_finish_by_the_request_deadline(tmp_path, monkeypatch):
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, "inner-block-hard teardown-slow", fx_teardown_seconds="60")
+    server = _fx_server(root)
+    started = time.monotonic()
+    try:
+        result = fx_evidence.TestBrokerClient(_fx_env(server)).run(
+            list(_FX_PYTEST), timeout_seconds=30, cwd=root, fixture="fixture.py",
+        )
+        elapsed = time.monotonic() - started
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))
+    assert (markers / "inner-blocking").exists() and (markers / "teardown-started").exists()
+    assert row.outcome == "timed_out" and result.outcome == "timed_out"
+    # Teardown consumed its whole positive bound and was cut off.
+    assert row.fixture.teardown_status == "timed_out"
+    assert 4.0 <= row.fixture.teardown_duration_seconds <= 8.0
+    # Termination, drain, teardown and the sweep all ended by the request
+    # deadline; only the declared snapshot overhead and reporting remain.
+    assert elapsed < 30 + 4.0, elapsed
+
+
+@_FX_HOST
+@pytest.mark.parametrize("verdict", ["unrecognized-launcher", "probe-containment-unavailable"])
+def test_fixture_unknown_launcher_verdict_never_spawns_the_target(tmp_path, monkeypatch, verdict):
+    root, markers = _fx_repo(tmp_path)
+    marker = markers / "unrecognized-ran"
+    if verdict == "unrecognized-launcher":
+        inner = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('1')"]
+    else:
+        inner = list(_FX_PYTEST)
+
+        def unavailable(argv, **kwargs):
+            return runtime.LauncherProbeResult(tuple(argv), "unknown", "probe containment unavailable", "id")
+
+        monkeypatch.setattr(runner_module, "probe_inner_launcher", unavailable)
+    server = _fx_server(root)
+    try:
+        code = _fx_cli(monkeypatch, server, root, inner)
+        row = _fx_row(server)
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))
+    assert not marker.exists() and not (markers / "inner-ran").exists()
+    assert (markers / "teardown-done").exists()
+    assert row.outcome == "launch-failed" and row.inner_exec == "not-attempted"
+    assert row.fixture.setup_status == 0 and row.fixture.teardown_status == 0
+    assert code == 1
+    assert not _authoritative_receipt_passes(row, claim="current-result")
+
+
+@pytest.mark.parametrize("unreadable", ["stat", "status"])
+def test_fixture_census_unreadable_stat_or_status_of_any_process_is_unconfirmed(tmp_path, unreadable):
+    # A pre-window process (start 50) still has to be fully readable.
+    proc = _fx_fake_proc(tmp_path / "proc", {100: {"start": 100}, 50: {"start": 50}})
+    target = proc / "50" / unreadable
+    target.unlink()
+    target.mkdir()  # reading it fails while the entry exists
+    result = fx_supervisor.census(window_start=100, owned=(), self_identity=(100, 100), proc_root=proc)
+    assert result.cleanup == "unconfirmed"
+    assert unreadable in result.reason or "unreadable" in result.reason
+
+
+def test_fixture_modules_import_without_fcntl_and_refuse_off_linux(monkeypatch):
+    import importlib
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # import fcntl raises ImportError
+    reloaded = importlib.reload(fx_supervisor)
+    try:
+        assert reloaded.fcntl is None
+        with pytest.raises(OSError):
+            reloaded._ns_get_parent("/proc/self/ns/pid")
+        monkeypatch.setattr(reloaded.sys, "platform", "win32")
+        with pytest.raises(reloaded.HostAuthorityError):
+            reloaded.verify_host_process_authority()
+        importlib.reload(fx_runtime)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(fx_supervisor)
+        importlib.reload(fx_runtime)

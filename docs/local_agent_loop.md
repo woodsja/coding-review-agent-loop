@@ -1719,7 +1719,7 @@ capture-failure row for these codes:
 | `fixture-symlink`, `fixture-not-regular-file` | A path component is a symlink, or the path is not a regular file. |
 | `fixture-untracked`, `fixture-ignored` | The path is not exactly one tracked index entry. |
 | `fixture-gitlink`, `fixture-not-executable`, `fixture-unsupported-mode` | The tracked mode is not `100755`. |
-| `fixture-modified`, `fixture-not-in-head` | The worktree bytes differ from the `HEAD` blob. |
+| `fixture-modified`, `fixture-not-in-head` | The raw worktree bytes differ from the `HEAD` blob. They are hashed with `git hash-object --no-filters`, so EOL, `ident` or clean/smudge attributes cannot hide a difference. |
 | `fixture-tree-dirty` | The tracked tree is not clean, or untracked input is present. |
 | `fixture-timeout-below-floor` | The timeout is below 30 s. The CLI also refuses it before dispatch. |
 | `fixture-scope-unsupported` | The broker cannot prove that it sees the whole host process table (see below). |
@@ -1736,10 +1736,22 @@ that reserve, so the 30 s floor leaves a 5 s teardown bound and a 5 s sweep
 allowance. The inner deadline bounds host worker admission, the probes, setup,
 the inner watchdog and the output drain. Setup starts only after host
 admission, and only when at least 10 s remain before the inner deadline;
-otherwise the row is `timed_out` with setup `not-run`. The launcher and
+otherwise the row is `timed_out` with setup `not-run`. The supervisor gets
+absolute monotonic deadlines. Setup is stopped 2.5 s before the inner deadline
+so that its termination grace still ends by that deadline. If the supervisor
+becomes ready only after that point, setup never starts and the row is
+`timed_out` with setup `timed_out`. The inner watchdog fires early enough that
+the SIGTERM grace, SIGKILL and the output drain also end by the inner deadline.
+Teardown is bounded so that the sweep allowance still fits before the request
+deadline, but it always keeps a positive bound. The broker waits for cleanup
+only until the request deadline plus 1 s of reporting slack, then forces
+termination. The launcher and
 lifecycle probes run after setup, bypass the per-invocation probe cache and
 are cut off at the inner deadline. A truncated probe never spawns the target
-and journals `timed_out` with `inner_exec=not-attempted`. If the launcher
+and journals `timed_out` with `inner_exec=not-attempted`. Any other verdict
+that is not `verified` never spawns it either: an unrecognized launcher or
+unavailable probe containment is journaled as `launch-failed` with
+`inner_exec=not-attempted`, and teardown still runs. If the launcher
 identity changes between the post-setup probe and the spawn, the target is not
 spawned and the row is a non-citable `launch-failed` row with the caveat
 `launcher changed after authentication`. The before and after snapshots run
@@ -1750,13 +1762,17 @@ are not counted against the worker budget.
 
 **Supervision and cleanup authority.** A Linux supervisor runs as
 `python -I` with `PR_SET_CHILD_SUBREAPER` and `PR_SET_NO_NEW_PRIVS`, so no
-fixture descendant can gain another uid through setuid binaries. It
+fixture descendant can gain another uid through setuid binaries. It reads
+phase output in bounded batches. A phase, or a descendant holding its output
+pipe, that floods the log can therefore never delay the deadline, the teardown
+command or the inventory. It
 inventories every descendant while setup runs and before teardown. After
 teardown it sweeps the owned tree (SIGTERM, a short wait, SIGKILL, reap).
 Cleanup is `confirmed` only when both of these hold:
 
 - the owned tree is empty and every inventoried `(pid, start time)` is gone;
-- a host-wide census of `/proc` finds no live non-kernel process, of any uid,
+- a host-wide census of `/proc`, reading both `stat` and `status` for every
+  process, finds no live non-kernel process, of any uid,
   started at or after the supervisor's start, other than the supervisor itself
   and the owned inventory.
 
@@ -1793,7 +1809,9 @@ and `NSpid` has a single entry.
 **Observation and citation.** A fixture row's observation, the broker
 response, the public projection and bounded round evidence carry an optional
 `fixture` record: the path, the digest, the setup and teardown statuses and
-durations, the sha256 digests of their bounded and redacted log tails, the
+durations, the sha256 digests of their bounded and redacted log tails (a phase
+that ran with no output still gets the digest of the empty tail; a phase that
+never started gets none), the
 cleanup state, and inventoried, swept and escaped counts. The redacted log
 excerpts stay in the private journal row only. Fixture-less rows have no
 `fixture` key. The observation key and the runtime-memory timing cohort include
