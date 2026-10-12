@@ -4785,7 +4785,8 @@ a green check:
   reaches the real `gh`. Every other command, including `gh pr checks`,
   `gh run view`, and GET `gh api`, is executed unchanged by the configured `gh`
   (`--gh-cmd`).
-- **Post-turn audit.** After a guarded turn the orchestrator lists
+- **Post-turn audit.** After a guarded turn's last coder continuation
+  (format repair or the semantic-evidence correction) the orchestrator lists
   `workflow_dispatch` runs on the PR branch created since the turn started, and
   every known head. This also covers the direct-issue first turn, once the
   created PR is authenticated. A non-managed run found there, for example one
@@ -4800,8 +4801,9 @@ The guard and the prompt text share one invocation-scoped decision. In the PR
 loop that decision is the live managed-CI state for the turn: explicit managed
 CI, or implicit `--auto-merge` with an activated contract. Activation fallback
 and a revalidation drop turn it off. In issue and approved-plan implementation
-the decision is the managed creation intent. Validated-agent retries and format
-repair of that coder turn inherit the decision. Reviewer, planner, and
+the decision is the managed creation intent. Validated-agent retries, format
+repair, and the semantic-evidence correction that resumes that coder session
+inherit the decision, prompt guidance included. Reviewer, planner, and
 step-back launches, and their repairs, never carry it. Orchestrator-owned
 GitHub calls, including the post-approval managed dispatch, never pass through
 the guard.

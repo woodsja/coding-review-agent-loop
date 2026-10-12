@@ -31,7 +31,10 @@ from .github import (
     validate_open_pr,
 )
 from .logging import log
-from .prompts import render_coder_human_requirements_prompt_context
+from .prompts import (
+    _coder_managed_ci_dispatch_guidance,
+    render_coder_human_requirements_prompt_context,
+)
 from .protocol import (
     ApprovedFollowups,
     ExecutionStrategyRecommendation,
@@ -294,6 +297,7 @@ def _post_auth_correction_prompt(
     diagnostics: Sequence[PostAuthClaimDiagnostic],
     execution_catalog: Sequence[Mapping[str, object]],
     include_coverage_map: bool = False,
+    managed_ci_dispatch_guard: bool = False,
 ) -> str:
     return (
         "The orchestrator authenticated the PR, then found a bounded semantic "
@@ -318,7 +322,9 @@ def _post_auth_correction_prompt(
         )
         + " If you cannot truthfully state a fact, leave it empty rather than "
         "inventing it; the row then stays unverified.\n\n"
-        f"Response kind: {parsed.kind}\n"
+        # The correction resumes the guarded coder session (#1366).
+        + _coder_managed_ci_dispatch_guidance(managed_ci_dispatch_guard)
+        + f"Response kind: {parsed.kind}\n"
         f"Approved enforceable row IDs: {json.dumps(list(matrix_row_ids))}\n"
         f"Post-authentication diagnostics: {json.dumps([item.to_payload() for item in diagnostics])}\n"
         f"Closed execution-handle catalog: {json.dumps(list(execution_catalog))}\n"
@@ -589,6 +595,7 @@ def _derive_authenticated_risk_evidence_for_coder(
             diagnostics=actionable,
             execution_catalog=_safe_execution_handle_catalog(catalog),
             include_coverage_map=coverage_map_applies(approved_plan_context),
+            managed_ci_dispatch_guard=config.coder_ci_dispatch_guard,
         )
         try:
             correction_result = run_agent_result(

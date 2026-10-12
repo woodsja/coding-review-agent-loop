@@ -8214,8 +8214,6 @@ def run_pr_loop(
                 carried_reasons=dispatch_carried_reasons,
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
-            coder_dispatch_audit_note = ""
-            coder_dispatch_audited = False
             try:
                 coder_response = _run_validated_agent(
                     runner,
@@ -8335,18 +8333,6 @@ def run_pr_loop(
                     source_round=round_number,
                 )
                 updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
-                if coder_ci_guarded:
-                    # Backstop for a dispatch that bypassed the gh guard: a
-                    # visible, non-authoritative diagnostic, never
-                    # qualification, and never a round blocker (#1366).
-                    coder_dispatch_audited = True
-                    coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
-                        runner,
-                        config,
-                        branch=updated_pr_context.metadata.head_branch or pr_metadata.head_branch,
-                        head_shas=(pre_turn_head, updated_pr_context.metadata.head_sha),
-                        turn_started_at=coder_turn_started_at,
-                    )
                 unresolved_items = _advance_machine_obligations_for_head(
                     unresolved_items,
                     current_head_sha=updated_pr_context.metadata.head_sha,
@@ -8379,7 +8365,11 @@ def run_pr_loop(
                             head_sha=updated_pr_context.metadata.head_sha,
                             predecessor_head=pr_metadata.head_sha,
                             head_change_expected=head_change_expected,
-                            config=config,
+                            # A semantic correction resumes this coder turn,
+                            # so it carries the same guard (#1366).
+                            config=dataclasses_replace(
+                                config, coder_ci_dispatch_guard=coder_ci_guarded
+                            ),
                             session_id=coder_response.session_id,
                             invocation_id=coder_response.acquisition_test_turn_id,
                             _closed_execution_catalog=coder_response.acquisition_test_observations,
@@ -8597,9 +8587,11 @@ def run_pr_loop(
                     ),
                 )
             except AgentLoopError as coder_followup_error:
-                if coder_ci_guarded and not coder_dispatch_audited:
-                    # A rejected guarded turn (including a failed format
-                    # repair) still gets the dispatch backstop (#1366).
+                if coder_ci_guarded:
+                    # A rejected guarded turn (a failed format repair, or a
+                    # rejection after semantic correction) posts no coder
+                    # comment, so the dispatch backstop publishes on its own
+                    # (#1366).
                     publish_rejected_coder_turn_dispatch_audit(
                         runner,
                         config,
@@ -8625,6 +8617,20 @@ def run_pr_loop(
                     carried_reasons=dispatch_carried_reasons,
                 )
                 raise
+            coder_dispatch_audit_note = ""
+            if coder_ci_guarded:
+                # Backstop for a dispatch that bypassed the gh guard, run after
+                # the turn's last coder continuation (format repair, semantic
+                # correction) so their dispatches are covered too: a visible,
+                # non-authoritative diagnostic, never qualification, and never
+                # a round blocker (#1366).
+                coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
+                    runner,
+                    config,
+                    branch=updated_pr_context.metadata.head_branch or pr_metadata.head_branch,
+                    head_shas=(pre_turn_head, updated_pr_context.metadata.head_sha),
+                    turn_started_at=coder_turn_started_at,
+                )
             post_pr_comment(
                 runner,
                 config=config,

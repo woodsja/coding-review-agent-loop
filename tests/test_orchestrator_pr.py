@@ -21403,6 +21403,53 @@ def _fake_real_gh(tmp_path, monkeypatch):
     return record
 
 
+_V2_NONCE = "nonce-1366" + "x" * 22
+
+
+def _install_v2_dispatch_boundary(monkeypatch):
+    """A v2 contract whose real dispatcher runs to its nonce-bearing POST.
+
+    Only the intent-ledger bookkeeping around the dispatch is stubbed; the
+    real ``dispatch_final_qualification`` and ``_dispatch_v2_qualification``
+    build and send the workflow dispatch through the runner boundary.
+    """
+    from coding_review_agent_loop import managed_ci as managed_ci_module
+
+    contract = ManagedCiContract(
+        protocol_version=2, base_ref="main", dispatch_ref="main",
+        trusted_actor_login="agent-loop", trusted_actor_id=1, nonce=_V2_NONCE,
+    )
+    discovered = []
+    monkeypatch.setattr(managed_ci_module, "_contract_dispatch_ref", lambda *_a, **_k: "main")
+    real_api_json = managed_ci_module._api_json
+    monkeypatch.setattr(
+        managed_ci_module, "_api_json",
+        lambda runner, config, path, **kw: (
+            {} if path.endswith("/commits/main") else real_api_json(runner, config, path, **kw)
+        ),
+    )
+    def mint_intent(*_args, contract, **_kwargs):
+        # The loop resets the generation per head; the ledger mints its nonce.
+        if contract.nonce is None:
+            contract.nonce = _V2_NONCE
+
+    monkeypatch.setattr(managed_ci_module, "_ensure_v2_intent", mint_intent)
+    monkeypatch.setattr(managed_ci_module, "_patch_intent", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        managed_ci_module, "_require_workflow_dispatch_authorization", lambda *_a, **_k: None
+    )
+    # Nothing is visible before the dispatch; the dispatched run after it.
+    monkeypatch.setattr(
+        managed_ci_module, "_discover_v2_run",
+        lambda *_a, **_k: (discovered.append(1) and None) if len(discovered) == 0 else (555, 1),
+    )
+    monkeypatch.setattr(
+        orchestrator, "publish_manual_v2_qualification",
+        lambda *_a, **kwargs: kwargs["expected_head_sha"],
+    )
+    return contract
+
+
 def _managed_guard_loop(
     tmp_path, monkeypatch, *, managed=True, mode="implicit", audit_runs=(), audit_returncode=0,
     claude_outputs=None, antigravity_outputs=None, real_repair=False, expect_error=None,
@@ -21440,6 +21487,8 @@ def _managed_guard_loop(
     contract = None
     if managed and mode in {"implicit", "explicit"}:
         contract = ManagedCiContract()
+    elif managed and mode == "v2":
+        contract = _install_v2_dispatch_boundary(monkeypatch)
     elif managed and mode == "revalidation-drop":
         contract = ManagedCiContract(adopted_existing_pr=True, base_ref="main")
         monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: False)
@@ -21450,9 +21499,15 @@ def _managed_guard_loop(
         lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha=runner.pr_payload["headRefOid"]),
     )
     monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
-    explicit = {"managed_ci": True, "managed_ci_trusted_actor": "agent-loop"} if mode == "explicit" else {}
+    explicit = (
+        {"managed_ci": True, "managed_ci_trusted_actor": "agent-loop"}
+        if mode in {"explicit", "v2"} else {}
+    )
     config = make_config(
-        tmp_path, auto_merge=managed, reviewer=("codex",), max_rounds=2, **explicit,
+        # v2 runs as explicit managed CI without a merge: the merge gate is
+        # out of scope, the dispatch is what this regression observes.
+        tmp_path, auto_merge=managed and mode != "v2", reviewer=("codex",), max_rounds=2,
+        **explicit,
     )
     started = datetime.datetime.now(datetime.timezone.utc)
     if expect_error is not None or (managed and contract is None) or mode == "revalidation-drop":
@@ -21472,6 +21527,15 @@ def _coder_comment(runner):
     )
 
 
+def _assert_single_v2_dispatch(runner, dispatches, head):
+    """Exactly one nonce-correlated v2 exact-head dispatch, after approval."""
+    _assert_single_correlated_dispatch(runner, dispatches, head)
+    cmd, _env = dispatches[0]
+    assert "inputs[protocol_version]=2" in cmd
+    assert f"inputs[managed_nonce]={_V2_NONCE}" in cmd
+    assert "ref=main" in cmd
+
+
 def _assert_single_correlated_dispatch(runner, dispatches, head):
     """The real v1 dispatcher posted exactly one exact-head workflow dispatch,
     correlated by PR number and expected head, outside every agent env."""
@@ -21481,7 +21545,7 @@ def _assert_single_correlated_dispatch(runner, dispatches, head):
     assert cmd[4].endswith("/dispatches")
     assert f"inputs[expected_head_sha]={head}" in cmd
     assert "inputs[pr_number]=77" in cmd
-    assert "ref=agent-loop/managed-77" in cmd
+    assert "ref=agent-loop/managed-77" in cmd or "inputs[managed_nonce]=" in " ".join(cmd)
     assert "AGENT_LOOP_CODER_CI_DISPATCH_GUARD" not in env
     # Dispatched only after the approving review of that head.
     names = [cmd[0] if cmd[:2] != ["codex", "exec"] else "review" for cmd, _cwd in runner.commands]
@@ -21703,3 +21767,211 @@ def test_rejected_guarded_coder_turn_still_publishes_dispatch_audit(tmp_path, mo
     assert "non-authoritative diagnostic, not qualification" in notes[0]
     assert "coder response for this turn was rejected" in notes[0]
     assert dispatches == []
+
+
+def test_v2_guarded_coder_turn_then_nonce_correlated_dispatch_after_approval(tmp_path, monkeypatch):
+    """#1366 item-5: the same guarded-coder regression on a v2 contract; the
+    real dispatcher sends one nonce-correlated exact-head dispatch after
+    approval, outside the agent guard."""
+    runner, record, dispatches, _ = _managed_guard_loop(tmp_path, monkeypatch, mode="v2")
+
+    [attempt] = runner.coder_dispatch_attempts
+    assert attempt.returncode == 3
+    assert not record.exists()
+    _assert_single_v2_dispatch(runner, dispatches, "abc123-coder-1")
+
+
+def _guarded_semantic_correction_loop(
+    tmp_path, monkeypatch, *, correction="ok", audit_runs_after_correction=(),
+):
+    """A managed PR follow-up whose authenticated claims force the bounded
+    semantic-evidence correction, launched through the real coder backend
+    (#1366 item-8/9/10)."""
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    def row(row_id, level):
+        return {
+            "row_id": row_id, "label": f"Behaviour {row_id}",
+            "entry_path_or_mode": "PR follow-up", "initial_state": "blocking review",
+            "event": "follow-up authenticated", "expected_outcome": "map rendered",
+            "forbidden_side_effects": ["No re-ask."], "proposed_test_level": level,
+            "proposed_test_location": "tests/test_orchestrator_pr.py",
+            "applicability": "required", "related_scope_item_ids": ["scope-1"],
+            "execution_owner": "one-shot",
+        }
+
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "rows": [row("followup-a", "unit")],
+        "important_exclusions": ["Planned tests are not evidence."],
+    })
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = orchestrator.make_approved_plan_context(
+        "Approved plan.\n\n" + render_risk_test_matrix_section(matrix),
+        source_locator="test guarded correction plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    record = _fake_real_gh(tmp_path, monkeypatch)
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2, auto_merge=True)
+    head = _init_followup_checkout(config.claude_dir)
+    current = _followup_observation(
+        execution_ref="coder-turn:observation-2", receipt_id="receipt-current-head",
+        head=head, timestamp="2026-01-01T00:00:01Z",
+    )
+
+    def claim(**extra):
+        return {
+            "row_id": "followup-a", "execution_refs": [current.execution_ref],
+            "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+            "test_locations": ["tests/test_orchestrator_pr.py"],
+            "workflow_path_claim": "The real follow-up caller ran.",
+            "outcome_assertions": ["It passed."], "forbidden_effect_assertions": ["No re-ask."],
+            "caveats": [], "test_level": "unit", **extra,
+        }
+
+    raw = structured_coder_followup(addressed_items=["item-1"], summary="Follow-up with correction.")
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    original = dict(payload)
+    # An unknown selector is an actionable diagnostic: it forces the correction.
+    original["risk_test_matrix_claims"] = [claim(execution_refs=["coder-turn:not-in-catalog"])]
+    text = json.dumps(original) + raw[end:]
+    corrected = dict(payload)
+    corrected["risk_test_matrix_claims"] = [claim()]
+    corrected_text = json.dumps(corrected) + raw[end:]
+    parsed = validate_structured_coder_followup(
+        text, required_architecture_impact_contract=1,
+        delivered_risk_test_matrix=plan_context.risk_test_matrix_payload,
+        delivered_risk_test_matrix_identity=identity, required_risk_test_matrix_contract=1,
+        delivered_risk_test_matrix_row_ids=("followup-a",),
+        execution_catalog=(current,),
+    )
+    coder_response = ValidatedAgentResponse(
+        text=text, session_id="coder-session", marker_value=parsed,
+        acquisition_test_turn_id="coder-turn", acquisition_test_observations=(current,),
+    )
+
+    class CorrectionRunner(_GuardedCoderRunner):
+        correction_launched = False
+
+        def run_with_log(self, args, **kwargs):
+            if str(args[0]) == "claude":
+                # Only the semantic correction reaches the claude backend here.
+                self.correction_launched = True
+                if correction == "raise":
+                    self.launch_envs.append(("claude", dict(kwargs.get("env") or {})))
+                    raise CheckoutVerificationError("assigned checkout corrupted during correction")
+            return super().run_with_log(args, **kwargs)
+
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            # The bypass run becomes visible only once the correction ran.
+            self.audit_runs = list(audit_runs_after_correction) if self.correction_launched else []
+            return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+    runner = CorrectionRunner(
+        seed_receipt=False,
+        claude_outputs=[corrected_text],
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Needs work.", blocking_items=["Fix the follow-up."]),
+            structured_pr_review(
+                state="approved", summary="Covered.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        pr_payload={"headRefOid": "predecessor-head", "headRefName": "agent-loop/managed-77"},
+        git_head="predecessor-head",
+    )
+    coder_configs = []
+    real_validated_agent = orchestrator._run_validated_agent
+
+    def fake_validated_agent(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            coder_configs.append(kwargs["config"])
+            runner.pr_payload["headRefOid"] = head
+            runner.simulate_agent_turn(config, config.claude_dir, head=head)
+            return coder_response
+        return real_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(
+        orchestrator, "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_read_assigned_workdir_head", lambda *_a, **_k: head)
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *_a, **_k: ManagedCiContract())
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha=runner.pr_payload["headRefOid"]),
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
+    if correction == "raise":
+        with pytest.raises(CheckoutVerificationError):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    else:
+        # The coder comment and the approving review are published first;
+        # this fixture models no issue handoff, so final qualification then
+        # stops fail-closed.  Dispatch after approval is covered by the
+        # v1/v2 guarded-coder regressions above.
+        with pytest.raises(AgentLoopError, match="handoff identity is missing"):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    return runner, record, coder_configs, head
+
+
+def test_semantic_correction_of_guarded_coder_turn_is_guarded(tmp_path, monkeypatch):
+    runner, record, coder_configs, head = _guarded_semantic_correction_loop(tmp_path, monkeypatch)
+
+    assert [cfg.coder_ci_dispatch_guard for cfg in coder_configs] == [True]
+    assert runner.correction_launched
+    correction_envs = [env for name, env in runner.launch_envs if name == "claude"]
+    assert correction_envs
+    assert all(env.get("AGENT_LOOP_CODER_CI_DISPATCH_GUARD") == "managed" for env in correction_envs)
+    # The correction's `gh workflow run` was refused and never reached GitHub.
+    assert [attempt.returncode for attempt in runner.coder_dispatch_attempts] == [3]
+    assert not record.exists()
+    correction_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
+    assert "bounded semantic coverage defect" in correction_prompt
+    assert "This pull request uses managed CI." in correction_prompt
+    # The reviewer launched after the correction stays unguarded.
+    last = max(index for index, (name, _env) in enumerate(runner.launch_envs) if name == "claude")
+    after = [env for name, env in runner.launch_envs[last + 1:] if name == "codex"]
+    assert after and not any(_GUARD_DIR_ENV in env for env in after)
+    assert runner.orchestrator_dispatches == []
+
+
+def test_audit_runs_after_semantic_correction_and_names_its_dispatch_once(tmp_path, monkeypatch):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runner, _record, _configs, head = _guarded_semantic_correction_loop(
+        tmp_path, monkeypatch,
+        audit_runs_after_correction=[_dispatch_run(4711, "correction-head", created_at=now)],
+    )
+
+    coder_comments = [
+        comment["body"] for comment in runner.pr_payload.get("comments", [])
+        if "Coder-turn CI dispatch audit" in comment["body"]
+    ]
+    assert len(coder_comments) == 1
+    assert coder_comments[0].count("run 4711 on `correction-head`") == 1
+    assert "non-authoritative diagnostic, not qualification" in coder_comments[0]
+    assert runner.orchestrator_dispatches == []
+
+
+def test_rejection_after_semantic_correction_still_publishes_the_audit_note(tmp_path, monkeypatch):
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    runner, _record, _configs, _head = _guarded_semantic_correction_loop(
+        tmp_path, monkeypatch, correction="raise",
+        audit_runs_after_correction=[_dispatch_run(4712, "bypass-head", created_at=now)],
+    )
+
+    notes = [
+        comment["body"] for comment in runner.pr_payload.get("comments", [])
+        if "Coder-turn CI dispatch audit" in comment["body"]
+    ]
+    assert len(notes) == 1
+    assert "run 4712 on `bypass-head`" in notes[0]
+    assert "coder response for this turn was rejected" in notes[0]
+    assert runner.orchestrator_dispatches == []

@@ -949,7 +949,6 @@ def run_issue_loop(
         validate_open_pr(runner, config=config, pr_number=pr_number)
         initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
         managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
-        coder_dispatch_audit_note = ""
         if managed_ci_creation_intent is not None:
             managed_ci_handoff = authenticate_issue_created_handoff(
                 runner,
@@ -970,15 +969,6 @@ def run_issue_loop(
                 handoff=managed_ci_handoff,
                 metadata=initial_pr_context.metadata,
                 issue_number=issue_number,
-            )
-            # Audit only after the created PR is authenticated: the reserved
-            # branch and turn start bound discovery (#1366).
-            coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
-                runner,
-                config,
-                branch=managed_ci_creation_intent.branch,
-                head_shas=(initial_pr_context.metadata.head_sha,),
-                turn_started_at=coder_turn_started_at,
             )
         else:
             reject_forged_protocol_markers(
@@ -1058,7 +1048,11 @@ def run_issue_loop(
             runner=runner,
             assigned_workdir=active_workdir(config),
             head_sha=initial_pr_metadata.head_sha,
-            config=config,
+            # A semantic correction resumes this coder turn, so it carries
+            # the same guard (#1366).
+            config=dataclasses_replace(
+                config, coder_ci_dispatch_guard=managed_ci_creation_intent is not None
+            ),
             session_id=coder_response.session_id,
             invocation_id=coder_response.acquisition_test_turn_id,
             _closed_execution_catalog=coder_response.acquisition_test_observations,
@@ -1072,6 +1066,18 @@ def run_issue_loop(
             legacy_tests_run=implementation_result.tests_run,
             cwd=active_workdir(config),
         )
+        coder_dispatch_audit_note = ""
+        if managed_ci_creation_intent is not None:
+            # Audit after the created PR is authenticated and after the turn's
+            # last coder continuation (semantic correction): the reserved
+            # branch and turn start bound discovery (#1366).
+            coder_dispatch_audit_note = coder_turn_dispatch_audit_note(
+                runner,
+                config,
+                branch=managed_ci_creation_intent.branch,
+                head_shas=(initial_pr_context.metadata.head_sha, initial_pr_metadata.head_sha),
+                turn_started_at=coder_turn_started_at,
+            )
         initial_coder_public = render_public_agent_comment(
             kind="issue_implementation",
             parsed=implementation_result,

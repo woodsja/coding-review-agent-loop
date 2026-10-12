@@ -854,7 +854,9 @@ def _implement_approved_issue(
         runner=runner,
         assigned_workdir=active_workdir(implementation_config),
         head_sha=initial_pr_context.metadata.head_sha,
-        config=implementation_config,
+        # A semantic correction resumes this coder turn, so it carries the
+        # same guard (#1366).
+        config=dataclasses_replace(implementation_config, coder_ci_dispatch_guard=coder_ci_guarded),
         session_id=coder_response.session_id,
         invocation_id=coder_response.acquisition_test_turn_id,
         _closed_execution_catalog=coder_response.acquisition_test_observations,

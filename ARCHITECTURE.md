@@ -1334,8 +1334,8 @@ approval (#1366). `pr_loop.py` evaluates `managed_ci_active` once per coder
 turn. Issue and approved-plan implementation use the managed creation intent
 instead. That boolean travels as `coder_ci_dispatch_guard` on a
 `dataclasses.replace`d config that is passed only to the coder prompt builder
-and the coder `_run_validated_agent` call. Retries and format repair inherit
-it, and reviewers never see it. The same flag emits the prompt guidance and
+and the coder `_run_validated_agent` call. Retries, format repair and the semantic-evidence correction
+inherit it, and reviewers never see it. The same flag emits the prompt guidance and
 installs `coder_ci_guard.py`'s `gh` guard. Every coder or repair launch site
 calls `coder_ci_guard_environment`: the four backends, `run_cli_repair`, and the
 Gemini repair subprocess. The guard refuses `gh workflow run`, `gh run rerun`,
@@ -1345,7 +1345,8 @@ and preserves the REST shim's `AGENT_LOOP_REAL_GH`. After the turn,
 `github.audit_coder_turn_dispatches` lists `workflow_dispatch` runs on the PR
 branch created since the turn started, and every known head, so intermediate
 heads are covered. Any non-managed run it finds is prepended to the coder
-comment as a non-authoritative diagnostic. On a rejected guarded turn,
+comment as a non-authoritative diagnostic. The audit runs after the turn's
+last coder continuation. On a rejected guarded turn,
 `publish_rejected_coder_turn_dispatch_audit` posts the note on its own and
 never masks the rejection. The classifier decodes arguments with one
 pflag-style tokenizer, so grouped and equals shorthands cannot slip past
