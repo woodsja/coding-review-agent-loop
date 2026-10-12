@@ -1531,6 +1531,12 @@ satisfied row makes the item an ordinary finding. A tagged prior item keeps its
 tag while it stays unresolved; if the concern becomes a code defect, resolve or
 replace the item and raise a new untagged blocking item. Never put the tag on
 `same_pr_followups` or `future_followups`.
+A row whose evidence the coder repeatedly could not capture may be converted by
+the orchestrator (or by the operator) to a human-only exact-head evidence
+obligation; it then appears among the human-only evidence obligations, owned by
+the reviewers whose tagged finding named it, and the converted part of that
+finding is no longer coder work. Do not re-tag a converted row: a new tag naming
+it is treated as an ordinary code finding.
 Enforceable approved matrix rows: {rows}"""
 
 
@@ -1808,7 +1814,7 @@ Rules:
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
 - `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited.
 - A standalone Node test script is citable only when run as `node --test <file>` (one runner test that passes only on exit 0); a package.json script is citable via `npm run <name>` only when it is a single recognized test command with no pre/post scripts.
-- When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)}{coverage_map_rules} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Planned tests and unverified commands are not evidence.
+- When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)}{coverage_map_rules} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Never emit `evidence_source` or `signed_evidence_reference`: only the orchestrator labels a row operator-signed, from signed human evidence the owning reviewers cleared. Planned tests and unverified commands are not evidence.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 
 The structured result is the public implementation record. Do not add prose,
@@ -1816,6 +1822,9 @@ code fences, a `Tests:` section, an `AGENT_PR` marker, or another footer to it."
 
 
 def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewItem] | None) -> str:
+    # Converted findings and cleared row tombstones (#1325) are retained only
+    # for provenance; they are nobody's open work and need no disposition.
+    unresolved_items = [item for item in unresolved_items or () if not item.is_inert_ledger_record]
     if not unresolved_items:
         return ""
     lines = [
@@ -1843,6 +1852,14 @@ def _format_unresolved_review_items(unresolved_items: Sequence[UnresolvedReviewI
             )
         if item.fix_scope:
             details.append("  Reviewer fix scope: " + ", ".join(f"`{path}`" for path in item.fix_scope))
+        if item.converted_row_ids:
+            # A partly converted evidence-only finding (#1325).
+            details.append(
+                "  Converted to human-only exact-head evidence: "
+                + ", ".join(f"`{row}`" for row in item.converted_row_ids)
+                + "; still demands evidence for: "
+                + (", ".join(f"`{row}`" for row in item.residual_evidence_row_ids) or "(none)")
+            )
         if item.sub_items:
             resolved_count = sum(1 for sub in item.sub_items if sub.status == "resolved")
             details.append(f"  Sub-items ({resolved_count}/{len(item.sub_items)} resolved):")

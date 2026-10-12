@@ -70,6 +70,7 @@ from .pr_contract import (
     render_pr_contract_marker,
 )
 from .logging import log
+from .evidence_conversion import capture_classification_payload
 from .managed_ci import (
     AuthenticatedIssueCreatedHandoff,
     authenticate_issue_created_handoff,
@@ -950,6 +951,15 @@ def _implement_approved_issue(
             risk_test_matrix_diagnostics=tuple(
                 diagnostic.to_payload()
                 for diagnostic in implementation_result.risk_test_matrix_diagnostics
+            ),
+            # The first conversion attempt (#1325): the same derivation's
+            # per-row capture classification, bound to this record's head.
+            risk_test_matrix_capture_classification=(
+                capture_classification_payload(
+                    _initial_derived_risk_evidence, head_sha=str(bound_round_head or "unknown")
+                )
+                if implementation_result.risk_test_matrix_evidence is not None
+                else None
             ),
             model_used=coder_response.model_used,
             **_metadata_identity_fields(coder_response),

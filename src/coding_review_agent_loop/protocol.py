@@ -246,6 +246,14 @@ class UnresolvedReviewItem:
     # Evidence-only tag fixed when the orchestrator mints the item (#1324).
     # Reviewer findings only; legacy and untagged items carry ().
     evidence_row_ids: tuple[str, ...] = ()
+    # Orchestrator-written subset of ``evidence_row_ids`` whose rows were
+    # converted to the operator evidence freeze (#1325).  The residual demand
+    # is ``evidence_row_ids`` minus these; reviewer findings only.
+    converted_row_ids: tuple[str, ...] = ()
+    # Row-converted evidence obligations (#1325) name the approved-matrix row
+    # and matrix identity they stand for.  Both or neither; evidence only.
+    converted_row_id: str | None = None
+    converted_matrix_identity: str | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_row_ids and (
@@ -254,6 +262,18 @@ class UnresolvedReviewItem:
             or self.lifecycle is not None
         ):
             raise ValueError("machine obligations cannot carry evidence_row_ids")
+        if self.converted_row_ids and not set(self.converted_row_ids) <= set(self.evidence_row_ids):
+            raise ValueError("converted_row_ids must be a subset of evidence_row_ids")
+        if len(set(self.converted_row_ids)) != len(self.converted_row_ids):
+            raise ValueError("converted_row_ids must be unique")
+        if (self.converted_row_id is None) != (self.converted_matrix_identity is None):
+            raise ValueError("converted row obligations need both a row ID and a matrix identity")
+        if self.converted_row_id is not None and self.obligation_kind != EVIDENCE_OBLIGATION_KIND:
+            raise ValueError("only evidence obligations may name a converted row")
+        if self.status == "converted" and (
+            not self.converted_row_ids or set(self.converted_row_ids) != set(self.evidence_row_ids)
+        ):
+            raise ValueError("a converted finding needs every tagged row converted")
         if self.sub_items:
             ids = [sub.sub_item_id for sub in self.sub_items]
             if len(set(ids)) != len(ids):
@@ -308,6 +328,27 @@ class UnresolvedReviewItem:
     @property
     def is_machine_obligation(self) -> bool:
         return self.authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} or self.obligation_kind is not None
+
+    @property
+    def residual_evidence_row_ids(self) -> tuple[str, ...]:
+        """Tagged rows that still demand evidence (#1325): tags minus converted rows."""
+        converted = set(self.converted_row_ids)
+        return tuple(row_id for row_id in self.evidence_row_ids if row_id not in converted)
+
+    @property
+    def is_inert_ledger_record(self) -> bool:
+        """A retained record no reviewer or coder acts on (#1325).
+
+        A converted finding and a cleared row-converted evidence tombstone stay
+        in the ledger only for provenance and head-change reopening.
+        """
+        if self.status == "converted":
+            return True
+        return (
+            self.converted_row_id is not None
+            and self.obligation_kind == EVIDENCE_OBLIGATION_KIND
+            and self.lifecycle == "cleared"
+        )
 
     @property
     def authority_kind(self) -> str | None:
@@ -2300,6 +2341,142 @@ def validate_risk_test_matrix_revision(
     return parsed_changes
 
 
+EVIDENCE_SOURCE_TOOL_CAPTURED = "tool-captured"
+EVIDENCE_SOURCE_OPERATOR_SIGNED = "operator-signed"
+_SHA_HEX_RE = re.compile(r"[^\s`]{1,128}")
+
+
+@dataclass(frozen=True)
+class SignedEvidenceReference:
+    """Orchestrator-owned proof that a converted row was answered (#1325).
+
+    Minted only when the owning reviewer(s) clear a row-converted evidence
+    obligation at its frozen head after newly surfaced signed human input.
+    ``reference_id`` is a SHA-256 over the canonical JSON of every other field,
+    so a decoded reference is internally consistent; authorship is checked
+    separately by the round-state admission predicate.
+    """
+
+    matrix_identity: str
+    row_id: str
+    head: str
+    obligation_identity: str
+    obligation_item_id: str
+    owners: tuple[str, ...]
+    signed_requirement_ids: tuple[str, ...]
+    clearing_reviewers: tuple[str, ...]
+    cleared_round: int
+    reference_id: str
+
+    @staticmethod
+    def _digest(fields: Mapping[str, object]) -> str:
+        return hashlib.sha256(
+            json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        matrix_identity: str,
+        row_id: str,
+        head: str,
+        obligation_identity: str,
+        obligation_item_id: str,
+        owners: Sequence[str],
+        signed_requirement_ids: Sequence[str],
+        clearing_reviewers: Sequence[str],
+        cleared_round: int,
+    ) -> "SignedEvidenceReference":
+        fields = {
+            "version": 1,
+            "matrix_identity": matrix_identity,
+            "row_id": row_id,
+            "head": head,
+            "obligation_identity": obligation_identity,
+            "obligation_item_id": obligation_item_id,
+            "owners": sorted(set(owners)),
+            "signed_requirement_ids": sorted(set(signed_requirement_ids)),
+            "clearing_reviewers": sorted(set(clearing_reviewers)),
+            "cleared_round": cleared_round,
+        }
+        return cls(
+            matrix_identity=matrix_identity,
+            row_id=row_id,
+            head=head,
+            obligation_identity=obligation_identity,
+            obligation_item_id=obligation_item_id,
+            owners=tuple(fields["owners"]),  # type: ignore[arg-type]
+            signed_requirement_ids=tuple(fields["signed_requirement_ids"]),  # type: ignore[arg-type]
+            clearing_reviewers=tuple(fields["clearing_reviewers"]),  # type: ignore[arg-type]
+            cleared_round=cleared_round,
+            reference_id=cls._digest(fields),
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "version": 1,
+            "matrix_identity": self.matrix_identity,
+            "row_id": self.row_id,
+            "head": self.head,
+            "obligation_identity": self.obligation_identity,
+            "obligation_item_id": self.obligation_item_id,
+            "owners": list(self.owners),
+            "signed_requirement_ids": list(self.signed_requirement_ids),
+            "clearing_reviewers": list(self.clearing_reviewers),
+            "cleared_round": self.cleared_round,
+            "reference_id": self.reference_id,
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> "SignedEvidenceReference | None":
+        """Strictly decode one reference; anything malformed is ``None``."""
+        if not isinstance(value, Mapping) or value.get("version") != 1:
+            return None
+        expected = {
+            "version", "matrix_identity", "row_id", "head", "obligation_identity",
+            "obligation_item_id", "owners", "signed_requirement_ids",
+            "clearing_reviewers", "cleared_round", "reference_id",
+        }
+        if set(value) != expected:
+            return None
+        strings = ("matrix_identity", "row_id", "head", "obligation_identity", "obligation_item_id", "reference_id")
+        if any(not isinstance(value[key], str) or not value[key].strip() for key in strings):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", value["matrix_identity"]):
+            return None
+        if not _SHA_HEX_RE.fullmatch(value["head"]):
+            return None
+        lists = ("owners", "signed_requirement_ids", "clearing_reviewers")
+        for key in lists:
+            entries = value[key]
+            if (
+                not isinstance(entries, list)
+                or any(not isinstance(entry, str) or not entry.strip() for entry in entries)
+                or entries != sorted(set(entries))
+            ):
+                return None
+        if not value["signed_requirement_ids"] or not value["clearing_reviewers"]:
+            return None
+        cleared_round = value["cleared_round"]
+        if isinstance(cleared_round, bool) or not isinstance(cleared_round, int) or cleared_round < 1:
+            return None
+        rebuilt = cls.build(
+            matrix_identity=value["matrix_identity"],
+            row_id=value["row_id"],
+            head=value["head"],
+            obligation_identity=value["obligation_identity"],
+            obligation_item_id=value["obligation_item_id"],
+            owners=value["owners"],
+            signed_requirement_ids=value["signed_requirement_ids"],
+            clearing_reviewers=value["clearing_reviewers"],
+            cleared_round=cleared_round,
+        )
+        if rebuilt.reference_id != value["reference_id"]:
+            return None
+        return rebuilt
+
+
 @dataclass(frozen=True)
 class RiskTestMatrixEvidenceRow:
     row_id: str
@@ -2311,9 +2488,14 @@ class RiskTestMatrixEvidenceRow:
     forbidden_effect_assertions: tuple[str, ...]
     evidence_citations: tuple[TestObservationCitation, ...]
     caveats: tuple[str, ...] = ()
+    # Provenance of a verified row (#1325).  ``operator-signed`` rows are
+    # produced only by :func:`apply_signed_evidence_references` from an
+    # orchestrator-owned reference; agents can never emit either field.
+    evidence_source: str = EVIDENCE_SOURCE_TOOL_CAPTURED
+    signed_evidence_reference: str | None = None
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
             "status": sanitize_historical_text(self.status),  # shape-check: fatal:authentication-or-forgery
             "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],  # shape-check: fatal:authentication-or-forgery
@@ -2329,6 +2511,11 @@ class RiskTestMatrixEvidenceRow:
             ],
             "caveats": [sanitize_historical_text(item) for item in self.caveats],  # shape-check: fatal:authentication-or-forgery
         }
+        # Tool-captured payloads stay byte-identical to the pre-#1325 shape.
+        if self.evidence_source == EVIDENCE_SOURCE_OPERATOR_SIGNED:
+            payload["evidence_source"] = EVIDENCE_SOURCE_OPERATOR_SIGNED
+            payload["signed_evidence_reference"] = self.signed_evidence_reference
+        return payload
 
 
 @dataclass(frozen=True)
@@ -2367,10 +2554,127 @@ class DerivedRiskEvidenceResult:
     diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
     # The exact PR head SHA this derivation bound to (#1290); in-memory only.
     bound_head_sha: str | None = None
+    # Per-row structured capture classification (#1325), built in the same
+    # loop that emits ``diagnostics`` and never read back from their codes:
+    # ``row_id -> {"class", "observation_classes", "disqualifiers"}``.
+    row_capture_classifications: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
 
     @property
     def risk_test_matrix_evidence(self) -> RiskTestMatrixEvidence:
         return self.evidence
+
+
+# Closed classification vocabulary for automatic evidence conversion (#1325).
+CAPTURE_LIMITED = "capture-limited"
+NOT_CAPTURE_LIMITED = "not-capture-limited"
+CAPTURE_LIMITED_OBSERVATION_CLASSES = frozenset(
+    {
+        # incomplete, interrupted, launch-failed or overlap-rejected outcome
+        "outcome-incomplete",
+        # passed, but not an authoritative receipt (launch integrity or
+        # attribution unverified, agent-reported, superseded)
+        "pass-unauthoritative",
+        # an authoritative pass without a tool-owned receipt ID
+        "pass-missing-receipt",
+        # an unknown, cross-turn or dropped execution selector
+        "unknown-ref",
+        # a fully admissible pass is neutral: it never limits nor disqualifies
+        "admissible-pass",
+    }
+)
+CAPTURE_OBSERVATION_CLASSES = CAPTURE_LIMITED_OBSERVATION_CLASSES | frozenset(
+    {"failed", "timed-out", "unclassified"}
+)
+CAPTURE_DISQUALIFIERS = frozenset(
+    {
+        "verified",
+        "missing-claim",
+        "incomplete-semantic-claim",
+        "truncated-semantic-claim",
+        "authoritative-failure",
+        "authoritative-timeout",
+        "unclassified-observation",
+        "head-mismatch",
+        "tree-mismatch",
+        "checkout-head-mismatch",
+        "checkout-tree-unavailable",
+        "journal-failure",
+        "head-changed-during-correction",
+    }
+)
+
+
+def disqualify_capture_classification(
+    derived: DerivedRiskEvidenceResult, reason: str
+) -> DerivedRiskEvidenceResult:
+    """Mark every row not capture-limited (e.g. the head raced a correction)."""
+    rows = {
+        row_id: {
+            "class": NOT_CAPTURE_LIMITED,
+            "observation_classes": list(entry.get("observation_classes", ())),  # type: ignore[call-overload]
+            "disqualifiers": sorted({*entry.get("disqualifiers", ()), reason}),  # type: ignore[misc]
+        }
+        for row_id, entry in derived.row_capture_classifications.items()
+    }
+    return dataclasses.replace(derived, row_capture_classifications=rows)
+
+
+def capture_observation_class(observation: object) -> str:
+    """Closed-set class of one selected observation, from its structured fields."""
+    semantics, _rich = _observation_semantics(observation)
+    outcome = semantics["outcome"]
+    if outcome in {"incomplete", "interrupted", "launch-failed", "overlap-rejected"}:
+        return "outcome-incomplete"
+    if outcome == "failed":
+        return "failed"
+    if outcome == "timed_out":
+        return "timed-out"
+    if outcome == "passed":
+        if not _authoritative_receipt_passes(observation, claim="current-result"):
+            return "pass-unauthoritative"
+        receipt_id = _observation_value(observation, "receipt_id")
+        if not isinstance(receipt_id, str) or not receipt_id.strip():
+            return "pass-missing-receipt"
+        return "admissible-pass"
+    return "unclassified"
+
+
+def _journal_disqualifies(observations: Sequence[object]) -> bool:
+    """An unsuperseded, parent-observed authoritative failure or timeout.
+
+    Narrower than derive's ``unsuperseded_failures``: incomplete, interrupted
+    and launch-failed journal entries are capture limitations, not failures.
+    """
+    return any(
+        _observation_value(observation, "provenance") == "parent-observed"
+        and _observation_value(observation, "outcome") in {"failed", "timed_out"}
+        and not _observation_value(observation, "superseded_by")
+        and not _is_non_evidence_launch_failure(observation)
+        for observation in observations
+    )
+
+
+def _row_capture_classification(
+    *,
+    status: str,
+    observation_classes: Sequence[str],
+    disqualifiers: set[str],
+) -> dict[str, object]:
+    disqualifiers = set(disqualifiers)
+    if status == "verified":
+        disqualifiers.add("verified")
+    for observation_class in observation_classes:
+        if observation_class == "failed":
+            disqualifiers.add("authoritative-failure")
+        elif observation_class == "timed-out":
+            disqualifiers.add("authoritative-timeout")
+        elif observation_class not in CAPTURE_LIMITED_OBSERVATION_CLASSES:
+            disqualifiers.add("unclassified-observation")
+    return {
+        "class": NOT_CAPTURE_LIMITED if disqualifiers else CAPTURE_LIMITED,
+        "observation_classes": sorted(set(observation_classes)),
+        "disqualifiers": sorted(disqualifiers),
+    }
 
 
 def _is_non_evidence_launch_failure(observation: object) -> bool:
@@ -2437,11 +2741,16 @@ CLAIM_FACT_OVERSIZE_RULE = "semantic fact exceeds the field bound"
 # Unknown claim keys that name orchestrator-owned verification authority.
 # ``status`` and ``evidence_citations`` are canonical evidence-row keys that
 # assert an outcome and receipt-backed support; ``receipt_id``, ``command``
-# and ``claim`` are receipt-citation keys that assert a broker receipt.  A
+# and ``claim`` are receipt-citation keys that assert a broker receipt.
+# ``evidence_source`` and ``signed_evidence_reference`` assert operator-signed
+# verification, which only the orchestrator may grant (#1325).  A
 # model-authored claim must never carry one, so these stay fatal (#891
 # forged-record family).  Matching is exact: every other unknown key degrades.
 CLAIM_RESERVED_AUTHORITY_KEYS = frozenset(
-    {"status", "evidence_citations", "receipt_id", "command", "claim"}
+    {
+        "status", "evidence_citations", "receipt_id", "command", "claim",
+        "evidence_source", "signed_evidence_reference",
+    }
 )
 
 
@@ -2706,6 +3015,8 @@ def derive_risk_test_matrix_evidence(
                 _degraded_row_claim_message(record),  # shape-check: fatal:authentication-or-forgery
             ))
     result_rows: list[RiskTestMatrixEvidenceRow] = []
+    capture_classifications: dict[str, dict[str, object]] = {}
+    journal_disqualifies = _journal_disqualifies(observations)
     for row in parsed_matrix.rows:
         if row.applicability not in {"applicable", "required"}:
             continue
@@ -2714,7 +3025,12 @@ def derive_risk_test_matrix_evidence(
         citations: list[TestObservationCitation] = []
         valid_selected = True
         selected: list[object] = []
+        # Structured capture classification (#1325), recorded beside each
+        # diagnostic below and never derived from diagnostic codes.
+        capture_classes: list[str] = []
+        capture_disqualifiers: set[str] = {"journal-failure"} if journal_disqualifies else set()
         if claim is None:
+            capture_disqualifiers.add("missing-claim")
             status = "missing"
             caveats.append("No semantic coverage claim was supplied for this enforceable row.")
             diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "missing-claim", "No semantic row claim was supplied."))
@@ -2726,6 +3042,7 @@ def derive_risk_test_matrix_evidence(
                 if not getattr(claim, field_name)
             ]
             if missing_semantic_facts:
+                capture_disqualifiers.add("incomplete-semantic-claim")
                 valid_selected = False
                 diagnostics.append(PostAuthClaimDiagnostic(
                     row.row_id,
@@ -2741,6 +3058,7 @@ def derive_risk_test_matrix_evidence(
                 # Truncation before authentication is accepted content loss
                 # (#913), so the retained prefix cannot stand in for the whole
                 # claim: the row stays unverified and says why.
+                capture_disqualifiers.add("truncated-semantic-claim")
                 valid_selected = False
                 diagnostics.append(PostAuthClaimDiagnostic(
                     row.row_id,
@@ -2757,6 +3075,7 @@ def derive_risk_test_matrix_evidence(
             for dropped_ref in claim.dropped_execution_refs:
                 # Dropped before authentication (#859): never selectable, so
                 # they stay out of ``selected`` and cannot yield citations.
+                capture_classes.append("unknown-ref")
                 valid_selected = False
                 diagnostics.append(PostAuthClaimDiagnostic(
                     row.row_id, "unknown-execution-ref",
@@ -2767,6 +3086,7 @@ def derive_risk_test_matrix_evidence(
             for execution_ref in claim.execution_refs:
                 observation = observation_by_ref.get(execution_ref)
                 if observation is None:
+                    capture_classes.append("unknown-ref")
                     valid_selected = False
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "unknown-execution-ref",
@@ -2777,7 +3097,9 @@ def derive_risk_test_matrix_evidence(
                 selected.append(observation)
                 selected_observation_valid = True
                 semantics, _rich = _observation_semantics(observation)
+                capture_classes.append(capture_observation_class(observation))
                 if invocation_id is not None and _observation_value(observation, "turn_id") != invocation_id:
+                    capture_classes.append("unknown-ref")
                     valid_selected = False
                     selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -2786,6 +3108,7 @@ def derive_risk_test_matrix_evidence(
                     ))
                 attribution = _observation_attribution(observation)
                 if checkout_head_mismatch:
+                    capture_disqualifiers.add("checkout-head-mismatch")
                     valid_selected = False
                     selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -2793,6 +3116,7 @@ def derive_risk_test_matrix_evidence(
                         "The assigned checkout was not authenticated at the exact current PR head.",
                     ))
                 elif predecessor_head_unmoved:
+                    capture_disqualifiers.add("checkout-head-mismatch")
                     valid_selected = False
                     selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -2800,6 +3124,7 @@ def derive_risk_test_matrix_evidence(
                         PREDECESSOR_HEAD_UNMOVED_MESSAGE,
                     ))
                 if checkout_tree_unavailable:
+                    capture_disqualifiers.add("checkout-tree-unavailable")
                     valid_selected = False
                     selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -2807,6 +3132,7 @@ def derive_risk_test_matrix_evidence(
                         "The assigned checkout was not authenticated as a stable clean tracked tree.",
                     ))
                 if current_head is not None and attribution.get("head") not in {None, current_head}:
+                    capture_disqualifiers.add("head-mismatch")
                     valid_selected = False
                     selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -2814,6 +3140,7 @@ def derive_risk_test_matrix_evidence(
                         f"Execution selector `{execution_ref}` was attributed to a different head.",
                     ))
                 if current_tree_digest is not None and attribution.get("tracked_digest") not in {None, current_tree_digest}:
+                    capture_disqualifiers.add("tree-mismatch")
                     valid_selected = False
                     selected_observation_valid = False
                     diagnostics.append(PostAuthClaimDiagnostic(
@@ -2879,9 +3206,15 @@ def derive_risk_test_matrix_evidence(
             evidence_citations=tuple(citations),
             caveats=tuple(dict.fromkeys(caveats)),
         ))
+        capture_classifications[row.row_id] = _row_capture_classification(
+            status=status,
+            observation_classes=capture_classes,
+            disqualifiers=capture_disqualifiers,
+        )
     return DerivedRiskEvidenceResult(
         evidence=RiskTestMatrixEvidence(identity, tuple(result_rows)),
         diagnostics=tuple(diagnostics),
+        row_capture_classifications=capture_classifications,
     )
 
 
@@ -2902,7 +3235,18 @@ def parse_risk_test_matrix_evidence(
     authoritative_test_observations: Sequence[object] | None = None,
     expected_row_ids: Sequence[str] | None = None,
     context: str = "risk_test_matrix_evidence",
+    trusted_signed_references: Sequence[SignedEvidenceReference] | None = None,
+    expected_signed_head: str | None = None,
 ) -> RiskTestMatrixEvidence:
+    """Parse canonical evidence.
+
+    ``trusted_signed_references`` (#1325) are orchestrator-decoded, admitted
+    references.  Without them any ``evidence_source`` or
+    ``signed_evidence_reference`` key is rejected, which covers every agent
+    output path.  With them, a receipt-free verified row is accepted only when
+    its reference resolves to a trusted reference for the same row, matrix
+    identity and ``expected_signed_head``.
+    """
     payload = _expect_object(value, context=context)  # shape-check: fatal:authentication-or-forgery
     _expect_exact_keys(payload, context=context, required={"matrix_identity", "rows"})  # shape-check: fatal:authentication-or-forgery
     identity = _risk_bounded_string(payload["matrix_identity"], context=f"{context}.matrix_identity", max_bytes=128)  # shape-check: fatal:authentication-or-forgery
@@ -2943,7 +3287,7 @@ def parse_risk_test_matrix_evidence(
                 "row_id", "status", "test_identifiers", "test_locations", "workflow_path_claim",
                 "outcome_assertions", "forbidden_effect_assertions", "evidence_citations",
             },
-            optional={"caveats"},
+            optional={"caveats", "evidence_source", "signed_evidence_reference"},
         )
         row_id = _validate_risk_row_id(row["row_id"], context=f"{row_context}.row_id")  # shape-check: fatal:no-conservative-reading
         if row_id in seen:
@@ -2967,6 +3311,17 @@ def parse_risk_test_matrix_evidence(
                 max_items=RISK_MATRIX_MAX_CAVEATS,
             ),
         )
+        if "evidence_source" in row or "signed_evidence_reference" in row:
+            parsed_row = _parse_operator_signed_row(  # shape-check: fatal:authentication-or-forgery
+                row,
+                parsed_row,
+                row_context=row_context,
+                matrix_identity=identity,
+                trusted_signed_references=trusted_signed_references,
+                expected_signed_head=expected_signed_head,
+            )
+            result.append(parsed_row)
+            continue
         if status == "verified" and (
             not parsed_row.test_identifiers
             or not parsed_row.test_locations
@@ -3048,6 +3403,107 @@ def parse_risk_test_matrix_evidence(
         extra = sorted({row.row_id for row in result} - expected_ids)
         raise AgentLoopError(f"{context} must map every delivered row exactly once (missing={missing}, extra={extra}).")  # shape-check: fatal:authentication-or-forgery
     return RiskTestMatrixEvidence(matrix_identity=identity, rows=tuple(result))
+
+
+def _parse_operator_signed_row(
+    row: Mapping[str, object],
+    parsed_row: RiskTestMatrixEvidenceRow,
+    *,
+    row_context: str,
+    matrix_identity: str,
+    trusted_signed_references: Sequence[SignedEvidenceReference] | None,
+    expected_signed_head: str | None,
+) -> RiskTestMatrixEvidenceRow:
+    """Accept an operator-signed row only through a trusted bound reference (#1325)."""
+    if trusted_signed_references is None:
+        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            f"{row_context} carries evidence provenance; only the orchestrator may label a "
+            "row operator-signed."
+        )
+    source = row.get("evidence_source")
+    reference_id = row.get("signed_evidence_reference")
+    if source != EVIDENCE_SOURCE_OPERATOR_SIGNED or not isinstance(reference_id, str):
+        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            f"{row_context} has invalid evidence provenance."
+        )
+    reference = next(
+        (ref for ref in trusted_signed_references if ref.reference_id == reference_id), None
+    )
+    if (
+        reference is None
+        or expected_signed_head is None
+        or reference.row_id != parsed_row.row_id
+        or reference.matrix_identity != matrix_identity
+        or reference.head != expected_signed_head
+    ):
+        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            f"{row_context} names a signed-evidence reference that is not bound to this row, "
+            "matrix and head."
+        )
+    if (
+        parsed_row.status != "verified"
+        or parsed_row.evidence_citations
+        or not parsed_row.outcome_assertions
+        or not parsed_row.forbidden_effect_assertions
+    ):
+        raise AgentLoopError(  # shape-check: fatal:authentication-or-forgery
+            f"{row_context} operator-signed rows must be verified, receipt-free, and carry "
+            "outcome and forbidden-effect assertions."
+        )
+    return dataclasses.replace(
+        parsed_row,
+        evidence_source=EVIDENCE_SOURCE_OPERATOR_SIGNED,
+        signed_evidence_reference=reference_id,
+    )
+
+
+def apply_signed_evidence_references(
+    evidence: RiskTestMatrixEvidence,
+    references: Sequence[SignedEvidenceReference],
+    *,
+    matrix_identity: str,
+    current_head: str | None,
+    approved_matrix: RiskTestMatrix | Mapping[str, object] | None = None,
+) -> RiskTestMatrixEvidence:
+    """The only producer of operator-signed rows (#1325).
+
+    A row whose canonical status is not ``verified`` becomes verified with
+    ``evidence_source: operator-signed`` when an admitted reference matches
+    its row, the matrix identity and ``current_head``.  The persisted coder
+    evidence is never rewritten; callers overlay it for decisions and display.
+    """
+    if not current_head or evidence.matrix_identity != matrix_identity:
+        return evidence
+    by_row = {
+        reference.row_id: reference
+        for reference in references
+        if reference.matrix_identity == matrix_identity and reference.head == current_head
+    }
+    if not by_row:
+        return evidence
+    approved_rows: dict[str, RiskTestMatrixRow] = {}
+    if approved_matrix is not None:
+        approved_rows = {row.row_id: row for row in parse_risk_test_matrix(approved_matrix).rows}  # shape-check: fatal:orchestrator-authored
+    rows: list[RiskTestMatrixEvidenceRow] = []
+    for row in evidence.rows:
+        reference = by_row.get(row.row_id)
+        if reference is None or row.status == "verified":
+            rows.append(row)
+            continue
+        approved = approved_rows.get(row.row_id)
+        outcome = (approved.expected_outcome,) if approved is not None else row.outcome_assertions
+        forbidden = approved.forbidden_side_effects if approved is not None else row.forbidden_effect_assertions
+        rows.append(dataclasses.replace(
+            row,
+            status="verified",
+            outcome_assertions=tuple(outcome) or ("Operator-signed exact-head evidence.",),
+            forbidden_effect_assertions=tuple(forbidden) or ("No forbidden effect was reported.",),
+            evidence_citations=(),
+            caveats=(f"Verified by operator-signed evidence for head {current_head}.",),
+            evidence_source=EVIDENCE_SOURCE_OPERATOR_SIGNED,
+            signed_evidence_reference=reference.reference_id,
+        ))
+    return dataclasses.replace(evidence, rows=tuple(rows))
 
 
 def _citation_matches_observation(

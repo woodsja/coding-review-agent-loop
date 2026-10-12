@@ -93,6 +93,7 @@ from .protocol import (
     EXECUTION_DISPOSITION_PLANNING,
 )
 from .evidence_stall import approved_matrix_row_ids
+from .evidence_conversion import capture_classification_payload
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
@@ -199,6 +200,7 @@ from .protocol import (
     ParsedReview,
     ReviewItemDisposition,
     StructuredCoderFollowup,
+    SignedEvidenceReference,
     UnresolvedReviewItem,
     human_requirements_resolved,
     parse_agent_state,
@@ -439,6 +441,17 @@ from .pr_loop_support import (
     _evidence_freeze_diagnostic,
     _publish_evidence_freeze,
     _pr_evidence_stall_decision,
+    _pr_operator_evidence_conversion,
+    _reconcile_converted_evidence,
+    _cumulative_references,
+    _evidence_gate_needed,
+    admitted_pr_records,
+    round_evidence_authority_records,
+    conversion_repeat_round,
+    evidence_authority_from_records,
+    freeze_signed_baseline,
+    latest_conversion_index,
+    mint_signed_evidence_references,
     _followup_reports_code_changes,
     _evidence_stall_citation_rows,
     _publish_evidence_release,
@@ -2900,6 +2913,38 @@ def run_pr_loop(
         # inside the current round: ``response`` when frozen evidence can be
         # answered, ``refresh`` for signed input that arrived before a freeze.
         pending_evidence_pass: str | None = None
+        # Evidence conversion (#1325).  ``pending_conversion_pass`` marks the
+        # same-head repeat after a conversion: the complete board re-reviews
+        # fresh, without signed-input response semantics.  It is recovered on
+        # resume from the latest admitted conversion record.  References
+        # minted by this process are kept here and carried cumulatively, with
+        # the admitted history, on every terminal evidence record.
+        pending_conversion_pass = False
+        signed_evidence_references_state: list[SignedEvidenceReference] = []
+        round_history_references: tuple[SignedEvidenceReference, ...] = ()
+        operator_conversion_pending = bool(config.pr_convert_evidence_rows)
+        matrix_applies = bool(
+            approved_plan_context is not None
+            and approved_plan_context.matrix_available
+            and approved_plan_context.risk_test_matrix_identity
+        )
+        if resumed_round is not None and matrix_applies:
+            # A restart between the conversion record and the repeated reviews
+            # resumes the repeat; an incomplete identity read stops here,
+            # before any agent runs.
+            pending_conversion_pass = conversion_repeat_round(
+                admitted_pr_records(
+                    runner, config, pr_number=pr_number,
+                    comments=initial_pr_context.comments, resume=True,
+                ),
+                round_number=resumed_round.round_number,
+                head_sha=initial_pr_context.metadata.head_sha,
+            )
+
+        def current_signed_references() -> tuple[SignedEvidenceReference, ...]:
+            return _cumulative_references(
+                (*round_history_references, *signed_evidence_references_state)
+            )
         # The signed-requirement IDs surfaced to the reviewers whose verdict the
         # next finalization relies on; ``None`` is an unverifiable baseline.
         evidence_surfaced_baseline: tuple[str, ...] | None = None
@@ -2977,6 +3022,33 @@ def run_pr_loop(
             )
             round_sequence.repeat_current()
 
+        def stage_same_head_conversion_review(*, current_round: int) -> None:
+            """Re-run the complete board at the same head after a conversion (#1325).
+
+            An ordinary review pass, not a signed-input response: the round
+            number and budget do not advance, and every configured reviewer is
+            freshly invoked with the converted obligations in its prompt.
+            """
+            nonlocal initial_pr_context, prefetched_pr_context, resumed_round
+            nonlocal pending_conversion_pass, issue_context_refreshed
+            nonlocal parent_issue_context_refreshed
+            context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+            pending_conversion_pass = True
+            resumed_round = None
+            issue_context_refreshed = False
+            parent_issue_context_refreshed = False
+            if current_round == start_round_number:
+                initial_pr_context = context
+            else:
+                prefetched_pr_context = context
+            log(
+                config,
+                f"Round {current_round}: risk-matrix evidence converted at head "
+                f"{context.metadata.head_sha}; re-running the full review board at the same "
+                "head without advancing the round",
+            )
+            round_sequence.repeat_current()
+
         def stage_evidence_head_change(context: PullRequestReviewContext) -> None:
             """Hand a head that moved before the freeze to the new-head path."""
             nonlocal unresolved_items, prefetched_pr_context, resumed_round
@@ -3009,6 +3081,8 @@ def run_pr_loop(
             )
             evidence_pass = pending_evidence_pass
             pending_evidence_pass = None
+            conversion_pass = pending_conversion_pass
+            pending_conversion_pass = False
             if round_number > allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -3219,6 +3293,59 @@ def run_pr_loop(
                 unresolved_items,
                 current_head_sha=pr_metadata.head_sha,
             )
+            # Live-head reconciliation of converted evidence (#1325): after the
+            # authoritative (resume) ledger assignment, so the replacement can
+            # never discard what it reopens, and the last assignment before the
+            # mergeability gate, the evidence response head, the carried-ledger
+            # snapshot, reviewer context and item partitioning.
+            if matrix_applies:
+                round_authority_records = round_evidence_authority_records(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    comments=pr_comments,
+                    ledger=unresolved_items,
+                    force=operator_conversion_pending,
+                )
+                round_history_references, _round_audits = evidence_authority_from_records(
+                    round_authority_records
+                )
+                unresolved_items = _reconcile_converted_evidence(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    ledger=unresolved_items,
+                    head_sha=pr_metadata.head_sha,
+                    approved_plan_context=approved_plan_context,
+                    in_process_references=signed_evidence_references_state,
+                    records=round_authority_records,
+                )
+            if operator_conversion_pending:
+                # Operator conversion takes effect before any reviewer or coder;
+                # an invalid row list fails closed before anything is posted.
+                operator_conversion_pending = False
+                operator_conversion = _pr_operator_evidence_conversion(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    round_number=round_number,
+                    head_sha=pr_metadata.head_sha,
+                    approved_plan_context=approved_plan_context,
+                    ledger=unresolved_items,
+                    next_item_number=next_unresolved_item_number,
+                    configured_reviewers=tuple(
+                        agent_display_name(reviewer) for reviewer in configured_reviewers
+                    ),
+                    signed_evidence_references=current_signed_references(),
+                )
+                if operator_conversion is not None:
+                    unresolved_items = list(operator_conversion.ledger)
+                    next_unresolved_item_number = operator_conversion.next_item_number
+                    # Earlier same-head approvals and resumed reviews never saw
+                    # the converted ledger, so every reviewer reviews fresh.
+                    conversion_pass = True
+                    if current_resume is not None:
+                        current_resume = dataclasses_replace(current_resume, completed_reviews=())
             # GitHub mergeability gate (#606): fetch and evaluate before starting
             # a review round so a confirmed conflict routes straight to the coder
             # instead of spending reviewer time (or later a full CI wait) on a
@@ -3372,6 +3499,7 @@ def run_pr_loop(
                             watch_failure_extension_used=watch_failure_extension_used,
                             watch_head_extension_used=watch_head_extension_used,
                             clearances=evidence_clearances,
+                            signed_evidence_references=current_signed_references(),
                             detail="; ".join(gate_reasons),
                         )
                         log(
@@ -3396,6 +3524,7 @@ def run_pr_loop(
                                 watch_failure_extension_used=watch_failure_extension_used,
                                 watch_head_extension_used=watch_head_extension_used,
                                 clearances=evidence_clearances,
+                                signed_evidence_references=current_signed_references(),
                                 still_frozen=True,
                             )
                             evidence_budget_correction_pending = False
@@ -3438,6 +3567,10 @@ def run_pr_loop(
             )
             if evidence_pass is not None:
                 evidence_skip_reviewers = False
+            # Evidence passes (#1068) and the conversion repeat (#1325) run the
+            # complete board fresh; computed after the frozen-rerun path above
+            # may have started a response pass.
+            full_board_pass = evidence_pass is not None or conversion_pass
             prior_unresolved_items = tuple(unresolved_items)
             pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
@@ -3477,6 +3610,10 @@ def run_pr_loop(
                 tuple(item.item_id for item in prior_unresolved_items if item.status == "future")
                 if use_compact_pr_context
                 else ()
+            ) + tuple(
+                # Converted findings and row tombstones (#1325) are not rendered
+                # to reviewers, so their dispositions are optional.
+                item.item_id for item in prior_unresolved_items if item.is_inert_ledger_record
             )
             coder_followup_context = _coder_followup_review_context(
                 latest_coder_output,
@@ -3484,6 +3621,7 @@ def run_pr_loop(
                 head_sha=pr_metadata.head_sha,
                 assigned_workdir=active_workdir(config),
                 coverage_map=latest_coder_coverage_map,
+                signed_evidence_references=current_signed_references(),
             ) + _evidence_review_context(
                 prior_unresolved_items, response_head=evidence_response_head
             )
@@ -3652,6 +3790,18 @@ def run_pr_loop(
                         primary_reviewer=scheduler_contract.primary_reviewer,
                         operator_force_full=scheduler_operator_force_full,
                     )
+                }
+            # An approval recorded before the latest conversion at this head
+            # never saw the converted ledger (#1325), so it is never carried.
+            conversion_boundary_index = latest_conversion_index(
+                _extract_round_metadata_records(pr_comments, flow="pr"),
+                head_sha=pr_metadata.head_sha,
+            )
+            if conversion_boundary_index >= 0:
+                unchanged_head_approvals = {
+                    name: record
+                    for name, record in unchanged_head_approvals.items()
+                    if record.index > conversion_boundary_index
                 }
             # A restored (#984), added, rebound or role-changed (#1376) reviewer
             # must re-approve the current head: an approval from before the
@@ -4235,9 +4385,10 @@ def run_pr_loop(
                 scheduler_calls_avoided += scheduler_decision.calls_avoided
                 final_sweep_pending = False
                 selected_reviewer_names = set(scheduler_decision.selected_reviewers)
-                if evidence_pass is not None:
-                    # Evidence-response and refresh passes always run the
-                    # complete board at the same head (#1068).
+                if full_board_pass:
+                    # Evidence-response and refresh passes (#1068) and the
+                    # conversion repeat (#1325) always run the complete board
+                    # at the same head.
                     selected_reviewer_names = {
                         agent_display_name(reviewer) for reviewer in configured_reviewers
                     }
@@ -4453,7 +4604,7 @@ def run_pr_loop(
                     return "skip"
                 prior_approval = unchanged_head_approvals.get(reviewer_name)
                 if (
-                    evidence_pass is None
+                    not full_board_pass
                     and prior_approval is not None
                     and prior_approval.metadata.round_number < round_number
                     and (
@@ -4959,7 +5110,7 @@ def run_pr_loop(
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
                     log(config, f"Round {round_number}: resuming {reviewer_name}'s completed review")
                 elif (
-                    evidence_pass is None
+                    not full_board_pass
                     and (prior_approval := unchanged_head_approvals.get(reviewer_name)) is not None
                     and prior_approval.metadata.round_number < round_number
                     and (
@@ -5591,6 +5742,33 @@ def run_pr_loop(
                 for clearance in round_evidence_clearances
                 if clearance not in evidence_clearances
             )
+            if round_evidence_clearances and evidence_response_head is not None:
+                # Signed-evidence references for cleared converted rows (#1325),
+                # minted in this pass before any later freeze moves the
+                # signed-input baseline, and carried on its terminal record.
+                freeze_baseline = (
+                    live_evidence_boundary.evidence_freeze.signed_requirement_ids_at_freeze
+                    if live_evidence_boundary is not None
+                    and live_evidence_boundary.phase == EVIDENCE_FREEZE_PHASE
+                    and live_evidence_boundary.evidence_freeze is not None
+                    and live_evidence_boundary.evidence_freeze.valid
+                    else freeze_signed_baseline(
+                        _extract_round_metadata_records(pr_comments, flow="pr"),
+                        evidence_response_head,
+                    )
+                )
+                signed_evidence_references_state.extend(
+                    mint_signed_evidence_references(
+                        prior_items=prior_unresolved_items,
+                        reconciled_items=unresolved_items,
+                        clearances=round_evidence_clearances,
+                        dispositions_by_item=prior_dispositions,
+                        response_head=evidence_response_head,
+                        surfaced_requirement_ids=surfaced_reviewer_requirement_ids,
+                        freeze_signed_requirement_ids=freeze_baseline,
+                        round_number=round_number,
+                    )
+                )
             for requesting_reviewer, requests in round_evidence_requests:
                 for request_text in requests:
                     unresolved_items, consumed_item_number = _upsert_evidence_obligation(
@@ -5833,6 +6011,7 @@ def run_pr_loop(
                         watch_failure_extension_used=watch_failure_extension_used,
                         watch_head_extension_used=watch_head_extension_used,
                         clearances=evidence_clearances,
+                        signed_evidence_references=current_signed_references(),
                     )
                     log(
                         config,
@@ -5853,6 +6032,7 @@ def run_pr_loop(
                         watch_failure_extension_used=watch_failure_extension_used,
                         watch_head_extension_used=watch_head_extension_used,
                         clearances=evidence_clearances,
+                        signed_evidence_references=current_signed_references(),
                     )
                     evidence_revalidation_required = True
                 elif evidence_response_head is not None:
@@ -5872,6 +6052,8 @@ def run_pr_loop(
                         watch_failure_extension_used=watch_failure_extension_used,
                         watch_head_extension_used=watch_head_extension_used,
                         clearances=evidence_clearances,
+                        signed_evidence_references=current_signed_references(),
+                        approved_plan_context=approved_plan_context,
                     )
                     assert gate_outcome.context is not None
                     if gate_outcome.action == "head_changed":
@@ -5905,6 +6087,7 @@ def run_pr_loop(
                         watch_failure_extension_used=watch_failure_extension_used,
                         watch_head_extension_used=watch_head_extension_used,
                         clearances=evidence_clearances,
+                        signed_evidence_references=current_signed_references(),
                     )
                     evidence_revalidation_required = True
 
@@ -6311,7 +6494,7 @@ def run_pr_loop(
                     # Exact-head evidence gate (#1068): the last reads before any
                     # finalization side effect; publishes the single freeze when evidence
                     # is pending, and otherwise revalidates head and signed input.
-                    if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                    if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
                         gate_outcome = _evidence_freeze_gate(
                             runner,
                             config=config,
@@ -6325,6 +6508,8 @@ def run_pr_loop(
                             watch_failure_extension_used=watch_failure_extension_used,
                             watch_head_extension_used=watch_head_extension_used,
                             clearances=evidence_clearances,
+                            signed_evidence_references=current_signed_references(),
+                            approved_plan_context=approved_plan_context,
                         )
                         assert gate_outcome.context is not None
                         if gate_outcome.action == "head_changed":
@@ -6579,7 +6764,7 @@ def run_pr_loop(
                         # Exact-head evidence gate (#1068): the last reads before any
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
-                        if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                        if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
                             gate_outcome = _evidence_freeze_gate(
                                 runner,
                                 config=config,
@@ -6593,6 +6778,8 @@ def run_pr_loop(
                                 watch_failure_extension_used=watch_failure_extension_used,
                                 watch_head_extension_used=watch_head_extension_used,
                                 clearances=evidence_clearances,
+                                signed_evidence_references=current_signed_references(),
+                                approved_plan_context=approved_plan_context,
                             )
                             assert gate_outcome.context is not None
                             if gate_outcome.action == "head_changed":
@@ -7208,7 +7395,7 @@ def run_pr_loop(
                                 # Exact-head evidence gate (#1068): the last reads before any
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
-                                if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                                if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
                                     gate_outcome = _evidence_freeze_gate(
                                         runner,
                                         config=config,
@@ -7222,6 +7409,8 @@ def run_pr_loop(
                                         watch_failure_extension_used=watch_failure_extension_used,
                                         watch_head_extension_used=watch_head_extension_used,
                                         clearances=evidence_clearances,
+                                        signed_evidence_references=current_signed_references(),
+                                        approved_plan_context=approved_plan_context,
                                     )
                                     assert gate_outcome.context is not None
                                     if gate_outcome.action == "head_changed":
@@ -7386,7 +7575,7 @@ def run_pr_loop(
                                 # Exact-head evidence gate (#1068): the last reads before any
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
-                                if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                                if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
                                     gate_outcome = _evidence_freeze_gate(
                                         runner,
                                         config=config,
@@ -7400,6 +7589,8 @@ def run_pr_loop(
                                         watch_failure_extension_used=watch_failure_extension_used,
                                         watch_head_extension_used=watch_head_extension_used,
                                         clearances=evidence_clearances,
+                                        signed_evidence_references=current_signed_references(),
+                                        approved_plan_context=approved_plan_context,
                                     )
                                     assert gate_outcome.context is not None
                                     if gate_outcome.action == "head_changed":
@@ -7679,7 +7870,7 @@ def run_pr_loop(
                             # Exact-head evidence gate (#1068): the last reads before any
                             # finalization side effect; publishes the single freeze when evidence
                             # is pending, and otherwise revalidates head and signed input.
-                            if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                            if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
                                 gate_outcome = _evidence_freeze_gate(
                                     runner,
                                     config=config,
@@ -7693,6 +7884,8 @@ def run_pr_loop(
                                     watch_failure_extension_used=watch_failure_extension_used,
                                     watch_head_extension_used=watch_head_extension_used,
                                     clearances=evidence_clearances,
+                                    signed_evidence_references=current_signed_references(),
+                                    approved_plan_context=approved_plan_context,
                                 )
                                 assert gate_outcome.context is not None
                                 if gate_outcome.action == "head_changed":
@@ -7739,7 +7932,7 @@ def run_pr_loop(
                         # Exact-head evidence gate (#1068): the last reads before any
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
-                        if evidence_revalidation_required or _pending_evidence_obligations(unresolved_items):
+                        if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
                             gate_outcome = _evidence_freeze_gate(
                                 runner,
                                 config=config,
@@ -7753,6 +7946,8 @@ def run_pr_loop(
                                 watch_failure_extension_used=watch_failure_extension_used,
                                 watch_head_extension_used=watch_head_extension_used,
                                 clearances=evidence_clearances,
+                                signed_evidence_references=current_signed_references(),
+                                approved_plan_context=approved_plan_context,
                             )
                             assert gate_outcome.context is not None
                             if gate_outcome.action == "head_changed":
@@ -7912,7 +8107,7 @@ def run_pr_loop(
             # Evidence-only stall (#1324): decided after the check snapshot and
             # CI reconciliation above, before any coder invocation.  Not
             # evaluated on the merge-conflict path, which makes no check calls.
-            evidence_stall_snapshot = (
+            evidence_stall_outcome = (
                 None
                 if has_merge_conflict_item
                 else _pr_evidence_stall_decision(
@@ -7924,8 +8119,24 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     open_items=unresolved_items,
                     pr_checks=pr_checks,
+                    configured_reviewers=tuple(
+                        agent_display_name(reviewer) for reviewer in configured_reviewers
+                    ),
+                    next_item_number=next_unresolved_item_number,
+                    signed_evidence_references=current_signed_references(),
                 )
             )
+            evidence_stall_snapshot = (
+                evidence_stall_outcome.snapshot if evidence_stall_outcome is not None else None
+            )
+            if evidence_stall_outcome is not None and evidence_stall_outcome.conversion is not None:
+                # Conversion was persisted before the stall check (#1325).  No
+                # coder turn, stall stop, or coder record follows: the complete
+                # board re-reviews this head with the converted ledger.
+                unresolved_items = list(evidence_stall_outcome.conversion.ledger)
+                next_unresolved_item_number = evidence_stall_outcome.conversion.next_item_number
+                stage_same_head_conversion_review(current_round=round_number)
+                continue
             if deferred_non_convergence:
                 # The evidence stall did not stop at this dispatch, so it cannot own
                 # the window: the non-convergence stop fires before any coder turn.
@@ -8140,6 +8351,7 @@ def run_pr_loop(
                     watch_failure_extension_used=watch_failure_extension_used,
                     watch_head_extension_used=watch_head_extension_used,
                     clearances=evidence_clearances,
+                    signed_evidence_references=current_signed_references(),
                 )
             _refuse_dispatch_while_evidence_frozen(
                 unresolved_items,
@@ -8532,6 +8744,20 @@ def run_pr_loop(
                         else None
                     ),
                     evidence_stall=evidence_stall_snapshot,
+                    risk_test_matrix_capture_classification=(
+                        capture_classification_payload(
+                            _followup_derived_risk_evidence,
+                            head_sha=str(
+                                followup_bound_head
+                                or updated_pr_context.metadata.head_sha
+                                or "unknown"
+                            ),
+                        )
+                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                        and coder_response.marker_value.risk_test_matrix_evidence is not None
+                        and _followup_derived_risk_evidence is not None
+                        else None
+                    ),
                     risk_test_matrix_evidence_full_round=(
                         matrix_evidence_render_decision.anchor_round
                         if matrix_evidence_render_decision is not None

@@ -708,7 +708,14 @@ def _derive_authenticated_risk_evidence_for_coder(
                         risk_test_matrix_diagnostics=raced_result.diagnostics,
                     )
                 if raced_result is not None:
-                    raced_result = dataclasses_replace(raced_result, bound_head_sha=corrected_head)
+                    from .protocol import disqualify_capture_classification
+
+                    # Evidence rebuilt after a head race never counts as a
+                    # capture-limited conversion attempt (#1325).
+                    raced_result = disqualify_capture_classification(
+                        dataclasses_replace(raced_result, bound_head_sha=corrected_head),
+                        "head-changed-during-correction",
+                    )
                 return raced_parsed, raced_result
             correction_error = "semantic correction was discarded because the authenticated PR head changed"
         diagnostic = PostAuthClaimDiagnostic(

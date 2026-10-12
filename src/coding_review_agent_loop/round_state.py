@@ -42,6 +42,7 @@ from .protocol_markers import (
 )
 from .workdir_guard import validate_checkout_inspected_evidence
 from .protocol import (
+    SignedEvidenceReference,
     HTML_COMMENT_RE,
     SIGNATURE_RE,
     ParseDegradation,
@@ -92,6 +93,7 @@ from .unresolved_items import (
 )
 
 from .evidence_stall import stall_snapshot_is_consistent
+from .evidence_conversion import EvidenceConversionAudit, decode_capture_classification
 
 logger = logging.getLogger(__name__)
 
@@ -365,6 +367,24 @@ class PostedRoundMetadata:
     # and is omitted from the encoding when None.  An invalid stored value
     # decodes as ``{"invalid": True}`` so history treats it as non-qualifying.
     evidence_stall: Mapping[str, object] | None = None
+    # Evidence conversion (#1325).  Every field below is orchestrator-written
+    # authority, admitted on resume only from the authenticated actor's own
+    # comments (see ``admit_evidence_authority_records``), and omitted from
+    # the encoding when empty so historical records decode unchanged.
+    # Per-attempt capture classification on PR coder records; a malformed or
+    # mis-bound value decodes as None (a non-qualifying attempt).
+    risk_test_matrix_capture_classification: Mapping[str, object] | None = None
+    # The conversion audit on an ``evidence-conversion`` summary record; an
+    # invalid audit decodes as None and is treated as unconverted.
+    evidence_conversion: "EvidenceConversionAudit | None" = None
+    # The review snapshot of the conversion round, which posts no coder
+    # follow-up record; ``review_round`` equals the record's own round.
+    conversion_stall_snapshot: Mapping[str, object] | None = None
+    # The round whose same-head repeat must re-run the complete board fresh.
+    conversion_review_round: int | None = None
+    # Cumulative signed-evidence references carried on every terminal freeze
+    # or release record and on conversion records; malformed entries drop.
+    signed_evidence_references: tuple[SignedEvidenceReference, ...] = ()
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -1335,6 +1355,9 @@ EVIDENCE_FREEZE_PHASE = "evidence-freeze"
 EVIDENCE_RESPONSE_PHASE = "evidence-response"
 EVIDENCE_RELEASE_PHASE = "evidence-release"
 EVIDENCE_TERMINAL_PHASES = frozenset({EVIDENCE_FREEZE_PHASE, EVIDENCE_RELEASE_PHASE})
+# The orchestrator's single conversion record (#1325): it carries the
+# post-conversion ledger and the audit, and is written before any dispatch.
+EVIDENCE_CONVERSION_PHASE = "evidence-conversion"
 EVIDENCE_RELEASE_REASONS = frozenset(
     {"evidence-cleared", "findings", "machine-gate", "refresh-clean"}
 )
@@ -1684,7 +1707,59 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
         payload["sub_items"] = [_serialize_sub_item(sub) for sub in item.sub_items]
     if item.evidence_row_ids:
         payload["evidence_row_ids"] = list(item.evidence_row_ids)
+    if item.converted_row_ids:
+        payload["converted_row_ids"] = list(item.converted_row_ids)
+    if item.converted_row_id is not None:
+        payload["converted_row_id"] = item.converted_row_id
+        payload["converted_matrix_identity"] = item.converted_matrix_identity
     return payload
+
+
+def _deserialize_converted_row_ids(payload: dict, evidence_row_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Decode the converted subset of a finding's tag (#1325); malformed is none.
+
+    Dropping it restores the full residual demand, so corrupt history never
+    hides a row from the coder or the stall detector.
+    """
+    raw = payload.get("converted_row_ids")
+    if raw is None:
+        return ()
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or any(not isinstance(entry, str) or entry not in evidence_row_ids for entry in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        logger.warning("Ignoring malformed converted_row_ids on a persisted review item")
+        return ()
+    return tuple(raw)
+
+
+def _deserialize_converted_row(payload: dict) -> dict[str, str]:
+    """Decode a row-converted obligation's row binding (#1325).
+
+    The pair must reproduce the obligation identity; otherwise the binding is
+    dropped and the item stays an ordinary evidence obligation that every
+    configured reviewer must clear.
+    """
+    row_id = payload.get("converted_row_id")
+    identity = payload.get("converted_matrix_identity")
+    if row_id is None and identity is None:
+        return {}
+    from .unresolved_items import converted_evidence_obligation_identity
+
+    if (
+        isinstance(row_id, str)
+        and row_id.strip()
+        and isinstance(identity, str)
+        and re.fullmatch(r"[0-9a-f]{64}", identity)
+        and payload.get("obligation_kind") == EVIDENCE_OBLIGATION_KIND
+        and payload.get("obligation_identity")
+        == converted_evidence_obligation_identity(row_id, identity)
+    ):
+        return {"converted_row_id": row_id, "converted_matrix_identity": identity}
+    logger.warning("Ignoring a malformed converted-row binding on a persisted evidence obligation")
+    return {}
 
 
 def _deserialize_evidence_row_ids(payload: dict) -> tuple[str, ...]:
@@ -1824,7 +1899,7 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
             obligation_identity=payload.get("obligation_identity"),
         )
         try:
-            item = UnresolvedReviewItem(**core, **machine)
+            item = UnresolvedReviewItem(**core, **machine, **_deserialize_converted_row(payload))
             # ``None`` is a valid default for the in-memory dataclass, but a
             # serialized record that contains machine keys and no usable
             # machine value is still a machine-shaped record.  Preserve it as
@@ -1841,10 +1916,18 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
                 lifecycle="repair_required",
                 obligation_identity="invalid-machine-record",
             )
+    evidence_row_ids = _deserialize_evidence_row_ids(payload)
+    converted_row_ids = _deserialize_converted_row_ids(payload, evidence_row_ids)
+    if core["status"] == "converted" and (
+        not converted_row_ids or set(converted_row_ids) != set(evidence_row_ids)
+    ):
+        # An inconsistent converted finding is restored as an open blocker.
+        core = {**core, "status": "blocking"}
     return UnresolvedReviewItem(
         **core,
         sub_items=_deserialize_sub_items(payload),
-        evidence_row_ids=_deserialize_evidence_row_ids(payload),
+        evidence_row_ids=evidence_row_ids,
+        converted_row_ids=converted_row_ids,
     )
 
 
@@ -2834,6 +2917,20 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["evidence_release"] = metadata.evidence_release.as_dict()
     if metadata.evidence_clearances:
         payload["evidence_clearances"] = [list(pair) for pair in metadata.evidence_clearances]
+    if metadata.risk_test_matrix_capture_classification is not None:
+        payload["risk_test_matrix_capture_classification"] = dict(
+            metadata.risk_test_matrix_capture_classification
+        )
+    if metadata.evidence_conversion is not None:
+        payload["evidence_conversion"] = metadata.evidence_conversion.to_payload()
+    if metadata.conversion_stall_snapshot is not None:
+        payload["conversion_stall_snapshot"] = dict(metadata.conversion_stall_snapshot)
+    if metadata.conversion_review_round is not None:
+        payload["conversion_review_round"] = metadata.conversion_review_round
+    if metadata.signed_evidence_references:
+        payload["signed_evidence_references"] = [
+            reference.to_payload() for reference in metadata.signed_evidence_references
+        ]
     payload.update(_encode_recovery_fields(metadata))
     return encode_mapping(payload)
 
@@ -2901,7 +2998,74 @@ def _decode_evidence_stall(payload: Mapping[str, object]) -> Mapping[str, object
         "qualifies": raw["qualifies"],
         "unsatisfied_row_ids": sorted(raw["unsatisfied_row_ids"]),
         "reasons": sorted(raw["reasons"]),
+        # The attempt pairing (#1325); absent on legacy snapshots, which then
+        # mean "attempt unknown" and never count toward conversion.
+        **(
+            {"bound_attempt_round": raw["bound_attempt_round"]}
+            if "bound_attempt_round" in raw
+            else {}
+        ),
     }
+
+
+def _decode_conversion_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode the #1325 conversion fields; malformed values never raise.
+
+    A malformed classification, audit, or snapshot decodes as absent (a
+    non-qualifying attempt or an unconverted row); a malformed reference is
+    dropped.  None of them can ever grant authority by being malformed.
+    """
+    fields: dict[str, object] = {}
+    if "risk_test_matrix_capture_classification" in payload:
+        evidence = payload.get("risk_test_matrix_evidence")
+        identity = evidence.get("matrix_identity") if isinstance(evidence, Mapping) else None
+        subject = payload.get("subject")
+        fields["risk_test_matrix_capture_classification"] = decode_capture_classification(
+            payload["risk_test_matrix_capture_classification"],
+            subject=subject if isinstance(subject, str) else None,
+            evidence_identity=identity if isinstance(identity, str) else None,
+        )
+        if fields["risk_test_matrix_capture_classification"] is None:
+            logger.warning("Ignoring a malformed or mis-bound capture classification")
+    if "evidence_conversion" in payload:
+        audit = EvidenceConversionAudit.from_payload(payload["evidence_conversion"])
+        if audit is None or audit.head != payload.get("subject"):
+            logger.warning("Ignoring a malformed evidence conversion audit record")
+            audit = None
+        fields["evidence_conversion"] = audit
+    if "conversion_stall_snapshot" in payload:
+        raw = payload["conversion_stall_snapshot"]
+        decoded = _decode_evidence_stall(
+            {"evidence_stall": raw, "round_number": (
+                payload["round_number"] + 1
+                if isinstance(payload.get("round_number"), int)
+                and not isinstance(payload.get("round_number"), bool)
+                else None
+            )}
+        )
+        fields["conversion_stall_snapshot"] = decoded
+    if "conversion_review_round" in payload:
+        value = payload["conversion_review_round"]
+        fields["conversion_review_round"] = (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value == payload.get("round_number")
+            else None
+        )
+    if "signed_evidence_references" in payload:
+        raw_references = payload["signed_evidence_references"]
+        references: list[SignedEvidenceReference] = []
+        if isinstance(raw_references, list):
+            for entry in raw_references:
+                reference = SignedEvidenceReference.from_payload(entry)
+                if reference is None:
+                    logger.warning("Ignoring a malformed signed-evidence reference")
+                    continue
+                if reference.reference_id not in {ref.reference_id for ref in references}:
+                    references.append(reference)
+        fields["signed_evidence_references"] = tuple(references)
+    return fields
 
 
 def _is_followup_dispatch_head(value: object) -> bool:
@@ -3327,6 +3491,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             plan_board_binding_init=_decode_board_object(payload, "plan_board_binding_init"),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             evidence_stall=_decode_evidence_stall(payload),
+            **_decode_conversion_fields(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
             plan_issue_digest=_decode_plan_issue_digest(payload),
             **_decode_recovery_fields(payload),
@@ -3996,7 +4161,12 @@ def _max_unresolved_item_number_from_records(records: Sequence[PostedRoundRecord
 
 
 def _active_pr_items(items: Sequence[UnresolvedReviewItem]) -> list[UnresolvedReviewItem]:
-    return [item for item in items if item.status in {"blocking", "same-pr"}]
+    # Inert converted findings and row tombstones (#1325) are retained so a
+    # resume keeps provenance and can reopen a tombstone at a new head.
+    return [
+        item for item in items
+        if item.status in {"blocking", "same-pr"} or item.is_inert_ledger_record
+    ]
 
 
 def _latest_qualification_checkpoint(
@@ -4458,17 +4628,97 @@ def _recovery_record_admitted(
     )
 
 
+def record_carries_evidence_authority(metadata: PostedRoundMetadata) -> bool:
+    """Whether a record carries #1325 evidence-conversion authority.
+
+    True for the conversion phase, any signed-evidence reference, a capture
+    classification, or a stall snapshot that pairs a review with a coder
+    attempt.  Such records are admitted only from the authenticated actor.
+    """
+    stall = metadata.evidence_stall
+    return (
+        metadata.phase == EVIDENCE_CONVERSION_PHASE
+        or bool(metadata.signed_evidence_references)
+        or metadata.risk_test_matrix_capture_classification is not None
+        or metadata.evidence_conversion is not None
+        or metadata.conversion_stall_snapshot is not None
+        or (isinstance(stall, Mapping) and "bound_attempt_round" in stall)
+    )
+
+
+def strip_evidence_authority(metadata: PostedRoundMetadata) -> PostedRoundMetadata:
+    """The record as an unauthenticated reader may use it (#1325).
+
+    References, the audit, the classification and the attempt pairing are
+    removed; the stall snapshot itself keeps the stage-1 trust model.
+    """
+    stall = metadata.evidence_stall
+    if isinstance(stall, Mapping) and "bound_attempt_round" in stall:
+        stall = {key: value for key, value in stall.items() if key != "bound_attempt_round"}
+    return replace(
+        metadata,
+        risk_test_matrix_capture_classification=None,
+        evidence_conversion=None,
+        conversion_stall_snapshot=None,
+        conversion_review_round=None,
+        signed_evidence_references=(),
+        evidence_stall=stall,
+    )
+
+
+def admit_evidence_authority_records(
+    records: Sequence[PostedRoundRecord],
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+) -> tuple[PostedRoundRecord, ...]:
+    """Fail-closed authorship check for #1325 authority carriers.
+
+    A record whose comment was not authored by the authenticated actor (or
+    when the actor is unknown) keeps its ordinary content but loses every
+    conversion and signed-evidence field.  Strict decoding and the hashed
+    reference ID prove consistency, not authorship.
+    """
+    admitted: list[PostedRoundRecord] = []
+    rejected = 0
+    for record in records:
+        if not record_carries_evidence_authority(record.metadata) or _recovery_record_admitted(
+            record, comments, trusted_actor
+        ):
+            admitted.append(record)
+            continue
+        rejected += 1
+        admitted.append(replace(record, metadata=strip_evidence_authority(record.metadata)))
+    if rejected:
+        logger.warning(
+            "Ignoring evidence-conversion authority on %d record(s) not authored by the "
+            "authenticated orchestrator actor", rejected,
+        )
+    return tuple(admitted)
+
+
 def _admit_recovery_records(
     records: Sequence[PostedRoundRecord],
     comments: Sequence[object],
     trusted_actor: tuple[str, int] | None,
 ) -> tuple[PostedRoundRecord, ...]:
-    """Drop new-phase records the authenticated actor did not author."""
-    return tuple(
-        record
-        for record in records
-        if record.metadata.phase not in RECOVERY_RECORD_PHASES
-        or _recovery_record_admitted(record, comments, trusted_actor)
+    """Drop new-phase records the authenticated actor did not author.
+
+    A conversion record (#1325) is a ledger handoff too, so a foreign one is
+    dropped rather than restored; every other record loses only its
+    evidence-conversion authority fields.
+    """
+    return admit_evidence_authority_records(
+        tuple(
+            record
+            for record in records
+            if (
+                record.metadata.phase not in RECOVERY_RECORD_PHASES
+                and record.metadata.phase != EVIDENCE_CONVERSION_PHASE
+            )
+            or _recovery_record_admitted(record, comments, trusted_actor)
+        ),
+        comments,
+        trusted_actor,
     )
 
 
@@ -4502,7 +4752,7 @@ def unauthenticated_recovery_record_indexes(
     needed: set[int] = set()
     for record in records:
         phase = record.metadata.phase
-        if phase in RECOVERY_RECORD_PHASES:
+        if phase in RECOVERY_RECORD_PHASES or record_carries_evidence_authority(record.metadata):
             needed.add(record.index)
         elif review_unrecorded_head and _is_budget_candidate(record.metadata):
             needed.add(record.index)
@@ -4527,7 +4777,11 @@ def pr_resume_needs_author_admission(
     if review_unrecorded_head:
         return True
     records = _extract_round_metadata_records(comments, flow="pr")
-    if any(record.metadata.phase in RECOVERY_RECORD_PHASES for record in records):
+    if any(
+        record.metadata.phase in RECOVERY_RECORD_PHASES
+        or record_carries_evidence_authority(record.metadata)
+        for record in records
+    ):
         return True
     return bool(
         records
@@ -4791,6 +5045,22 @@ def _recover_unrecorded_pr_head_advance(
         return None
     latest_prior_subject = prior_records[-1].metadata.subject
     latest_prior_record = prior_records[-1]
+    if latest_prior_record.metadata.phase == EVIDENCE_CONVERSION_PHASE:
+        # A push after a conversion record (#1325): its post-conversion ledger
+        # is the handoff, and live-head reconciliation rebinds the converted
+        # obligations to the new head.
+        recovered = _active_pr_items(release_evidence_freeze(latest_prior_record.metadata.prior_items))
+        if not recovered:
+            return None
+        return ResumedReviewRound(
+            round_number=latest_prior_record.metadata.round_number,
+            prior_items=tuple(recovered),
+            coder_output=None,
+            completed_reviews=(),
+            next_unresolved_item_number=_max_unresolved_item_number_from_records(records) + 1,
+            ledger_may_be_incomplete=False,
+            unrecorded_head_advance=True,
+        )
     if latest_prior_record.metadata.phase in EVIDENCE_TERMINAL_PHASES:
         # A freeze or release was the last handoff before someone pushed a
         # new head.  The old head's evidence does not carry forward: frozen
@@ -5531,6 +5801,33 @@ def _resume_pr_round_from_records(
             qualification_checkpoint=None,
             evidence_boundary=boundary,
             evidence_clearances=boundary.evidence_clearances,
+        )
+    if current_head_records and current_head_records[-1].metadata.phase == EVIDENCE_CONVERSION_PHASE:
+        # The conversion record (#1325) was posted before the same-head repeat
+        # started any reviewer: it is the handoff boundary carrying the
+        # post-conversion ledger and round.  Its repeat re-runs every reviewer.
+        conversion = current_head_records[-1].metadata
+        latest_coder = next(
+            (record for record in reversed(current_head_records) if record.metadata.role == "coder"),
+            None,
+        )
+        return ResumedReviewRound(
+            round_number=conversion.round_number,
+            prior_items=tuple(conversion.prior_items),
+            coder_output=(
+                latest_coder.metadata.raw_structured_coder_response or latest_coder.body
+                if latest_coder is not None
+                else None
+            ),
+            coder_metadata=latest_coder.metadata if latest_coder is not None else None,
+            coder_comment_body=latest_coder.body if latest_coder is not None else None,
+            completed_reviews=(),
+            next_unresolved_item_number=_max_unresolved_item_number_from_records(
+                list(walk_records)
+            )
+            + 1,
+            reconciled=True,
+            qualification_checkpoint=None,
         )
     selection = _select_current_round_records(records, subject=head_sha)
     if selection is None:

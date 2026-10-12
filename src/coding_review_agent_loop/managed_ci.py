@@ -4570,6 +4570,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--plan-review-policy", "--primary-plan-reviewer", "--plan-primary-stall-rounds",
     "--plan-step-back-rounds", "--plan-step-back-escalation-rounds",
     "--pr-step-back-rounds", "--pr-step-back-line-window", "--pr-evidence-stall-rounds",
+    "--pr-evidence-capture-attempts", "--pr-convert-evidence-rows",
     "--pr-non-convergence-rounds",
     "--plan-growth-gate", "--plan-growth-max-chars", "--plan-growth-max-revisions",
     "--plan-growth-max-scope-items", "--plan-growth-max-matrix-rows",
@@ -4600,7 +4601,7 @@ _PR_ONLY_RECOVERY_OPTIONS = frozenset({"--managed-ci-adopt-existing-pr"})
 _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file"})
 # One-shot operator flags a rendered recovery/rerun command must never replay.
 _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS = frozenset(
-    {"--plan-reset-stall-streak", "--plan-resume-keep-on-issue-edit"}
+    {"--plan-reset-stall-streak", "--plan-resume-keep-on-issue-edit", "--pr-convert-evidence-rows"}
 )
 _MANAGED_RECOVERY_OPTIONS = frozenset({
     "--managed-ci", "--managed-ci-trusted-actor", "--allow-unprotected-managed-ci",

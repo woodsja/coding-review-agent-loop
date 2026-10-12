@@ -103,13 +103,14 @@ Source paths below are relative to
 | Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
 | Panel evidence | `panel_evidence.py` | PR/plan panel evidence, board-amendment notes, plan primary streak, and plan-growth gates. |
 | Evidence stall | `evidence_stall.py` | Pure evidence-only stall classification (#1324): derives the unsatisfied risk-matrix rows from persisted canonical evidence bound to the head and approved matrix identity, classifies a review round (closed reason set), and walks the K-round window; it performs no I/O. The dispatch-path decision and stop message live in `pr_loop_support.py`. |
+| Evidence conversion | `evidence_conversion.py` | Pure risk-matrix evidence conversion (#1325): decodes the per-attempt capture classification, decides automatic conversion from N consecutive capture-limited attempts paired with their review snapshots, validates operator row lists, encodes and strictly decodes the conversion audit, and reconciles converted obligations to the live head (restore from audit, reopen, tool supersession). It performs no I/O; the dispatch-path conversion, operator path, reference minting and authenticated comment access live in `pr_loop_support.py`. |
 | Review step-back | `review_step_back.py` | Pure, history-derived step-back bookkeeping (#1251): classifies each primary review from its historical record as `new-finding`, `repeat-only`, or `approved`; derives the trigger streak and the active episode separately; derives the episode anchor (dissolved items and trade-offs from the step-back candidate record, #1278) with the planner and reviewer anchor blocks and the declaration-based list of reintroduced dissolved items, and renders the step-back planner guidance, the step-back reviewer notice, and the human-decision stop message. For the PR fix loop (#1251) it also projects finding locations, maps anchors across heads from supplied diff text (`SHIFTED`/`REWRITTEN`/`UNMAPPABLE`), clusters findings, applies the shared `in_cluster` membership rule, and renders the coder step-back, reviewer sweep, and sibling-escalation text; the git reads happen in `pr_loop_support.py`. It performs no I/O. |
 | Finding history | `finding_history.py` | Advisory, bounded per-run history of earlier rounds' findings (resolved ones included, each with its `path:line` references; CI failures as instances keyed by obligation identity plus failed head) and the agent's own previous fixes (#1273). A per-loop in-memory `FindingHistoryLedger` is seeded once from round records the loop already extracted (deferral outcomes replayed read-only by `round_state.canonical_history_item_outcomes`) and updated from the authoritative post-reconciliation ledger; status is never inferred from historical votes. Renders the standing proactive-generalization guidance (always present) plus at most 6 rounds / 6000 characters of history into every planner revision prompt and coder fix prompt (not the merge-conflict prompt), before any step-back text, and logs a declared `Generalization:` tagged proactive or step-back-directed. A failure inside the history degrades to an unavailable notice, never a stop; it performs no I/O and persists nothing. |
 | Review rounds | `review_rounds.py` | Review outcome classification, round-ledger helpers, parallel reviewer-turn launch, spool replay, and partial-round refusal. |
 | Discuss loop | `discuss_loop.py` | The discuss mode entry point and its consensus and split-proposal analyzers. |
 | Execution policy | `execution_policy.py` | Execution-policy resolution, child routing and provenance, staged reporting, typed plan-stage extraction, and fresh-topology preflights. |
 | Child plan binding | `child_plan_binding.py` | Inherited-matrix replan state, child-plan rebind and supersession, and structured plan-round assembly. |
-| PR loop support | `pr_loop_support.py` | Exact-head merge proof, finalization, evidence freeze, qualification snapshot, and PR transition observation. |
+| PR loop support | `pr_loop_support.py` | Exact-head merge proof, finalization, evidence freeze, qualification snapshot, and PR transition observation; evidence conversion and signed-evidence references (#1325), read through the one authenticated comment accessor `authenticated_pr_comments`. |
 | PR review loop | `pr_loop.py` | The PR review loop entry point (`run_pr_loop`). |
 | Approved-plan implementation | `issue_implementation.py` | Approved-plan implementation handoff and plan decomposition. |
 | Plan-first loop | `plan_first_loop.py` | The plan-first loop together with staged child dispatch and child planning cycles (one mutually recursive group, kept in one module). |
@@ -118,7 +119,7 @@ Source paths below are relative to
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
-| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `risk_coverage_map.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. `risk_coverage_map.py` is the pure, deterministic coverage-map completeness check (every enforceable row claimed or declared a gap, cited test paths are regular files in one pinned commit, declared `test_level` meets the required level), run once by the approved-plan implementation seam with a single pre-review coverage re-ask (#1290). Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. A repaired reviewer `architecture_impact.status` must likewise be the status the reviewer's own source declared; repair never supplies the decision (#1185). |
+| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `risk_coverage_map.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. `risk_coverage_map.py` is the pure, deterministic coverage-map completeness check (every enforceable row claimed or declared a gap, cited test paths are regular files in one pinned commit, declared `test_level` meets the required level), run once by the approved-plan implementation seam with a single pre-review coverage re-ask (#1290). Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. A repaired reviewer `architecture_impact.status` must likewise be the status the reviewer's own source declared; repair never supplies the decision (#1185). The derivation also records a structured per-row capture classification, and `apply_signed_evidence_references` is the only producer of `operator-signed` rows; canonical-evidence parsing refuses provenance keys unless the orchestrator supplies trusted references bound to the row, matrix and head (#1325). |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
 | Declared scope | `scope_declarations.py` | Pure extraction and rendering of operator-declared `Out of scope` / `Non-goals` heading sections from the issue body and signed human comments into a binding-scope prompt block (#1389). |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
@@ -855,6 +856,23 @@ at H inside the same round, so it spends no round budget. Only the requester
 can clear its evidence there. New findings or a failing machine gate release
 the freeze with one release comment, and an external push breaks it.
 
+Risk-matrix rows whose evidence cannot be tool-captured are converted into the
+same obligation kind (#1325), keyed by (row, approved matrix identity) and owned
+by the reviewers whose evidence-only finding named the row (or the whole board).
+Conversion happens automatically after N consecutive capture-limited coder
+attempts, evaluated from the persisted per-attempt classification and the review
+snapshots' `bound_attempt_round` before the evidence-only stall window, or on
+operator request (`--pr-convert-evidence-rows`) before any agent runs. One
+`evidence-conversion` summary record persists the converted ledger and an audit;
+the complete board then re-reviews the same head fresh inside the same round.
+Owner clearance at the frozen head after new signed input mints a head-bound
+signed-evidence reference carried cumulatively on every terminal freeze or
+release record; an orchestrator-only overlay turns it into an `operator-signed`
+verified row. Cleared converted obligations remain as tombstones that live-head
+reconciliation (round start and the finalization gate) reopens with the same item
+ID at any other head, unless tool-captured evidence bound to that head verifies
+the row.
+
 Conjunctive findings carry sub-items (#958). A PR-review blocking or same-PR
 finding may declare an ordered `sub_items` array of two to twelve distinct
 statements; a single-obligation finding is unchanged. The orchestrator mints
@@ -1016,6 +1034,25 @@ invalid unless it equals the record number minus one and its content is consiste
 and a qualifying snapshot names its head, identity, and rows). An invalid or missing
 snapshot ends the window walk. History that cannot be decoded suppresses the stop with a log
 line. State is orchestrator-owned, so a resumed run recomputes the same decision.
+
+**Evidence conversion** (#1325; `--pr-evidence-capture-attempts` N, default 2, `0`
+disables; `--pr-convert-evidence-rows`). `protocol.derive_risk_test_matrix_evidence`
+records `row_capture_classifications` in the loop that emits diagnostics, and both
+coder-record writers persist it as `risk_test_matrix_capture_classification` (bound to
+the record head and evidence identity; malformed or mis-bound decodes as no
+classification). Stall snapshots gain `bound_attempt_round`. `_pr_evidence_stall_decision`
+first computes the current snapshot, then `evidence_conversion.auto_conversion_rows`,
+and only without a conversion evaluates the stall window. A conversion mints
+row-keyed obligations (`unresolved_items._upsert_converted_evidence_obligation`),
+applies the residual-tag transition (`converted_row_ids`, terminal `converted` status),
+posts one `evidence-conversion` record (audit, `conversion_stall_snapshot`,
+`conversion_review_round`, cumulative references), and `pr_loop.py` repeats the round
+at the same head with `conversion_pass`, which forces the complete board and blocks
+carried approvals; approvals older than the latest conversion at the head are dropped.
+The evidence-response pass mints `SignedEvidenceReference`s for cleared converted rows
+(`mint_signed_evidence_references`), keeps a durable tombstone, and threads the
+cumulative set onto every terminal record. `reconcile_converted_obligations` runs after
+the round-start ledger assignment and inside `_evidence_freeze_gate`.
 
 ### CI and Merge
 
@@ -1366,6 +1403,7 @@ between GitHub and local artifacts:
 | Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
 | Work in progress | Tool-owned per-run worktrees (removed at run end) or explicitly supplied checkouts; run artifacts (a relative `--log-dir`) live under `<cache>/run-artifacts/OWNER-REPO/<run-token>/`, a relative `--agent-memory-dir` under `<cache>/repos/OWNER-REPO/`, and worktree owner records under the host lock root; tracked diffs can be preserved as salvage on supported failure paths. |
 | Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |
+| Evidence-conversion authority | Capture classifications, conversion audits, attempt pairings and signed-evidence references in round metadata (#1325); admitted only from comments authored by the authenticated orchestrator actor, with REST identity hydration on resume and on every rereading consumer. |
 | Orientation only | Repo-scoped memory, file inventories, and cached execution profiles; these may be stale. |
 
 Durable comment carriers persist a bounded visible label outside the unchanged

@@ -383,6 +383,19 @@ def _format_unresolved_item_label(
         return f"Human-requirements acknowledgement item, round {item.source_round}: {summary}"
     if item.item_id == MERGE_CONFLICT_ITEM_ID:
         return f"Merge conflict item, round {item.source_round}: {summary}"
+    if item.status == "converted":
+        return (
+            f"Converted finding from {_public_reviewer_name(item.reviewer, config, role='reviewer')}, "
+            f"round {item.source_round}: its risk-matrix row(s) "
+            + ", ".join(f"`{row}`" for row in item.converted_row_ids)
+            + " now need human-only exact-head evidence; not counted as resolved"
+        )
+    if item.converted_row_id is not None and item.lifecycle == "cleared":
+        return (
+            f"Converted risk-matrix row `{item.converted_row_id}`, round {item.source_round}: "
+            f"verified by operator-signed or tool-captured evidence at "
+            f"`{item.candidate_head_sha or 'unknown'}`"
+        )
     if item.obligation_kind == EVIDENCE_OBLIGATION_KIND and item.lifecycle != "evidence_frozen":
         # A deferred request must not reach a human before the freeze asks
         # for it at a clean head (#1068).
@@ -829,7 +842,10 @@ def _render_risk_test_matrix_evidence(
         summary = f"Full matrix evidence ({len(rows)} {'row' if len(rows) == 1 else 'rows'})"
     lines.extend(["", "<details>", f"<summary>{summary}</summary>", ""])
     for row in shown:
-        lines.append(f"- **{safe(row.row_id)}** — `{safe(row.status)}`")
+        provenance = (
+            " (operator-signed)" if row.evidence_source == "operator-signed" else ""
+        )
+        lines.append(f"- **{safe(row.row_id)}** — `{safe(row.status)}`{provenance}")
         lines.append(f"  - Tests: {', '.join(safe(item) for item in row.test_identifiers) or 'none'}")
         lines.append(f"  - Locations: {', '.join(safe(item) for item in row.test_locations) or 'none'}")
         lines.append(f"  - Workflow path: {safe(row.workflow_path_claim)}")

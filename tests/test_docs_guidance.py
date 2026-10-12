@@ -929,6 +929,33 @@ def test_operator_docs_document_the_pr_evidence_stall_stop():
     assert "no GitHub comment" in text
 
 
+def test_operator_docs_document_evidence_conversion_and_the_stall_option():
+    """#1325: the stop message's option 2 names the conversion flag and the row list."""
+    import pathlib
+
+    from coding_review_agent_loop.pr_loop_support import render_evidence_stall_decision
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = (root / "ARCHITECTURE.md").read_text()
+    for document in (text, readme, architecture):
+        assert "--pr-evidence-capture-attempts" in document
+        assert "--pr-convert-evidence-rows" in document
+    for term in (
+        "**Automatic conversion (#1325).**", "**Residual tags.**", "**Operator conversion.**",
+        "**Converted risk-matrix rows (#1325).**", "`bound_attempt_round`", "`operator-signed`",
+        "`evidence_source`", "`risk_test_matrix_capture_classification`",
+    ):
+        assert term in text
+    assert "not yet available" not in text
+    assert "evidence_conversion.py" in architecture
+    message = render_evidence_stall_decision(77, "abc123", "f" * 64, {"row-b": "x", "row-a": "y"}, 2)
+    assert "2. Convert the named rows to the operator evidence freeze: rerun with " in message
+    assert "`--pr-convert-evidence-rows row-a,row-b`" in message
+    assert "not yet available" not in message
+
+
 def test_docs_name_decompose_only_as_review_before_implementation_mode():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert "Staged plans under plan-only and implement-one-shot" in text
