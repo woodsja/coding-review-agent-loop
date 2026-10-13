@@ -22430,3 +22430,89 @@ def test_contentless_push_with_a_missing_root_is_not_a_change(tmp_path):
         _SetRunner(), config=frozen, metadata=_set_metadata(pushed), stored_identity=identity
     )
     assert changed is False
+
+
+class _SetHybridRunner(FakeRunner):
+    """Fake GitHub plus real immutable Git object reads for architecture acquisition."""
+
+    def run_binary(self, args, *, cwd, max_bytes=None, check=True, env=None):
+        cmd = [str(value) for value in args]
+        if cmd[:1] == ["git"] and ("ls-tree" in cmd or "cat-file" in cmd):
+            return _SetRunner.run_binary(self, args, cwd=cwd, max_bytes=max_bytes, check=check, env=env)
+        return super().run_binary(args, cwd=cwd, max_bytes=max_bytes, check=check, env=env)
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(value) for value in args]
+        if cmd[:2] == ["git", "merge-base"] or cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return _SetRunner.run(self, args, cwd=cwd, input_text=input_text, check=check, env=env)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _set_persist_approval(runner, head, identity):
+    _m943_append(
+        runner,
+        _attach_round_metadata(
+            "approved review",
+            PostedRoundMetadata(
+                flow="pr", role="reviewer", agent="Codex", round_number=1,
+                subject=head, state="approved", architecture_identity=identity,
+                architecture_contract_version=1,
+            ),
+        ),
+    )
+
+
+def _set_qualify(runner, config):
+    context, _requirements, _plan, fresh_config = orchestrator._fresh_pr_qualification_snapshot(
+        runner, config=config, pr_number=77, issue_context=None, parent_issue_context=None,
+    )
+    return context, fresh_config
+
+
+@pytest.mark.parametrize("read_size", [64 * 1024, 32], ids=["material-root", "oversized-root"])
+def test_qualification_revalidates_a_persisted_set_identity_once(tmp_path, read_size):
+    config, repo, head = _set_pr_repo(
+        tmp_path,
+        {"ARCHITECTURE.md": _SET_ROOT, "docs/architecture/billing.md": "# Billing\n"},
+        architecture_read_size=read_size,
+    )
+    frozen, identity = _set_identity(config, head)
+    runner = _SetHybridRunner(pr_payload={"headRefOid": head})
+    _set_persist_approval(runner, head, identity)
+    context, _config = _set_qualify(runner, frozen)
+    assert context.architecture_identity_changed is False
+
+    edited = _set_commit(repo, {"docs/architecture/billing.md": "# Billing v2\n"})
+    runner.pr_payload["headRefOid"] = edited
+    _set_persist_approval(runner, edited, identity)
+    context, fresh_config = _set_qualify(runner, frozen)
+    assert context.architecture_identity_changed is True
+    assert fresh_config.architecture_context.set_change == "modified"
+
+    # Once the fresh observation is the persisted approval, the gate is quiet.
+    runner.pr_payload["comments"].clear()
+    _set_persist_approval(runner, edited, fresh_config.architecture_context.identity())
+    context, _config = _set_qualify(runner, fresh_config)
+    assert context.architecture_identity_changed is False
+
+
+def test_qualification_keeps_a_legacy_root_only_identity_and_missing_root_quiet(tmp_path):
+    config, _repo, head = _set_pr_repo(tmp_path, {"ARCHITECTURE.md": "# Root\n\nOverview.\n"})
+    frozen, identity = _set_identity(config, head)
+    assert set(identity["candidate"]) == {
+        "repository", "path", "revision", "blob_oid", "sha256", "availability", "size",
+    }
+    runner = _SetHybridRunner(pr_payload={"headRefOid": head})
+    _set_persist_approval(runner, head, identity)
+    context, _config = _set_qualify(runner, frozen)
+    assert context.architecture_identity_changed is False
+
+    missing_tmp = tmp_path / "missing"
+    missing_tmp.mkdir()
+    config, repo, head = _set_pr_repo(missing_tmp, {"README.md": "# Readme\n"})
+    frozen, identity = _set_identity(config, head)
+    pushed = _set_commit(repo, {"src.py": "x = 1\n"})
+    runner = _SetHybridRunner(pr_payload={"headRefOid": pushed})
+    _set_persist_approval(runner, pushed, identity)
+    context, _config = _set_qualify(runner, frozen)
+    assert context.architecture_identity_changed is False
