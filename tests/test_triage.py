@@ -861,3 +861,43 @@ def test_existing_pr_resumption_skips_triage_and_logs_the_recorded_route(tmp_pat
     assert usage._dispatch_hook_state == "unarmed"
     _assert_no_triage(runner, usage)
     assert "--triage skipped; the recorded route of existing PR #77 wins" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# CLI and recovery-command wiring
+# ---------------------------------------------------------------------------
+
+
+def test_triage_flags_parse_into_config_and_require_triage(tmp_path, capsys):
+    from coding_review_agent_loop.cli import build_parser, config_from_args, main
+
+    parser = build_parser()
+    base = ["issue", "56", "--repo", "OWNER/REPO"]
+    default = config_from_args(parser.parse_args(base), FakeRunner())
+    assert (default.triage, default.triage_model, default.triage_history) == (False, "", None)
+    history = tmp_path / "history.json"
+    args = parser.parse_args(
+        [*base, "--triage", "--triage-model", "gpt-triage", "--triage-history", str(history)]
+    )
+    config = config_from_args(args, FakeRunner())
+    assert (config.triage, config.triage_model, config.triage_history) == (True, "gpt-triage", history)
+    assert main([*base, "--triage-model", "gpt-triage"]) == 1
+    assert "--triage-model and --triage-history require --triage" in capsys.readouterr().err
+
+
+def test_recovery_commands_never_replay_the_one_shot_triage_flags(tmp_path):
+    from coding_review_agent_loop.managed_ci import _render_recovery_command
+
+    config = make_config(
+        tmp_path, triage=True, triage_model="gpt-triage",
+        invocation_argv=(
+            "agent-loop", "issue", "56", "--triage", "--triage-model", "gpt-triage",
+            "--triage-history", "history.json", "--reviewer", "codex",
+        ),
+    )
+    for target in ("issue", "pr"):
+        rendered = _render_recovery_command(
+            config, target=target, identifier=7, managed_ci=True, preserve_managed_options=True,
+        )
+        assert "--triage" not in rendered and "history.json" not in rendered
+        assert "gpt-triage" not in rendered and "--reviewer codex" in rendered
