@@ -1418,3 +1418,111 @@ def _validate_structured_response_observations_with_post_pr_context(
         pr_number=pr_number,
         report_description="structured test-observation report",
     )
+
+
+# ---------------------------------------------------------------------------
+# Advisory issue triage response (#1434)
+# ---------------------------------------------------------------------------
+
+TRIAGE_ROUTES = ("discuss-first", "plan-first", "direct")
+TRIAGE_FALLBACK_ROUTE = "plan-first"
+TRIAGE_MAX_REASONS = 8
+TRIAGE_MAX_REASON_CHARS = 600
+# The only text allowed after the JSON object: one standalone signature line.
+_TRIAGE_SIGNATURE_RE = re.compile(r"-- [^\r\n{}\[\]]+")
+
+
+@dataclass(frozen=True)
+class TriageReason:
+    signal: str
+    explanation: str
+
+
+@dataclass(frozen=True)
+class TriageAnswer:
+    """A validated triage answer; ``route`` is always a recognized route.
+
+    ``model_route`` keeps what the model wrote.  An ``unsure`` answer, or a
+    route outside :data:`TRIAGE_ROUTES`, is reported as plan-first.
+    """
+
+    route: str
+    model_route: str
+    unsure: bool
+    unsure_reason: str | None
+    reasons: tuple[TriageReason, ...]
+
+
+def _triage_json_object(text: str) -> dict:
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        raise AgentLoopError("Triage response must start with one JSON object.")
+    try:
+        payload, end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError as exc:
+        raise AgentLoopError(f"Triage response is not valid JSON: {exc.msg}.") from exc
+    if not isinstance(payload, dict):
+        raise AgentLoopError("Triage response must be a JSON object.")
+    suffix = stripped[end:].strip()
+    if suffix and not _TRIAGE_SIGNATURE_RE.fullmatch(suffix):
+        raise AgentLoopError(
+            "Triage response may contain only one JSON object followed by a signature line."
+        )
+    return payload
+
+
+def parse_triage_response(text: str, *, allowed_signals: Sequence[str]) -> TriageAnswer:
+    """Strictly validate one ``issue_triage`` answer and map unsure to plan-first."""
+    payload = _triage_json_object(text)
+    required = {"schema_version", "kind", "route", "unsure", "reasons"}
+    if set(payload) != required:
+        missing = sorted(required - set(payload))
+        unknown = sorted(set(payload) - required)
+        raise AgentLoopError(
+            f"Triage response fields differ from the contract (missing {missing}, unknown {unknown})."
+        )
+    if payload["schema_version"] != 1 or isinstance(payload["schema_version"], bool):
+        raise AgentLoopError("Triage response schema_version must be 1.")
+    if payload["kind"] != "issue_triage":
+        raise AgentLoopError("Triage response kind must be `issue_triage`.")
+    model_route = payload["route"]
+    if not isinstance(model_route, str) or not model_route.strip():
+        raise AgentLoopError("Triage response route must be a non-empty string.")
+    model_route = model_route.strip()
+    if not isinstance(payload["unsure"], bool):
+        raise AgentLoopError("Triage response unsure must be a boolean.")
+    reasons_payload = payload["reasons"]
+    if not isinstance(reasons_payload, list) or not reasons_payload:
+        raise AgentLoopError("Triage response reasons must be a non-empty list.")
+    if len(reasons_payload) > TRIAGE_MAX_REASONS:
+        raise AgentLoopError(f"Triage response has more than {TRIAGE_MAX_REASONS} reasons.")
+    allowed = set(allowed_signals)
+    reasons: list[TriageReason] = []
+    for index, item in enumerate(reasons_payload):
+        if not isinstance(item, dict) or set(item) != {"signal", "explanation"}:
+            raise AgentLoopError(f"Triage reason {index} must have exactly `signal` and `explanation`.")
+        signal, explanation = item["signal"], item["explanation"]
+        if not isinstance(signal, str) or signal not in allowed:
+            raise AgentLoopError(
+                f"Triage reason {index} must name one of the listed signals, got {signal!r}."
+            )
+        if not isinstance(explanation, str) or not explanation.strip():
+            raise AgentLoopError(f"Triage reason {index} needs a non-empty explanation.")
+        if len(explanation) > TRIAGE_MAX_REASON_CHARS:
+            raise AgentLoopError(
+                f"Triage reason {index} explanation exceeds {TRIAGE_MAX_REASON_CHARS} characters."
+            )
+        reasons.append(TriageReason(signal=signal, explanation=explanation.strip()))
+    unsure_reason = None
+    if payload["unsure"]:
+        unsure_reason = "the triage model answered unsure"
+    elif model_route not in TRIAGE_ROUTES:
+        unsure_reason = f"the triage model named an unrecognized route {model_route[:40]!r}"
+    route = TRIAGE_FALLBACK_ROUTE if unsure_reason is not None else model_route
+    return TriageAnswer(
+        route=route,
+        model_route=model_route,
+        unsure=unsure_reason is not None,
+        unsure_reason=unsure_reason,
+        reasons=tuple(reasons),
+    )

@@ -7,7 +7,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 AgentName = Literal["claude", "codex", "gemini", "antigravity"]
 UsageMode = Literal["exact", "partial", "estimated"]
@@ -209,6 +209,14 @@ class RunUsageContext:
     first_agent_dispatch_at: str | None = None
     # Parallel discuss debaters add records from worker threads (#475).
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    # One-shot pre-first-dispatch hook (#1434): ``unarmed`` -> ``armed`` ->
+    # ``running`` (owned by one thread) -> ``done``.  Unarmed, it does nothing.
+    _dispatch_hook: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    _dispatch_hook_state: str = field(default="unarmed", repr=False, compare=False)
+    _dispatch_hook_owner: int | None = field(default=None, repr=False, compare=False)
+    _dispatch_hook_done: threading.Event = field(
+        default_factory=threading.Event, repr=False, compare=False
+    )
 
     def add_record(
         self,
@@ -279,10 +287,47 @@ class RunUsageContext:
             for agent, records in sorted(agent_records.items())
         }
 
+    def arm_pre_first_dispatch_hook(self, hook: Callable[[], None]) -> bool:
+        """Arm ``hook`` to run once, before the first agent dispatch.
+
+        Arming has no side effect.  A context arms at most once: a hook that is
+        already armed, running or done is never replaced.
+        """
+        with self._lock:
+            if self._dispatch_hook_state != "unarmed":
+                return False
+            self._dispatch_hook = hook
+            self._dispatch_hook_state = "armed"
+            return True
+
     def note_agent_dispatch(self) -> None:
+        hook: Callable[[], None] | None = None
+        wait = False
         with self._lock:
             if self.first_agent_dispatch_at is None:
                 self.first_agent_dispatch_at = datetime.now(UTC).isoformat()
+            if self._dispatch_hook_state == "armed":
+                # Claim under the lock; run outside it, so the hook's own nested
+                # dispatch and add_record calls take the lock normally.
+                self._dispatch_hook_state = "running"
+                self._dispatch_hook_owner = threading.get_ident()
+                hook = self._dispatch_hook
+            elif (
+                self._dispatch_hook_state == "running"
+                and self._dispatch_hook_owner != threading.get_ident()
+            ):
+                wait = True
+        if hook is not None:
+            try:
+                hook()
+            finally:
+                with self._lock:
+                    self._dispatch_hook_state = "done"
+                    self._dispatch_hook = None
+                self._dispatch_hook_done.set()
+        elif wait:
+            # A sibling dispatcher never starts before the hook completes.
+            self._dispatch_hook_done.wait()
 
     def _timing(self) -> dict[str, object]:
         provenance = self.tool_provenance or {}

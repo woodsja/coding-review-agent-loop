@@ -4542,6 +4542,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--managed-ci-issue-number",
     "--implementation-coder", "--implementation-coder-model",
     "--implementation-codex-reasoning-effort", "--implementation-claude-effort",
+    "--triage-model", "--triage-history",
     "--claude-effort", "--claude-cmd", "--codex-cmd",
     "--gemini-cmd", "--antigravity-cmd", "--antigravity-print-timeout-seconds",
     "--repair-backend", "--repair-model", "--repair-timeout-seconds", "--repair-reasoning-effort",
@@ -4601,7 +4602,11 @@ _PR_ONLY_RECOVERY_OPTIONS = frozenset({"--managed-ci-adopt-existing-pr"})
 _MANAGED_PR_ONLY_RECOVERY_OPTIONS = frozenset({"--head", "--title", "--body-file"})
 # One-shot operator flags a rendered recovery/rerun command must never replay.
 _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS = frozenset(
-    {"--plan-reset-stall-streak", "--plan-resume-keep-on-issue-edit", "--pr-convert-evidence-rows"}
+    {
+        "--plan-reset-stall-streak", "--plan-resume-keep-on-issue-edit", "--pr-convert-evidence-rows",
+        # Advisory triage runs once, before a fresh run's first agent turn (#1434).
+        "--triage", "--triage-model", "--triage-history",
+    }
 )
 _MANAGED_RECOVERY_OPTIONS = frozenset({
     "--managed-ci", "--managed-ci-trusted-actor", "--allow-unprotected-managed-ci",

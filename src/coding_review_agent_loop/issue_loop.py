@@ -177,6 +177,7 @@ from .plan_first_loop import (
     _dispatch_decomposition_child,
     _run_plan_first_loop,
 )
+from .triage import arm_issue_triage
 
 
 def _issue_floor_plan_owner(runner: Runner, *, config: AgentLoopConfig, issue_number: int):
@@ -285,6 +286,12 @@ def run_issue_loop(
                 f"stage `{fresh_child.stage_id}` resolved route `{route.disposition}` "
                 f"(origin={route.origin})",
             )
+            if config.triage:
+                log(
+                    config,
+                    f"Issue #{issue_number}: --triage skipped; the recorded child route "
+                    f"`{route.disposition}` wins.",
+                )
             if route.is_human:
                 raise AgentLoopError(
                     f"Issue #{issue_number} is stage `{fresh_child.stage_id}` of parent "
@@ -665,6 +672,12 @@ def run_issue_loop(
                 f"Issue #{issue_number}: resuming PR #{resolved_pr.pr_number} review instead of "
                 f"invoking {agent_display_name(config.coder)}.",
             )
+            if config.triage and fresh_child is None:
+                log(
+                    config,
+                    f"Issue #{issue_number}: --triage skipped; the recorded route of existing "
+                    f"PR #{resolved_pr.pr_number} wins.",
+                )
             log(
                 config,
                 f"Issue #{issue_number}: PR #{resolved_pr.pr_number} association source="
@@ -749,6 +762,20 @@ def run_issue_loop(
                 managed_ci_issue_number=issue_number,
             )
 
+        # Fresh-dispatch point: arm (never run) the advisory triage hook.  It
+        # fires at the first agent dispatch, after every refusal on either
+        # branch, and never changes plan_first, the execution mode or policy.
+        if config.triage and fresh_child is None:
+            if config.dry_run:
+                log(config, f"Issue #{issue_number}: dry run; --triage makes no triage call.")
+            else:
+                arm_issue_triage(
+                    runner,
+                    config=config,
+                    usage_context=usage_context,
+                    issue_context=issue_context,
+                    operator_route="plan-first" if plan_first else "direct",
+                )
         memory = prepare_agent_memory(runner, config)
         if plan_first:
             return _run_plan_first_loop(

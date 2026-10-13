@@ -6476,3 +6476,50 @@ For `confirm`, omit `answer`. For `refine`, include a non-empty replacement `ans
 <!-- AGENT_PLAN_STATE: approved -->
 -- {signature}
 """
+
+
+def build_triage_prompt(
+    issue_context: IssueContext,
+    config: AgentLoopConfig,
+    *,
+    agent: AgentName,
+    signals_block: str,
+    similar_block: str,
+    signal_names: Sequence[str],
+) -> str:
+    """The advisory route-triage prompt (#1434).
+
+    The deterministic signals and the retrieved outcome rows are computed by
+    code; the model only reads them.  The answer never selects the route.
+    """
+    signature = agent_signature(agent, config, role="reviewer")
+    names = ", ".join(f"`{name}`" for name in signal_names)
+    return f"""Triage GitHub issue #{issue_context.number} in {config.repo} before an agent-loop run: recommend which route the work should take.
+
+This is advisory only. The operator already chose the route, and this run continues with that route whatever you answer. Do not edit the issue, post comments, create branches, or change files. You may read the repository checkout to judge whether the change is local and its tests are specified.
+
+Routes:
+- `discuss-first`: open design questions (for example "how should ..."), edge-case lists without closed acceptance criteria, competing designs or policy choices, or a prior stalled plan for a similar subject.
+- `direct`: the fix and its tests are specified and the change is local.
+- `plan-first`: anything else. Set `unsure` to true when you are not confident; an unsure answer is reported as plan-first.
+
+{format_issue_context(issue_context)}
+
+Deterministic signals computed from the issue text and similar past issues:
+{signals_block}
+
+Similar past issues from this repository, with their measured outcomes:
+{similar_block}
+
+{_architecture_context_block(config)}
+Return exactly one JSON object and nothing else before the signature:
+{{
+  "schema_version": 1,
+  "kind": "issue_triage",
+  "route": "plan-first",
+  "unsure": false,
+  "reasons": [{{"signal": "open-design-question", "explanation": "Why this signal supports the route."}}]
+}}
+Rules: `route` is exactly one of `discuss-first`, `plan-first` or `direct`. `reasons` holds 1 to 8 entries; each names one signal from: {names}. Use `code-context` for a reason drawn from reading the code or architecture docs, and `no-signal` when no listed signal applies. Each explanation is plain text of at most 600 characters.
+-- {signature}
+"""
