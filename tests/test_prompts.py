@@ -6305,3 +6305,220 @@ def test_managed_ci_dispatch_guidance_only_when_turn_is_guarded(tmp_path):
     for name, prompt in _coder_prompt_set(managed_unguarded).items():
         assert "This pull request uses managed CI." not in prompt, name
     assert prompts_module._coder_managed_ci_dispatch_guidance(False) == ""
+
+
+# ---------------------------------------------------------------------------
+# Architecture set prompt compatibility and oversized fallback (#1454)
+# ---------------------------------------------------------------------------
+
+from dataclasses import replace as _set_replace  # noqa: E402
+
+from coding_review_agent_loop.architecture_context import (  # noqa: E402
+    ArchitectureMember as _SetMember,
+    ArchitecturePair as _SetPair,
+)
+
+_LEGACY_IMPACT_GUIDANCE = (
+    "Architecture-impact assessment (required):\n"
+    "When emitting it, use an object with `status` (`changed` or `unchanged`) and a "
+    "non-empty `rationale`; include the component, dependency, execution/data-flow, "
+    "persistence, public-contract, security-boundary, and canonical-document fields "
+    "shown by the response schema as arrays/strings of the documented types. "
+    "The list fields are arrays of plain strings, not objects; describe each "
+    "component, dependency, flow, persistence item, contract, or boundary in one "
+    "sentence. "
+    "For `unchanged`, empty arrays and an empty canonical-document rationale are valid; "
+    "give a meaningful no-impact rationale. Source inspection remains mandatory; "
+    "documentation cannot excuse an implementation defect.\n"
+)
+_SET_GUIDANCE_FRAGMENT = "must name a document in the architecture set"
+_SET_STRINGS = (_SET_GUIDANCE_FRAGMENT, "Detail documents in the architecture set", "Architecture set")
+
+
+def _set_snapshot(**overrides):
+    fields = dict(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available",
+        size=40, content="# System\n\nThe architecture overview.\n", heading_index=("System",),
+        links_status="scanned",
+    )
+    fields.update(overrides)
+    return ArchitectureSnapshot(**fields)
+
+
+def _oversized(**overrides):
+    fields = dict(
+        sha256=None, content=None, availability="oversized", size=200_000,
+        heading_index=("System", "Lifecycle"),
+        diagnostic="Architecture blob is 200000 bytes; limit is 65536. The document is too large to inject and should be split into a short root overview plus docs/architecture/* detail docs.",
+    )
+    fields.update(overrides)
+    return _set_snapshot(**fields)
+
+
+_SET_BUILDERS = {
+    "issue": lambda config: build_issue_prompt(56, config),
+    "task": lambda config: build_task_prompt("Implement the requested change.", config),
+    "plan": lambda config: build_issue_plan_prompt(56, config),
+    "plan-review": lambda config: build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex"),
+    "pr-review": lambda config: build_review_prompt(77, 1, config, reviewer="codex"),
+    "pr-followup": lambda config: build_followup_prompt(77, 2, "Fix the bug.", config),
+}
+
+
+@pytest.mark.parametrize("builder", sorted(_SET_BUILDERS))
+def test_root_only_under_limit_prompt_has_no_set_specific_text(tmp_path, builder):
+    config = make_config(tmp_path, architecture_context=_set_snapshot())
+    prompt = _SET_BUILDERS[builder](config)
+    assert "The architecture overview." in prompt
+    for text in _SET_STRINGS:
+        assert text not in prompt
+    # The legacy root-only guidance is pinned; the set clause is not added.
+    assert prompts_module._architecture_impact_guidance(required=True, config=config) == _LEGACY_IMPACT_GUIDANCE
+    assert prompts_module._architecture_impact_guidance(required=True) == _LEGACY_IMPACT_GUIDANCE
+    optional = _LEGACY_IMPACT_GUIDANCE.replace(
+        "(required)", "(expected when architecture context is available)"
+    )
+    assert prompts_module._architecture_impact_guidance(config=config) == optional
+    expected = optional if builder in {"plan-review", "pr-review"} else _LEGACY_IMPACT_GUIDANCE
+    assert expected in prompt
+
+
+@pytest.mark.parametrize("builder", sorted(_SET_BUILDERS))
+def test_set_guidance_appears_only_with_members_or_oversized_root(tmp_path, builder):
+    member = _SetMember("docs/architecture/billing.md", "c" * 40, "available", 20, "Billing")
+    config = make_config(tmp_path, architecture_context=_set_snapshot(members=(member,)))
+    prompt = _SET_BUILDERS[builder](config)
+    assert _SET_GUIDANCE_FRAGMENT in prompt
+    assert "- docs/architecture/billing.md — Billing" in prompt
+    oversized = make_config(tmp_path, architecture_context=_oversized())
+    assert _SET_GUIDANCE_FRAGMENT in _SET_BUILDERS[builder](oversized)
+    disabled = make_config(
+        tmp_path, architecture_context=_set_snapshot(members=(member,)), architecture_context_enabled=False,
+    )
+    assert _SET_GUIDANCE_FRAGMENT not in _SET_BUILDERS[builder](disabled)
+
+
+def _pair_of(base, candidate, change="unchanged"):
+    return _SetPair(
+        repository="owner/repo", path="ARCHITECTURE.md", target_revision="main",
+        candidate_revision="c" * 40, merge_base_revision="m" * 40,
+        base=base, candidate=candidate, change=change,
+    )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        _oversized(),
+        _oversized(heading_index=(), members=(_SetMember("docs/architecture/component.md", "c" * 40, "available", 9, "Component"),)),
+        _oversized(heading_index=(), links_status="unscanned"),
+    ],
+    ids=["headed", "headingless", "above-ceiling"],
+)
+def test_oversized_root_is_injected_in_snapshot_and_pair_prompts(tmp_path, context):
+    for value in (context, _pair_of(context, context)):
+        config = make_config(tmp_path, architecture_context=value)
+        block = prompts_module._architecture_context_block(config)
+        assert block
+        assert "- Size: 200000 bytes" in block
+        assert "should be split" in block
+        assert "Architecture context omitted for managed prompt budget" not in block
+    if context.links_status == "unscanned":
+        assert "membership unknown" in prompts_module._architecture_context_block(
+            make_config(tmp_path, architecture_context=context)
+        )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        _set_snapshot(availability="missing", blob_oid=None, sha256=None, content=None, size=None, heading_index=(), links_status="not-applicable"),
+        _set_snapshot(availability="binary", content=None, links_status="unscanned"),
+    ],
+    ids=["missing", "binary"],
+)
+def test_missing_and_binary_roots_keep_the_legacy_empty_block(tmp_path, context):
+    config = make_config(tmp_path, architecture_context=context)
+    assert prompts_module._architecture_context_block(config) == ""
+    assert build_task_prompt("Implement.", config) == build_task_prompt("Implement.", make_config(tmp_path))
+
+
+def test_oversized_fallback_changes_only_the_architecture_block_and_guidance(tmp_path):
+    requirement = HumanReviewRequirement(
+        source_type="PR comment", author="reviewer", created_at="2026-01-01T00:00:00Z",
+        url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
+        body="Keep " + ("the compatibility contract " * 900) + ".",
+    )
+    oversized_config = make_config(tmp_path, architecture_context=_oversized())
+    legacy_config = make_config(tmp_path)
+    with_block = build_followup_prompt(77, 2, "Fix.", oversized_config, human_requirements=(requirement,))
+    legacy = build_followup_prompt(77, 2, "Fix.", legacy_config, human_requirements=(requirement,))
+    block = prompts_module._architecture_context_block(
+        oversized_config,
+        protected_context=(),
+    )
+    set_clause = prompts_module._architecture_impact_guidance(
+        required=True, config=oversized_config
+    )[len(_LEGACY_IMPACT_GUIDANCE):]
+    assert set_clause and block
+    stripped = with_block.replace(set_clause, "", 1)
+    start = stripped.index("Architecture context (advisory repository context")
+    end = stripped.index("\n", stripped.index("Sections available for targeted checkout inspection:"))
+    end = stripped.index("- Lifecycle\n", end) + len("- Lifecycle\n")
+    # Lossless (material-gated) requirement rendering is unchanged.
+    assert stripped[:start] + stripped[end:] == legacy
+
+
+_ROOT_ONLY_PROMPT_GOLDEN = Path(__file__).parent / "fixtures" / "architecture_root_only_prompts.json"
+# Host-measured values in the coder prompts: the containment limits derive
+# from physical memory, and the worker estimate from CPUs, memory and cgroup
+# ceilings.  The golden was recorded on one host and is compared on others
+# (managed CI runners), so these values are neutralized on both sides.
+_HOST_MEASURED = (
+    (re.compile(r"\(aggregate=\{[^}]*\}; test-gate child=\{[^}]*\}\)"), "(aggregate=<host>; test-gate child=<host>)"),
+    (re.compile(r"\(preliminary pre-admission estimate: [^()]*\([^()]*\)\)"), "(preliminary pre-admission estimate: <host>)"),
+)
+
+
+def _host_neutral(text):
+    for pattern, replacement in _HOST_MEASURED:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+@pytest.mark.parametrize("host", ["this-host", "small-host"])
+@pytest.mark.parametrize("builder", sorted(_SET_BUILDERS))
+def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, monkeypatch, builder, host):
+    """Every full prompt for a root-only context equals the pre-#1454 output.
+
+    The fixture holds the complete prompts that merge-base 6ff2ca3725 builds
+    for this snapshot (without the new set fields) under the test conftest,
+    with every ``AGENT_LOOP_*`` variable cleared and the per-run temporary
+    directory replaced by ``<TMP>``.  Host-measured values are neutralized,
+    and the ``small-host`` variant proves the comparison does not depend on
+    the machine running it.  The worker estimate is pinned to the recorded
+    budget so the worker-dependent guidance sentences stay comparable.
+    """
+    import json as _golden_json
+    import os as _golden_os
+
+    import coding_review_agent_loop.containment as containment_module
+    import coding_review_agent_loop.test_workers as test_workers_module
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
+    for name in list(_golden_os.environ):
+        if name.startswith("AGENT_LOOP_"):
+            monkeypatch.delenv(name)
+    if host == "small-host":
+        monkeypatch.setattr(containment_module, "probe_host_memory_bytes", lambda: 2 * 1024 ** 3)
+        monkeypatch.setattr(test_workers_module, "probe_cpu_count", lambda: (2, "test"))
+    monkeypatch.setattr(
+        prompts_module, "preliminary_worker_budget",
+        lambda _config: WorkerBudget(8, "derived", "clamp", "cpu", {}, True),
+    )
+    golden = _golden_json.loads(_ROOT_ONLY_PROMPT_GOLDEN.read_text(encoding="utf-8"))
+    snapshot = _set_snapshot(links_status="scanned", members=())
+    config = make_config(tmp_path, architecture_context=snapshot)
+    prompt = _SET_BUILDERS[builder](config).replace(str(tmp_path), "<TMP>")
+    assert _host_neutral(prompt) == _host_neutral(golden[builder])

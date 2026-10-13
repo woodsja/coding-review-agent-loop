@@ -120,6 +120,7 @@ from .architecture_contract import (
     _TerminalNoPrImplementation,
     _TerminalIssueImplementationConflict,
     _architecture_mode_validators,
+    _architecture_document_paths_hook,
     _risk_coverage_reask_prompt,
     _surface_decomposition_degradations,
     _surface_refused_decomposition,
@@ -518,6 +519,7 @@ def _implement_approved_issue(
             session_id=session_id,
             marker_description="structured issue_implementation result, blocking, or clarification",
             require_architecture_impact_contract=True,
+            architecture_document_paths=_architecture_document_paths_hook(runner, invoke_config),
             **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,

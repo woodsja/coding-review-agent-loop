@@ -901,14 +901,22 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--architecture-path",
             default="ARCHITECTURE.md",
-            help="Repository-relative POSIX architecture document path.",
+            help=(
+                "Repository-relative POSIX path of the root architecture document. "
+                "The architecture set is this root plus the docs/architecture/*.md "
+                "files it links to (one level only)."
+            ),
         )
         subparser.add_argument(
             "--architecture-read-size",
             type=int,
             default=64 * 1024,
             metavar="BYTES",
-            help="Maximum committed architecture blob size to read (default: 65536).",
+            help=(
+                "Maximum committed size of the root and of each architecture-set member "
+                "to read (default: 65536). A larger root is injected as identity, size "
+                "and heading index with a recommendation to split it."
+            ),
         )
         subparser.add_argument(
             "--architecture-snapshot-max-chars",

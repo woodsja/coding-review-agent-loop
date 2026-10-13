@@ -1824,6 +1824,15 @@ paths, and fresh turns with an acquired architecture snapshot use the versioned
 architecture-impact assessment. Legacy records remain decodable without
 inventing a snapshot or assessment; source inspection remains required.
 
+The architecture path names the root of an architecture set (#1454): the root
+plus the `docs/architecture/*.md` files it links to, one level only. Member
+blob identities join the snapshot and PR-pair identity only when members
+exist, so root-only identities are unchanged. An oversized root is injected as
+identity, size and heading index with a split recommendation; coder
+`canonical_document_path` values are validated against the set by a semantic
+re-ask; and the PR comparison reports a detail-doc-only edit as a set change.
+See `docs/local_agent_loop.md` for the layout and size budget.
+
 Semantic-claim validation degrades the narrowest offending element instead of
 rejecting the whole response. The architecture-impact parser has three explicit
 modes. `strict` is the default and accepts only `changed` and `unchanged`.

@@ -329,6 +329,7 @@ from .architecture_contract import (
     _test_observation_degradation_fields,
     _latest_pr_architecture_observation,
     _architecture_mode_validators,
+    _architecture_document_paths_hook,
     _resumed_review_architecture,
     _acknowledgement_repair_forbids_assessment,
     _pin_acknowledgement_repair,
@@ -8500,6 +8501,7 @@ def run_pr_loop(
                     session_id=coder_session_id,
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
+                    architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
                     **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
                         text,
                         unresolved_items=items,

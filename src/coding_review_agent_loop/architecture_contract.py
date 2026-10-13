@@ -12,7 +12,12 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 
 from .agents.base import AgentResult
-from .architecture_context import architecture_material, freeze_architecture_context
+from .architecture_context import (
+    architecture_material,
+    architecture_set_paths,
+    freeze_architecture_context,
+    resolve_architecture_document_path,
+)
 from .config import AgentLoopConfig
 from .decomposition import PlanDecomposition
 from .errors import AgentInvocationError, AgentLoopError
@@ -226,13 +231,29 @@ def _revalidate_pr_architecture_identity(
             comparable_fresh = dict(fresh_identity)
             comparable_previous.pop("candidate_revision", None)
             comparable_fresh.pop("candidate_revision", None)
+
+            def _strip_revision(identity: dict, *, own: bool = True) -> dict:
+                stripped = dict(identity)
+                if own:
+                    stripped.pop("revision", None)
+                # Set members (#1454) carry blob identities only; strip any
+                # revision field too, so a contentless push never reads as a
+                # set change while a member blob change still does.
+                if isinstance(stripped.get("members"), list):
+                    stripped["members"] = [
+                        {k: v for k, v in member.items() if k != "revision"}
+                        if isinstance(member, dict) else member
+                        for member in stripped["members"]
+                    ]
+                return stripped
+
+            comparable_previous = _strip_revision(comparable_previous, own=False)
+            comparable_fresh = _strip_revision(comparable_fresh, own=False)
             for key in ("base", "candidate"):
                 if isinstance(comparable_previous.get(key), dict):
-                    comparable_previous[key] = dict(comparable_previous[key])
-                    comparable_previous[key].pop("revision", None)
+                    comparable_previous[key] = _strip_revision(comparable_previous[key])
                 if isinstance(comparable_fresh.get(key), dict):
-                    comparable_fresh[key] = dict(comparable_fresh[key])
-                    comparable_fresh[key].pop("revision", None)
+                    comparable_fresh[key] = _strip_revision(comparable_fresh[key])
             changed = (
                 comparable_previous != comparable_fresh
                 or _availability(previous_identity) != _availability(fresh_identity)
@@ -539,6 +560,117 @@ def _architecture_contract_retry_prompt(prompt: str, diagnostic: str) -> str:
         "assessment was absent or not determinable. Include `architecture_impact` with "
         "`status` set to exactly `changed` or `unchanged` and a non-empty rationale.\n"
         f"Diagnostic: {detail}\n"
+    )
+
+
+# Only coder carriers are membership-validated; planners and reviewers may
+# name a document that does not exist yet (#1454).
+_ARCHITECTURE_DOCUMENT_PATH_CARRIERS = (
+    StructuredIssueImplementation,
+    StructuredCoderFollowup,
+    StructuredTaskResult,
+)
+_ARCHITECTURE_DOCUMENT_PATH_REASK_MEMBERS = 40
+_ARCHITECTURE_DOCUMENT_PATH_REASK_PATH_CHARS = 300
+
+
+def _reported_canonical_document_path(result: object) -> str | None:
+    """A coder carrier's non-null canonical_document_path, else None."""
+    carrier = _unwrap_architecture_result(result)
+    if not isinstance(carrier, _ARCHITECTURE_DOCUMENT_PATH_CARRIERS):
+        return None
+    impact = carrier.architecture_impact
+    value = getattr(impact, "canonical_document_path", None) if impact is not None else None
+    if value is None:
+        return None
+    return value if isinstance(value, str) else str(value)
+
+
+def _architecture_document_path_rejection(
+    result: object, paths: frozenset[str] | None
+) -> str | None:
+    """The coder's original canonical_document_path when it is outside the set.
+
+    The value is normalized with the same resolver as link targets only for
+    the membership decision; the carrier keeps the coder's string unchanged.
+    """
+    if paths is None:
+        return None
+    value = _reported_canonical_document_path(result)
+    if value is None:
+        return None
+    resolved = resolve_architecture_document_path(value)
+    if resolved is not None and resolved in paths:
+        return None
+    return value
+
+
+def _architecture_document_path_diagnostic(path: str, members: frozenset[str]) -> str:
+    return (
+        f"architecture_impact.canonical_document_path {path!r} is not a document in the "
+        f"architecture set ({len(members)} member(s))."
+    )
+
+
+def _architecture_document_paths_hook(
+    runner: Runner, config: AgentLoopConfig
+) -> Callable[[], frozenset[str] | None] | None:
+    """Membership source for one coder invocation: prompt-time set plus coder HEAD.
+
+    The union with a fresh acquisition at the coder workdir HEAD accepts a
+    detail doc the coder created and linked in this turn.  A prompt-time set
+    that is unknowable (no root, unscanned root, disabled) skips validation.
+    """
+    if not config.architecture_context_enabled:
+        return None
+    prompt_context = config.architecture_context
+
+    def paths() -> frozenset[str] | None:
+        frozen = architecture_set_paths(prompt_context)
+        if frozen is None:
+            return None
+        fresh_paths: frozenset[str] | None = None
+        try:
+            checkout = active_workdir(config)
+            if checkout.is_dir():
+                fresh_paths = architecture_set_paths(
+                    freeze_architecture_context(
+                        runner,
+                        checkout=checkout,
+                        repository=config.repo,
+                        path=config.architecture_path,
+                        read_size=config.architecture_read_size,
+                    )
+                )
+        except (AgentLoopError, OSError):
+            fresh_paths = None
+        return frozen | fresh_paths if fresh_paths else frozen
+
+    return paths
+
+
+def _architecture_document_path_retry_prompt(
+    prompt: str, path: str, members: Sequence[str] | frozenset[str]
+) -> str:
+    """Append one bounded, marker-free section naming the rejected path and the set."""
+
+    def _clean(text: str) -> str:
+        cleaned = " ".join(sanitize_historical_text(text).replace("<", "(").replace(">", ")").split())
+        if len(cleaned) > _ARCHITECTURE_DOCUMENT_PATH_REASK_PATH_CHARS:
+            cleaned = cleaned[:_ARCHITECTURE_DOCUMENT_PATH_REASK_PATH_CHARS] + "..."
+        return cleaned
+
+    ordered = sorted(members)
+    listed = "\n".join(f"- {_clean(member)}" for member in ordered[:_ARCHITECTURE_DOCUMENT_PATH_REASK_MEMBERS])
+    if len(ordered) > _ARCHITECTURE_DOCUMENT_PATH_REASK_MEMBERS:
+        listed += f"\n- [{len(ordered) - _ARCHITECTURE_DOCUMENT_PATH_REASK_MEMBERS} more members]"
+    return (
+        f"{prompt}\n\n## Previous response not accepted: canonical_document_path\n\n"
+        f"The previous response set `architecture_impact.canonical_document_path` to "
+        f"`{_clean(path)}`, which is not a document in the architecture set. Set it to the "
+        "repository-relative path of the set member that owns the change, or null for "
+        "no-change, then re-emit the complete response. Architecture set members:\n"
+        f"{listed}\n"
     )
 
 
