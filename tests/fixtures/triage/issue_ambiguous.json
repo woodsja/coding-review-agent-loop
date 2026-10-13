@@ -1,0 +1,5 @@
+{
+  "number": 9001,
+  "title": "Make review loop logs easier to follow",
+  "body": "Some log lines are hard to follow during long runs, and it is not always obvious which agent produced them. Tidy this up so operators can read a run log more easily."
+}

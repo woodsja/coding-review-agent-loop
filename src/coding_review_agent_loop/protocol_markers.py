@@ -371,6 +371,9 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
         # issue when an edited issue opens a fresh plan; admitted only from the
         # authenticated orchestrator actor.
         _b64_definition("AGENT_PLAN_SCOPE_BOUNDARY", surfaces=frozenset({ISSUE_COMMENT_SURFACE})),
+        # Orchestrator-only advisory triage recommendation (#1434), posted on the
+        # issue before the run's first agent turn; it never selects a route.
+        _b64_definition("AGENT_ISSUE_TRIAGE", surfaces=frozenset({ISSUE_COMMENT_SURFACE})),
         # Cross-surface workflow transaction record (#827).  Prepared and
         # terminal records live only in trusted PR comments.
         MarkerDefinition(

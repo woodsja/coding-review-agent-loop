@@ -62,6 +62,7 @@ MARKERS = (
     ),
     ("AGENT_PR_BOARD_CHANGE", f"<!-- AGENT_PR_BOARD_CHANGE: {_b64({'kind': 'reviewer-board-change'})} -->", PR_COMMENT_SURFACE),
     ("AGENT_PLAN_BOARD_CHANGE", f"<!-- AGENT_PLAN_BOARD_CHANGE: {_b64({'kind': 'reviewer-board-change'})} -->", ISSUE_COMMENT_SURFACE),
+    ("AGENT_ISSUE_TRIAGE", f"<!-- AGENT_ISSUE_TRIAGE: {_b64({'kind': 'issue_triage'})} -->", ISSUE_COMMENT_SURFACE),
     ("AGENT_WORKFLOW_TRANSACTION", f"<!-- AGENT_WORKFLOW_TRANSACTION: {_b64({'phase': 'prepared', 'schema_version': 1})} -->", PR_COMMENT_SURFACE),
     ("AGENT_MANAGED_PR_SOURCE_V1", f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {_b64({'source_branch': 'fix', 'source_sha': 'a'})} -->", PR_BODY_SURFACE),
     ("AGENT_SPLIT_CHILD", "<!-- AGENT_SPLIT_CHILD: parent=1 key=" + "a" * 64 + " -->", ISSUE_BODY_SURFACE),
@@ -215,7 +216,7 @@ def test_ordinary_issue_comment_writer_enforces_issue_comment_surface():
 
 def test_source_inventory_has_no_unregistered_protocol_literals():
     assert_source_inventory(Path(__file__).parents[1])
-    assert len(RESERVED_MARKER_REGISTRY) == 37
+    assert len(RESERVED_MARKER_REGISTRY) == 38
 
 
 def test_issue_provenance_trailer_is_not_a_reserved_marker_or_forged_body_record():

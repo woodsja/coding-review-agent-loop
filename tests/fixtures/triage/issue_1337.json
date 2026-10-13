@@ -1,0 +1,5 @@
+{
+  "number": 1337,
+  "title": "Normalize degraded PR-review sub_items and preserve their content in grounding and evidence-tag identity (deferred from #1328)",
+  "body": "Deferred from #1328 (its first planning attempt stalled on these questions, with the plan grown to 110k characters).\n\nHow should degraded or malformed PR-review `sub_items` (mixed-type lists, non-list values, objects inside them) be normalized? And how should their content be preserved in review grounding (`_validate_review_grounding` / `_joined_text`) and in evidence-tag identity, including distinguishing sibling identities and handling tag swaps?\n\n#1328 deliberately leaves today's behaviour for these unchanged. Pick this up only if real runs show rounds lost to it; attach the failing payload when filing evidence.\n\n-- Anthropic Claude"
+}

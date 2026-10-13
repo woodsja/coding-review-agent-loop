@@ -1258,6 +1258,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     issue.add_argument(
+        "--triage",
+        action="store_true",
+        help=(
+            "Advisory triage (#1434): just before the run's first agent turn, one "
+            "model call recommends discuss-first, plan-first or direct, and the "
+            "recommendation is posted as an issue comment. The run then continues "
+            "with exactly the route you selected. Skipped for dry runs, staged "
+            "children with a recorded route and existing-PR resumption."
+        ),
+    )
+    issue.add_argument(
+        "--triage-model",
+        default=None,
+        metavar="MODEL",
+        help=(
+            "With --triage, override only the triage model. The backend stays the "
+            "primary plan reviewer, else the first codex reviewer, else the first "
+            "configured reviewer."
+        ),
+    )
+    issue.add_argument(
+        "--triage-history",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "With --triage, a local `agent-loop history export` JSON file. Up to 5 "
+            "similar same-repository issues whose outcomes were complete before the "
+            "triage time are given to the triage call."
+        ),
+    )
+    issue.add_argument(
         "--materialize-split-issues",
         action="store_true",
         help=(
@@ -2597,6 +2629,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--plan-narrow-staged requires --plan-first.")
             if getattr(args, "plan_resume_keep_on_issue_edit", False) and not args.plan_first:
                 raise AgentLoopError("--plan-resume-keep-on-issue-edit requires --plan-first.")
+            if (args.triage_model or args.triage_history is not None) and not args.triage:
+                raise AgentLoopError("--triage-model and --triage-history require --triage.")
             if implementation_override_requested and not args.plan_first:
                 raise AgentLoopError("--implementation-coder options require --plan-first.")
             plan_execution_mode = args.plan_execution_mode

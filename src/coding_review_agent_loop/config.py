@@ -277,6 +277,11 @@ class AgentLoopConfig:
     # Never inherited by child planning or recovery commands.
     plan_resume_keep_on_issue_edit: bool = False
     plan_narrow_staged: bool = False
+    # Advisory triage before an issue run's first agent dispatch (#1434).  It
+    # posts a route recommendation and never changes the operator's route.
+    triage: bool = False
+    triage_model: str = ""
+    triage_history: Path | None = None
     # Plan-growth gate (#886): structural thresholds above which a one-shot
     # plan needs a reviewed justification or a staged restructure.
     plan_growth_gate: str = "enforce"
@@ -2439,6 +2444,9 @@ def config_from_args(
             getattr(args, "plan_resume_keep_on_issue_edit", False)
         ),
         plan_narrow_staged=bool(getattr(args, "plan_narrow_staged", False)),
+        triage=bool(getattr(args, "triage", False)),
+        triage_model=getattr(args, "triage_model", None) or "",
+        triage_history=getattr(args, "triage_history", None),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
         plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),
         plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),

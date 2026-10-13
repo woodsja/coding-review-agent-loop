@@ -4790,6 +4790,54 @@ tool commit comes from local `*-usage-summary.json` files whose run ID has a
 its linked PRs (the worker telemetry log by default). Anything else is
 `unavailable`.
 
+### Advisory issue triage
+
+`agent-loop issue N --triage` asks one model which route the issue should take,
+`discuss-first`, `plan-first` or `direct`, and posts the answer on the issue.
+The recommendation is advisory: the run always continues with the route you
+selected (`--plan-first` or not, with the same execution mode and policy).
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO --plan-first --triage
+agent-loop issue 123 --repo OWNER/REPO --triage --triage-history history.json
+agent-loop issue 123 --repo OWNER/REPO --triage --triage-model gpt-5.5
+```
+
+- **When it runs.** Triage runs immediately before the run's first agent turn,
+  so every startup guard and refusal comes first; a refused run makes no
+  triage call and posts nothing. In a parallel first reviewer batch, the other
+  reviewers wait until triage finishes. Dry runs, staged children with a
+  recorded or reviewed route, and runs that resume an existing PR skip triage,
+  and the log says the recorded route wins.
+- **Backend and model.** The primary plan reviewer when one is set
+  (`--plan-review-policy primary-then-panel`), else the first configured codex
+  reviewer, else the first configured reviewer. The model is that reviewer's
+  configured reviewer model (a named seat keeps its seat model);
+  `--triage-model` overrides only the model. The log and the comment name the
+  backend, model and selection reason.
+- **Inputs.** The issue text and comments, the architecture context, read-only
+  access to the reviewer's checkout, and deterministic signals computed by
+  code: open design questions (`how should ...`), edge-case lists without closed
+  acceptance criteria, competing designs or policy choices, a prior stalled plan
+  (in the issue text or among similar issues), named local files, specified
+  behavior, and closed acceptance criteria. With `--triage-history PATH` (an
+  [outcome history export](#outcome-history-export) JSON file), up to 5 similar
+  issues from the same repository are added with their outcome rows. A row is
+  eligible only when its outcome was complete and available before the triage
+  time and its run-start snapshot is usable and dated before it, so a run that
+  finished later never leaks in. Without the file, triage says it retrieved
+  zero similar issues.
+- **Answer.** A strict JSON object: `route`, `unsure`, and 1 to 8 reasons that
+  each name a listed signal. `unsure: true` or an unrecognized route is
+  reported as plan-first.
+- **Failures.** A backend failure, an answer that stays invalid after repair,
+  or a failed comment post is logged; the run continues unchanged and no
+  recommendation is posted.
+- **Record.** The comment carries a tool-owned triage record (recommended
+  route, operator route, signals, similar issues, backend and model). Only a
+  copy written by the authenticated orchestrator actor carries authority.
+  Triage never edits the issue.
+
 ## Workdirs
 
 ### Checkout claims
