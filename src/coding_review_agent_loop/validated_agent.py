@@ -118,6 +118,10 @@ from .architecture_contract import (
     _accept_candidate,
     _accepted_validated_response,
     _architecture_contract_retry_prompt,
+    _architecture_document_path_diagnostic,
+    _architecture_document_path_rejection,
+    _architecture_document_path_retry_prompt,
+    _reported_canonical_document_path,
     _fresh_matrix_contract_retry_prompt,
     _evidence_rejection_reask_prompt,
     _prior_disposition_omission_reask_prompt,
@@ -1007,6 +1011,7 @@ def _run_validated_agent(
     reask_on_prior_disposition_omission: bool = False,
     reask_on_missing_judgement_field: bool = False,
     reask_on_evidence_rejection: bool = False,
+    architecture_document_paths: Callable[[], frozenset[str] | None] | None = None,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -1021,17 +1026,35 @@ def _run_validated_agent(
     # The last response refused for an unsatisfied architecture-impact
     # contract.  It is retained and surfaced, never silently discarded.
     preserved_unsatisfied: PreservedUnsatisfiedResponse | None = None
+    # The (rejected path, set members) of the latest refusal when it was an
+    # out-of-set canonical_document_path (#1454); it selects the re-ask text.
+    document_path_rejection: tuple[str, frozenset[str]] | None = None
 
     def contract_refusal(
         result: object, text: str, records: tuple[ParseDegradation, ...] = ()
     ) -> str | None:
         """Store an unsatisfied result as the preserved candidate; return its diagnostic."""
-        nonlocal preserved_unsatisfied
-        if not require_architecture_impact_contract:
-            return None
-        diagnostic = _architecture_contract_diagnostic(result)
+        nonlocal preserved_unsatisfied, document_path_rejection
+        diagnostic = (
+            _architecture_contract_diagnostic(result)
+            if require_architecture_impact_contract else None
+        )
+        rejection: tuple[str, frozenset[str]] | None = None
+        if (
+            diagnostic is None
+            and architecture_document_paths is not None
+            and _reported_canonical_document_path(result) is not None
+        ):
+            # A semantic membership refusal, never a format-repair target:
+            # repair pins schema-valid paths, so only the coder can fix it.
+            members = architecture_document_paths()
+            rejected = _architecture_document_path_rejection(result, members)
+            if rejected is not None and members is not None:
+                rejection = (rejected, members)
+                diagnostic = _architecture_document_path_diagnostic(rejected, members)
         if diagnostic is None:
             return None
+        document_path_rejection = rejection
         carrier = _unwrap_architecture_result(result)
         preserved_unsatisfied = PreservedUnsatisfiedResponse(
             text=text,
@@ -1291,6 +1314,10 @@ def _run_validated_agent(
             if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = "omission-reask"
             pending_omission_reask_ids = None
+        elif pending_contract_reprompt is not None and document_path_rejection is not None:
+            attempt_prompt = _architecture_document_path_retry_prompt(
+                prompt, *document_path_rejection
+            )
         else:
             attempt_prompt = (
                 _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)

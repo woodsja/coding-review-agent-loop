@@ -20,7 +20,9 @@ from .architecture_context import (
     ArchitecturePair,
     ArchitectureSnapshot,
     DEFAULT_MANAGED_CONTEXT_CHARS,
+    architecture_injectable,
     architecture_material,
+    architecture_set_guidance_applicable,
     render_architecture_pair,
     render_architecture_snapshot,
 )
@@ -141,7 +143,9 @@ def _architecture_context_block(
         if isinstance(config.architecture_context, (ArchitectureSnapshot, ArchitecturePair))
         else None
     )
-    if not architecture_material(context):
+    # An oversized root is injected as identity, size and index (#1454);
+    # every other material-gated prompt mode keeps architecture_material.
+    if not architecture_injectable(context):
         return ""
     protected_size = sum(len(block) for block in protected_context)
     configured_limit = config.managed_context_max_chars
@@ -225,8 +229,21 @@ def _with_architecture_context(config: AgentLoopConfig, context: object | None) 
     return dataclass_replace(config, architecture_context=context)
 
 
-def _architecture_impact_guidance(*, required: bool = False) -> str:
+def _architecture_impact_guidance(*, required: bool = False, config: AgentLoopConfig | None = None) -> str:
     qualifier = "required" if required else "expected when architecture context is available"
+    context = (
+        config.architecture_context
+        if config is not None and config.architecture_context_enabled
+        else None
+    )
+    set_guidance = (
+        "`canonical_document_path` must name a document in the architecture set (the root "
+        "doc or a linked docs/architecture/*.md detail doc), or null for no change; update "
+        "the detail doc that owns the changed component, and update the root only when the "
+        "component map, invariants or main flows change.\n"
+        if architecture_set_guidance_applicable(context)
+        else ""
+    )
     return (
         "Architecture-impact assessment (" + qualifier + "):\n"
         "When emitting it, use an object with `status` (`changed` or `unchanged`) and a "
@@ -239,7 +256,7 @@ def _architecture_impact_guidance(*, required: bool = False) -> str:
         "For `unchanged`, empty arrays and an empty canonical-document rationale are valid; "
         "give a meaningful no-impact rationale. Source inspection remains mandatory; "
         "documentation cannot excuse an implementation defect.\n"
-    )
+    ) + set_guidance
 
 
 def format_agent_list(agents: Sequence[AgentName]) -> str:
@@ -3113,7 +3130,7 @@ run relevant tests, commit, push, and open a pull request against {config.base}.
 {provenance_guidance}
 {managed_creation_guidance}
 {_architecture_context_block(config, architecture_context, protected_context=(human_requirements_context.block,))}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
@@ -3417,7 +3434,7 @@ def build_issue_plan_prompt(
 
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning stage.
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 For a plan (rather than a clarification), respond with exactly one structured JSON
 `plan_state` object. It must have this complete contract:
 
@@ -3579,7 +3596,7 @@ Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this planning review.
 {_review_command_policy(config)}
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
-{_architecture_impact_guidance()}
+{_architecture_impact_guidance(config=config)}
 {_architecture_context_block(config, protected_context=(human_requirements_block,))}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}{declared_out_of_scope_block(issue_context)}
@@ -3788,7 +3805,7 @@ def build_plan_decomposition_prompt(
 Use this local checkout only to inspect context. Do not edit files, create a
 branch, commit, push, or open a pull request during this decomposition stage.
 {_coder_workdir_guidance(config, implementation=False)}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_architecture_context_block(config, protected_context=(human_requirements_block, approved_plan))}
 {_scratch_file_guidance()}
 {human_requirements_block}{_issue_context_block(issue_context)}
@@ -4050,7 +4067,7 @@ def build_plan_revision_prompt(
 Revise the plan in this local checkout without editing code. Do not create a
 branch, commit, push, or open a pull request during this planning stage.
 {_coder_workdir_guidance(config, implementation=False)}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_scratch_file_guidance()}
 {human_requirements_context.block}{_coder_human_requirements_guidance(
     human_requirements_context,
@@ -4313,7 +4330,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {provenance_guidance}
 {managed_creation_guidance}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, format_approved_plan_context(plan_context, max_chars=None)))}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
@@ -4409,7 +4426,7 @@ def build_task_prompt(
 
 Task:
 {task_text}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_architecture_context_block(config, protected_context=(task_text,))}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -4487,7 +4504,7 @@ def build_task_clarification_prompt(
 
 Original task:
 {task_text}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_architecture_context_block(config, protected_context=(task_text,))}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -5301,7 +5318,7 @@ mismatch instead of changing the checkout. Do not spend time discovering the
 PR branch. Do not report findings based on untracked files unless those files
 are present in the PR diff.
 {_coder_workdir_guidance(config, implementation=False, agent=reviewer)}
-{_architecture_impact_guidance()}
+{_architecture_impact_guidance(config=config)}
 {_scratch_file_guidance()}
 {_review_command_policy(config, metadata)}
 {_pr_review_scheduling_guidance(config)}
@@ -5459,7 +5476,7 @@ Do not create a new PR.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -5528,7 +5545,7 @@ same PR. Do not create a new PR.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 
@@ -5595,7 +5612,7 @@ against the new head after your push.
 {_issue_context_block(issue_context)}
 {_approved_plan_review_context_block(approved_plan_context, max_chars=(None if architecture_material(config.architecture_context) else approved_plan_max_chars))}
 {human_requirements_context.block}{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
-{_architecture_impact_guidance(required=True)}
+{_architecture_impact_guidance(required=True, config=config)}
 {_architecture_context_block(config, protected_context=(human_requirements_context.block, approved_plan_context and _approved_plan_review_context_block(approved_plan_context, max_chars=None) or ""))}
 {_memory_block(memory, config, include_runtime=True)}
 

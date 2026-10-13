@@ -116,6 +116,7 @@ from .architecture_contract import (
     _TerminalNoPrImplementation,
     _TerminalIssueImplementationConflict,
     _architecture_mode_validators,
+    _architecture_document_paths_hook,
 )
 from .validated_agent import (
     _new_usage_context,
@@ -878,6 +879,7 @@ def run_issue_loop(
             ),
             marker_description="structured issue_implementation result, blocking, or clarification",
             require_architecture_impact_contract=True,
+            architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
             **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
@@ -1250,6 +1252,7 @@ def run_task_loop(
                 session_id=session_id,
                 marker_description="structured task_result JSON, blocking, or clarification outcome",
                 require_architecture_impact_contract=True,
+                architecture_document_paths=_architecture_document_paths_hook(runner, config),
                 **_architecture_mode_validators(lambda mode: lambda text: _require_task_implementation_result(
                     text,
                     # This is a fresh task turn even when architecture context

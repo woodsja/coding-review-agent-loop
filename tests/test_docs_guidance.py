@@ -1299,3 +1299,31 @@ def test_fixture_hook_contract_is_documented_and_linked():
         if "--fixture" in action.option_strings
     )
     assert run_tests.metavar == "PATH" and "run-tests" in help_text
+
+
+def test_docs_describe_the_architecture_set_layout_and_size_budget():
+    local = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    assert "#### Architecture set, layout and size budget" in local
+    for text in (local, readme):
+        flat = " ".join(text.split())
+        assert "architecture set" in flat
+        assert "docs/architecture/" in flat
+        assert "one level only" in flat
+        assert "at most about 10k characters" in flat
+        assert "10–30k characters" in flat
+        assert "Decisions" in flat
+        assert "should be split into a short root overview" in flat
+        assert "`--architecture-read-size`" in flat
+        assert "canonical_document_path" in flat
+        assert "only a detail doc" in flat or "changes only a detail doc" in flat
+    assert "docs/architecture/" in " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    import argparse
+
+    parser = build_parser()
+    subparsers = next(
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+    )
+    help_text = " ".join(subparsers.choices["issue"].format_help().split())
+    assert "docs/architecture/*.md" in help_text
+    assert "split it" in help_text

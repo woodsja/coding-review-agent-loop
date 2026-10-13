@@ -1022,6 +1022,62 @@ Use `--architecture-read-size`, `--architecture-snapshot-max-chars`, and
 an explicitly restrictive value fails before invocation if protected context
 cannot fit. The default expands as needed for the bounded architecture block.
 
+#### Architecture set, layout and size budget
+
+`--architecture-path` names the root of the **architecture set**: the root
+document plus every repository-relative Markdown file under `docs/architecture/`
+that the root links to. Inline links count, as do full, collapsed and shortcut
+reference links; a reference definition counts only when a reference outside
+code uses its label. Links inside code, external URLs, non-`.md` targets,
+targets outside `docs/architecture/`, and escapes above the repository root are
+ignored. Links are followed one level only, so links inside detail docs and
+unlinked files under `docs/architecture/` are never members. Every member is
+read from the same immutable revision as the root, in bounded batches.
+
+Recommended layout:
+
+- **Root (`ARCHITECTURE.md`)**: a short overview injected whole, at most about
+  10k characters: what the system is; a component map with one row per
+  component (role, main source paths, detail doc); system-wide invariants; the
+  main flows in a few lines each; and an index of the detail docs. No issue
+  history.
+- **Detail docs (`docs/architecture/*.md`)**: one per component or group of
+  related decisions, about 10–30k characters each. Each opens with a short
+  summary and the source paths it covers, and ends with a "Decisions" section
+  recording what was chosen, why, and which issue.
+
+Size budget: `--architecture-read-size` (default 64 KiB) applies to the root
+and to each member. When the set has detail docs, the prompt carries the root
+overview followed by a detail-doc index (path plus first heading); the overview
+truncates before the index, and the index collapses to a member count under a
+tight budget. A root larger than the read size is still injected as identity,
+size and a bounded heading index (never prose), with a diagnostic that the
+document is too large to inject and should be split into a short root overview
+plus `docs/architecture/*` detail docs. The root is scanned for headings and
+links up to a 2 MiB ceiling; above it, or when the root is not valid UTF-8
+text, the prompt says set membership is unknown. A repository with only a root
+document under the read size gets exactly the same prompts and round-metadata
+identity as before.
+
+Coders' `architecture_impact.canonical_document_path` must be null or a member
+of the set. The value is normalized as a repository-relative path (surrounding
+whitespace and `./` or `.` segments are accepted) only for the membership
+decision; the reported string is kept unchanged. A detail doc the coder created
+and linked from the root in the same turn is accepted. An out-of-set path gets
+one bounded re-ask naming the members, within the existing retry budget, and
+fails closed when retries are exhausted. Validation is skipped when no root
+exists or its membership is unknown. Update the detail doc that owns the changed
+component, and update the root only when the component map, invariants or main
+flows change.
+
+PR comparison covers the whole set: a PR that changes only a detail doc reports
+`Architecture set change: modified` and names the changed members, while the
+injected text stays limited to the base and candidate root documents. A
+member lookup that failed or a root that could not be scanned reports the set
+change as `unavailable`, never `unchanged`. Member blob identities are part of
+the PR architecture identity, so a detail-doc edit invalidates prior approvals
+exactly once.
+
 #### Degraded architecture-impact assessments
 
 Fresh coder and reviewer turns must return an `architecture_impact` whose

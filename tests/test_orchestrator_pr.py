@@ -22317,3 +22317,116 @@ def test_issue_created_named_pr_below_floor_board_change_is_refused_before_any_w
         run_pr_loop(runner, pr_number=77, config=reduced)
     assert len(runner.pr_payload["comments"]) == comments and _links_1365(runner) == []
     assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
+
+
+# ---------------------------------------------------------------------------
+# #1454: PR revalidation over the architecture set
+# ---------------------------------------------------------------------------
+
+import subprocess as _set_subprocess  # noqa: E402
+
+from coding_review_agent_loop.architecture_contract import (  # noqa: E402
+    _freeze_prompt_architecture as _set_freeze,
+    _revalidate_pr_architecture_identity as _set_revalidate,
+)
+from coding_review_agent_loop.runner import Runner as _SetRunner  # noqa: E402
+
+
+def _set_git(cwd, *args):
+    return _set_subprocess.run(
+        ("git", *args), cwd=cwd, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+
+def _set_commit(repo, files):
+    for name, content in files.items():
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    _set_git(repo, "add", "-A")
+    _set_git(repo, "commit", "-qm", "update")
+    return _set_git(repo, "rev-parse", "HEAD")
+
+
+def _set_pr_repo(tmp_path, files, **overrides):
+    config = make_config(tmp_path, **overrides)
+    repo = config.claude_dir
+    _set_git(repo, "init", "-q")
+    _set_git(repo, "config", "user.email", "test@example.com")
+    _set_git(repo, "config", "user.name", "Test")
+    base = _set_commit(repo, files)
+    _set_git(repo, "update-ref", "refs/remotes/origin/main", base)
+    _set_git(repo, "checkout", "-qb", "candidate")
+    head = _set_commit(repo, {"README.md": "first push\n"})
+    return config, repo, head
+
+
+def _set_identity(config, head):
+    frozen = _set_freeze(
+        _SetRunner(), config, target_revision="main", candidate_revision=head, pr_pair=True
+    )
+    return frozen, frozen.architecture_context.identity()
+
+
+def _set_metadata(head):
+    return SimpleNamespace(base_branch="main", head_sha=head)
+
+
+_SET_ROOT = "# Root\n\nOverview.\n\n- [Billing](docs/architecture/billing.md)\n"
+
+
+def test_revalidation_keeps_a_legacy_root_only_identity_unchanged(tmp_path):
+    config, _repo, head = _set_pr_repo(tmp_path, {"ARCHITECTURE.md": "# Root\n\nOverview.\n"})
+    frozen, identity = _set_identity(config, head)
+    assert "set_change" not in identity and "members" not in identity["candidate"]
+    _fresh, changed = _set_revalidate(
+        _SetRunner(), config=frozen, metadata=_set_metadata(head), stored_identity=identity
+    )
+    assert changed is False
+
+
+@pytest.mark.parametrize("read_size", [64 * 1024, 32], ids=["material-root", "oversized-root"])
+def test_member_blob_change_is_reported_exactly_once(tmp_path, read_size):
+    config, repo, head = _set_pr_repo(
+        tmp_path,
+        {"ARCHITECTURE.md": _SET_ROOT, "docs/architecture/billing.md": "# Billing\n"},
+        architecture_read_size=read_size,
+    )
+    frozen, identity = _set_identity(config, head)
+    assert identity["set_change"] == "unchanged"
+    edited = _set_commit(repo, {"docs/architecture/billing.md": "# Billing v2\n"})
+    fresh, changed = _set_revalidate(
+        _SetRunner(), config=frozen, metadata=_set_metadata(edited), stored_identity=identity
+    )
+    assert changed is True
+    assert fresh.set_change == "modified"
+    refrozen = dataclasses.replace(frozen, architecture_context=fresh)
+    _again, repeated = _set_revalidate(
+        _SetRunner(), config=refrozen, metadata=_set_metadata(edited),
+        stored_identity=fresh.identity(),
+    )
+    assert repeated is False
+
+
+def test_contentless_push_is_not_a_set_change_for_an_oversized_root(tmp_path):
+    config, repo, head = _set_pr_repo(
+        tmp_path,
+        {"ARCHITECTURE.md": _SET_ROOT, "docs/architecture/billing.md": "# Billing\n"},
+        architecture_read_size=32,
+    )
+    frozen, identity = _set_identity(config, head)
+    pushed = _set_commit(repo, {"README.md": "second push\n"})
+    _fresh, changed = _set_revalidate(
+        _SetRunner(), config=frozen, metadata=_set_metadata(pushed), stored_identity=identity
+    )
+    assert changed is False
+
+
+def test_contentless_push_with_a_missing_root_is_not_a_change(tmp_path):
+    config, repo, head = _set_pr_repo(tmp_path, {"README.md": "# Readme\n"})
+    frozen, identity = _set_identity(config, head)
+    pushed = _set_commit(repo, {"src.py": "x = 1\n"})
+    _fresh, changed = _set_revalidate(
+        _SetRunner(), config=frozen, metadata=_set_metadata(pushed), stored_identity=identity
+    )
+    assert changed is False

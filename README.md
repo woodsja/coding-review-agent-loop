@@ -801,7 +801,31 @@ from committed Git objects and include a bounded, revision- and hash-labeled
 overview in planning, implementation, and review prompts. Use
 `--architecture-path docs/ARCHITECTURE.md` for a validated repository-relative
 POSIX override, or `--no-architecture-context` to opt out. Missing, unsafe,
-binary, oversized, or unavailable documents preserve the legacy prompt path.
+binary, or unavailable documents preserve the legacy prompt path.
+
+The path names the root of an **architecture set**: the root document plus every
+repository-relative Markdown file under `docs/architecture/` that the root links
+to (inline links and reference links whose definition is actually used). Links
+are followed one level only; unlinked files under `docs/architecture/` are not
+members. The recommended layout is a short root overview of at most about 10k
+characters (what the system is, a component map with each component's role,
+main source paths and detail doc, system-wide invariants, the main flows, and an
+index of the detail docs, with no issue history) plus detail docs of about
+10–30k characters each under `docs/architecture/`. Each detail doc opens with a
+short summary and the source paths it covers and ends with a "Decisions"
+section holding the decision history. When the set has detail docs, prompts
+carry the root overview followed by a short detail-doc index (path plus first
+heading). `--architecture-read-size` applies to the root and to each member.
+A root larger than the read size is not dropped: the prompt carries its
+identity, size and a bounded heading index, with a diagnostic that the document
+is too large and should be split into a short root overview plus
+`docs/architecture/*` detail docs (roots above a 2 MiB scan ceiling, or that are
+not valid UTF-8, are injected without an index and with set membership marked
+unknown). A coder's `canonical_document_path` must be null or name a member of
+the set (normalized as a repository-relative path); an out-of-set path gets one
+bounded re-ask. The PR base/candidate comparison covers every member, so a PR
+that edits only a detail doc is reported as an architecture change; member
+paths are named but only the root documents' text is injected.
 The read and rendering budgets are configurable with `--architecture-read-size`,
 `--architecture-snapshot-max-chars`, and `--architecture-aggregate-max-chars`;
 `--managed-context-max-chars` bounds active managed prompt context and fails

@@ -11,7 +11,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from .errors import AgentLoopError
 from .protocol_markers import sanitize_historical_text
@@ -23,9 +23,32 @@ DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS = 12_000
 DEFAULT_ARCHITECTURE_AGGREGATE_CHARS = 24_000
 DEFAULT_MANAGED_CONTEXT_CHARS = 80_000
 
+# The architecture set (#1454): the root document plus every Markdown file
+# under this directory that the root links to, one level only.
+ARCHITECTURE_DETAIL_DIR = "docs/architecture/"
+# An oversized root is still read up to this ceiling so its heading index and
+# links are known; above it the root is never read.
+DEFAULT_ARCHITECTURE_SCAN_CEILING = 2 * 1024 * 1024
+# First-heading reads (and therefore prompt rendering detail) stop after this
+# many members; membership and identities never do.
+ARCHITECTURE_MEMBER_HEADING_CAP = 64
+ARCHITECTURE_LS_TREE_BATCH = 100
+_ARCHITECTURE_HEADING_CHARS = 200
+_OVERSIZED_HEADING_INDEX_CAP = 500
+_ARCHITECTURE_CHANGED_MEMBER_RENDER_CAP = 20
+
 _OID_RE = re.compile(rb"^[0-9a-fA-F]{40,64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MARKER_LIKE_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_MEMBERSHIP_UNKNOWN_LINE = "- Architecture set: membership unknown (root could not be scanned)"
+_SPLIT_RECOMMENDATION = (
+    "The document is too large to inject and should be split into a short root "
+    "overview plus docs/architecture/* detail docs."
+)
+_MEMBERSHIP_UNKNOWN_NOTE = (
+    "Architecture-set membership is unknown because the root could not be scanned."
+)
 
 
 def _sanitize_architecture_text(text: str) -> str:
@@ -64,6 +87,24 @@ class ArchitectureLocator:
 
 
 @dataclass(frozen=True)
+class ArchitectureMember:
+    """One linked detail document of the architecture set (#1454)."""
+
+    path: str
+    blob_oid: str | None
+    # available, missing, oversized, binary, or unavailable.
+    availability: str
+    size: int | None = None
+    first_heading: str | None = None
+
+    def identity(self) -> dict[str, object]:
+        return {
+            "path": self.path, "blob_oid": self.blob_oid,
+            "availability": self.availability, "size": self.size,
+        }
+
+
+@dataclass(frozen=True)
 class ArchitectureSnapshot:
     repository: str
     path: str
@@ -76,6 +117,12 @@ class ArchitectureSnapshot:
     truncated: bool = False
     heading_index: tuple[str, ...] = ()
     diagnostic: str | None = None
+    members: tuple[ArchitectureMember, ...] = ()
+    # Whether the root's links are known: ``scanned`` (root text decoded),
+    # ``unscanned`` (root exists but its text could not be decoded), or
+    # ``not-applicable`` (root missing or unavailable).  Never part of the
+    # identity, so root-only identities stay byte-identical.
+    links_status: str = "not-applicable"
 
     @property
     def is_available(self) -> bool:
@@ -86,11 +133,16 @@ class ArchitectureSnapshot:
         return self.is_available and bool(self.content)
 
     def identity(self) -> dict[str, object]:
-        return {
+        identity: dict[str, object] = {
             "repository": self.repository, "path": self.path, "revision": self.revision,
             "blob_oid": self.blob_oid, "sha256": self.sha256,
             "availability": self.availability, "size": self.size,
         }
+        if self.members:
+            identity["members"] = [
+                member.identity() for member in sorted(self.members, key=lambda item: item.path)
+            ]
+        return identity
 
 
 @dataclass(frozen=True)
@@ -108,8 +160,59 @@ class ArchitecturePair:
     def material(self) -> bool:
         return self.base.material or self.candidate.material
 
+    @property
+    def has_members(self) -> bool:
+        return bool(self.base.members or self.candidate.members)
+
+    @property
+    def member_changes(self) -> tuple[tuple[str, str], ...]:
+        """Every member whose (availability, blob) differs between the sides."""
+        base_map = {member.path: member for member in self.base.members}
+        candidate_map = {member.path: member for member in self.candidate.members}
+        changes: list[tuple[str, str]] = []
+        for path in sorted(set(base_map) | set(candidate_map)):
+            base_member = base_map.get(path)
+            candidate_member = candidate_map.get(path)
+            base_key = (
+                (base_member.availability, base_member.blob_oid) if base_member else ("unlinked", None)
+            )
+            candidate_key = (
+                (candidate_member.availability, candidate_member.blob_oid)
+                if candidate_member else ("unlinked", None)
+            )
+            if base_key == candidate_key:
+                continue
+            if "unavailable" in (base_key[0], candidate_key[0]):
+                changes.append((path, "unavailable"))
+                continue
+            base_present = base_key[0] not in {"missing", "unlinked"}
+            candidate_present = candidate_key[0] not in {"missing", "unlinked"}
+            if candidate_present and not base_present:
+                changes.append((path, "added"))
+            elif base_present and not candidate_present:
+                changes.append((path, "deleted"))
+            else:
+                changes.append((path, "modified"))
+        return tuple(changes)
+
+    @property
+    def set_change(self) -> str:
+        """Root-plus-members comparison; incomplete knowledge is never unchanged."""
+        if self.change == "unavailable":
+            return "unavailable"
+        sides = (self.base, self.candidate)
+        if any(side.links_status == "unscanned" for side in sides):
+            return "unavailable"
+        if any(member.availability == "unavailable" for side in sides for member in side.members):
+            return "unavailable"
+        if not self.member_changes:
+            return self.change
+        if self.change in {"added", "deleted"}:
+            return self.change
+        return "modified"
+
     def identity(self) -> dict[str, object]:
-        return {
+        identity: dict[str, object] = {
             "repository": self.repository, "path": self.path,
             "target_revision": self.target_revision,
             "candidate_revision": self.candidate_revision,
@@ -117,6 +220,10 @@ class ArchitecturePair:
             "change": self.change, "base": self.base.identity(),
             "candidate": self.candidate.identity(),
         }
+        if self.has_members:
+            identity["set_change"] = self.set_change
+            identity["member_changes"] = [list(change) for change in self.member_changes]
+        return identity
 
 
 def _snapshot_unavailable(locator: ArchitectureLocator, revision: str | None, diagnostic: str) -> ArchitectureSnapshot:
@@ -156,6 +263,256 @@ def _headings(text: str) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _bounded_heading(heading: str) -> str:
+    heading = " ".join(heading.split())
+    if len(heading) > _ARCHITECTURE_HEADING_CHARS:
+        heading = heading[: _ARCHITECTURE_HEADING_CHARS - 3] + "..."
+    return heading
+
+
+def _resolve_repo_relative(base_dir_parts: Iterable[str], value: object) -> str | None:
+    """Resolve a link target or reported path to a normalized repository path.
+
+    Shared by link discovery and ``canonical_document_path`` membership, so an
+    equivalent spelling of a member resolves identically.  Absolute paths,
+    URIs, and escapes above the repository root return ``None``.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value.startswith("/") or _URI_SCHEME_RE.match(value):
+        return None
+    parts = list(base_dir_parts)
+    for segment in value.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            if not parts:
+                return None
+            parts.pop()
+            continue
+        parts.append(segment)
+    if not parts:
+        return None
+    try:
+        return normalize_architecture_path("/".join(parts))
+    except AgentLoopError:
+        return None
+
+
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_INLINE_CODE_RE = re.compile(r"(`+)(?:(?!\1).)+?\1")
+_REFERENCE_DEFINITION_RE = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(<[^>]*>|\S+)")
+_INLINE_LINK_RE = re.compile(
+    r"(?<!!)\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)"
+)
+_FULL_REFERENCE_RE = re.compile(r"(?<!!)\[([^\]]*)\]\[([^\]]*)\]")
+_SHORTCUT_REFERENCE_RE = re.compile(r"(?<![!\]])\[([^\]]+)\](?![\[(:])")
+
+
+def _reference_label(label: str) -> str:
+    return " ".join(label.split()).casefold()
+
+
+def _prose_lines(text: str) -> list[str]:
+    """Return lines outside fenced code blocks, with inline code spans removed."""
+    lines: list[str] = []
+    fence: str | None = None
+    for line in text.splitlines():
+        match = _FENCE_RE.match(line)
+        if fence is not None:
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
+                fence = None
+            continue
+        if match:
+            fence = match.group(1)
+            continue
+        lines.append(_INLINE_CODE_RE.sub(" ", line))
+    return lines
+
+
+def _clean_link_target(target: str) -> str:
+    target = target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    return target.split("#", 1)[0].split("?", 1)[0]
+
+
+def _linked_detail_paths(root_text: str, root_path: str) -> tuple[str, ...]:
+    """Repository paths of docs/architecture/*.md files linked from the root.
+
+    Inline links and reference links (full, collapsed and shortcut) count; a
+    reference definition contributes only when a reference outside code uses
+    its label.  Code is skipped, and detail docs are never scanned, so links
+    are followed one level only.
+    """
+    definitions: dict[str, str] = {}
+    prose: list[str] = []
+    for line in _prose_lines(root_text):
+        match = _REFERENCE_DEFINITION_RE.match(line)
+        if match:
+            definitions.setdefault(_reference_label(match.group(1)), match.group(2))
+            continue
+        prose.append(line)
+    targets: list[str] = []
+    used_labels: set[str] = set()
+    for line in prose:
+        for match in _INLINE_LINK_RE.finditer(line):
+            targets.append(match.group(1))
+        remaining = _INLINE_LINK_RE.sub(" ", line)
+        for match in _FULL_REFERENCE_RE.finditer(remaining):
+            used_labels.add(_reference_label(match.group(2) or match.group(1)))
+        remaining = _FULL_REFERENCE_RE.sub(" ", remaining)
+        for match in _SHORTCUT_REFERENCE_RE.finditer(remaining):
+            used_labels.add(_reference_label(match.group(1)))
+    targets.extend(definitions[label] for label in sorted(used_labels) if label in definitions)
+    base_dir_parts = root_path.split("/")[:-1]
+    found: set[str] = set()
+    for target in targets:
+        resolved = _resolve_repo_relative(base_dir_parts, _clean_link_target(target))
+        if (
+            resolved is not None
+            and resolved != root_path
+            and resolved.startswith(ARCHITECTURE_DETAIL_DIR)
+            and resolved.endswith(".md")
+        ):
+            found.add(resolved)
+    return tuple(sorted(found))
+
+
+def _blob_size(runner: Runner, checkout, oid: str) -> int | None:
+    result = runner.run_binary(("git", "cat-file", "-s", oid), cwd=checkout, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_blob(runner: Runner, checkout, oid: str, size: int) -> bytes | None:
+    blob = runner.run_binary(
+        ("git", "cat-file", "blob", oid), cwd=checkout, max_bytes=size, check=False,
+    )
+    if blob.returncode != 0 or len(blob.stdout) != size:
+        return None
+    return blob.stdout
+
+
+def _decode_text(data: bytes) -> tuple[str | None, str | None]:
+    """Apply the shared NUL and UTF-8 checks; return (text, failure diagnostic)."""
+    if b"\x00" in data:
+        return None, "Architecture blob contains NUL bytes."
+    try:
+        return data.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "Architecture blob is not valid UTF-8."
+
+
+def _parse_ls_tree_batch(raw: bytes, paths: Sequence[str]) -> dict[str, tuple[bytes, bytes, bytes]] | None:
+    """Parse one batched listing; ``None`` when any entry is ambiguous or unparsable."""
+    wanted = {path.encode("utf-8"): path for path in paths}
+    found: dict[str, tuple[bytes, bytes, bytes]] = {}
+    for entry in raw.split(b"\x00"):
+        if not entry:
+            continue
+        try:
+            header, entry_path = entry.split(b"\t", 1)
+            mode, kind, oid = header.split(b" ", 2)
+        except ValueError:
+            return None
+        path = wanted.get(entry_path)
+        if path is None:
+            return None
+        if path in found:
+            return None
+        found[path] = (mode, kind, oid)
+    return found
+
+
+def _acquire_members(
+    runner: Runner, *, checkout, revision: str, paths: Sequence[str], max_bytes: int,
+) -> tuple[ArchitectureMember, ...]:
+    """Resolve every linked member from immutable Git objects, in bounded batches."""
+    members: list[ArchitectureMember] = []
+    for start in range(0, len(paths), ARCHITECTURE_LS_TREE_BATCH):
+        batch = list(paths[start:start + ARCHITECTURE_LS_TREE_BATCH])
+        # One entry is "<mode> <type> <oid>\t<path>\0"; allow generous slack.
+        bound = sum(len(path.encode("utf-8")) + 128 for path in batch)
+        parsed: dict[str, tuple[bytes, bytes, bytes]] | None
+        try:
+            listing = runner.run_binary(
+                ("git", "--literal-pathspecs", "ls-tree", "-z", revision, "--", *batch),
+                cwd=checkout, max_bytes=bound, check=False,
+            )
+        except AgentLoopError:
+            listing = None
+        if listing is None or listing.returncode != 0 or len(listing.stdout) > bound:
+            parsed = None
+        else:
+            parsed = _parse_ls_tree_batch(listing.stdout, batch)
+        for path in batch:
+            if parsed is None:
+                # A failed, truncated, or ambiguous listing is unknown, never missing.
+                members.append(ArchitectureMember(path, None, "unavailable"))
+                continue
+            entry = parsed.get(path)
+            if entry is None:
+                members.append(ArchitectureMember(path, None, "missing"))
+                continue
+            mode, kind, oid = entry
+            if kind != b"blob" or mode not in {b"100644", b"100755"} or not _OID_RE.fullmatch(oid):
+                members.append(ArchitectureMember(path, None, "unavailable"))
+                continue
+            members.append(ArchitectureMember(path, oid.decode("ascii"), "available"))
+    resolved: list[ArchitectureMember] = []
+    headings_read = 0
+    for member in members:
+        if member.availability != "available" or member.blob_oid is None:
+            resolved.append(member)
+            continue
+        try:
+            size = _blob_size(runner, checkout, member.blob_oid)
+        except AgentLoopError:
+            size = None
+        if size is None:
+            resolved.append(ArchitectureMember(member.path, member.blob_oid, "unavailable"))
+            continue
+        if size > max_bytes:
+            resolved.append(ArchitectureMember(member.path, member.blob_oid, "oversized", size))
+            continue
+        if headings_read >= ARCHITECTURE_MEMBER_HEADING_CAP:
+            resolved.append(ArchitectureMember(member.path, member.blob_oid, "available", size))
+            continue
+        headings_read += 1
+        try:
+            data = _read_blob(runner, checkout, member.blob_oid, size)
+        except AgentLoopError:
+            data = None
+        if data is None:
+            resolved.append(ArchitectureMember(member.path, member.blob_oid, "unavailable", size))
+            continue
+        text, failure = _decode_text(data)
+        if text is None:
+            resolved.append(ArchitectureMember(member.path, member.blob_oid, "binary", size))
+            continue
+        headings = _headings(text)
+        first = _bounded_heading(headings[0]) if headings else None
+        resolved.append(ArchitectureMember(member.path, member.blob_oid, "available", size, first))
+    return tuple(resolved)
+
+
+def _members_for_root(
+    runner: Runner, *, checkout, revision: str, root_text: str, root_path: str, max_bytes: int,
+) -> tuple[ArchitectureMember, ...]:
+    paths = _linked_detail_paths(root_text, root_path)
+    if not paths:
+        return ()
+    return _acquire_members(
+        runner, checkout=checkout, revision=revision, paths=paths, max_bytes=max_bytes,
+    )
+
+
 def acquire_architecture_snapshot(
     runner: Runner,
     *,
@@ -164,9 +521,12 @@ def acquire_architecture_snapshot(
     revision: str,
     path: str = DEFAULT_ARCHITECTURE_PATH,
     max_bytes: int = DEFAULT_ARCHITECTURE_READ_SIZE,
+    scan_ceiling: int | None = None,
 ) -> ArchitectureSnapshot:
-    """Read one architecture blob from an immutable Git revision."""
+    """Read the architecture set's root (and its linked members) from one immutable revision."""
     locator = ArchitectureLocator(repository, path)
+    if scan_ceiling is None:
+        scan_ceiling = DEFAULT_ARCHITECTURE_SCAN_CEILING
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise AgentLoopError("Architecture read size must be a positive integer.")
     listing = runner.run_binary(
@@ -201,10 +561,32 @@ def acquire_architecture_snapshot(
     except (TypeError, ValueError):
         return _snapshot_unavailable(locator, revision, "Git returned an invalid blob size.")
     if size > max_bytes:
+        diagnostic = f"Architecture blob is {size} bytes; limit is {max_bytes}. {_SPLIT_RECOMMENDATION}"
+        oversized = ArchitectureSnapshot(
+            repository=locator.repository, path=locator.path, revision=revision,
+            blob_oid=oid.decode("ascii"), sha256=None, availability="oversized", size=size,
+            diagnostic=f"{diagnostic} {_MEMBERSHIP_UNKNOWN_NOTE}", links_status="unscanned",
+        )
+        if size > scan_ceiling:
+            return oversized
+        try:
+            data = _read_blob(runner, checkout, oid.decode("ascii"), size)
+        except AgentLoopError:
+            data = None
+        text = _decode_text(data)[0] if data is not None else None
+        if text is None:
+            return oversized
+        # Links are discovered independently of headings, so a headingless
+        # oversized root keeps its members.
+        members = _members_for_root(
+            runner, checkout=checkout, revision=revision, root_text=text,
+            root_path=locator.path, max_bytes=max_bytes,
+        )
+        headings = tuple(_bounded_heading(item) for item in _headings(text)[:_OVERSIZED_HEADING_INDEX_CAP])
         return ArchitectureSnapshot(
             repository=locator.repository, path=locator.path, revision=revision,
             blob_oid=oid.decode("ascii"), sha256=None, availability="oversized", size=size,
-            diagnostic=f"Architecture blob is {size} bytes; limit is {max_bytes}.",
+            heading_index=headings, diagnostic=diagnostic, members=members, links_status="scanned",
         )
     blob = runner.run_binary(
         ("git", "cat-file", "blob", oid.decode("ascii")),
@@ -214,24 +596,22 @@ def acquire_architecture_snapshot(
     )
     if blob.returncode != 0 or len(blob.stdout) != size:
         return _snapshot_unavailable(locator, revision, "Architecture blob could not be read completely.")
-    if b"\x00" in blob.stdout:
+    text, failure = _decode_text(blob.stdout)
+    if text is None:
         return ArchitectureSnapshot(
             repository=locator.repository, path=locator.path, revision=revision,
             blob_oid=oid.decode("ascii"), sha256=hashlib.sha256(blob.stdout).hexdigest(),
-            availability="binary", size=size, diagnostic="Architecture blob contains NUL bytes.",
+            availability="binary", size=size, diagnostic=failure, links_status="unscanned",
         )
-    try:
-        text = blob.stdout.decode("utf-8")
-    except UnicodeDecodeError:
-        return ArchitectureSnapshot(
-            repository=locator.repository, path=locator.path, revision=revision,
-            blob_oid=oid.decode("ascii"), sha256=hashlib.sha256(blob.stdout).hexdigest(),
-            availability="binary", size=size, diagnostic="Architecture blob is not valid UTF-8.",
-        )
+    members = _members_for_root(
+        runner, checkout=checkout, revision=revision, root_text=text,
+        root_path=locator.path, max_bytes=max_bytes,
+    )
     return ArchitectureSnapshot(
         repository=locator.repository, path=locator.path, revision=revision,
         blob_oid=oid.decode("ascii"), sha256=hashlib.sha256(blob.stdout).hexdigest(),
         availability="available", size=size, content=text, heading_index=_headings(text),
+        members=members, links_status="scanned",
     )
 
 
@@ -327,7 +707,71 @@ def _snapshot_metadata(snapshot: ArchitectureSnapshot, label: str) -> str:
         lines.append(f"- Size: {snapshot.size} bytes")
     if snapshot.diagnostic:
         lines.append(f"- Read note: {sanitize_historical_text(snapshot.diagnostic)}")
+    if snapshot.links_status == "unscanned":
+        lines.append(_MEMBERSHIP_UNKNOWN_LINE)
     return "\n".join(lines)
+
+
+def _fit_listing(header: str, lines: Sequence[str], budget: int, more_template: str) -> str:
+    """Header plus as many lines as fit, then a count of the rest; '' if nothing fits."""
+    if not lines:
+        return ""
+    prefix = [0]
+    for line in lines:
+        prefix.append(prefix[-1] + len(line))
+    if len(header) + prefix[-1] + len(lines) - 1 <= budget:
+        return header + "\n".join(lines)
+    for count in range(len(lines) - 1, -1, -1):
+        more = more_template.format(n=len(lines) - count)
+        if len(header) + prefix[count] + count + len(more) <= budget:
+            return header + "\n".join([*lines[:count], more])
+    return ""
+
+
+def _member_index(members: Sequence[ArchitectureMember], budget: int) -> str:
+    """The detail-document index: path plus first heading, bounded by ``budget``."""
+    if not members or budget <= 0:
+        return ""
+    lines: list[str] = []
+    for member in sorted(members, key=lambda item: item.path):
+        path = sanitize_historical_text(member.path)
+        if member.availability != "available":
+            lines.append(f"- {path} — ({member.availability})")
+        elif member.first_heading:
+            lines.append(f"- {path} — {_sanitize_architecture_text(member.first_heading)}")
+        else:
+            lines.append(f"- {path}")
+    text = _fit_listing(
+        "\n\nDetail documents in the architecture set (open the file in the assigned checkout):\n",
+        lines, budget, "[{n} more members]",
+    )
+    if text:
+        return text
+    notice = (
+        f"\n\nArchitecture set: {len(members)} linked detail document(s); "
+        "index omitted for prompt budget."
+    )
+    return notice if len(notice) <= budget else ""
+
+
+def _render_oversized_snapshot(snapshot: ArchitectureSnapshot, metadata: str, max_chars: int) -> str:
+    """Identity, size and split diagnostic always; then bounded indexes, never prose."""
+    detail = _member_index(snapshot.members, max_chars - len(metadata) - 1)
+    budget = max_chars - len(metadata) - len(detail) - 1
+    index = ""
+    if snapshot.heading_index:
+        index = _fit_listing(
+            "\n\nSections available for targeted checkout inspection:\n",
+            [f"- {sanitize_historical_text(heading)}" for heading in snapshot.heading_index],
+            budget,
+            "[{n} more headings omitted for prompt budget]",
+        )
+        notice = "\n\nSection index omitted for prompt budget; inspect headings in the assigned checkout."
+    else:
+        notice = "\n\nNo section index is available; inspect the document in the assigned checkout directly."
+    if not index and len(notice) <= budget:
+        index = notice
+    return metadata + index + detail + "\n"
 
 
 def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: int = DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS, label: str = "Architecture context") -> str:
@@ -340,6 +784,11 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
         # that intentionally request a tiny display bound. Pair rendering
         # performs its own mandatory-identity admission check below.
         return metadata[:max_chars]
+    if snapshot.availability == "oversized":
+        return _render_oversized_snapshot(snapshot, metadata, max_chars)
+    # The detail-document index is budgeted after the mandatory identity and
+    # before the overview prose, so the overview truncates first (#1454).
+    detail = _member_index(snapshot.members, max_chars - len(metadata) - 1)
     index = ""
     if snapshot.heading_index:
         index = "\n\nSections available for targeted checkout inspection:\n" + "\n".join(
@@ -350,20 +799,34 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
     # Identity is mandatory. Indexes and prose are the first material to omit
     # under a tight budget; neither may be allowed to displace revision, blob,
     # digest, availability, or the diagnostic classification.
-    remaining = max_chars - len(metadata) - len(index) - len(overview_prefix) - 1
-    if remaining < len(omission):
+    truncation_status = "\n- Overview status: truncated; this is not complete coverage."
+    # With a detail index, reserve room for a truncated overview's status
+    # line so the render never collapses to identity-only.  Root-only
+    # rendering keeps its historical budget arithmetic unchanged.
+    reserve = len(omission) + (len(truncation_status) if detail and snapshot.content else 0)
+    remaining = max_chars - len(metadata) - len(index) - len(detail) - len(overview_prefix) - 1
+    if remaining < reserve:
         index = "\n\nSection index omitted for prompt budget; inspect headings in the assigned checkout."
-        remaining = max_chars - len(metadata) - len(index) - len(overview_prefix) - 1
+        remaining = max_chars - len(metadata) - len(index) - len(detail) - len(overview_prefix) - 1
+    if remaining < reserve and detail:
+        detail = _member_index(
+            snapshot.members,
+            max_chars - len(metadata) - len(index) - len(overview_prefix) - reserve - 1,
+        )
+        remaining = max_chars - len(metadata) - len(index) - len(detail) - len(overview_prefix) - 1
     if remaining < len(omission):
         # Returning identity-only text is deterministic and still bounded.
         return metadata
     if snapshot.content is not None and snapshot.is_available and remaining > 0:
-        text, truncated = _bounded_text(_sanitize_architecture_text(snapshot.content), remaining)
+        sanitized = _sanitize_architecture_text(snapshot.content)
+        if detail and len(sanitized) > remaining and remaining - len(truncation_status) >= len(omission):
+            remaining -= len(truncation_status)
+        text, truncated = _bounded_text(sanitized, remaining)
         if truncated:
-            metadata += "\n- Overview status: truncated; this is not complete coverage."
-        result = metadata + index + overview_prefix + text + "\n"
+            metadata += truncation_status
+        result = metadata + index + overview_prefix + text + detail + "\n"
     else:
-        result = metadata + index + overview_prefix + omission + "\n"
+        result = metadata + index + overview_prefix + omission + detail + "\n"
     if len(result) > max_chars:
         # This can only happen when adding the truncation status consumed part
         # of the reserved space. Re-render without optional material rather
@@ -372,13 +835,42 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
     return result
 
 
+def _comparison_prefix(pair: ArchitecturePair) -> str:
+    lines = [
+        "PR architecture comparison (advisory and untrusted; never a correctness waiver)",
+        f"- Change: {pair.change}",
+        f"- Merge base: {pair.merge_base_revision or '(unavailable)'}",
+    ]
+    unscanned = [
+        side for side, snapshot in (("base", pair.base), ("candidate", pair.candidate))
+        if snapshot.links_status == "unscanned"
+    ]
+    set_change = pair.set_change
+    if set_change != pair.change or pair.has_members or unscanned:
+        lines.append(f"- Architecture set change: {set_change}")
+    if unscanned:
+        lines.append(
+            "- Architecture set: membership unknown for the "
+            + " and ".join(unscanned)
+            + " root (root could not be scanned)"
+        )
+    changes = pair.member_changes
+    if changes:
+        shown = "; ".join(
+            f"{sanitize_historical_text(path)[:_ARCHITECTURE_HEADING_CHARS]} ({kind})"
+            for path, kind in changes[:_ARCHITECTURE_CHANGED_MEMBER_RENDER_CAP]
+        )
+        if len(changes) > _ARCHITECTURE_CHANGED_MEMBER_RENDER_CAP:
+            shown += f"; [{len(changes) - _ARCHITECTURE_CHANGED_MEMBER_RENDER_CAP} more changed members]"
+        lines.append(f"- Changed architecture set members: {shown}")
+    return "\n".join(lines) + "\n\n"
+
+
 def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT_ARCHITECTURE_AGGREGATE_CHARS) -> str:
     if max_chars <= 0:
         raise AgentLoopError("Architecture aggregate render size must be positive.")
-    comparison_prefix = (
-        "PR architecture comparison (advisory and untrusted; never a correctness waiver)\n"
-        f"- Change: {pair.change}\n- Merge base: {pair.merge_base_revision or '(unavailable)'}\n\n"
-    )
+    # Members are named, never quoted: only the root snapshots carry text.
+    comparison_prefix = _comparison_prefix(pair)
     if len(comparison_prefix) + 2 > max_chars:
         raise AgentLoopError("Architecture aggregate budget is too small for comparison identity.")
     candidate_label = "Candidate architecture snapshot"
@@ -410,6 +902,57 @@ def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT
 
 def architecture_material(context: object | None) -> bool:
     return bool(getattr(context, "material", False))
+
+
+def _context_sides(context: object | None) -> tuple[ArchitectureSnapshot, ...]:
+    if isinstance(context, ArchitecturePair):
+        return (context.base, context.candidate)
+    if isinstance(context, ArchitectureSnapshot):
+        return (context,)
+    return ()
+
+
+def architecture_injectable(context: object | None) -> bool:
+    """Prompt gate for the architecture block only (#1454).
+
+    Material content, or an oversized root whose identity, size and split
+    diagnostic must never be silently dropped.  Every other material-gated
+    prompt mode keeps using :func:`architecture_material`.
+    """
+    if architecture_material(context):
+        return True
+    return any(side.availability == "oversized" for side in _context_sides(context))
+
+
+def architecture_set_guidance_applicable(context: object | None) -> bool:
+    """Whether set-specific architecture-impact guidance applies."""
+    return any(
+        side.members or side.availability == "oversized" for side in _context_sides(context)
+    )
+
+
+def architecture_set_paths(context: object | None) -> frozenset[str] | None:
+    """The root plus every linked member path, or ``None`` when membership is unknowable.
+
+    ``None`` (skip validation) covers a disabled or absent context, a missing
+    or unavailable root, and any side whose root could not be scanned.
+    """
+    sides = _context_sides(context)
+    if not sides or any(side.links_status == "unscanned" for side in sides):
+        return None
+    scanned = [side for side in sides if side.links_status == "scanned"]
+    if not scanned:
+        return None
+    paths: set[str] = set()
+    for side in scanned:
+        paths.add(side.path)
+        paths.update(member.path for member in side.members)
+    return frozenset(paths)
+
+
+def resolve_architecture_document_path(value: object) -> str | None:
+    """Normalize a reported repository-relative path with the link resolver."""
+    return _resolve_repo_relative((), value)
 
 
 def freeze_architecture_context(
