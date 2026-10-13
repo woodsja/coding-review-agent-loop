@@ -6488,6 +6488,15 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     for name in list(_golden_os.environ):
         if name.startswith("AGENT_LOOP_"):
             monkeypatch.delenv(name)
+    # The worker-budget estimate depends on the host's CPUs and cgroup
+    # ceiling, which differ between the machine that recorded the fixture
+    # and CI runners; pin it to the recorded estimate.
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
+    monkeypatch.setattr(
+        prompts_module, "preliminary_worker_budget",
+        lambda _config: WorkerBudget(8, "derived", "clamp", "cpu", {}, True),
+    )
     golden = _golden_json.loads(_ROOT_ONLY_PROMPT_GOLDEN.read_text(encoding="utf-8"))
     snapshot = _set_snapshot(links_status="scanned", members=())
     config = make_config(tmp_path, architecture_context=snapshot)
