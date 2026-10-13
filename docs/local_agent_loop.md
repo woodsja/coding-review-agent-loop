@@ -4838,6 +4838,145 @@ agent-loop issue 123 --repo OWNER/REPO --triage --triage-model gpt-5.5
   copy written by the authenticated orchestrator actor carries authority.
   Triage never edits the issue.
 
+### Offline triage backtest
+
+`agent-loop triage backtest` measures a triage provider against outcomes that
+already happened. It reads only the [outcome history export](#outcome-history-export)
+JSON files you pass, runs your provider command once per labeled issue, and
+writes one report. It makes no GitHub call, starts no agent, posts nothing and
+never changes routing: `agent-loop issue --triage` stays advisory whatever the
+report says.
+
+```bash
+agent-loop history export --repo OWNER/REPO --output history.json
+agent-loop triage backtest --history history.json \
+  --provider-command "python3 my_provider.py --model local" \
+  --output backtest.json
+agent-loop triage backtest --history a.json --history b.json \
+  --provider-command ./provider.sh --output backtest.md --format markdown
+```
+
+Options: `--history FILE` (required, repeatable), `--provider-command CMD`
+(required), `--output PATH` (required), `--format json|markdown` (default
+`json`), `--repo OWNER/NAME` (only evaluate targets from this repository),
+`--provider-timeout S` (seconds per call, 1 to 600, default 60),
+`--discuss-min-plan-rounds N` (default 4, minimum 2),
+`--direct-max-pr-rounds N` (default 2), `--hybrid-target-accuracy X` (in
+(0, 1], default 0.9) and `--hybrid-min-support N` (default 10). Every value is
+checked before the first provider call.
+
+- **Corpus.** Rows are keyed by repository and issue number. A row repeated
+  byte-for-byte across files collapses to one; two different rows for the same
+  issue are refused, so each issue is evaluated once.
+- **Outcome labels (label spec v1).** Labels come only from verified measured
+  counts, never from `route`, `route_taken`, `terminal_states` or a triage
+  record. In order: no label when `outcome_complete` is not true
+  (`outcome-incomplete`), when infrastructure coverage is not complete
+  (`infrastructure-coverage-partial`), or when one of `human_decision_stops`,
+  `step_backs`, `plan_rounds`, `pr_rounds` or `merged` is unavailable
+  (`count-unavailable:<column>`; an unavailable count is never read as zero).
+  Then `discuss-first` for any human-decision stop or step-back, or at least
+  `--discuss-min-plan-rounds` plan rounds; no label for an unmerged outcome
+  (`no-delivery-outcome`); `direct` for a merged outcome with at most one plan
+  round and at most `--direct-max-pr-rounds` PR rounds; otherwise
+  `plan-first`. The thresholds are a heuristic, not ground truth; the report
+  echoes them and counts unlabeled rows by reason.
+- **Targets and leak-free requests.** A labeled row is sent only when its
+  run-start snapshot is usable and has title and body, `run_started_at`
+  parses, and the snapshot is dated at or before the run start. Otherwise it is
+  counted as excluded (`no-usable-snapshot`, `no-run-start`, `snapshot-undated`
+  or `snapshot-after-run-start`; the last covers a snapshot matched after an
+  issue edit that came after the first record). The cutoff `T` is the run
+  start. Similar issues use the same retrieval as advisory triage: same
+  repository, outcome complete and available strictly before `T`, snapshot
+  dated before `T`. The request never carries the target's own outcome or
+  label.
+- **Splits.** Targets are ordered by `T`, repository and issue; the first half
+  (rounded up) is `calibration` and the rest is `holdout`. Each issue is in
+  exactly one split.
+
+The request on stdin is one JSON object:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "triage_backtest_request",
+  "repo": "OWNER/REPO",
+  "issue_number": 1337,
+  "cutoff": "2026-09-01T00:00:00+00:00",
+  "title": "run-start title",
+  "body": "run-start body",
+  "signals": [{"name": "open-design-question", "route_hint": "discuss-first", "evidence": ["..."]}],
+  "similar_issues": [{"issue_number": 1300, "score": 0.42, "title": "...", "body": "...",
+                      "snapshot_status": "never-edited", "snapshot_as_of": "...", "outcome": {"...": "..."}}],
+  "routes": ["discuss-first", "plan-first", "direct"],
+  "reason_signals": ["open-design-question", "..."],
+  "answer_shapes": ["issue_triage", "issue_triage_probability"]
+}
+```
+
+The answer on stdout is either the [advisory triage](#advisory-issue-triage)
+route answer (`kind: issue_triage`, validated exactly as live triage does) or a
+probability answer with an explicit abstain, for classifiers such as TypeSafe
+System One:
+
+```json
+{"schema_version": 1, "kind": "issue_triage_probability",
+ "probabilities": {"discuss-first": 0.7, "plan-first": 0.2, "direct": 0.1},
+ "abstain": false}
+```
+
+The probability answer must have exactly these keys and nothing after the
+object; each probability is a finite number in [0, 1] and they sum to 1 within
+0.001. The prediction is the most likely route and its probability is the
+confidence.
+
+- **Abstain and invalid answers.** `unsure: true` (or an unrecognized route),
+  `abstain: true` (`provider-abstained`) and an exact tie for the top
+  probability (`probability-tie`) are well-formed abstains. A timeout,
+  stdout over 64 KiB, a launch failure (`launch-failed:<errno>`, never a path),
+  a nonzero exit (`exit-<code>`), non-UTF-8 output or a validation failure
+  (`invalid-answer: ...`) is invalid. Both count as abstain with the reason
+  recorded per target; one failed call never stops the backtest. Every abstain
+  has null confidence.
+- **Metrics.** For calibration, holdout and all targets: per-route support,
+  predictions, precision and recall, coverage, accuracy on covered targets and
+  the invalid count. A zero denominator is `null` (`n/a` in Markdown). The
+  `abstain_excluded` view leaves abstains unpredicted; the `as_deployed` view
+  maps well-formed abstains to plan-first, as live triage does, and leaves
+  invalid answers abstained, as live triage posts nothing. A majority baseline
+  (the most frequent calibration label; ties prefer plan-first, then
+  discuss-first, then direct) is scored on every split.
+- **Hybrid routing finding.** Only committed probability answers (not
+  abstains or ties) count. For each threshold 0.50, 0.55, ..., 0.95 the report
+  gives, per split, the answers at or above it, their accuracy and their
+  coverage. The first matching rule decides: `not-applicable` when the
+  provider returned no valid probability answer; `insufficient-data` when
+  either split has fewer than `--hybrid-min-support` committed answers;
+  `not-supported` when no threshold reaches the support and
+  `--hybrid-target-accuracy` on calibration; otherwise `supported` or
+  `not-supported` by whether holdout also reaches them at that threshold.
+  `decided_by` names the rule. This is a measurement only; adopting hybrid
+  routing would need a separate change.
+- **Execution limits.** The command line is split without a shell (a relative
+  executable path is resolved against your working directory) and runs in a
+  fresh temporary directory, in its own process group, with `GH_TOKEN`,
+  `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` removed.
+  stderr is drained and only its first 16 KiB are kept (`stderr_truncated`
+  marks more); its first 200 characters go to the log for a failed call. After
+  every call the whole process group is sent SIGTERM, then SIGKILL, and the
+  temporary directory is removed. A process that leaves the group itself
+  (`setsid`) is not contained.
+- **Report.** JSON (sorted keys, no timestamps, the provider recorded only as
+  its executable name and an argv hash) or Markdown rendered from the same
+  data, written atomically. The same corpus and provider answers give a
+  byte-identical report. The exit code is 0 whenever the report is written,
+  even when every answer is invalid; a one-line summary goes to stderr.
+- **Data handling.** The provider receives issue titles, bodies and similar
+  issues. Running it against an external service is an operator decision that
+  needs approval for which repositories' text may be sent. Tests use fixture
+  corpora and a local fixture provider only.
+
 ## Workdirs
 
 ### Checkout claims

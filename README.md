@@ -568,6 +568,7 @@ agent-loop task "Add a health-check endpoint" \
 | `agent-loop managed-ci preflight` | You want a read-only readiness report for managed CI. |
 | `agent-loop issue --triage` | You want an advisory route recommendation (discuss-first, plan-first or direct) posted before the run's first agent turn; the run still takes the route you selected. See [advisory issue triage](docs/local_agent_loop.md#advisory-issue-triage). |
 | `agent-loop history export` | You want a read-only per-issue outcome table (route taken, plan/PR rounds, step-backs, human-decision stops, merge state, infrastructure failures, run-start snapshot). See [outcome history export](docs/local_agent_loop.md#outcome-history-export). |
+| `agent-loop triage backtest` | You want an offline, report-only measurement of a triage provider command against outcome labels from `history export` files (per-route precision/recall, majority baseline, hybrid-routing threshold finding). See [offline triage backtest](docs/local_agent_loop.md#offline-triage-backtest). |
 
 Run `agent-loop <command> --help` for the complete options for one workflow.
 The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume

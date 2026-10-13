@@ -1551,6 +1551,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     history_export.add_argument("--gh-cmd", default="gh", help="GitHub CLI executable (default: gh).")
 
+    triage_command = subparsers.add_parser(
+        "triage", help="Offline triage evaluation over local history export files."
+    )
+    triage_subparsers = triage_command.add_subparsers(dest="triage_command", required=True)
+    triage_backtest = triage_subparsers.add_parser(
+        "backtest",
+        help=(
+            "Run a triage provider command over local `history export` files and report "
+            "per-route precision/recall against measured outcome labels, a majority "
+            "baseline and a hybrid-routing threshold finding. Offline and report-only: "
+            "no GitHub call, no agent, and routing is unchanged."
+        ),
+    )
+    triage_backtest.add_argument(
+        "--history", type=Path, action="append", required=True, metavar="FILE",
+        help="A stage-1 `history export` JSON file (repeatable).",
+    )
+    triage_backtest.add_argument(
+        "--provider-command", required=True, metavar="CMD",
+        help=(
+            "Provider command line (split without a shell). It reads one JSON request "
+            "on stdin and writes one route or probability answer on stdout."
+        ),
+    )
+    triage_backtest.add_argument("--output", type=Path, required=True, help="Report output path.")
+    triage_backtest.add_argument(
+        "--format", choices=("json", "markdown"), default="json", help="Report format (default: json)."
+    )
+    triage_backtest.add_argument(
+        "--repo", default=None, metavar="OWNER/NAME",
+        help="Only evaluate targets from this repository; retrieval stays same-repository.",
+    )
+    triage_backtest.add_argument(
+        "--provider-timeout", type=int, default=60, metavar="S",
+        help="Seconds per provider call, 1 to 600 (default: 60).",
+    )
+    triage_backtest.add_argument(
+        "--discuss-min-plan-rounds", type=int, default=4, metavar="N",
+        help="Plan rounds at or above which an outcome is labeled discuss-first (default: 4, minimum 2).",
+    )
+    triage_backtest.add_argument(
+        "--direct-max-pr-rounds", type=int, default=2, metavar="N",
+        help="Most PR rounds a merged one-plan-round outcome may take to be labeled direct (default: 2).",
+    )
+    triage_backtest.add_argument(
+        "--hybrid-target-accuracy", type=float, default=0.9, metavar="X",
+        help="Confident-answer accuracy the hybrid finding requires, in (0, 1] (default: 0.9).",
+    )
+    triage_backtest.add_argument(
+        "--hybrid-min-support", type=int, default=10, metavar="N",
+        help="Committed probability answers each split needs for a hybrid finding (default: 10).",
+    )
+
     task = subparsers.add_parser(
         "task",
         help="Ask the coder to implement a free-form task, then review it.",
@@ -2419,6 +2472,32 @@ def _history_export_command(args: argparse.Namespace) -> int:
         return 1
 
 
+def _triage_backtest_command(args: argparse.Namespace) -> int:
+    """``agent-loop triage backtest``: local reads, provider calls and one local write."""
+    from .triage_backtest import LabelSpec, run_backtest, summary_line
+
+    try:
+        report = run_backtest(
+            tuple(args.history),
+            provider_command=args.provider_command,
+            output=args.output,
+            output_format=args.format,
+            repo=args.repo,
+            provider_timeout=args.provider_timeout,
+            spec=LabelSpec(
+                discuss_min_plan_rounds=args.discuss_min_plan_rounds,
+                direct_max_pr_rounds=args.direct_max_pr_rounds,
+            ),
+            hybrid_target_accuracy=args.hybrid_target_accuracy,
+            hybrid_min_support=args.hybrid_min_support,
+        )
+        print(f"agent-loop: {summary_line(report)}", file=sys.stderr)
+        return 0
+    except (AgentLoopError, OSError) as exc:
+        print(f"agent-loop: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     tokens = list(sys.argv[1:] if argv is None else argv)
     if tokens and tokens[0] == "inspect":
@@ -2461,6 +2540,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_tests_command(args)
     if args.command == "history" and args.history_command == "export":
         return _history_export_command(args)
+    if args.command == "triage" and args.triage_command == "backtest":
+        return _triage_backtest_command(args)
     if args.command == "managed-ci" and args.managed_ci_command == "preflight":
         try:
             context = ManagedCiProbeContext(args.repo, args.gh_cmd, Path.cwd())
