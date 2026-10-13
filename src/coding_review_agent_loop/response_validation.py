@@ -1428,6 +1428,8 @@ TRIAGE_ROUTES = ("discuss-first", "plan-first", "direct")
 TRIAGE_FALLBACK_ROUTE = "plan-first"
 TRIAGE_MAX_REASONS = 8
 TRIAGE_MAX_REASON_CHARS = 600
+# The only text allowed after the JSON object: one standalone signature line.
+_TRIAGE_SIGNATURE_RE = re.compile(r"-- [^\r\n{}\[\]]+")
 
 
 @dataclass(frozen=True)
@@ -1461,8 +1463,11 @@ def _triage_json_object(text: str) -> dict:
         raise AgentLoopError(f"Triage response is not valid JSON: {exc.msg}.") from exc
     if not isinstance(payload, dict):
         raise AgentLoopError("Triage response must be a JSON object.")
-    if "{" in stripped[end:]:
-        raise AgentLoopError("Triage response must contain exactly one JSON object.")
+    suffix = stripped[end:].strip()
+    if suffix and not _TRIAGE_SIGNATURE_RE.fullmatch(suffix):
+        raise AgentLoopError(
+            "Triage response may contain only one JSON object followed by a signature line."
+        )
     return payload
 
 

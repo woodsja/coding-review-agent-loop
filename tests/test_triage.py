@@ -230,6 +230,11 @@ def test_unsure_or_unknown_route_is_reported_as_plan_first(tmp_path, capsys, rou
     assert "advisory triage recommends `plan-first` (unsure:" in log_text
 
 
+def test_triage_validator_accepts_only_a_bare_object_or_one_signature():
+    for text in (_triage_output(), _triage_output().split("\n", 1)[0], _triage_output() + "\n"):
+        assert parse_triage_response(text, allowed_signals=TRIAGE_REASON_SIGNALS).route == "discuss-first"
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -240,8 +245,15 @@ def test_unsure_or_unknown_route_is_reported_as_plan_first(tmp_path, capsys, rou
             "schema_version": 1, "kind": "issue_triage", "route": "direct", "unsure": "no",
             "reasons": [{"signal": "no-signal", "explanation": "x"}],
         }),
+        _triage_output().replace("\n-- OpenAI Codex", '\n["direct"]\n-- OpenAI Codex'),
+        _triage_output().replace("\n-- OpenAI Codex", "\n42"),
+        _triage_output().replace("\n-- OpenAI Codex", "\nActually the route is direct.\n-- OpenAI Codex"),
+        _triage_output().replace("\n-- OpenAI Codex", "\n-- OpenAI Codex\n-- OpenAI Codex"),
     ],
-    ids=["prose", "missing-reasons", "unknown-signal", "non-boolean-unsure"],
+    ids=[
+        "prose", "missing-reasons", "unknown-signal", "non-boolean-unsure",
+        "trailing-json-array", "trailing-scalar", "trailing-prose", "two-signatures",
+    ],
 )
 def test_triage_validator_is_strict(text):
     with pytest.raises(AgentLoopError):
@@ -267,6 +279,11 @@ def _row(number, *, repo="OWNER/REPO", complete=True, available="2026-09-01T00:0
         "human_decision_stops": {"value": stops, "evidence": "verified"},
         "pr_rounds": {"value": None, "evidence": "unavailable"},
         "merged": {"value": False, "evidence": "verified"},
+        "final_plan_size": {"value": 4200, "evidence": "verified"},
+        "infrastructure_failures": [{"category": "auth-expiry", "round": 2}],
+        "infrastructure_coverage": "partial",
+        "missing_reviewer_records": [],
+        "terminal_states": ["issue-closed"],
     }
 
 
@@ -329,6 +346,14 @@ def test_retrieved_stall_feeds_the_prior_stalled_plan_signal(tmp_path):
     assert any("#10" in item for item in stall.evidence)
     (prompt,) = _codex_prompts(runner)
     assert "#10 (similarity" in prompt and "#11" not in prompt
+    # The model sees the retrieved snapshot and the complete outcome row.
+    assert "Run-start body:\ndegraded payload normalization" in prompt
+    for evidence in (
+        '"final_plan_size"', '"infrastructure_failures"', '"infrastructure_coverage": "partial"',
+        '"missing_reviewer_records"', '"terminal_states"', '"outcome_available_at"',
+        '"snapshot_status": "never-edited"', "auth-expiry",
+    ):
+        assert evidence in prompt, evidence
     assert parse_triage_record(_triage_comments(runner)[0])["similar_issues"] == [10]
 
 
@@ -546,13 +571,21 @@ def _parallel_batch(tmp_path, monkeypatch, *, codex_outputs):
         in_triage.set()
         assert release.wait(10)
 
+    # Appended inside the hook, before it returns and the completion Event is set.
+    triage_finished: list[str] = []
+
     def blocking_post(*args, **kwargs):
         hold()
-        return real_post(*args, **kwargs)
+        result = real_post(*args, **kwargs)
+        triage_finished.append("posted")
+        return result
 
     def blocking_failure_log(config_arg, message):
         if "advisory triage failed" in message:
             hold()
+            result = real_log(config_arg, message)
+            triage_finished.append("failed")
+            return result
         return real_log(config_arg, message)
 
     monkeypatch.setattr(triage_module, "post_trusted_issue_comment", blocking_post)
@@ -560,14 +593,12 @@ def _parallel_batch(tmp_path, monkeypatch, *, codex_outputs):
     assert triage_module.arm_issue_triage(
         runner, config=config, usage_context=usage, issue_context=_issue(), operator_route="plan-first"
     )
-    started: dict[str, float] = {}
-    triage_done: list[float] = []
+    started: dict[str, tuple[bool, int]] = {}
 
     def role_turn(name):
         usage.note_agent_dispatch()
-        if name == "owner":
-            triage_done.append(time.monotonic())
-        started[name] = time.monotonic()
+        # What this role turn observes when it would invoke its backend.
+        started[name] = (usage._dispatch_hook_done.is_set(), len(triage_finished))
 
     owner = threading.Thread(target=role_turn, args=("owner",))
     owner.start()
@@ -580,7 +611,8 @@ def _parallel_batch(tmp_path, monkeypatch, *, codex_outputs):
     owner.join(10)
     sibling.join(10)
     assert not owner.is_alive() and not sibling.is_alive(), "deadlock"
-    assert started["sibling"] >= triage_done[0]
+    assert started["sibling"] == (True, 1), "the sibling dispatched before triage finished"
+    assert started["owner"] == (True, 1)
     assert lock_free_during_triage == [True]
     return runner, usage
 
@@ -901,3 +933,99 @@ def test_recovery_commands_never_replay_the_one_shot_triage_flags(tmp_path):
         )
         assert "--triage" not in rendered and "history.json" not in rendered
         assert "gpt-triage" not in rendered and "--reviewer codex" in rendered
+
+
+# ---------------------------------------------------------------------------
+# triage-first-dispatch-hook: a real plan-first resume whose first dispatch is
+# the parallel reviewer batch
+# ---------------------------------------------------------------------------
+
+TRIAGE_PROMPT_PREFIX = "Triage GitHub issue #56"
+
+
+class _BarrierProbeRunner(FakeRunner):
+    """Records, at every backend spawn, whether the triage hook had completed."""
+
+    def __init__(self, *, raise_triage=False, **kwargs):
+        super().__init__(**kwargs)
+        self.usage_context = None
+        self.raise_triage = raise_triage
+        self.spawns: list[tuple[str, bool, bool]] = []
+        self._spawn_lock = threading.Lock()
+
+    def run_with_log(self, args, *, cwd, **kwargs):
+        cmd = [str(arg) for arg in args]
+        backend = {"codex": "codex", "gemini": "gemini", "claude": "claude"}.get(cmd[0] if cmd else "")
+        if backend is not None and self.usage_context is not None:
+            text = " ".join(cmd) + str(kwargs.get("input_text") or "")
+            is_triage = TRIAGE_PROMPT_PREFIX in text
+            with self._spawn_lock:
+                self.spawns.append(
+                    (backend, is_triage, self.usage_context._dispatch_hook_done.is_set())
+                )
+            if is_triage and self.raise_triage:
+                raise RuntimeError("triage backend crashed")
+            if not is_triage:
+                time.sleep(0.05)  # widen the window in which an early sibling would show
+        return super().run_with_log(args, cwd=cwd, **kwargs)
+
+
+def _resume_parallel_plan_with_triage(tmp_path, *, raise_triage):
+    from agent_loop_helpers import structured_plan_review, structured_plan_state
+
+    runner = _BarrierProbeRunner(
+        raise_triage=raise_triage,
+        claude_outputs=[structured_plan_state()], codex_outputs=[], gemini_outputs=[],
+        authenticated_actor=("agent-loop", 4242), serve_rest_issue_comments=True,
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
+    )
+    # First invocation: the planner posts round 1, then both reviewers fail.
+    with pytest.raises(Exception):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert runner.claude_outputs == []
+    planner_comments = len(runner.comments)
+
+    # Resume with --triage: the first dispatch is the parallel reviewer batch.
+    runner.codex_outputs = (
+        [] if raise_triage else [_triage_output("discuss-first")]
+    ) + [structured_plan_review(summary="Codex resumed review.")]
+    runner.gemini_outputs = [
+        structured_plan_review(summary="Gemini resumed review.", reviewer="Google Gemini")
+    ]
+    resumed = replace(config, triage=True)
+    usage = _new_usage_context(resumed)
+    runner.usage_context = usage
+    assert run_issue_loop(
+        runner, issue_number=56, config=resumed, plan_first=True, usage_context=usage
+    ) == 0
+    return runner, usage, planner_comments
+
+
+@pytest.mark.parametrize("raise_triage", [False, True], ids=["triage-succeeds", "triage-backend-raises"])
+def test_plan_first_resume_parallel_batch_waits_for_the_real_triage_turn(tmp_path, raise_triage):
+    runner, usage, planner_comments = _resume_parallel_plan_with_triage(
+        tmp_path, raise_triage=raise_triage
+    )
+    triage_spawns = [spawn for spawn in runner.spawns if spawn[1]]
+    reviewer_spawns = [spawn for spawn in runner.spawns if not spawn[1]]
+    # Triage ran exactly once, as the first backend spawn, before completion was signalled.
+    assert triage_spawns == [("codex", True, False)]
+    assert runner.spawns[0] == triage_spawns[0]
+    # Both reviewers of the parallel batch ran, and only after triage completed.
+    assert sorted(backend for backend, _triage, _done in reviewer_spawns) == ["codex", "gemini"]
+    assert all(done for _backend, _triage, done in reviewer_spawns)
+    assert usage._dispatch_hook_state == "done"
+    reviews = [comment for comment in runner.comments[planner_comments:] if "resumed review" in comment]
+    assert len(reviews) == 2
+    triage_comments = _triage_comments(runner)
+    if raise_triage:
+        # The raising backend leaves no triage record and no comment; reviewers still ran.
+        assert triage_comments == []
+        assert len(usage.records) == 2
+    else:
+        # Exactly one nested triage usage record, ahead of the two reviewer records.
+        assert len(triage_comments) == 1
+        assert runner.comments.index(triage_comments[0]) < runner.comments.index(reviews[0])
+        assert len(usage.records) == 3 and usage.records[0].agent == "codex"

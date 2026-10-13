@@ -406,6 +406,41 @@ def render_similar_block(similar: Sequence[SimilarIssue], *, history_note: str) 
     return "\n".join(lines)
 
 
+_PROMPT_SNAPSHOT_BODY_CHARS = 4_000
+
+
+def render_similar_prompt_block(similar: Sequence[SimilarIssue], *, history_note: str) -> str:
+    """The model's view of each retrieved issue: its run-start snapshot and full outcome row.
+
+    The comment uses the shorter :func:`render_similar_block`; the prompt keeps
+    every outcome column, including plan size and infrastructure evidence, so
+    the model can tell difficult work from infrastructure stops.
+    """
+    if not similar:
+        return f"- None. {history_note}"
+    parts = [f"- {history_note}"]
+    for item in similar:
+        snapshot = item.row.get("snapshot")
+        snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+        body = str(snapshot.get("body") or "")
+        if len(body) > _PROMPT_SNAPSHOT_BODY_CHARS:
+            body = body[:_PROMPT_SNAPSHOT_BODY_CHARS] + "\n[snapshot body truncated]"
+        outcome = {key: value for key, value in item.row.items() if key != "snapshot"}
+        outcome["snapshot_status"] = snapshot.get("status")
+        outcome["snapshot_as_of"] = snapshot.get("as_of")
+        parts.append(
+            "\n".join([
+                f"### Similar issue #{item.issue_number} (similarity {item.score:.2f})",
+                f"Run-start title: {sanitize_untrusted_prose(str(snapshot.get('title') or '(untitled)'))}",
+                "Run-start body:",
+                sanitize_untrusted_prose(body) or "(empty)",
+                "Outcome row (history export):",
+                sanitize_untrusted_prose(json.dumps(outcome, indent=2, sort_keys=True, ensure_ascii=False)),
+            ])
+        )
+    return "\n\n".join(parts)
+
+
 def _encode_record(payload: Mapping[str, object]) -> str:
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -548,7 +583,7 @@ def run_issue_triage(
             triage_config,
             agent=agent,
             signals_block=render_signals_block(signals),
-            similar_block=render_similar_block(similar, history_note=history_note),
+            similar_block=render_similar_prompt_block(similar, history_note=history_note),
             signal_names=TRIAGE_REASON_SIGNALS,
         )
         response = _run_validated_agent(
@@ -643,6 +678,8 @@ __all__ = [
     "extract_signals",
     "load_triage_history",
     "parse_triage_record",
+    "render_similar_block",
+    "render_similar_prompt_block",
     "render_triage_comment",
     "resolve_triage_backend",
     "retrieval_exclusion",
