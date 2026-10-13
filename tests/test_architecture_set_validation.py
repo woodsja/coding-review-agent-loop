@@ -374,3 +374,20 @@ def test_every_coder_invocation_wires_the_membership_hook():
             wired += 1
     # task, direct issue, approved-plan issue implementation, PR follow-up.
     assert wired >= 4
+
+
+def test_a_parenthesized_member_is_accepted_and_a_code_span_link_is_rejected(tmp_path):
+    member = "docs/architecture/component(v2).md"
+    config, _repo = _coder_repo(tmp_path, {
+        "ARCHITECTURE.md": (
+            f"# Root\n\nSee [component]({member}).\n\n"
+            "Code `start\n[demo](docs/architecture/demo.md) end`.\n"
+        ),
+        member: "# Component\n",
+        "docs/architecture/demo.md": "# Demo\n",
+    })
+    runner = FakeRunner(claude_outputs=[_task_output("docs/architecture/demo.md"), _task_output(member)])
+    response = _run(runner, tmp_path, "task", _hook(config))
+    first, second = _prompts(runner)
+    assert SECTION in second
+    assert _path_of(response) == member

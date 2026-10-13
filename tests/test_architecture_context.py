@@ -708,3 +708,55 @@ def test_missing_root_has_no_set(tmp_path):
     assert architecture_set_paths(snapshot) is None
     assert not architecture_injectable(snapshot)
     assert architecture_set_paths(None) is None
+
+
+# Markdown constructs that span lines or nest (#1459 review items 1 and 2):
+# discovery is paragraph-scoped, so each case is one root document whose
+# linked members must be exactly ``expected``.
+@pytest.mark.parametrize(
+    "root,expected",
+    [
+        ("[c](docs/architecture/component(v2).md)\n", ("docs/architecture/component(v2).md",)),
+        ("[c](docs/architecture/a(b(c)).md \"Title\")\n", ("docs/architecture/a(b(c)).md",)),
+        ("[c](docs/architecture/esc\\(1\\).md)\n", ("docs/architecture/esc(1).md",)),
+        ("See the [billing\ncomponent](docs/architecture/billing.md).\n", ("docs/architecture/billing.md",)),
+        ("See [billing](\ndocs/architecture/billing.md\n'Title')\n", ("docs/architecture/billing.md",)),
+        ("See [billing].\n\n[billing]:\n  docs/architecture/billing.md\n", ("docs/architecture/billing.md",)),
+        ("[nested [label]](docs/architecture/nested.md)\n", ("docs/architecture/nested.md",)),
+        ("Code `start\n[demo](docs/architecture/demo.md) end` here.\n", ()),
+        ("Code ``a ` b\n[demo](docs/architecture/demo.md)`` here.\n", ()),
+        ("```python\n[x](docs/architecture/x.md)\n``` python\n[y](docs/architecture/y.md)\n```\n", ()),
+        ("~~~~\n[x](docs/architecture/x.md)\n~~~\n[y](docs/architecture/y.md)\n~~~~\n", ()),
+        ("```\n[x](docs/architecture/x.md)\n```\n\n[z](docs/architecture/z.md)\n", ("docs/architecture/z.md",)),
+        ("Literal ``` fence `[x](docs/architecture/x.md)` [y](docs/architecture/y.md)\n", ("docs/architecture/y.md",)),
+        ("Unclosed `tick [z](docs/architecture/z.md)\n", ("docs/architecture/z.md",)),
+        ("[broken](docs/architecture/open(.md\n", ()),
+        ("![image](docs/architecture/pic.md)\n", ()),
+        ("[a][b]\n\n[b]: <docs/architecture/angle (x).md>\n", ("docs/architecture/angle (x).md",)),
+    ],
+    ids=[
+        "balanced-parens", "nested-parens-title", "escaped-parens", "multiline-text",
+        "destination-next-line", "definition-next-line", "nested-brackets",
+        "multiline-code-span", "double-backtick-span", "info-string-not-closing",
+        "short-tilde-not-closing", "fence-then-link", "backtick-info-not-fence",
+        "unmatched-backtick-literal", "unbalanced-destination", "image", "angle-definition",
+    ],
+)
+def test_link_discovery_handles_spanning_and_nested_markdown(root, expected):
+    assert _linked_detail_paths(root, "ARCHITECTURE.md") == expected
+
+
+def test_parenthesized_member_is_acquired_validated_and_compared(tmp_path):
+    member = "docs/architecture/component(v2).md"
+    base = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": f"# Root\n\nSee [component]({member}).\n",
+        member: "# Component\n",
+    })
+    snapshot = _snapshot(tmp_path, base)
+    assert [(m.path, m.availability) for m in snapshot.members] == [(member, "available")]
+    assert member in architecture_set_paths(snapshot)
+    candidate = _write(tmp_path, {member: "# Component v2\n"})
+    pair = _pair(tmp_path, base, candidate)
+    assert pair.change == "unchanged"
+    assert pair.set_change == "modified"
+    assert pair.member_changes == ((member, "modified"),)

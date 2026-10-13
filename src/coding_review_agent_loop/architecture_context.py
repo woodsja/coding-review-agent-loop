@@ -300,35 +300,187 @@ def _resolve_repo_relative(base_dir_parts: Iterable[str], value: object) -> str 
         return None
 
 
-_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_INLINE_CODE_RE = re.compile(r"(`+)(?:(?!\1).)+?\1")
-_REFERENCE_DEFINITION_RE = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(<[^>]*>|\S+)")
-_INLINE_LINK_RE = re.compile(
-    r"(?<!!)\[[^\]]*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)"
-)
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+_REFERENCE_DEFINITION_RE = re.compile(r"^ {0,3}\[([^\]]+)\]:[ \t]*(.*)$")
 _FULL_REFERENCE_RE = re.compile(r"(?<!!)\[([^\]]*)\]\[([^\]]*)\]")
 _SHORTCUT_REFERENCE_RE = re.compile(r"(?<![!\]])\[([^\]]+)\](?![\[(:])")
+_BACKSLASH_ESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])")
 
 
 def _reference_label(label: str) -> str:
     return " ".join(label.split()).casefold()
 
 
-def _prose_lines(text: str) -> list[str]:
-    """Return lines outside fenced code blocks, with inline code spans removed."""
-    lines: list[str] = []
+def _strip_code_spans(text: str) -> str:
+    """Blank CommonMark code spans, which may span lines within a paragraph.
+
+    A backtick run opens a span closed by the next run of exactly the same
+    length; an unmatched run is literal text.
+    """
+    out: list[str] = []
+    index, length = 0, len(text)
+    while index < length:
+        if text[index] != "`":
+            out.append(text[index])
+            index += 1
+            continue
+        run_end = index
+        while run_end < length and text[run_end] == "`":
+            run_end += 1
+        run = run_end - index
+        cursor, close = run_end, -1
+        while cursor < length:
+            if text[cursor] != "`":
+                cursor += 1
+                continue
+            other = cursor
+            while other < length and text[other] == "`":
+                other += 1
+            if other - cursor == run:
+                close = other
+                break
+            cursor = other
+        if close < 0:
+            out.append(text[index:run_end])
+            index = run_end
+        else:
+            out.append(" ")
+            index = close
+    return "".join(out)
+
+
+def _prose_paragraphs(text: str) -> list[str]:
+    """Paragraphs outside fenced code blocks, with code spans blanked.
+
+    Markdown constructs (code spans, link text and destinations) may span
+    lines within a paragraph but never a blank line or a fence, so parsing
+    is paragraph-scoped rather than line-scoped.  A closing fence must use
+    the opening character, be at least as long, and carry only trailing
+    whitespace; a backtick fence's info string may not contain a backtick.
+    """
+    paragraphs: list[str] = []
+    current: list[str] = []
     fence: str | None = None
+
+    def flush() -> None:
+        if current:
+            paragraphs.append("\n".join(current))
+            current.clear()
+
     for line in text.splitlines():
-        match = _FENCE_RE.match(line)
         if fence is not None:
+            match = _FENCE_CLOSE_RE.match(line)
             if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence):
                 fence = None
             continue
-        if match:
+        match = _FENCE_OPEN_RE.match(line)
+        if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+            flush()
             fence = match.group(1)
             continue
-        lines.append(_INLINE_CODE_RE.sub(" ", line))
-    return lines
+        if not line.strip():
+            flush()
+            continue
+        current.append(line)
+    flush()
+    return [_strip_code_spans(paragraph) for paragraph in paragraphs]
+
+
+def _skip_link_whitespace(text: str, index: int) -> int:
+    """Skip spaces and tabs plus at most one line ending, as link syntax allows."""
+    newline_seen = False
+    while index < len(text):
+        char = text[index]
+        if char in " \t":
+            index += 1
+        elif char == "\n" and not newline_seen:
+            newline_seen = True
+            index += 1
+        else:
+            break
+    return index
+
+
+def _parse_link_destination(text: str, index: int) -> tuple[str, int] | None:
+    """Parse ``destination [title] )`` after ``](``; return (destination, end)."""
+    length = len(text)
+    index = _skip_link_whitespace(text, index)
+    if index < length and text[index] == "<":
+        close = text.find(">", index + 1)
+        if close < 0 or "\n" in text[index + 1:close]:
+            return None
+        destination = text[index + 1:close]
+        index = close + 1
+    else:
+        start, depth = index, 0
+        while index < length:
+            char = text[index]
+            if char == "\\" and index + 1 < length:
+                index += 2
+                continue
+            if char.isspace() or ord(char) < 0x20:
+                break
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            index += 1
+        if depth:
+            return None
+        destination = _BACKSLASH_ESCAPE_RE.sub(r"\1", text[start:index])
+    index = _skip_link_whitespace(text, index)
+    if index < length and text[index] in "\"'(":
+        closer = ")" if text[index] == "(" else text[index]
+        close = text.find(closer, index + 1)
+        if close < 0:
+            return None
+        index = _skip_link_whitespace(text, close + 1)
+    if index < length and text[index] == ")":
+        return destination, index + 1
+    return None
+
+
+def _inline_links(text: str) -> tuple[list[str], str]:
+    """Inline link destinations in a paragraph, and the paragraph with them blanked.
+
+    Link text may contain nested brackets and line breaks; destinations may
+    contain balanced parentheses and start on the next line.  Images are not
+    links.
+    """
+    destinations: list[str] = []
+    spans: list[tuple[int, int]] = []
+    search = 0
+    while True:
+        bracket = text.find("](", search)
+        if bracket < 0:
+            break
+        depth, start, cursor = 0, -1, bracket - 1
+        floor = spans[-1][1] if spans else 0
+        while cursor >= floor:
+            char = text[cursor]
+            if char == "]":
+                depth += 1
+            elif char == "[":
+                if depth == 0:
+                    start = cursor
+                    break
+                depth -= 1
+            cursor -= 1
+        parsed = _parse_link_destination(text, bracket + 2)
+        if start < 0 or parsed is None or (start > 0 and text[start - 1] == "!"):
+            search = bracket + 2
+            continue
+        destination, end = parsed
+        destinations.append(destination)
+        spans.append((start, end))
+        search = end
+    remaining = text
+    for start, end in reversed(spans):
+        remaining = remaining[:start] + " " + remaining[end:]
+    return destinations, remaining
 
 
 def _clean_link_target(target: str) -> str:
@@ -336,6 +488,15 @@ def _clean_link_target(target: str) -> str:
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1].strip()
     return target.split("#", 1)[0].split("?", 1)[0]
+
+
+def _definition_destination(rest: str) -> str | None:
+    """A reference definition's destination: ``<...>`` (may hold spaces) or one token."""
+    if rest.startswith("<"):
+        close = rest.find(">")
+        return rest[: close + 1] if close > 0 else None
+    parts = rest.split()
+    return _BACKSLASH_ESCAPE_RE.sub(r"\1", parts[0]) if parts else None
 
 
 def _linked_detail_paths(root_text: str, root_path: str) -> tuple[str, ...]:
@@ -347,19 +508,29 @@ def _linked_detail_paths(root_text: str, root_path: str) -> tuple[str, ...]:
     are followed one level only.
     """
     definitions: dict[str, str] = {}
-    prose: list[str] = []
-    for line in _prose_lines(root_text):
-        match = _REFERENCE_DEFINITION_RE.match(line)
-        if match:
-            definitions.setdefault(_reference_label(match.group(1)), match.group(2))
-            continue
-        prose.append(line)
     targets: list[str] = []
     used_labels: set[str] = set()
-    for line in prose:
-        for match in _INLINE_LINK_RE.finditer(line):
-            targets.append(match.group(1))
-        remaining = _INLINE_LINK_RE.sub(" ", line)
+    for paragraph in _prose_paragraphs(root_text):
+        lines = paragraph.split("\n")
+        body: list[str] = []
+        index = 0
+        while index < len(lines):
+            match = _REFERENCE_DEFINITION_RE.match(lines[index])
+            if match is None:
+                body.append(lines[index])
+                index += 1
+                continue
+            rest = match.group(2).strip()
+            if not rest and index + 1 < len(lines):
+                # The destination may start on the following line.
+                index += 1
+                rest = lines[index].strip()
+            destination = _definition_destination(rest)
+            if destination:
+                definitions.setdefault(_reference_label(match.group(1)), destination)
+            index += 1
+        inline, remaining = _inline_links("\n".join(body))
+        targets.extend(inline)
         for match in _FULL_REFERENCE_RE.finditer(remaining):
             used_labels.add(_reference_label(match.group(2) or match.group(1)))
         remaining = _FULL_REFERENCE_RE.sub(" ", remaining)

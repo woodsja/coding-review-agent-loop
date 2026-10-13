@@ -6468,3 +6468,28 @@ def test_oversized_fallback_changes_only_the_architecture_block_and_guidance(tmp
     end = stripped.index("- Lifecycle\n", end) + len("- Lifecycle\n")
     # Lossless (material-gated) requirement rendering is unchanged.
     assert stripped[:start] + stripped[end:] == legacy
+
+
+_ROOT_ONLY_PROMPT_GOLDEN = Path(__file__).parent / "fixtures" / "architecture_root_only_prompts.json"
+
+
+@pytest.mark.parametrize("builder", sorted(_SET_BUILDERS))
+def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, monkeypatch, builder):
+    """Every full prompt for a root-only context equals the pre-#1454 output.
+
+    The fixture holds the complete prompts that merge-base 6ff2ca3725 builds
+    for this snapshot (without the new set fields) under the test conftest,
+    with every ``AGENT_LOOP_*`` variable cleared and the per-run temporary
+    directory replaced by ``<TMP>``.
+    """
+    import json as _golden_json
+    import os as _golden_os
+
+    for name in list(_golden_os.environ):
+        if name.startswith("AGENT_LOOP_"):
+            monkeypatch.delenv(name)
+    golden = _golden_json.loads(_ROOT_ONLY_PROMPT_GOLDEN.read_text(encoding="utf-8"))
+    snapshot = _set_snapshot(links_status="scanned", members=())
+    config = make_config(tmp_path, architecture_context=snapshot)
+    prompt = _SET_BUILDERS[builder](config).replace(str(tmp_path), "<TMP>")
+    assert prompt == golden[builder]
