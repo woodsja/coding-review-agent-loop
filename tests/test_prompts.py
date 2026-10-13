@@ -6471,28 +6471,48 @@ def test_oversized_fallback_changes_only_the_architecture_block_and_guidance(tmp
 
 
 _ROOT_ONLY_PROMPT_GOLDEN = Path(__file__).parent / "fixtures" / "architecture_root_only_prompts.json"
+# Host-measured values in the coder prompts: the containment limits derive
+# from physical memory, and the worker estimate from CPUs, memory and cgroup
+# ceilings.  The golden was recorded on one host and is compared on others
+# (managed CI runners), so these values are neutralized on both sides.
+_HOST_MEASURED = (
+    (re.compile(r"\(aggregate=\{[^}]*\}; test-gate child=\{[^}]*\}\)"), "(aggregate=<host>; test-gate child=<host>)"),
+    (re.compile(r"\(preliminary pre-admission estimate: [^()]*\([^()]*\)\)"), "(preliminary pre-admission estimate: <host>)"),
+)
 
 
+def _host_neutral(text):
+    for pattern, replacement in _HOST_MEASURED:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+@pytest.mark.parametrize("host", ["this-host", "small-host"])
 @pytest.mark.parametrize("builder", sorted(_SET_BUILDERS))
-def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, monkeypatch, builder):
+def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, monkeypatch, builder, host):
     """Every full prompt for a root-only context equals the pre-#1454 output.
 
     The fixture holds the complete prompts that merge-base 6ff2ca3725 builds
     for this snapshot (without the new set fields) under the test conftest,
     with every ``AGENT_LOOP_*`` variable cleared and the per-run temporary
-    directory replaced by ``<TMP>``.
+    directory replaced by ``<TMP>``.  Host-measured values are neutralized,
+    and the ``small-host`` variant proves the comparison does not depend on
+    the machine running it.  The worker estimate is pinned to the recorded
+    budget so the worker-dependent guidance sentences stay comparable.
     """
     import json as _golden_json
     import os as _golden_os
 
+    import coding_review_agent_loop.containment as containment_module
+    import coding_review_agent_loop.test_workers as test_workers_module
+    from coding_review_agent_loop.test_workers import WorkerBudget
+
     for name in list(_golden_os.environ):
         if name.startswith("AGENT_LOOP_"):
             monkeypatch.delenv(name)
-    # The worker-budget estimate depends on the host's CPUs and cgroup
-    # ceiling, which differ between the machine that recorded the fixture
-    # and CI runners; pin it to the recorded estimate.
-    from coding_review_agent_loop.test_workers import WorkerBudget
-
+    if host == "small-host":
+        monkeypatch.setattr(containment_module, "probe_host_memory_bytes", lambda: 2 * 1024 ** 3)
+        monkeypatch.setattr(test_workers_module, "probe_cpu_count", lambda: (2, "test"))
     monkeypatch.setattr(
         prompts_module, "preliminary_worker_budget",
         lambda _config: WorkerBudget(8, "derived", "clamp", "cpu", {}, True),
@@ -6501,4 +6521,4 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     snapshot = _set_snapshot(links_status="scanned", members=())
     config = make_config(tmp_path, architecture_context=snapshot)
     prompt = _SET_BUILDERS[builder](config).replace(str(tmp_path), "<TMP>")
-    assert prompt == golden[builder]
+    assert _host_neutral(prompt) == _host_neutral(golden[builder])
