@@ -335,23 +335,57 @@ def _link_destination_path(href: str) -> str:
     return unquote(href.split("#", 1)[0].split("?", 1)[0])
 
 
-def _linked_detail_paths(root_text: str, root_path: str) -> tuple[str, ...] | None:
-    """Repository paths of docs/architecture/*.md files linked from the root.
-
-    Every link the CommonMark parser produces counts: inline links and
-    reference links whose definition exists.  Images, code, raw HTML and
-    unused definitions produce no links.  Detail docs are never parsed, so
-    links are followed one level only.  Returns None when no parser is
-    available, so membership is reported as unknown.
-    """
+def _parse_markdown(text: str) -> list | None:
     parser = _commonmark_parser()
     if parser is None:
         return None
+    return parser.parse(text)
+
+
+def _parsed_headings(text: str, tokens: list | None = None) -> tuple[str, ...] | None:
+    """Text of every real CommonMark heading (ATX, indented ATX and Setext).
+
+    Lines inside code blocks, raw HTML or comments are not headings.  Returns
+    None when no parser is available.  The legacy root-only renderer keeps
+    ``_headings`` so its output stays byte-identical.
+    """
+    if tokens is None:
+        tokens = _parse_markdown(text)
+        if tokens is None:
+            return None
+    result: list[str] = []
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or index + 1 >= len(tokens):
+            continue
+        inline = tokens[index + 1]
+        if inline.type == "inline" and inline.content.strip():
+            result.append(inline.content)
+    return tuple(result)
+
+
+def _linked_detail_paths(
+    root_text: str, root_path: str, tokens: list | None = None,
+) -> tuple[str, ...] | None:
+    """Repository paths of docs/architecture/*.md files linked from the root.
+
+    Every link the CommonMark parser produces counts: inline links and
+    reference links whose definition exists.  Images (including any link
+    inside an image description, which renders only as alt text), code, raw
+    HTML and unused definitions produce no links.  Detail docs are never
+    parsed, so links are followed one level only.  Returns None when no
+    parser is available, so membership is reported as unknown.
+    """
+    if tokens is None:
+        tokens = _parse_markdown(root_text)
+        if tokens is None:
+            return None
     base_dir_parts = root_path.split("/")[:-1]
     found: set[str] = set()
-    pending = list(parser.parse(root_text))
+    pending = list(tokens)
     while pending:
         token = pending.pop()
+        if token.type == "image":
+            continue
         if token.children:
             pending.extend(token.children)
         if token.type != "link_open":
@@ -486,7 +520,7 @@ def _acquire_members(
         if text is None:
             resolved.append(ArchitectureMember(member.path, member.blob_oid, "binary", size))
             continue
-        headings = _headings(text)
+        headings = _parsed_headings(text)
         first = _bounded_heading(headings[0]) if headings else None
         resolved.append(ArchitectureMember(member.path, member.blob_oid, "available", size, first))
     return tuple(resolved)
@@ -494,9 +528,10 @@ def _acquire_members(
 
 def _members_for_root(
     runner: Runner, *, checkout, revision: str, root_text: str, root_path: str, max_bytes: int,
+    tokens: list | None = None,
 ) -> tuple[ArchitectureMember, ...] | None:
     """Linked members, or None when the root's links cannot be parsed."""
-    paths = _linked_detail_paths(root_text, root_path)
+    paths = _linked_detail_paths(root_text, root_path, tokens)
     if paths is None:
         return None
     if not paths:
@@ -571,11 +606,16 @@ def acquire_architecture_snapshot(
             return oversized
         # Links are discovered independently of headings, so a headingless
         # oversized root keeps its members.
+        # Parse once: links and the section index both come from real
+        # Markdown structure, so example headings in code or HTML never
+        # appear (or consume the index cap).
+        tokens = _parse_markdown(text)
         members = _members_for_root(
             runner, checkout=checkout, revision=revision, root_text=text,
-            root_path=locator.path, max_bytes=max_bytes,
+            root_path=locator.path, max_bytes=max_bytes, tokens=tokens,
         )
-        headings = tuple(_bounded_heading(item) for item in _headings(text)[:_OVERSIZED_HEADING_INDEX_CAP])
+        parsed_headings = _parsed_headings(text, tokens) if tokens is not None else ()
+        headings = tuple(_bounded_heading(item) for item in parsed_headings[:_OVERSIZED_HEADING_INDEX_CAP])
         if members is None:
             diagnostic = f"{diagnostic} {_PARSER_UNAVAILABLE_NOTE}"
         return ArchitectureSnapshot(

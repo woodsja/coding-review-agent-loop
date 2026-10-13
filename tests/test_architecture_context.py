@@ -982,3 +982,95 @@ def test_pair_render_fits_its_mandatory_budget(name):
         rendered = render_architecture_pair(pair, max_chars=budget)
         assert len(rendered) <= budget
         assert base_identity in rendered and candidate_identity in rendered
+
+
+# #1459 item 18: links inside image descriptions render only as alt text, so
+# they are never members; links beside an image still are.
+IMAGE_DESCRIPTION_FORMS = {
+    "inline-link-in-image": "![diagram [demo](docs/architecture/demo.md)](diagram.png)\n",
+    "reference-link-in-image": "![diagram [demo]](diagram.png)\n\n[demo]: docs/architecture/demo.md\n",
+    "nested-image-link": "![outer ![inner [demo](docs/architecture/demo.md)](i.png)](o.png)\n",
+    "reference-image-description": "![diagram [demo](docs/architecture/demo.md)][img]\n\n[img]: diagram.png\n",
+}
+
+
+@pytest.mark.parametrize("form", sorted(IMAGE_DESCRIPTION_FORMS))
+def test_links_inside_image_descriptions_are_not_members(tmp_path, form):
+    document = IMAGE_DESCRIPTION_FORMS[form]
+    assert _linked_detail_paths(document, "ARCHITECTURE.md") == ()
+    beside = document.rstrip("\n") + " and [real](docs/architecture/real.md)\n"
+    if "\n\n[" in document:
+        head, defs = document.split("\n\n", 1)
+        beside = head + " and [real](docs/architecture/real.md)\n\n" + defs
+    assert _linked_detail_paths(beside, "ARCHITECTURE.md") == ("docs/architecture/real.md",)
+    base = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": "# Root\n\n" + document,
+        "docs/architecture/demo.md": "# Demo\n",
+    })
+    snapshot = _snapshot(tmp_path, base)
+    assert snapshot.links_status == "scanned"
+    assert snapshot.members == ()
+    candidate = _write(tmp_path, {"docs/architecture/demo.md": "# Demo v2\n"})
+    pair = _pair(tmp_path, base, candidate)
+    assert pair.set_change == "unchanged"
+    assert pair.member_changes == ()
+
+
+# #1459 item 19: the member first heading and the oversized section index use
+# real Markdown headings, so code, HTML and comments never contribute, while
+# Setext and indented ATX headings do.
+FIRST_HEADING_FORMS = {
+    "fenced-example-first": ("```\n# Example\n```\n\n# Billing\n", "Billing"),
+    "html-comment-first": ("<!--\n# Example\n-->\n\n# Billing\n", "Billing"),
+    "indented-code-first": ("    # Example\n\n# Billing\n", "Billing"),
+    "setext": ("Billing\n=======\n\nBody.\n", "Billing"),
+    "setext-level-two": ("Billing\n-------\n\nBody.\n", "Billing"),
+    "indented-atx": ("   # Billing #\n", "Billing"),
+    "no-heading": ("```\n# Example\n```\n", None),
+}
+
+
+@pytest.mark.parametrize("form", sorted(FIRST_HEADING_FORMS))
+def test_member_first_heading_is_a_real_markdown_heading(tmp_path, form):
+    member_text, expected = FIRST_HEADING_FORMS[form]
+    member = "docs/architecture/billing.md"
+    revision = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": f"# Root\n\n[b]({member})\n", member: member_text,
+    })
+    snapshot = _snapshot(tmp_path, revision)
+    (acquired,) = snapshot.members
+    assert acquired.first_heading == expected
+    rendered = render_architecture_snapshot(snapshot)
+    if expected is None:
+        assert f"- {member}\n" in rendered
+    else:
+        assert f"- {member} — {expected}" in rendered
+    assert "Example" not in rendered.split("Detail documents", 1)[1]
+
+
+def test_oversized_index_lists_only_real_sections(tmp_path):
+    examples = "".join(f"```\n# Example {index}\n```\n\n" for index in range(600))
+    text = (
+        "Overview\n========\n\n"
+        + examples
+        + "<!--\n# Commented\n-->\n\n"
+        + "  ## Lifecycle\n\nBilling\n-------\n"
+    )
+    base = _set_repo(tmp_path, {"ARCHITECTURE.md": text})
+    snapshot = _snapshot(tmp_path, base, max_bytes=64)
+    assert snapshot.availability == "oversized"
+    assert snapshot.heading_index == ("Overview", "Lifecycle", "Billing")
+    rendered = render_architecture_snapshot(snapshot)
+    assert "Example" not in rendered and "Commented" not in rendered
+    assert "- Lifecycle" in rendered and "- Billing" in rendered
+    pair = _pair(tmp_path, base, base, max_bytes=64)
+    pair_rendered = render_architecture_pair(pair)
+    assert "Example" not in pair_rendered and "Commented" not in pair_rendered
+    assert "- Lifecycle" in pair_rendered
+
+
+def test_root_only_under_limit_keeps_the_legacy_line_heading_index(tmp_path):
+    # The legacy renderer is preserved byte-for-byte for root-only docs.
+    text = "# System\n\n```\n# Example\n```\n"
+    revision = _set_repo(tmp_path, {"ARCHITECTURE.md": text})
+    assert _snapshot(tmp_path, revision).heading_index == ("System", "Example")

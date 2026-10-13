@@ -1035,11 +1035,15 @@ unlinked files under `docs/architecture/` are never members. Every member is
 read from the same immutable revision as the root, in bounded batches.
 Links are read with a CommonMark parser (`markdown-it-py`, a runtime
 dependency), so membership follows rendered Markdown: fenced and indented
-code, code spans, raw HTML blocks and comments, images, escaped brackets and
-reference links whose label is undefined never count, while escapes and
+code, code spans, raw HTML blocks and comments, images (including links inside
+an image description), escaped brackets and reference links whose label is
+undefined never count, while escapes and
 character references in destinations are decoded. If the parser cannot be
 imported, the root is treated as unscanned: membership is unknown, validation
-is skipped and the PR set change is `unavailable`.
+is skipped and the PR set change is `unavailable`. The member first-heading
+index and the oversized root's section index use the parser's headings too
+(ATX, indented ATX and Setext), so example headings inside code or HTML are
+never listed.
 
 Recommended layout:
 

@@ -443,3 +443,21 @@ def test_round_three_forms_drive_canonical_path_validation(tmp_path, root, membe
         assert len(prompts) == 1 and _path_of(response) == member
     else:
         assert len(prompts) == 2 and SECTION in prompts[1] and _path_of(response) is None
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "![diagram [c](docs/architecture/c.md)](diagram.png)\n",
+        "![diagram [c]](diagram.png)\n\n[c]: docs/architecture/c.md\n",
+    ],
+    ids=["inline-link-in-image", "reference-link-in-image"],
+)
+def test_a_link_inside_an_image_description_is_rejected(tmp_path, root):
+    # #1459 item 18: such links render only as alt text, so they name no member.
+    member = "docs/architecture/c.md"
+    config, _repo = _coder_repo(tmp_path, {"ARCHITECTURE.md": "# Root\n\n" + root, member: "# C\n"})
+    runner = FakeRunner(claude_outputs=[_task_output(member), _task_output(None)])
+    response = _run(runner, tmp_path, "task", _hook(config))
+    prompts = _prompts(runner)
+    assert len(prompts) == 2 and SECTION in prompts[1] and _path_of(response) is None
