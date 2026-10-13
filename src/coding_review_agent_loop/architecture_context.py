@@ -8,7 +8,6 @@ document's prose cannot affect acquisition or protocol state.
 from __future__ import annotations
 
 import hashlib
-import html
 import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -47,6 +46,10 @@ _MEMBERSHIP_UNKNOWN_LINE = "- Architecture set: membership unknown (root could n
 _SPLIT_RECOMMENDATION = (
     "The document is too large to inject and should be split into a short root "
     "overview plus docs/architecture/* detail docs."
+)
+_PARSER_UNAVAILABLE_NOTE = (
+    "The CommonMark parser (markdown-it-py) is unavailable, so architecture-set "
+    "membership is unknown."
 )
 _MEMBERSHIP_UNKNOWN_NOTE = (
     "Architecture-set membership is unknown because the root could not be scanned."
@@ -302,439 +305,61 @@ def _resolve_repo_relative(base_dir_parts: Iterable[str], value: object) -> str 
         return None
 
 
-# Markdown link discovery (#1454).  The tool has no runtime dependencies, so
-# this is a bounded CommonMark subset parser: a block phase that resolves
-# blockquote and list-item containers, fenced and indented code, and
-# paragraphs, then an escape-aware inline phase for code spans, links and
-# link reference definitions.  tests/test_architecture_context.py checks it
-# against a full CommonMark parser over a shared corpus.
-_ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
-_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
-_LIST_MARKER_RE = re.compile(r"^( {0,3})([-+*]|\d{1,9}[.)])(?=[ \t]|$)")
-_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
-_THEMATIC_BREAK_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
-_SETEXT_UNDERLINE_RE = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+# Markdown link discovery (#1454) delegates to a CommonMark parser
+# (markdown-it-py, a declared runtime dependency).  Membership must follow
+# real Markdown structure -- containers, code, raw HTML, escapes, character
+# references and reference-link resolution -- which a bounded hand parser
+# kept approximating incorrectly.  Without the parser, membership is unknown
+# and the root is treated as unscanned rather than guessed.
+_COMMONMARK_PARSER = None
 
 
-_HEADING_SENTINEL = "\x01"
-
-
-def _reference_label(label: str) -> str:
-    return " ".join(label.split()).casefold()
-
-
-def _expand_tabs(line: str) -> str:
-    return line.expandtabs(4)
-
-
-def _leading_spaces(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
-
-
-def _starts_block(rest: str) -> bool:
-    """Whether a line can interrupt a paragraph (so it is not a lazy continuation)."""
-    return bool(
-        not rest.strip()
-        or _FENCE_OPEN_RE.match(rest)
-        or re.match(r"^ {0,3}>", rest)
-        or _ATX_HEADING_RE.match(rest)
-        or _THEMATIC_BREAK_RE.match(rest)
-        or re.match(r"^ {0,3}(?:[-+*]|1[.)])[ \t]+\S", rest)
-    )
-
-
-def _markdown_paragraphs(text: str) -> list[str]:
-    """Paragraph and heading texts outside code, with container prefixes removed.
-
-    Containers are blockquotes (``>``) and list items (content indentation);
-    fenced code closes with its container, and indented code (four or more
-    spaces outside a paragraph) is skipped.
-    """
-    paragraphs: list[str] = []
-    current: list[str] = []
-    # Each open container is ("quote", 0) or ("list", content_indent).
-    containers: list[tuple[str, int]] = []
-    # Index of a list item opened with no content yet; a blank line closes it.
-    empty_item: int | None = None
-    fence: tuple[str, int] | None = None  # (fence string, container depth)
-
-    def flush() -> None:
-        if current:
-            paragraphs.append("\n".join(current))
-            current.clear()
-
-    for raw_line in text.splitlines():
-        rest = _expand_tabs(raw_line)
-        matched = 0
-        for kind, indent in containers:
-            if kind == "quote":
-                match = re.match(r"^ {0,3}> ?", rest)
-                if match is None:
-                    break
-                rest = rest[match.end():]
-            else:
-                if rest.strip() and _leading_spaces(rest) < indent:
-                    break
-                rest = rest[indent:] if rest.strip() else ""
-            matched += 1
-        if matched < len(containers):
-            lazy = bool(current) and fence is None and not _starts_block(rest)
-            if lazy:
-                current.append(rest.strip())
-                continue
-            flush()
-            del containers[matched:]
-            if fence is not None and fence[1] > matched:
-                fence = None
-        if fence is not None:
-            close = _FENCE_CLOSE_RE.match(rest)
-            if close and close.group(1)[0] == fence[0][0] and len(close.group(1)) >= len(fence[0]):
-                fence = None
-            continue
-        # Open new containers.
-        opened_empty: int | None = None
-        while True:
-            quote = re.match(r"^ {0,3}> ?", rest)
-            if quote:
-                flush()
-                containers.append(("quote", 0))
-                rest = rest[quote.end():]
-                continue
-            marker = _LIST_MARKER_RE.match(rest)
-            if marker and (not current or rest[marker.end():].strip()):
-                after = rest[marker.end():]
-                spaces = _leading_spaces(after)
-                if not after.strip():
-                    width = marker.end() + 1
-                elif spaces > 4:
-                    width = marker.end() + 1
-                else:
-                    width = marker.end() + spaces
-                flush()
-                containers.append(("list", width))
-                if not after.strip():
-                    opened_empty = len(containers) - 1
-                rest = rest[width:] if len(rest) >= width else ""
-                continue
-            break
-        if not rest.strip():
-            flush()
-            if opened_empty is None and empty_item is not None and empty_item < len(containers):
-                # A list item may begin with at most one blank line.
-                del containers[empty_item:]
-                empty_item = None
-            elif opened_empty is not None:
-                empty_item = opened_empty
-            else:
-                empty_item = None
-            continue
-        empty_item = None
-        opening = _FENCE_OPEN_RE.match(rest)
-        if opening and not (opening.group(1)[0] == "`" and "`" in opening.group(2)):
-            flush()
-            fence = (opening.group(1), len(containers))
-            continue
-        if not current and _leading_spaces(rest) >= 4:
-            continue  # indented code block
-        if _ATX_HEADING_RE.match(rest):
-            flush()
-            # A heading never holds link reference definitions.
-            paragraphs.append(_HEADING_SENTINEL + re.sub(r"^ {0,3}#{1,6}", "", rest).strip())
-            continue
-        if _THEMATIC_BREAK_RE.match(rest) and not (current and _SETEXT_UNDERLINE_RE.match(rest)):
-            flush()
-            continue
-        if current and _SETEXT_UNDERLINE_RE.match(rest):
-            flush()
-            continue
-        current.append(rest.strip())
-    flush()
-    return paragraphs
-
-
-def _inline_chars(text: str, *, code_spans: bool = True) -> tuple[list[str], list[bool]]:
-    """Characters with a literal mask: escapes decoded, code spans blanked.
-
-    An escaped ASCII punctuation character is literal and can never act as a
-    delimiter; a code span becomes one literal space.  Backslashes are not
-    escapes inside a code span.
-    """
-    chars: list[str] = []
-    literal: list[bool] = []
-    index, length = 0, len(text)
-    while index < length:
-        char = text[index]
-        if char == "\\" and index + 1 < length and text[index + 1] in _ESCAPABLE:
-            chars.append(text[index + 1])
-            literal.append(True)
-            index += 2
-            continue
-        if char != "`" or not code_spans:
-            chars.append(char)
-            literal.append(False)
-            index += 1
-            continue
-        run_end = index
-        while run_end < length and text[run_end] == "`":
-            run_end += 1
-        run = run_end - index
-        cursor, close = run_end, -1
-        while cursor < length:
-            if text[cursor] != "`":
-                cursor += 1
-                continue
-            other = cursor
-            while other < length and text[other] == "`":
-                other += 1
-            if other - cursor == run:
-                close = other
-                break
-            cursor = other
-        if close < 0:
-            chars.extend(text[index:run_end])
-            literal.extend([True] * run)
-            index = run_end
-        else:
-            chars.append(" ")
-            literal.append(True)
-            index = close
-    return chars, literal
-
-
-def _skip_link_whitespace(chars: list[str], index: int) -> int:
-    """Skip spaces and tabs plus at most one line ending, as link syntax allows."""
-    newline_seen = False
-    while index < len(chars):
-        if chars[index] in " \t":
-            index += 1
-        elif chars[index] == "\n" and not newline_seen:
-            newline_seen = True
-            index += 1
-        else:
-            break
-    return index
-
-
-def _is(chars: list[str], literal: list[bool], index: int, value: str) -> bool:
-    return index < len(chars) and chars[index] == value and not literal[index]
-
-
-def _scan_destination(chars: list[str], literal: list[bool], index: int) -> tuple[str, int] | None:
-    """Parse a link destination at ``index``; return (decoded destination, end)."""
-    length = len(chars)
-    if _is(chars, literal, index, "<"):
-        cursor = index + 1
-        while cursor < length and not _is(chars, literal, cursor, ">"):
-            if chars[cursor] == "\n" or _is(chars, literal, cursor, "<"):
-                return None
-            cursor += 1
-        if cursor >= length:
+def _commonmark_parser():
+    global _COMMONMARK_PARSER
+    if _COMMONMARK_PARSER is None:
+        try:
+            from markdown_it import MarkdownIt
+        except ImportError:
             return None
-        return "".join(chars[index + 1:cursor]), cursor + 1
-    start, depth, cursor = index, 0, index
-    while cursor < length:
-        char = chars[cursor]
-        if char.isspace() or ord(char) < 0x20:
-            break
-        if not literal[cursor]:
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                if depth == 0:
-                    break
-                depth -= 1
-        cursor += 1
-    if depth or cursor == start:
-        return None
-    return "".join(chars[start:cursor]), cursor
+        _COMMONMARK_PARSER = MarkdownIt("commonmark")
+    return _COMMONMARK_PARSER
 
 
-def _scan_title(chars: list[str], literal: list[bool], index: int) -> int | None:
-    """Skip an escape-aware link title at ``index``; return the end or None."""
-    if index >= len(chars) or literal[index] or chars[index] not in "\"'(":
-        return index
-    closer = ")" if chars[index] == "(" else chars[index]
-    cursor = index + 1
-    while cursor < len(chars):
-        if _is(chars, literal, cursor, closer):
-            return cursor + 1
-        if closer == ")" and _is(chars, literal, cursor, "("):
-            return None
-        cursor += 1
-    return None
+def _link_destination_path(href: str) -> str:
+    """The repository path a parsed link destination names.
 
-
-def _inline_links(text: str) -> tuple[list[str], str]:
-    """Inline link destinations in a paragraph, and its non-link remainder.
-
-    Link text may nest brackets and span lines; destinations may contain
-    balanced or escaped parentheses, may be angle-bracketed, and may start
-    on the next line.  Escaped brackets never delimit a link; images are not
-    links.  The remainder keeps the literal mask so references can be read.
+    The parser has already decoded escapes and character references and
+    percent-encoded the result, so a literal ``#`` or ``?`` is a URL
+    delimiter; percent-decoding happens only after they are removed.
     """
-    chars, literal = _inline_chars(text)
-    destinations: list[str] = []
-    keep = [True] * len(chars)
-    starts = [False] * len(chars)
-    floor = 0
-    for close in range(len(chars) - 1):
-        if close < floor or not (_is(chars, literal, close, "]") and _is(chars, literal, close + 1, "(")):
-            continue
-        depth, start, cursor = 0, -1, close - 1
-        while cursor >= floor:
-            if _is(chars, literal, cursor, "]"):
-                depth += 1
-            elif _is(chars, literal, cursor, "["):
-                if depth == 0:
-                    start = cursor
-                    break
-                depth -= 1
-            cursor -= 1
-        if start < 0 or (start > 0 and _is(chars, literal, start - 1, "!")):
-            continue
-        index = _skip_link_whitespace(chars, close + 2)
-        if _is(chars, literal, index, ")"):
-            parsed: tuple[str, int] | None = ("", index)
-        else:
-            parsed = _scan_destination(chars, literal, index)
-        if parsed is None:
-            continue
-        destination, index = parsed
-        after_destination = index
-        index = _skip_link_whitespace(chars, index)
-        title_end = _scan_title(chars, literal, index) if index > after_destination else index
-        if title_end is None:
-            continue
-        index = _skip_link_whitespace(chars, title_end)
-        if not _is(chars, literal, index, ")"):
-            continue
-        destinations.append(destination)
-        starts[start] = True
-        for position in range(start, index + 1):
-            keep[position] = False
-        floor = index + 1
-    # Literal brackets (escaped, or code spans) become NUL so reference
-    # patterns can never use them as delimiters.
-    remaining = "".join(
-        ("\x00" if lit and char in "[]" else char) if kept else ("\x02" if starts[position] else " ")
-        for position, (char, lit, kept) in enumerate(zip(chars, literal, keep))
-    )
-    return destinations, remaining
+    return unquote(href.split("#", 1)[0].split("?", 1)[0])
 
 
-_FULL_REFERENCE_RE = re.compile(r"(?<!!)\[([^\[\]\x00]*)\]\[([^\[\]\x00]*)\]")
-# Full and collapsed references are removed before shortcuts are read; a
-# shortcut may not be followed by another link label (\x02 marks where an
-# inline link's text began).
-_SHORTCUT_REFERENCE_RE = re.compile(r"(?<!!)\[([^\[\]\x00]+)\](?![\[\x02])")
-_REFERENCE_DEFINITION_START_RE = re.compile(r"^ {0,3}\[")
-
-
-def _reference_definition(text: str) -> tuple[str, str, int] | None:
-    """Parse one link reference definition at the start of ``text``.
-
-    Returns (label, decoded destination, characters consumed through the end
-    of its line).
-    """
-    if not _REFERENCE_DEFINITION_START_RE.match(text):
-        return None
-    # Definitions are block structure: backticks do not form code spans here.
-    chars, literal = _inline_chars(text, code_spans=False)
-    open_index = chars.index("[") if "[" in chars else -1
-    cursor = open_index + 1
-    while cursor < len(chars) and not _is(chars, literal, cursor, "]"):
-        if _is(chars, literal, cursor, "["):
-            return None
-        cursor += 1
-    if cursor + 1 >= len(chars) or not _is(chars, literal, cursor + 1, ":"):
-        return None
-    label = "".join(chars[open_index + 1:cursor])
-    if not label.strip():
-        return None
-    index = _skip_link_whitespace(chars, cursor + 2)
-    parsed = _scan_destination(chars, literal, index)
-    if parsed is None:
-        return None
-    destination, index = parsed
-
-    def line_end(position: int) -> int | None:
-        while position < len(chars) and chars[position] in " \t":
-            position += 1
-        if position >= len(chars) or chars[position] == "\n":
-            return position
-        return None
-
-    end = line_end(index)
-    if end is None:
-        # Only whitespace and then a title may follow the destination.
-        start = index
-        while index < len(chars) and chars[index] in " \t":
-            index += 1
-        title_end = _scan_title(chars, literal, index) if index > start else None
-        end = line_end(title_end) if title_end not in (None, index) else None
-        if end is None:
-            return None
-    elif end < len(chars):
-        # A title may sit alone on the following line.
-        title_start = end + 1
-        while title_start < len(chars) and chars[title_start] in " \t":
-            title_start += 1
-        title_end = _scan_title(chars, literal, title_start)
-        if title_end not in (None, title_start):
-            title_line_end = line_end(title_end)
-            if title_line_end is not None:
-                end = title_line_end
-    # Map the consumed character count back to the raw text by line count.
-    consumed_lines = "".join(chars[:end]).count("\n")
-    raw_lines = text.split("\n")
-    consumed = len("\n".join(raw_lines[: consumed_lines + 1]))
-    return label, destination, consumed
-
-
-def _clean_link_target(target: str) -> str:
-    target = target.strip()
-    if target.startswith("<") and target.endswith(">"):
-        target = target[1:-1].strip()
-    target = target.split("#", 1)[0].split("?", 1)[0]
-    return unquote(html.unescape(target))
-
-
-def _linked_detail_paths(root_text: str, root_path: str) -> tuple[str, ...]:
+def _linked_detail_paths(root_text: str, root_path: str) -> tuple[str, ...] | None:
     """Repository paths of docs/architecture/*.md files linked from the root.
 
-    Inline links and reference links (full, collapsed and shortcut) count; a
-    reference definition contributes only when a reference outside code uses
-    its label.  Code is skipped, and detail docs are never scanned, so links
-    are followed one level only.
+    Every link the CommonMark parser produces counts: inline links and
+    reference links whose definition exists.  Images, code, raw HTML and
+    unused definitions produce no links.  Detail docs are never parsed, so
+    links are followed one level only.  Returns None when no parser is
+    available, so membership is reported as unknown.
     """
-    definitions: dict[str, str] = {}
-    targets: list[str] = []
-    used_labels: set[str] = set()
-    for paragraph in _markdown_paragraphs(root_text):
-        heading = paragraph.startswith(_HEADING_SENTINEL)
-        body = paragraph.lstrip(_HEADING_SENTINEL)
-        while not heading:
-            definition = _reference_definition(body)
-            if definition is None:
-                break
-            label, destination, consumed = definition
-            definitions.setdefault(_reference_label(label), destination)
-            body = body[consumed:].lstrip("\n")
-        if not body.strip():
-            continue
-        inline, remaining = _inline_links(body)
-        targets.extend(inline)
-        for match in _FULL_REFERENCE_RE.finditer(remaining):
-            used_labels.add(_reference_label(match.group(2) or match.group(1)))
-        remaining = _FULL_REFERENCE_RE.sub(" ", remaining)
-        for match in _SHORTCUT_REFERENCE_RE.finditer(remaining):
-            used_labels.add(_reference_label(match.group(1)))
-    targets.extend(definitions[label] for label in sorted(used_labels) if label in definitions)
+    parser = _commonmark_parser()
+    if parser is None:
+        return None
     base_dir_parts = root_path.split("/")[:-1]
     found: set[str] = set()
-    for target in targets:
-        resolved = _resolve_repo_relative(base_dir_parts, _clean_link_target(target))
+    pending = list(parser.parse(root_text))
+    while pending:
+        token = pending.pop()
+        if token.children:
+            pending.extend(token.children)
+        if token.type != "link_open":
+            continue
+        href = token.attrGet("href")
+        if not isinstance(href, str):
+            continue
+        resolved = _resolve_repo_relative(base_dir_parts, _link_destination_path(href))
         if (
             resolved is not None
             and resolved != root_path
@@ -869,8 +494,11 @@ def _acquire_members(
 
 def _members_for_root(
     runner: Runner, *, checkout, revision: str, root_text: str, root_path: str, max_bytes: int,
-) -> tuple[ArchitectureMember, ...]:
+) -> tuple[ArchitectureMember, ...] | None:
+    """Linked members, or None when the root's links cannot be parsed."""
     paths = _linked_detail_paths(root_text, root_path)
+    if paths is None:
+        return None
     if not paths:
         return ()
     return _acquire_members(
@@ -948,10 +576,13 @@ def acquire_architecture_snapshot(
             root_path=locator.path, max_bytes=max_bytes,
         )
         headings = tuple(_bounded_heading(item) for item in _headings(text)[:_OVERSIZED_HEADING_INDEX_CAP])
+        if members is None:
+            diagnostic = f"{diagnostic} {_PARSER_UNAVAILABLE_NOTE}"
         return ArchitectureSnapshot(
             repository=locator.repository, path=locator.path, revision=revision,
             blob_oid=oid.decode("ascii"), sha256=None, availability="oversized", size=size,
-            heading_index=headings, diagnostic=diagnostic, members=members, links_status="scanned",
+            heading_index=headings, diagnostic=diagnostic, members=members or (),
+            links_status="unscanned" if members is None else "scanned",
         )
     blob = runner.run_binary(
         ("git", "cat-file", "blob", oid.decode("ascii")),
@@ -976,7 +607,8 @@ def acquire_architecture_snapshot(
         repository=locator.repository, path=locator.path, revision=revision,
         blob_oid=oid.decode("ascii"), sha256=hashlib.sha256(blob.stdout).hexdigest(),
         availability="available", size=size, content=text, heading_index=_headings(text),
-        members=members, links_status="scanned",
+        diagnostic=_PARSER_UNAVAILABLE_NOTE if members is None else None,
+        members=members or (), links_status="unscanned" if members is None else "scanned",
     )
 
 
@@ -1136,7 +768,10 @@ def _render_oversized_snapshot(snapshot: ArchitectureSnapshot, metadata: str, ma
         notice = "\n\nNo section index is available; inspect the document in the assigned checkout directly."
     if not index and len(notice) <= budget:
         index = notice
-    return metadata + index + detail + "\n"
+    result = metadata + index + detail
+    # The trailing newline is optional: at the identity-only boundary it must
+    # not push the render past its allocation.
+    return result + "\n" if len(result) < max_chars else result
 
 
 def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: int = DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS, label: str = "Architecture context") -> str:

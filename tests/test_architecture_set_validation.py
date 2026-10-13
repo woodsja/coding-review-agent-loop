@@ -419,3 +419,27 @@ def test_round_two_forms_drive_canonical_path_validation(tmp_path, root, member,
         assert len(prompts) == 1 and _path_of(response) == member
     else:
         assert len(prompts) == 2 and SECTION in prompts[1] and _path_of(response) is None
+
+
+@pytest.mark.parametrize(
+    "root,member,accepted",
+    [
+        ("[c](docs/architecture/c&#46;md)\n", "docs/architecture/c.md", True),
+        ("[c](docs/architecture/c.md&#35;section)\n", "docs/architecture/c.md", True),
+        ("[c](docs/architecture/`c`.md)\n", "docs/architecture/`c`.md", True),
+        ("\\![c]\n\n[c]: docs/architecture/c.md\n", "docs/architecture/c.md", True),
+        ("<pre>\n[c](docs/architecture/c.md)\n</pre>\n", "docs/architecture/c.md", False),
+        ("<!-- [c](docs/architecture/c.md) -->\n", "docs/architecture/c.md", False),
+    ],
+    ids=["char-ref", "char-ref-fragment", "backtick-destination", "escaped-image", "html-pre", "html-comment"],
+)
+def test_round_three_forms_drive_canonical_path_validation(tmp_path, root, member, accepted):
+    config, _repo = _coder_repo(tmp_path, {"ARCHITECTURE.md": "# Root\n\n" + root, member: "# C\n"})
+    outputs = [_task_output(member)] if accepted else [_task_output(member), _task_output(None)]
+    runner = FakeRunner(claude_outputs=outputs)
+    response = _run(runner, tmp_path, "task", _hook(config))
+    prompts = _prompts(runner)
+    if accepted:
+        assert len(prompts) == 1 and _path_of(response) == member
+    else:
+        assert len(prompts) == 2 and SECTION in prompts[1] and _path_of(response) is None

@@ -816,62 +816,169 @@ def test_round_two_code_and_literal_forms_are_not_members(tmp_path, form):
     assert architecture_set_paths(snapshot) == frozenset({"ARCHITECTURE.md"})
 
 
-# CommonMark oracle: link discovery must agree with a full CommonMark parser
-# (markdown-it-py, a dev dependency) on every document in this corpus.  Two
-# known markdown-it-py deviations from the spec, which GitHub's cmark-gfm
-# follows, are deliberately absent: a code span inside unclosed link
-# brackets, and an indented line directly after a reference definition.
-COMMONMARK_CORPUS = [
-    *(template.format(name=name) for template, name in SET_MEMBER_FORMS.values()),
-    *SET_EXCLUDED_FORMS.values(),
-    "[c](docs/architecture/component(v2).md)\n",
-    "[c](docs/architecture/a(b(c)).md \"Title\")\n",
-    "See the [billing\ncomponent](docs/architecture/billing.md).\n",
-    "See [billing](\ndocs/architecture/billing.md\n'Title')\n",
-    "See [billing].\n\n[billing]:\n  docs/architecture/billing.md\n",
-    "[nested [label]](docs/architecture/nested.md)\n",
-    "Code `start\n[demo](docs/architecture/demo.md) end` here.\n",
-    "```python\n[x](docs/architecture/x.md)\n``` python\n[y](docs/architecture/y.md)\n```\n",
-    "~~~~\n[x](docs/architecture/x.md)\n~~~\n[y](docs/architecture/y.md)\n~~~~\n",
-    "![image](docs/architecture/pic.md)\n",
-    "> quote\nlazy [x](docs/architecture/x.md)\n",
-    "1. one\n   > [q](docs/architecture/q.md)\n",
-    "* a\n\n  [b](docs/architecture/b.md)\n",
-    "text\n    [cont](docs/architecture/cont.md)\n",
-    "# Head [h](docs/architecture/h.md)\n",
-    "# [b]: docs/architecture/b.md\n\nSee [b].\n",
-    "[a\\_b]\n\n[a\\_b]: docs/architecture/ab.md\n",
-    "[b]: docs/architecture/b.md  # junk\n\n[b][]\n",
-    "[b]: docs/architecture/b.md\n\"title\"\n\n[b]\n",
-    "Text [b]: here.\n\n[b]: docs/architecture/b.md\n",
-    "\\[[[b][a](docs/architecture/a.md)\n\n[b]: docs/architecture/b.md\n",
-    "1. \n    [a](docs/architecture/a.md)\n",
-    "- \n\n    [a](docs/architecture/a.md)\n",
-    "[t](docs/architecture/t.md 'single') [u](docs/architecture/u.md (paren))\n",
-    "<docs/architecture/auto.md> [x](<docs/architecture/x y.md>)\n",
-    "[x](docs/architecture/x.md#section) [y](docs/architecture/y.md?q=1)\n",
-    "[e](docs/architecture/e&amp;f.md)\n",
+# CommonMark conformance (#1459 items 1-2, 5-14): every document maps to the
+# exact member paths a CommonMark renderer links.  Link discovery delegates
+# to markdown-it-py, so these pin its integration (destination decoding,
+# fragment and percent handling, path resolution), not a hand parser.
+COMMONMARK_EXPECTATIONS = [
+    ('\\` [component](docs/architecture/component.md) \\`\n', ('docs/architecture/component.md',)),
+    ('[component](<docs/architecture/component\\(v2\\).md>)\n', ('docs/architecture/component(v2).md',)),
+    ('See [c].\n\n[c]: <docs/architecture/c\\(v2\\).md>\n', ('docs/architecture/c(v2).md',)),
+    ('[component](docs/architecture/component.md "The \\"component\\" service")\n', ('docs/architecture/component.md',)),
+    ('> See [component].\n>\n> [component]: docs/architecture/component.md\n', ('docs/architecture/component.md',)),
+    ('[c](docs/architecture/a%20b.md)\n', ('docs/architecture/a b.md',)),
+    ('\\[demo](docs/architecture/demo.md)\n', ()),
+    ('> ~~~\n> [demo](docs/architecture/demo.md)\n> ~~~\n', ()),
+    ('Para.\n\n    [demo](docs/architecture/demo.md)\n', ()),
+    ('- item\n\n      [demo](docs/architecture/demo.md)\n', ()),
+    ('- item\n  ```\n  [demo](docs/architecture/demo.md)\n  ```\n', ()),
+    ('> > text\n>\n>     [demo](docs/architecture/demo.md)\n', ()),
+    ('[c](docs/architecture/component(v2).md)\n', ('docs/architecture/component(v2).md',)),
+    ('[c](docs/architecture/a(b(c)).md "Title")\n', ('docs/architecture/a(b(c)).md',)),
+    ('See the [billing\ncomponent](docs/architecture/billing.md).\n', ('docs/architecture/billing.md',)),
+    ("See [billing](\ndocs/architecture/billing.md\n'Title')\n", ('docs/architecture/billing.md',)),
+    ('See [billing].\n\n[billing]:\n  docs/architecture/billing.md\n', ('docs/architecture/billing.md',)),
+    ('[nested [label]](docs/architecture/nested.md)\n', ('docs/architecture/nested.md',)),
+    ('Code `start\n[demo](docs/architecture/demo.md) end` here.\n', ()),
+    ('```python\n[x](docs/architecture/x.md)\n``` python\n[y](docs/architecture/y.md)\n```\n', ()),
+    ('~~~~\n[x](docs/architecture/x.md)\n~~~\n[y](docs/architecture/y.md)\n~~~~\n', ()),
+    ('![image](docs/architecture/pic.md)\n', ()),
+    ('> quote\nlazy [x](docs/architecture/x.md)\n', ('docs/architecture/x.md',)),
+    ('1. one\n   > [q](docs/architecture/q.md)\n', ('docs/architecture/q.md',)),
+    ('* a\n\n  [b](docs/architecture/b.md)\n', ('docs/architecture/b.md',)),
+    ('text\n    [cont](docs/architecture/cont.md)\n', ('docs/architecture/cont.md',)),
+    ('# Head [h](docs/architecture/h.md)\n', ('docs/architecture/h.md',)),
+    ('# [b]: docs/architecture/b.md\n\nSee [b].\n', ()),
+    ('[a\\_b]\n\n[a\\_b]: docs/architecture/ab.md\n', ('docs/architecture/ab.md',)),
+    ('[b]: docs/architecture/b.md  # junk\n\n[b][]\n', ()),
+    ('[b]: docs/architecture/b.md\n"title"\n\n[b]\n', ('docs/architecture/b.md',)),
+    ('Text [b]: here.\n\n[b]: docs/architecture/b.md\n', ('docs/architecture/b.md',)),
+    ('\\[[[b][a](docs/architecture/a.md)\n\n[b]: docs/architecture/b.md\n', ('docs/architecture/a.md',)),
+    ('1. \n    [a](docs/architecture/a.md)\n', ('docs/architecture/a.md',)),
+    ('- \n\n    [a](docs/architecture/a.md)\n', ()),
+    ("[t](docs/architecture/t.md 'single') [u](docs/architecture/u.md (paren))\n", ('docs/architecture/t.md', 'docs/architecture/u.md')),
+    ('<docs/architecture/auto.md> [x](<docs/architecture/x y.md>)\n', ('docs/architecture/x y.md',)),
+    ('[x](docs/architecture/x.md#section) [y](docs/architecture/y.md?q=1)\n', ('docs/architecture/x.md', 'docs/architecture/y.md')),
+    ('[e](docs/architecture/e&amp;f.md)\n', ('docs/architecture/e&f.md',)),
+    ('<pre>\n[demo](docs/architecture/demo.md)\n</pre>\n', ()),
+    ('<!-- [demo](docs/architecture/demo.md) -->\n', ()),
+    ('<div>\n\n[shown](docs/architecture/shown.md)\n\n</div>\n', ('docs/architecture/shown.md',)),
+    ('[c](docs/architecture/c&#46;md)\n', ('docs/architecture/c.md',)),
+    ('[c](docs/architecture/c.md&#35;section)\n', ('docs/architecture/c.md',)),
+    ('[c][d]\n\n[d]: docs/architecture/c&#46;md\n', ('docs/architecture/c.md',)),
+    ('[x](docs/architecture/a%23b.md)\n', ('docs/architecture/a#b.md',)),
+    ('[c](docs/architecture/`c`.md)\n', ('docs/architecture/`c`.md',)),
+    ('[c](<docs/architecture/`c` d.md>)\n', ('docs/architecture/`c` d.md',)),
+    ('[component][undefined]\n\n[component]: docs/architecture/component.md\n', ()),
+    ('[component]: docs/architecture/component.md\n\n[component][undefined]\n', ()),
+    ('[foo][bar][baz]\n\n[baz]: docs/architecture/baz.md\n[foo]: docs/architecture/foo.md\n', ('docs/architecture/baz.md',)),
+    ('\\![component]\n\n[component]: docs/architecture/component.md\n', ('docs/architecture/component.md',)),
+    ('\\![c][]\n\n[c]: docs/architecture/c.md\n', ('docs/architecture/c.md',)),
+    ('\\![x][c]\n\n[c]: docs/architecture/c.md\n', ('docs/architecture/c.md',)),
 ]
 
 
-@pytest.mark.parametrize("document", COMMONMARK_CORPUS)
-def test_link_discovery_matches_commonmark(document):
-    markdown_it = pytest.importorskip("markdown_it")
-    from urllib.parse import unquote
+@pytest.mark.parametrize("document,expected", COMMONMARK_EXPECTATIONS)
+def test_link_discovery_follows_commonmark(document, expected):
+    assert _linked_detail_paths(document, "ARCHITECTURE.md") == expected
 
-    from coding_review_agent_loop.architecture_context import ARCHITECTURE_DETAIL_DIR
 
-    expected: set[str] = set()
+def test_missing_parser_makes_membership_unknown(tmp_path, monkeypatch):
+    revision = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": "# Root\n\n[c](docs/architecture/c.md)\n",
+        "docs/architecture/c.md": "# C\n",
+    })
+    monkeypatch.setattr(architecture_module, "_commonmark_parser", lambda: None)
+    snapshot = _snapshot(tmp_path, revision)
+    assert snapshot.availability == "available"
+    assert snapshot.links_status == "unscanned"
+    assert snapshot.members == ()
+    assert "markdown-it-py" in snapshot.diagnostic
+    assert architecture_set_paths(snapshot) is None
+    pair = _pair(tmp_path, revision, revision)
+    assert pair.set_change == "unavailable"
 
-    def walk(tokens):
-        for token in tokens:
-            if token.type == "link_open":
-                href = unquote(token.attrs.get("href", "")).split("#", 1)[0].split("?", 1)[0]
-                resolved = _resolve_repo_relative((), href)
-                if resolved and resolved.startswith(ARCHITECTURE_DETAIL_DIR) and resolved.endswith(".md"):
-                    expected.add(resolved)
-            if token.children:
-                walk(token.children)
 
-    walk(markdown_it.MarkdownIt("commonmark").parse(document))
-    assert _linked_detail_paths(document, "ARCHITECTURE.md") == tuple(sorted(expected))
+# Round-3 review forms (#1459 items 10-14) through real Git acquisition and
+# PR comparison.
+ROUND_THREE_MEMBER_FORMS = {
+    "char-ref-in-destination": ("[c](docs/architecture/c&#46;md)\n", "docs/architecture/c.md"),
+    "char-ref-fragment": ("[c](docs/architecture/c.md&#35;section)\n", "docs/architecture/c.md"),
+    "char-ref-in-definition": ("[c][d]\n\n[d]: docs/architecture/c&#46;md\n", "docs/architecture/c.md"),
+    "backticks-in-destination": ("[c](docs/architecture/`c`.md)\n", "docs/architecture/`c`.md"),
+    "escaped-image-shortcut": ("\\![c]\n\n[c]: docs/architecture/c.md\n", "docs/architecture/c.md"),
+}
+ROUND_THREE_EXCLUDED_FORMS = {
+    "html-pre-block": "<pre>\n[demo](docs/architecture/demo.md)\n</pre>\n",
+    "html-comment": "<!-- [demo](docs/architecture/demo.md) -->\n",
+    "undefined-full-reference-label": "[demo][undefined]\n\n[demo]: docs/architecture/demo.md\n",
+}
+
+
+@pytest.mark.parametrize("form", sorted(ROUND_THREE_MEMBER_FORMS))
+def test_round_three_member_forms_are_acquired_and_compared(tmp_path, form):
+    root, member = ROUND_THREE_MEMBER_FORMS[form]
+    base = _set_repo(tmp_path, {"ARCHITECTURE.md": "# Root\n\n" + root, member: "# Member\n"})
+    snapshot = _snapshot(tmp_path, base)
+    assert [(m.path, m.availability) for m in snapshot.members] == [(member, "available")]
+    candidate = _write(tmp_path, {member: "# Member v2\n"})
+    pair = _pair(tmp_path, base, candidate)
+    assert pair.set_change == "modified"
+    assert pair.member_changes == ((member, "modified"),)
+
+
+@pytest.mark.parametrize("form", sorted(ROUND_THREE_EXCLUDED_FORMS))
+def test_round_three_excluded_forms_are_not_members(tmp_path, form):
+    revision = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": "# Root\n\n" + ROUND_THREE_EXCLUDED_FORMS[form],
+        "docs/architecture/demo.md": "# Demo\n",
+    })
+    assert _snapshot(tmp_path, revision).members == ()
+
+
+# #1459 item 15: renders stay within their allocation at the identity-only
+# boundary, for snapshots and for pairs given exactly their mandatory budget.
+def _boundary_snapshots():
+    oversized = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256=None, availability="oversized", size=100_000,
+        diagnostic="Architecture blob is 100000 bytes; limit is 65536.", links_status="scanned",
+    )
+    oversized_indexed = ArchitectureSnapshot(
+        **{**oversized.__dict__, "heading_index": ("System",),
+           "members": (ArchitectureMember("docs/architecture/a.md", "a" * 40, "available", 3, "A"),)},
+    )
+    available = ArchitectureSnapshot(
+        repository="owner/repo", path="ARCHITECTURE.md", revision="r" * 40,
+        blob_oid="b" * 40, sha256="s" * 64, availability="available", size=20,
+        content="# System\n\nOverview.\n", heading_index=("System",), links_status="scanned",
+    )
+    return {"oversized": oversized, "oversized-indexed": oversized_indexed, "available": available}
+
+
+@pytest.mark.parametrize("name", sorted(_boundary_snapshots()))
+def test_snapshot_render_fits_the_identity_only_boundary(name):
+    snapshot = _boundary_snapshots()[name]
+    identity = architecture_module._snapshot_metadata(snapshot, "Architecture context")
+    for budget in (len(identity), len(identity) + 1, len(identity) + 2):
+        rendered = render_architecture_snapshot(snapshot, max_chars=budget)
+        assert len(rendered) <= budget
+        assert rendered.startswith(identity)
+
+
+@pytest.mark.parametrize("name", sorted(_boundary_snapshots()))
+def test_pair_render_fits_its_mandatory_budget(name):
+    snapshot = _boundary_snapshots()[name]
+    pair = ArchitecturePair(
+        repository="owner/repo", path="ARCHITECTURE.md", target_revision="main",
+        candidate_revision="c" * 40, merge_base_revision="m" * 40,
+        base=snapshot, candidate=snapshot, change="unchanged",
+    )
+    prefix = architecture_module._comparison_prefix(pair)
+    base_identity = architecture_module._snapshot_metadata(pair.base, "Established base architecture snapshot")
+    candidate_identity = architecture_module._snapshot_metadata(pair.candidate, "Candidate architecture snapshot")
+    mandatory = len(prefix) + len(base_identity) + 1 + len(candidate_identity)
+    for budget in (mandatory, mandatory + 1):
+        rendered = render_architecture_pair(pair, max_chars=budget)
+        assert len(rendered) <= budget
+        assert base_identity in rendered and candidate_identity in rendered

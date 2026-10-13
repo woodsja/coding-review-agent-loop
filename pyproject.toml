@@ -19,7 +19,8 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 
-dependencies = []
+# markdown-it-py parses the architecture root's links (#1454).
+dependencies = ["markdown-it-py>=3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-xdist>=3", "pytest-timeout>=2", "markdown-it-py>=3", "pyyaml>=6"]

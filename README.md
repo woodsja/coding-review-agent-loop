@@ -807,7 +807,9 @@ The path names the root of an **architecture set**: the root document plus every
 repository-relative Markdown file under `docs/architecture/` that the root links
 to (inline links and reference links whose definition is actually used). Links
 are followed one level only; unlinked files under `docs/architecture/` are not
-members. The recommended layout is a short root overview of at most about 10k
+members. Links are read with a CommonMark parser (the `markdown-it-py`
+runtime dependency), so code, raw HTML, images and unresolved references never
+count; without the parser, membership is reported as unknown. The recommended layout is a short root overview of at most about 10k
 characters (what the system is, a component map with each component's role,
 main source paths and detail doc, system-wide invariants, the main flows, and an
 index of the detail docs, with no issue history) plus detail docs of about

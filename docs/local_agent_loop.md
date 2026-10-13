@@ -1033,6 +1033,13 @@ targets outside `docs/architecture/`, and escapes above the repository root are
 ignored. Links are followed one level only, so links inside detail docs and
 unlinked files under `docs/architecture/` are never members. Every member is
 read from the same immutable revision as the root, in bounded batches.
+Links are read with a CommonMark parser (`markdown-it-py`, a runtime
+dependency), so membership follows rendered Markdown: fenced and indented
+code, code spans, raw HTML blocks and comments, images, escaped brackets and
+reference links whose label is undefined never count, while escapes and
+character references in destinations are decoded. If the parser cannot be
+imported, the root is treated as unscanned: membership is unknown, validation
+is skipped and the PR set change is `unavailable`.
 
 Recommended layout:
 
