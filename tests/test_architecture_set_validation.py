@@ -391,3 +391,31 @@ def test_a_parenthesized_member_is_accepted_and_a_code_span_link_is_rejected(tmp
     first, second = _prompts(runner)
     assert SECTION in second
     assert _path_of(response) == member
+
+
+@pytest.mark.parametrize(
+    "root,member,accepted",
+    [
+        ("\\` [c](docs/architecture/c.md) \\`\n", "docs/architecture/c.md", True),
+        ("[c](<docs/architecture/c\\(v2\\).md>)\n", "docs/architecture/c(v2).md", True),
+        ('[c](docs/architecture/c.md "The \\"c\\" service")\n', "docs/architecture/c.md", True),
+        ("> See [c].\n>\n> [c]: docs/architecture/c.md\n", "docs/architecture/c.md", True),
+        ("\\[c](docs/architecture/c.md)\n", "docs/architecture/c.md", False),
+        ("> ~~~\n> [c](docs/architecture/c.md)\n> ~~~\n", "docs/architecture/c.md", False),
+        ("Para.\n\n    [c](docs/architecture/c.md)\n", "docs/architecture/c.md", False),
+    ],
+    ids=[
+        "escaped-backticks", "angle-escaped-parens", "escaped-title-quote", "blockquote-definition",
+        "escaped-bracket", "blockquote-fence", "indented-code",
+    ],
+)
+def test_round_two_forms_drive_canonical_path_validation(tmp_path, root, member, accepted):
+    config, _repo = _coder_repo(tmp_path, {"ARCHITECTURE.md": "# Root\n\n" + root, member: "# C\n"})
+    outputs = [_task_output(member)] if accepted else [_task_output(member), _task_output(None)]
+    runner = FakeRunner(claude_outputs=outputs)
+    response = _run(runner, tmp_path, "task", _hook(config))
+    prompts = _prompts(runner)
+    if accepted:
+        assert len(prompts) == 1 and _path_of(response) == member
+    else:
+        assert len(prompts) == 2 and SECTION in prompts[1] and _path_of(response) is None

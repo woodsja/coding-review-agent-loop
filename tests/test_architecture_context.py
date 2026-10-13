@@ -760,3 +760,118 @@ def test_parenthesized_member_is_acquired_validated_and_compared(tmp_path):
     assert pair.change == "unchanged"
     assert pair.set_change == "modified"
     assert pair.member_changes == ((member, "modified"),)
+
+
+# Round-2 review forms (#1459 items 5-9).  Each member form is a real link
+# to its detail doc; each excluded form is code or literal text.
+SET_MEMBER_FORMS = {
+    "escaped-backticks": ("\\` [component](docs/architecture/{name}) \\`\n", "component.md"),
+    "angle-escaped-parens": ("[component](<docs/architecture/{name}>)\n", "component\\(v2\\).md"),
+    "angle-reference-definition": ("See [c].\n\n[c]: <docs/architecture/{name}>\n", "c\\(v2\\).md"),
+    "escaped-title-quote": ('[component](docs/architecture/{name} "The \\"component\\" service")\n', "component.md"),
+    "blockquote-definition": ("> See [component].\n>\n> [component]: docs/architecture/{name}\n", "component.md"),
+    "percent-encoded": ("[c](docs/architecture/{name})\n", "a%20b.md"),
+}
+SET_EXCLUDED_FORMS = {
+    "escaped-bracket": "\\[demo](docs/architecture/demo.md)\n",
+    "blockquote-fence": "> ~~~\n> [demo](docs/architecture/demo.md)\n> ~~~\n",
+    "indented-code": "Para.\n\n    [demo](docs/architecture/demo.md)\n",
+    "list-indented-code": "- item\n\n      [demo](docs/architecture/demo.md)\n",
+    "list-fence": "- item\n  ```\n  [demo](docs/architecture/demo.md)\n  ```\n",
+    "nested-quote-code": "> > text\n>\n>     [demo](docs/architecture/demo.md)\n",
+}
+
+
+def _decoded_member(name: str) -> str:
+    from urllib.parse import unquote
+
+    return "docs/architecture/" + unquote(name.replace("\\", ""))
+
+
+@pytest.mark.parametrize("form", sorted(SET_MEMBER_FORMS))
+def test_round_two_member_forms_are_acquired_and_compared(tmp_path, form):
+    template, name = SET_MEMBER_FORMS[form]
+    member = _decoded_member(name)
+    base = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": "# Root\n\n" + template.format(name=name),
+        member: "# Member\n",
+    })
+    snapshot = _snapshot(tmp_path, base)
+    assert [(m.path, m.availability) for m in snapshot.members] == [(member, "available")]
+    assert member in architecture_set_paths(snapshot)
+    candidate = _write(tmp_path, {member: "# Member v2\n"})
+    pair = _pair(tmp_path, base, candidate)
+    assert pair.set_change == "modified"
+    assert pair.member_changes == ((member, "modified"),)
+
+
+@pytest.mark.parametrize("form", sorted(SET_EXCLUDED_FORMS))
+def test_round_two_code_and_literal_forms_are_not_members(tmp_path, form):
+    revision = _set_repo(tmp_path, {
+        "ARCHITECTURE.md": "# Root\n\n" + SET_EXCLUDED_FORMS[form],
+        "docs/architecture/demo.md": "# Demo\n",
+    })
+    snapshot = _snapshot(tmp_path, revision)
+    assert snapshot.members == ()
+    assert architecture_set_paths(snapshot) == frozenset({"ARCHITECTURE.md"})
+
+
+# CommonMark oracle: link discovery must agree with a full CommonMark parser
+# (markdown-it-py, a dev dependency) on every document in this corpus.  Two
+# known markdown-it-py deviations from the spec, which GitHub's cmark-gfm
+# follows, are deliberately absent: a code span inside unclosed link
+# brackets, and an indented line directly after a reference definition.
+COMMONMARK_CORPUS = [
+    *(template.format(name=name) for template, name in SET_MEMBER_FORMS.values()),
+    *SET_EXCLUDED_FORMS.values(),
+    "[c](docs/architecture/component(v2).md)\n",
+    "[c](docs/architecture/a(b(c)).md \"Title\")\n",
+    "See the [billing\ncomponent](docs/architecture/billing.md).\n",
+    "See [billing](\ndocs/architecture/billing.md\n'Title')\n",
+    "See [billing].\n\n[billing]:\n  docs/architecture/billing.md\n",
+    "[nested [label]](docs/architecture/nested.md)\n",
+    "Code `start\n[demo](docs/architecture/demo.md) end` here.\n",
+    "```python\n[x](docs/architecture/x.md)\n``` python\n[y](docs/architecture/y.md)\n```\n",
+    "~~~~\n[x](docs/architecture/x.md)\n~~~\n[y](docs/architecture/y.md)\n~~~~\n",
+    "![image](docs/architecture/pic.md)\n",
+    "> quote\nlazy [x](docs/architecture/x.md)\n",
+    "1. one\n   > [q](docs/architecture/q.md)\n",
+    "* a\n\n  [b](docs/architecture/b.md)\n",
+    "text\n    [cont](docs/architecture/cont.md)\n",
+    "# Head [h](docs/architecture/h.md)\n",
+    "# [b]: docs/architecture/b.md\n\nSee [b].\n",
+    "[a\\_b]\n\n[a\\_b]: docs/architecture/ab.md\n",
+    "[b]: docs/architecture/b.md  # junk\n\n[b][]\n",
+    "[b]: docs/architecture/b.md\n\"title\"\n\n[b]\n",
+    "Text [b]: here.\n\n[b]: docs/architecture/b.md\n",
+    "\\[[[b][a](docs/architecture/a.md)\n\n[b]: docs/architecture/b.md\n",
+    "1. \n    [a](docs/architecture/a.md)\n",
+    "- \n\n    [a](docs/architecture/a.md)\n",
+    "[t](docs/architecture/t.md 'single') [u](docs/architecture/u.md (paren))\n",
+    "<docs/architecture/auto.md> [x](<docs/architecture/x y.md>)\n",
+    "[x](docs/architecture/x.md#section) [y](docs/architecture/y.md?q=1)\n",
+    "[e](docs/architecture/e&amp;f.md)\n",
+]
+
+
+@pytest.mark.parametrize("document", COMMONMARK_CORPUS)
+def test_link_discovery_matches_commonmark(document):
+    markdown_it = pytest.importorskip("markdown_it")
+    from urllib.parse import unquote
+
+    from coding_review_agent_loop.architecture_context import ARCHITECTURE_DETAIL_DIR
+
+    expected: set[str] = set()
+
+    def walk(tokens):
+        for token in tokens:
+            if token.type == "link_open":
+                href = unquote(token.attrs.get("href", "")).split("#", 1)[0].split("?", 1)[0]
+                resolved = _resolve_repo_relative((), href)
+                if resolved and resolved.startswith(ARCHITECTURE_DETAIL_DIR) and resolved.endswith(".md"):
+                    expected.add(resolved)
+            if token.children:
+                walk(token.children)
+
+    walk(markdown_it.MarkdownIt("commonmark").parse(document))
+    assert _linked_detail_paths(document, "ARCHITECTURE.md") == tuple(sorted(expected))
