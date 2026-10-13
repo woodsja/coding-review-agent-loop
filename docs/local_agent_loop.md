@@ -4850,7 +4850,7 @@ report says.
 ```bash
 agent-loop history export --repo OWNER/REPO --output history.json
 agent-loop triage backtest --history history.json \
-  --provider-command "python3 my_provider.py --model local" \
+  --provider-command "python3 /abs/path/my_provider.py --model local" \
   --output backtest.json
 agent-loop triage backtest --history a.json --history b.json \
   --provider-command ./provider.sh --output backtest.md --format markdown
@@ -4933,12 +4933,13 @@ confidence.
 
 - **Abstain and invalid answers.** `unsure: true` (or an unrecognized route),
   `abstain: true` (`provider-abstained`) and an exact tie for the top
-  probability (`probability-tie`) are well-formed abstains. A timeout,
-  stdout over 64 KiB, a launch failure (`launch-failed:<errno>`, never a path),
-  a nonzero exit (`exit-<code>`), non-UTF-8 output or a validation failure
-  (`invalid-answer: ...`) is invalid. Both count as abstain with the reason
-  recorded per target; one failed call never stops the backtest. Every abstain
-  has null confidence.
+  probability (`probability-tie`) are well-formed abstains. A timeout, stdout
+  over 64 KiB, a launch failure (`launch-failed:<errno>`, never a path), a
+  nonzero exit (`exit-<code>`), non-UTF-8 output or a validation failure
+  (`invalid-answer: ...`, including output the JSON decoder cannot handle,
+  such as very deep nesting or huge numbers) is invalid. Both count as abstain
+  with the reason recorded per target; one failed call never stops the
+  backtest. Every abstain has null confidence.
 - **Metrics.** For calibration, holdout and all targets: per-route support,
   predictions, precision and recall, coverage, accuracy on covered targets and
   the invalid count. A zero denominator is `null` (`n/a` in Markdown). The
@@ -4958,9 +4959,11 @@ confidence.
   `not-supported` by whether holdout also reaches them at that threshold.
   `decided_by` names the rule. This is a measurement only; adopting hybrid
   routing would need a separate change.
-- **Execution limits.** The command line is split without a shell (a relative
-  executable path is resolved against your working directory) and runs in a
-  fresh temporary directory, in its own process group, with `GH_TOKEN`,
+- **Execution limits.** The command line is split without a shell. Only a
+  relative executable path (the first word, such as `./provider.sh`) is
+  resolved against your working directory; pass every other file argument,
+  such as a script given to `python3`, as an absolute path. The provider runs
+  in a fresh temporary directory, in its own process group, with `GH_TOKEN`,
   `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` removed.
   stderr is drained and only its first 16 KiB are kept (`stderr_truncated`
   marks more); its first 200 characters go to the log for a failed call. After

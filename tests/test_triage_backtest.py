@@ -129,6 +129,9 @@ elif kind == "extra-key":
     print(prob("0.2,0.2,0.6", note="x"))
 elif kind == "malformed":
     print("{not json")
+elif kind == "file":
+    with open(arg) as handle:
+        sys.stdout.write(handle.read())
 elif kind == "exit":
     print(route("direct"))
     sys.exit(int(arg))
@@ -791,3 +794,130 @@ def test_selection_counts_considered_rows():
     corpus = backtest.Corpus(files=("x.json",), rows=(_row(1), _row(2, complete=False)))
     selection = select_targets(corpus, LabelSpec())
     assert (selection.considered, selection.labeled, len(selection.targets)) == (2, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Decoder resource limits stay per-target invalid answers
+# ---------------------------------------------------------------------------
+
+_HUGE_INT = "9" * 401
+_HUGE_DIGITS = "1" * 5000
+_DEEP = "[" * 2000 + "]" * 2000
+DECODER_LIMIT_ANSWERS = {
+    "probability-401-digit-int": (
+        '{"schema_version": 1, "kind": "issue_triage_probability", "probabilities": '
+        f'{{"discuss-first": {_HUGE_INT}, "plan-first": 0, "direct": 0}}, "abstain": false}}'
+    ),
+    "probability-5000-digit-int": (
+        '{"schema_version": 1, "kind": "issue_triage_probability", "probabilities": '
+        f'{{"discuss-first": {_HUGE_DIGITS}, "plan-first": 0, "direct": 0}}, "abstain": false}}'
+    ),
+    "top-level-deep-nesting": _DEEP,
+    "probability-deep-nesting": (
+        '{"schema_version": 1, "kind": "issue_triage_probability", "probabilities": '
+        f'{_DEEP}, "abstain": false}}'
+    ),
+    "route-deep-nesting": (
+        '{"schema_version": 1, "kind": "issue_triage", "route": "direct", "unsure": false, '
+        f'"reasons": {_DEEP}}}'
+    ),
+    "route-5000-digit-schema": (
+        f'{{"schema_version": {_HUGE_DIGITS}, "kind": "issue_triage", "route": "direct", '
+        '"unsure": false, "reasons": []}'
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(DECODER_LIMIT_ANSWERS))
+def test_decoder_resource_limits_are_invalid_answers(name):
+    text = DECODER_LIMIT_ANSWERS[name]
+    assert len(text.encode()) < backtest.MAX_STDOUT_BYTES
+    result = validate_answer(text)
+    assert result.prediction == ABSTAIN and result.answer_shape == "invalid"
+    assert result.confidence is None
+    assert classify_reason(result.reason) == "invalid"
+
+
+def test_decoder_limit_answers_do_not_abort_the_backtest(tmp_path, provider):
+    answers = tmp_path / "answers"
+    answers.mkdir()
+    names = sorted(DECODER_LIMIT_ANSWERS)
+    behaviors = {}
+    for number, name in enumerate(names, start=1):
+        path = answers / f"{name}.txt"
+        path.write_text(DECODER_LIMIT_ANSWERS[name], encoding="utf-8")
+        behaviors[number] = f"file:{path}"
+    last = len(names) + 1
+    behaviors[last] = "route:direct"
+    rows = [
+        _row(number, run_started=f"2026-09-{number:02d}T00:00:00+00:00", as_of=f"2026-09-{number:02d}T00:00:00+00:00")
+        for number in behaviors
+    ]
+    report, output = _report(tmp_path, rows, provider, behaviors)
+    targets = _by_issue(report)
+    for number in range(1, last):
+        assert targets[number]["prediction"] == ABSTAIN
+        assert targets[number]["reason"].startswith("invalid-answer: ")
+    assert targets[last]["prediction"] == "direct"
+    assert json.loads(output.read_text()) == report
+
+
+# ---------------------------------------------------------------------------
+# Hybrid decisions use unrounded accuracy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target_accuracy, status, decided_by", [
+    (0.6667, "not-supported", "rule-3-calibration-search"),
+    (0.6666, "supported", "rule-4-holdout-check"),
+])
+def test_hybrid_decision_compares_unrounded_accuracy(target_accuracy, status, decided_by):
+    scored = []
+    for split, base in (("calibration", 0), ("holdout", 10)):
+        for offset, label in enumerate(("direct", "direct", "plan-first")):
+            scored.append(_scored(base + offset, label, _committed("direct", 0.9), split))
+    finding = hybrid_finding(scored, target_accuracy=target_accuracy, min_support=3)
+    assert finding["sweep"][0]["calibration"]["accuracy"] == 0.6667
+    assert (finding["status"], finding["decided_by"]) == (status, decided_by)
+    holdout_only = [item for item in scored if item.split == "calibration"] + [
+        _scored(20 + n, "direct", _committed("direct", 0.9), "holdout") for n in range(3)
+    ]
+    assert hybrid_finding(holdout_only, target_accuracy=0.6667, min_support=3)["status"] == "not-supported"
+
+
+# ---------------------------------------------------------------------------
+# Markdown carries the full baseline comparison
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_renders_baseline_per_route_precision_and_recall():
+    scored = [
+        _scored(1, "direct", Prediction("route", "direct", None)),
+        _scored(2, "direct", Prediction("route", "direct", None)),
+        _scored(3, "plan-first", Prediction("route", "plan-first", None), "holdout"),
+    ]
+    report = {
+        "label_spec": {"version": 1, "discuss_min_plan_rounds": 4, "direct_max_pr_rounds": 2},
+        "provider": {"executable": "p", "argv_sha256": "x", "timeout_seconds": 1},
+        "corpus": {"rows": 3, "files": ["h.json"], "labeled": 3, "targets": 3,
+                   "unlabeled_by_reason": {}, "excluded_targets_by_reason": {}},
+        "metrics": compute_metrics(scored),
+        "baseline": backtest.majority_baseline(scored),
+        "hybrid": hybrid_finding(scored, target_accuracy=0.9, min_support=1),
+        "targets": [],
+    }
+    text = backtest.render_report_markdown(report)
+    baseline_section = text.split("## Majority baseline", 1)[1].split("## Hybrid", 1)[0]
+    assert "- Route: direct" in baseline_section
+    assert "| calibration | 1.0 | direct | 2 | 2 | 1.0 | 1.0 |" in baseline_section
+    assert "| holdout | 0.0 | direct | 0 | 1 | 0.0 | n/a |" in baseline_section
+    assert "| holdout | 0.0 | plan-first | 1 | 0 | n/a | 0.0 |" in baseline_section
+    assert "| all | 0.6667 | direct | 2 | 3 | 0.6667 | 1.0 |" in baseline_section
+
+
+def test_docs_provider_example_uses_an_absolute_script_path():
+    text = (Path(__file__).resolve().parents[1] / "docs" / "local_agent_loop.md").read_text(encoding="utf-8")
+    section = text.split("### Offline triage backtest", 1)[1].split("\n## ", 1)[0]
+    assert "python3 my_provider.py" not in section
+    assert "python3 /abs/path/my_provider.py" in section
+    assert "pass every other file argument" in section

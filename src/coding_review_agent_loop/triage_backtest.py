@@ -587,7 +587,9 @@ def _invalid(message: str) -> Prediction:
 def _is_probability(value: object) -> bool:
     return (
         isinstance(value, (int, float)) and not isinstance(value, bool)
-        and math.isfinite(value) and 0.0 <= value <= 1.0
+        # Range first: an exact int/float comparison never converts a huge
+        # integer to float, so it cannot overflow.
+        and 0 <= value <= 1 and math.isfinite(value)
     )
 
 
@@ -622,7 +624,19 @@ def _validate_probability(payload: Mapping[str, object], suffix: str) -> Predict
 
 
 def validate_answer(text: str) -> Prediction:
-    """A route answer, a probability-with-abstain answer, or an invalid abstain."""
+    """A route answer, a probability-with-abstain answer, or an invalid abstain.
+
+    Any failure while decoding or checking the bounded provider output,
+    including decoder resource limits (deep nesting, oversized numbers), is
+    an invalid answer for this target and never aborts the backtest.
+    """
+    try:
+        return _validate_answer(text)
+    except (ValueError, RecursionError, OverflowError, MemoryError, TypeError) as exc:
+        return _invalid(f"answer could not be decoded ({type(exc).__name__}).")
+
+
+def _validate_answer(text: str) -> Prediction:
     stripped = text.strip()
     try:
         payload, end = json.JSONDecoder().raw_decode(stripped)
@@ -785,13 +799,17 @@ def hybrid_finding(scored: Sequence[Scored], *, target_accuracy: float, min_supp
         for name in SPLITS
     }
 
-    def at(name: str, threshold: float) -> dict:
+    def counts(name: str, threshold: float) -> tuple[int, int]:
         confident = [item for item in committed[name] if item.prediction.confidence >= threshold]  # type: ignore[operator]
         correct = sum(1 for item in confident if item.prediction.prediction == item.target.label)
+        return len(confident), correct
+
+    def at(name: str, threshold: float) -> dict:
+        confident, correct = counts(name, threshold)
         return {
-            "confident": len(confident),
-            "accuracy": _ratio(correct, len(confident)),
-            "coverage": _ratio(len(confident), totals[name]),
+            "confident": confident,
+            "accuracy": _ratio(correct, confident),
+            "coverage": _ratio(confident, totals[name]),
         }
 
     sweep = [
@@ -802,11 +820,10 @@ def hybrid_finding(scored: Sequence[Scored], *, target_accuracy: float, min_supp
         **base, "committed_answers": {name: len(committed[name]) for name in SPLITS}, "sweep": sweep,
     }
 
-    def qualifies(entry: Mapping[str, object]) -> bool:
-        return (
-            entry["confident"] >= min_support  # type: ignore[operator]
-            and entry["accuracy"] is not None and entry["accuracy"] >= target_accuracy  # type: ignore[operator]
-        )
+    def qualifies(name: str, threshold: float) -> bool:
+        # Decide on the unrounded accuracy; rounding is for the report only.
+        confident, correct = counts(name, threshold)
+        return confident >= min_support and confident > 0 and correct / confident >= target_accuracy
 
     if any(len(committed[name]) < min_support for name in SPLITS):
         return {
@@ -814,14 +831,14 @@ def hybrid_finding(scored: Sequence[Scored], *, target_accuracy: float, min_supp
             "reason": f"a split has fewer than {min_support} committed probability answers",
             "threshold": None,
         }
-    chosen = next((entry for entry in sweep if qualifies(entry[SPLIT_CALIBRATION])), None)
+    chosen = next((entry for entry in sweep if qualifies(SPLIT_CALIBRATION, entry["threshold"])), None)
     if chosen is None:
         return {
             **result, "status": "not-supported", "decided_by": "rule-3-calibration-search",
             "reason": "no threshold meets the target accuracy and support on calibration",
             "threshold": None,
         }
-    if qualifies(chosen[SPLIT_HOLDOUT]):
+    if qualifies(SPLIT_HOLDOUT, chosen["threshold"]):
         return {
             **result, "status": "supported", "decided_by": "rule-4-holdout-check",
             "reason": "the calibration threshold also meets the target on holdout",
@@ -959,9 +976,15 @@ def render_report_markdown(report: Mapping[str, object]) -> str:
     if baseline["route"] is None:
         lines.append(f"- n/a ({baseline['reason']})")
     else:
-        lines.append(f"- Route: {baseline['route']}")
+        lines += [f"- Route: {baseline['route']}", "",
+                  "| Split | Accuracy | Route | Support | Predicted | Precision | Recall |",
+                  "| --- | --- | --- | --- | --- | --- | --- |"]
         for split, values in baseline["splits"].items():  # type: ignore[union-attr]
-            lines.append(f"- {split} accuracy: {_cell(values['accuracy'])}")
+            for route, per in values["per_route"].items():
+                lines.append(
+                    f"| {split} | {_cell(values['accuracy'])} | {route} | {per['support']} | "
+                    f"{per['predicted']} | {_cell(per['precision'])} | {_cell(per['recall'])} |"
+                )
     lines += [
         "", "## Hybrid routing finding", "",
         f"- Status: **{hybrid['status']}** (decided by {hybrid['decided_by']}; {hybrid['reason']})",
