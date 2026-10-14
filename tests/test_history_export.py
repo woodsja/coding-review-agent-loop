@@ -675,8 +675,10 @@ def test_cli_history_export_writes_requested_format(tmp_path, monkeypatch):
 
 def test_history_export_is_documented():
     root = Path(__file__).resolve().parents[1]
-    for path in ("README.md", "docs/local_agent_loop.md", "ARCHITECTURE.md"):
+    for path in ("README.md", "docs/local_agent_loop.md"):
         assert "history export" in (root / path).read_text(encoding="utf-8"), path
+    architecture_set = [root / "ARCHITECTURE.md", *sorted((root / "docs" / "architecture").glob("*.md"))]
+    assert "history export" in "\n\n".join(path.read_text(encoding="utf-8") for path in architecture_set)
 
 
 # --- review round 1: real publication and failure paths -----------------------
