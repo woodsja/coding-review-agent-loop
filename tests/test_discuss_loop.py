@@ -3412,9 +3412,17 @@ def test_discuss_loop_config_rejects_invalid_failure_policy_and_timeout(tmp_path
         make_config(tmp_path, reviewer=("codex", "gemini"), discuss_debater_timeout=0)
 
 
+# Bound for each probe's wait on its peer debater (#1471). Event.wait returns
+# as soon as the peer starts, so a green run pays nothing; the bound only caps
+# how long a real serialization regression takes to fail.
+_OVERLAP_PROBE_TIMEOUT_SECONDS = 60.0
+
+
 class _ConcurrencyProbeRunner(FakeRunner):
     """Each debater blocks until the other has started: deadlocks (then fails
-    fast via the wait timeout) unless same-round debaters truly overlap."""
+    after the bounded wait) unless same-round debaters truly overlap."""
+
+    overlap_timeout = _OVERLAP_PROBE_TIMEOUT_SECONDS
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -3426,11 +3434,11 @@ class _ConcurrencyProbeRunner(FakeRunner):
         cmd = [str(arg) for arg in args]
         if cmd[:2] == ["codex", "exec"]:
             self.codex_started.set()
-            if not self.gemini_started.wait(timeout=10):
+            if not self.gemini_started.wait(timeout=self.overlap_timeout):
                 self.overlap_confirmed = False
         elif cmd[:1] == ["gemini"]:
             self.gemini_started.set()
-            if not self.codex_started.wait(timeout=10):
+            if not self.codex_started.wait(timeout=self.overlap_timeout):
                 self.overlap_confirmed = False
         return super().run_with_log(args, cwd=cwd, **kwargs)
 
@@ -3451,6 +3459,24 @@ def test_discuss_parallel_runs_same_round_debaters_concurrently(tmp_path):
     assert "Round 1: Codex position" in runner.comments[0]
     assert "Round 1: Gemini position" in runner.comments[1]
     assert "Consensus: Implement" in runner.comments[2]
+
+
+def test_discuss_sequential_debaters_fail_overlap_probe_after_bounded_wait(tmp_path):
+    """A serialized round must still read as non-overlapping, after the bound
+    rather than hanging (#1471)."""
+    implement_text = _discuss_review_text(outcome="implement")
+    runner = _ConcurrencyProbeRunner(
+        codex_outputs=[implement_text],
+        gemini_outputs=[implement_text],
+    )
+    runner.overlap_timeout = 0.5
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_parallel=False)
+
+    started = time.monotonic()
+    assert run_discuss_loop(runner, issue_number=56, config=config) == 0
+
+    assert runner.overlap_confirmed is False
+    assert time.monotonic() - started < _OVERLAP_PROBE_TIMEOUT_SECONDS
 
 
 def test_discuss_parallel_matches_sequential_output(tmp_path):

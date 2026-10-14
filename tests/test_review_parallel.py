@@ -1169,9 +1169,19 @@ def test_review_parallel_flag_scoped_to_issue_pr_task_not_discuss():
 # Concurrency probes
 # ---------------------------------------------------------------------------
 
+# Bound for each probe's wait on its peer reviewer (#1471). Event.wait returns
+# as soon as the peer starts, so a green run pays nothing; the bound only caps
+# how long a real serialization regression takes to fail. Pre-launch work
+# (snapshot/worktree setup, git subprocesses) can take well over 10 s on a
+# loaded host, so a short bound turns slow scheduling into a false failure.
+_OVERLAP_PROBE_TIMEOUT_SECONDS = 60.0
+
+
 class _ReviewConcurrencyProbeRunner(FakeRunner):
     """Each reviewer blocks until the other has started, so a timeout means
     same-round reviewers did not truly overlap."""
+
+    overlap_timeout = _OVERLAP_PROBE_TIMEOUT_SECONDS
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -1183,11 +1193,11 @@ class _ReviewConcurrencyProbeRunner(FakeRunner):
         cmd = [str(arg) for arg in args]
         if cmd[:2] == ["codex", "exec"]:
             self.codex_started.set()
-            if not self.gemini_started.wait(timeout=10):
+            if not self.gemini_started.wait(timeout=self.overlap_timeout):
                 self.overlap_confirmed = False
         elif cmd[:1] == ["gemini"]:
             self.gemini_started.set()
-            if not self.codex_started.wait(timeout=10):
+            if not self.codex_started.wait(timeout=self.overlap_timeout):
                 self.overlap_confirmed = False
         return super().run_with_log(args, cwd=cwd, **kwargs)
 
@@ -1225,6 +1235,25 @@ def test_pr_loop_parallel_runs_same_round_reviewers_concurrently(tmp_path):
     assert any("Codex PR review complete." in comment for comment in runner.comments)
     assert any("Gemini PR review complete." in comment for comment in runner.comments)
     assert "reconciliation" in runner.comments[-1]
+
+
+def test_pr_loop_serialized_reviewers_fail_overlap_probe_after_bounded_wait(tmp_path):
+    """A serialized round must still read as non-overlapping, after the bound
+    rather than hanging (#1471)."""
+    runner = _ReviewConcurrencyProbeRunner(
+        codex_outputs=[structured_pr_review(summary="Codex PR review complete.")],
+        gemini_outputs=[
+            structured_pr_review(summary="Gemini PR review complete.", reviewer="Google Gemini")
+        ],
+    )
+    runner.overlap_timeout = 0.5
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=False)
+
+    started = time.monotonic()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.overlap_confirmed is False
+    assert time.monotonic() - started < _OVERLAP_PROBE_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize("context_mode", ["compact", "full"])
@@ -2478,6 +2507,8 @@ class _SecondaryPanelConcurrencyProbeRunner(FakeRunner):
     """The two secondaries block until each other has started; the primary
     must have finished before either one begins."""
 
+    overlap_timeout = _OVERLAP_PROBE_TIMEOUT_SECONDS
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.gemini_started = threading.Event()
@@ -2492,13 +2523,13 @@ class _SecondaryPanelConcurrencyProbeRunner(FakeRunner):
             if not self.primary_finished.is_set():
                 self.panel_started_before_primary = True
             self.gemini_started.set()
-            if not self.antigravity_started.wait(timeout=10):
+            if not self.antigravity_started.wait(timeout=self.overlap_timeout):
                 self.overlap_confirmed = False
         elif cmd[:1] == ["agy"] and "catalog" not in cmd:
             if not self.primary_finished.is_set():
                 self.panel_started_before_primary = True
             self.antigravity_started.set()
-            if not self.gemini_started.wait(timeout=10):
+            if not self.gemini_started.wait(timeout=self.overlap_timeout):
                 self.overlap_confirmed = False
         result = super().run_with_log(args, cwd=cwd, **kwargs)
         if cmd[:2] == ["codex", "exec"]:
@@ -2535,6 +2566,32 @@ def test_primary_then_panel_parallel_panel_runs_from_one_snapshot_after_primary_
     assert runner.overlap_confirmed, "secondary panel reviewers did not run concurrently"
     assert not runner.panel_started_before_primary
     assert any("phase: secondary-audit" in comment for comment in runner.comments)
+
+
+def test_primary_then_panel_serialized_panel_fails_overlap_probe_after_bounded_wait(tmp_path):
+    """Without --review-parallel the secondary panel launches with one worker;
+    the probe must report non-overlap after its bound instead of hanging (#1471)."""
+    runner = _SecondaryPanelConcurrencyProbeRunner(
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
+        antigravity_outputs=[_staged_review(reviewer="Antigravity")],
+    )
+    runner.overlap_timeout = 0.5
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "gemini", "antigravity"),
+        review_parallel=False,
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        max_rounds=2,
+    )
+
+    started = time.monotonic()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert runner.overlap_confirmed is False
+    assert not runner.panel_started_before_primary
+    assert time.monotonic() - started < _OVERLAP_PROBE_TIMEOUT_SECONDS
 
 
 def test_primary_then_panel_parallel_panel_failure_keeps_healthy_result_and_blocks_finalization(

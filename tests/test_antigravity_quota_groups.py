@@ -379,6 +379,12 @@ def test_all_groups_quoted_json_long_reset_raises_and_ignores_unrelated_groups(t
         assert "Reset in 4h" in str(error)  # earliest chain reset (Gemini's 14400 s), not 60 s
 
 
+# Bound for the two reviewer turns to meet at the launcher barrier (#1471).
+# Barrier.wait returns as soon as both parties arrive, so a green run pays
+# nothing; a serialized launcher still raises BrokenBarrierError after it.
+_PEER_BARRIER_TIMEOUT_SECONDS = 60.0
+
+
 def test_parallel_memory_through_production_reviewer_launcher(tmp_path):
     from coding_review_agent_loop import review_rounds
 
@@ -396,7 +402,7 @@ def test_parallel_memory_through_production_reviewer_launcher(tmp_path):
     def run_turn(reviewer):
         state = agy.AntigravityAttemptState.from_config(config, 1)
         seen.append(state.memory)
-        barrier.wait(timeout=10)
+        barrier.wait(timeout=_PEER_BARRIER_TIMEOUT_SECONDS)
         state.next_after_quota_exhaustion(quota, 0.0)
         return review_rounds._ReviewerTurnResult(reviewer_name=str(reviewer))
 
