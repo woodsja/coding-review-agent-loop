@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -60,6 +61,11 @@ CODEX, CLAUDE = "Codex", "Claude"
 
 def at(minute: int, hour: int = 10) -> str:
     return f"2026-10-01T{hour:02d}:{minute:02d}:00Z"
+
+
+def after_cutoff(minute: int, hour: int = 10) -> str:
+    """A time after the step-back feature cutoff (2026-10-04T00:00:00Z)."""
+    return f"2026-10-06T{hour:02d}:{minute:02d}:00Z"
 
 
 def record(flow: str, role: str, agent: str, round_number: int, **fields) -> str:
@@ -331,11 +337,15 @@ def test_route_discuss_only_and_discuss_then_plan():
 
 
 def test_legacy_records_render_unavailable_without_failing():
+    # Written after the step-back cutoff, yet without era fields: ambiguous.
     legacy_coder = record("plan", "coder", "Claude", 1, canonical_plan="Old plan.")
     legacy_review = record("plan", "reviewer", CODEX, 1, state="approved")
     row = derive(
-        history(state="CLOSED", closed=at(30, 11)),
-        issue_view(comment(1, legacy_coder), comment(2, legacy_review)),
+        history(state="CLOSED", closed=after_cutoff(30, 11)),
+        issue_view(
+            comment(1, legacy_coder, created=after_cutoff(1)),
+            comment(2, legacy_review, created=after_cutoff(2)),
+        ),
     )
     assert row["plan_rounds"] == {"value": 1, "evidence": "verified"}
     assert row["step_backs"] == {"value": None, "evidence": "unavailable"}
@@ -964,13 +974,19 @@ def test_snapshot_uses_only_the_first_planner_record_digest():
 
 
 def test_mixed_era_step_backs_stay_unavailable():
+    # The legacy round is after the step-back cutoff, so it is an era round
+    # missing its record rather than a pre-feature round.
     legacy = (
-        comment(1, record("plan", "coder", "Claude", 1, canonical_plan="Old plan.")),
-        comment(2, record("plan", "reviewer", CODEX, 1, state="blocking")),
+        comment(1, record("plan", "coder", "Claude", 1, canonical_plan="Old plan."), created=after_cutoff(1)),
+        comment(2, record("plan", "reviewer", CODEX, 1, state="blocking"), created=after_cutoff(2)),
     )
     mixed = derive(
-        history(state="CLOSED", closed=at(30, 11)),
-        issue_view(*legacy, comment(3, plan_coder(2)), comment(4, plan_review(CODEX, 2, "approved"))),
+        history(state="CLOSED", closed=after_cutoff(30, 11)),
+        issue_view(
+            *legacy,
+            comment(3, plan_coder(2), created=after_cutoff(3)),
+            comment(4, plan_review(CODEX, 2, "approved"), created=after_cutoff(4)),
+        ),
     )
     assert mixed["step_backs"] == {"value": None, "evidence": "unavailable"}
     modern = derive(
@@ -981,3 +997,134 @@ def test_mixed_era_step_backs_stay_unavailable():
         ),
     )
     assert modern["step_backs"] == {"value": 0, "evidence": "verified"}
+
+
+# --- step-backs before the step-back feature (#1442) ---------------------------
+
+
+PRE_FEATURE = {"value": 0, "evidence": "not-applicable-pre-feature"}
+UNAVAILABLE = {"value": None, "evidence": "unavailable"}
+
+
+def _legacy_coder(round_number: int, **kwargs) -> str:
+    return record("plan", "coder", "Claude", round_number, canonical_plan="Old plan.", **kwargs)
+
+
+def _legacy_review(round_number: int, state: str) -> str:
+    return record("plan", "reviewer", CODEX, round_number, state=state)
+
+
+def _legacy_pr(role: str, round_number: int, state: str | None = None) -> str:
+    return record("pr", role, CODEX if role == "reviewer" else "Claude", round_number, state=state)
+
+
+def test_pre_feature_only_flow_exports_a_provable_zero():
+    row = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(
+            comment(1, _legacy_coder(1)), comment(2, _legacy_review(1, "blocking")),
+            comment(3, _legacy_coder(2)), comment(4, _legacy_review(2, "approved")),
+        ),
+    )
+    assert row["step_backs"] == PRE_FEATURE
+    assert row["plan_rounds"] == {"value": 2, "evidence": "verified"}
+    assert row["human_decision_stops"] == {"value": 0, "evidence": "verified"}
+    assert row["final_plan_size"] == {"value": len("Old plan."), "evidence": "verified"}
+
+
+def test_post_cutoff_round_without_era_evidence_stays_unavailable():
+    row = derive(
+        history(state="CLOSED", closed=after_cutoff(30, 11)),
+        issue_view(
+            comment(1, _legacy_coder(1)), comment(2, _legacy_review(1, "blocking")),
+            comment(3, _legacy_coder(2), created=after_cutoff(3)),
+            comment(4, _legacy_review(2, "approved"), created=after_cutoff(4)),
+        ),
+    )
+    assert row["step_backs"] == UNAVAILABLE
+
+
+def test_mixed_flow_counts_era_step_backs_and_pre_era_rounds_add_zero():
+    def mixed(entries):
+        return derive(
+            history(state="CLOSED", closed=after_cutoff(30, 11)),
+            issue_view(
+                comment(1, _legacy_coder(1)), comment(2, _legacy_review(1, "blocking")),
+                comment(3, plan_coder(2), created=after_cutoff(3)),
+                comment(4, plan_review(CODEX, 2, "blocking", **entries), created=after_cutoff(4)),
+                comment(5, plan_coder(3), created=after_cutoff(5)),
+                comment(6, plan_review(CODEX, 3, "approved"), created=after_cutoff(6)),
+            ),
+        )
+
+    stepped = {"phase": "plan", "reviewer": CODEX, "trigger_round": 2}
+    assert mixed({"step_back_entries": (stepped,)})["step_backs"] == {"value": 1, "evidence": "verified"}
+    assert mixed({})["step_backs"] == {"value": 0, "evidence": "verified"}
+
+
+def test_round_straddling_the_cutoff_without_era_evidence_stays_unavailable():
+    row = derive(
+        history(state="CLOSED", closed=after_cutoff(30, 11)),
+        issue_view(
+            comment(1, _legacy_coder(1)),
+            comment(2, _legacy_review(1, "approved"), created=after_cutoff(2)),
+        ),
+    )
+    assert row["step_backs"] == UNAVAILABLE
+
+
+def test_pre_feature_plan_ledger_with_a_linked_pr_ledger():
+    plan = (comment(1, _legacy_coder(1)), comment(2, _legacy_review(1, "approved")))
+    closed = history(state="CLOSED", closed=after_cutoff(50, 12), linked=[merged_pr(when=after_cutoff(50, 12))])
+    era_pr = derive(closed, issue_view(*plan), {PR: pr_view(
+        pr_comment(20, pr_record("coder", "Claude", 1), created=after_cutoff(20)),
+        pr_comment(21, pr_record("reviewer", CODEX, 1, "approved"), created=after_cutoff(21)),
+    )})
+    assert era_pr["step_backs"] == {"value": 0, "evidence": "verified"}
+    uncovered_pr = derive(closed, issue_view(*plan), {PR: pr_view(
+        pr_comment(20, _legacy_pr("coder", 1), created=after_cutoff(20)),
+        pr_comment(21, _legacy_pr("reviewer", 1, "approved"), created=after_cutoff(21)),
+    )})
+    assert uncovered_pr["step_backs"] == UNAVAILABLE
+    pre_feature_pr = derive(
+        history(state="CLOSED", closed=at(50, 12), linked=[merged_pr()]),
+        issue_view(*plan),
+        {PR: pr_view(
+            pr_comment(20, _legacy_pr("coder", 1)), pr_comment(21, _legacy_pr("reviewer", 1, "approved")),
+        )},
+    )
+    assert pre_feature_pr["step_backs"] == PRE_FEATURE
+
+
+def test_unbounded_pre_feature_history_stays_unavailable():
+    row = derive(
+        history(),
+        issue_view(comment(1, _legacy_coder(1)), comment(2, _legacy_review(1, "blocking"))),
+    )
+    assert row["step_backs"] == UNAVAILABLE
+
+
+def test_pre_feature_proof_requires_a_known_edit_time_before_the_cutoff():
+    def derive_review(review: AuthenticatedComment):
+        return derive(
+            history(state="CLOSED", closed=after_cutoff(30, 11)),
+            issue_view(comment(1, _legacy_coder(1)), review),
+        )
+
+    edited_after = comment(2, _legacy_review(1, "approved"), updated=after_cutoff(2))
+    assert derive_review(edited_after)["step_backs"] == UNAVAILABLE
+    # The current body was replaced by a different round's record after the cutoff.
+    replaced = derive(
+        history(state="CLOSED", closed=after_cutoff(30, 11)),
+        issue_view(
+            comment(1, _legacy_coder(1)), comment(2, _legacy_review(1, "approved")),
+            comment(3, _legacy_coder(2), updated=after_cutoff(3)),
+        ),
+    )
+    assert replaced["step_backs"] == UNAVAILABLE
+    edited_before = comment(2, _legacy_review(1, "approved"), updated="2026-10-02T10:00:00Z")
+    assert derive_review(edited_before)["step_backs"] == PRE_FEATURE
+    unknown_edit = dataclasses.replace(comment(2, _legacy_review(1, "approved")), updated_at=None)
+    assert derive_review(unknown_edit)["step_backs"] == UNAVAILABLE
+    era_edit = comment(2, plan_review(CODEX, 1, "approved"), updated=after_cutoff(2))
+    assert derive_review(era_edit)["step_backs"] == {"value": 0, "evidence": "verified"}

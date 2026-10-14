@@ -23,6 +23,7 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.history_export import (
     COVERAGE_COMPLETE,
     COVERAGE_PARTIAL,
+    EVIDENCE_PRE_FEATURE,
     EVIDENCE_UNAVAILABLE,
     EVIDENCE_VERIFIED,
     SCHEMA_VERSION,
@@ -253,6 +254,32 @@ def test_labels_follow_the_table_and_ignore_route_and_terminal_states():
         assert derive_outcome_label(mutated, spec) == result
         stripped = {key: value for key, value in row.items() if key not in {"route", "route_taken", "terminal_states"}}
         assert derive_outcome_label(stripped, spec) == result
+
+
+def test_pre_feature_step_backs_count_as_zero_and_the_row_is_labelled():
+    spec = LabelSpec()
+    row = _row(20, plan_rounds=1, pr_rounds=1) | {"step_backs": _pair(0, EVIDENCE_PRE_FEATURE)}
+    result = derive_outcome_label(row, spec)
+    assert result.label == "direct"
+    assert not result.reason.startswith("count-unavailable")
+    # A pre-feature zero never forces discuss-first by itself.
+    planned = _row(21, plan_rounds=2, pr_rounds=1) | {"step_backs": _pair(0, EVIDENCE_PRE_FEATURE)}
+    assert derive_outcome_label(planned, spec).label == "plan-first"
+
+
+@pytest.mark.parametrize("column,pair", [
+    ("plan_rounds", _pair(0, EVIDENCE_PRE_FEATURE)),
+    ("pr_rounds", _pair(1, EVIDENCE_PRE_FEATURE)),
+    ("human_decision_stops", _pair(0, EVIDENCE_PRE_FEATURE)),
+    ("step_backs", _pair(1, EVIDENCE_PRE_FEATURE)),
+    ("step_backs", _pair(True, EVIDENCE_PRE_FEATURE)),
+    ("step_backs", _pair(False, EVIDENCE_PRE_FEATURE)),
+    ("step_backs", _pair(None, EVIDENCE_PRE_FEATURE)),
+])
+def test_pre_feature_evidence_outside_a_zero_step_back_count_stays_unavailable(column, pair):
+    result = derive_outcome_label(_row(22) | {column: pair}, LabelSpec())
+    assert result.label is None
+    assert result.reason == f"count-unavailable:{column}"
 
 
 def test_label_thresholds_are_overridable_and_validated():

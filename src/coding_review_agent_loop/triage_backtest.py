@@ -32,7 +32,12 @@ from dataclasses import dataclass, field, replace as dataclasses_replace
 from pathlib import Path
 
 from .errors import AgentLoopError
-from .history_export import COVERAGE_COMPLETE, EVIDENCE_VERIFIED, SCHEMA_VERSION as HISTORY_SCHEMA_VERSION
+from .history_export import (
+    COVERAGE_COMPLETE,
+    EVIDENCE_PRE_FEATURE,
+    EVIDENCE_VERIFIED,
+    SCHEMA_VERSION as HISTORY_SCHEMA_VERSION,
+)
 from .response_validation import TRIAGE_ROUTES, parse_triage_response
 from .triage import (
     TRIAGE_REASON_SIGNALS,
@@ -217,7 +222,15 @@ class LabelResult:
 
 def _verified(row: Mapping[str, object], column: str) -> tuple[bool, object]:
     pair = row.get(column)
-    if not isinstance(pair, Mapping) or pair.get("evidence") != EVIDENCE_VERIFIED:
+    if not isinstance(pair, Mapping):
+        return False, None
+    if pair.get("evidence") == EVIDENCE_PRE_FEATURE:
+        # A pre-feature step-back count is a provable zero; nothing else may use it.
+        value = pair.get("value")
+        if column == "step_backs" and type(value) is int and value == 0:
+            return True, 0
+        return False, None
+    if pair.get("evidence") != EVIDENCE_VERIFIED:
         return False, None
     value = pair.get("value")
     if column == "merged":
