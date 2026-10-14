@@ -7194,6 +7194,9 @@ scripts/transport_smoke.sh --repo OWNER/REPO [--trusted-origin-protocol ssh] \
     [--git-ssh-identity PATH] [--base BRANCH] [--gh-cmd GH]
 ```
 
+Both `--repo OWNER/REPO` and `--repo=OWNER/REPO` are accepted; a missing or
+empty `--repo` exits 2 before any venv is created.
+
 Why it exists (#1383): the #1380 regression from PR #1364, where the trusted
 SSH transport ignored the `IdentityFile` in `~/.ssh/config`, reached `main`
 because the network tests wrapped `_transport_env` with a fixture that supplied

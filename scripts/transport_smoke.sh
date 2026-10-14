@@ -9,6 +9,7 @@
 #
 # Usage: scripts/transport_smoke.sh --repo OWNER/REPO [--base BRANCH]
 #          [--trusted-origin-protocol https|ssh] [--git-ssh-identity PATH] [--gh-cmd GH]
+# The argparse form --repo=OWNER/REPO is also accepted.
 #
 # Environment: AGENT_LOOP_SMOKE_SOURCE (checkout to build; default: this
 # script's repository root), AGENT_LOOP_SMOKE_PYTHON (default: python3).
@@ -19,9 +20,9 @@ set -euo pipefail
 
 has_repo=0
 for arg in "$@"; do
-  if [ "$arg" = "--repo" ]; then
-    has_repo=1
-  fi
+  case "$arg" in
+    --repo|--repo=?*) has_repo=1 ;;
+  esac
 done
 if [ "$has_repo" -ne 1 ]; then
   echo "transport-smoke: --repo OWNER/REPO is required" >&2

@@ -569,3 +569,22 @@ def test_smoke_refuses_without_repo_before_creating_a_venv(smoke):
     assert result.returncode == 2
     assert result.stdout == ""
     assert not (smoke.tmp_path / "pip-argv").exists()
+
+
+def test_smoke_accepts_repo_equals_form_and_forwards_verbatim(smoke):
+    result = smoke("--repo=OWNER/REPO", "--base", "main")
+    assert (result.returncode, result.stdout, result.stderr) == (0, "transport-check: pass\n", "")
+    check_argv = (smoke.tmp_path / "check-argv").read_text().splitlines()
+    assert check_argv == ["transport-check", "--repo=OWNER/REPO", "--base", "main"]
+
+
+@pytest.mark.parametrize("args", [
+    ("--repo=",),
+    ("--repository=OWNER/REPO",),
+    ("--base", "--repo-ish"),
+])
+def test_smoke_refuses_empty_or_lookalike_repo_before_creating_a_venv(smoke, args):
+    result = smoke(*args)
+    assert (result.returncode, result.stdout, result.stderr) == (
+        2, "", "transport-smoke: --repo OWNER/REPO is required\n")
+    assert not (smoke.tmp_path / "pip-argv").exists()
