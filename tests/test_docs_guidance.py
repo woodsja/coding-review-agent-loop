@@ -1,7 +1,15 @@
 import re
+import subprocess
 from pathlib import Path
 
+from coding_review_agent_loop.architecture_context import (
+    _linked_detail_paths,
+    _sanitize_architecture_text,
+    acquire_architecture_snapshot,
+    render_architecture_snapshot,
+)
 from coding_review_agent_loop.cli import build_parser
+from coding_review_agent_loop.runner import Runner
 
 REPO_ROOT = Path(__file__).parent.parent
 LOCAL_AGENT_LOOP_DOC = REPO_ROOT / "docs" / "local_agent_loop.md"
@@ -27,6 +35,17 @@ def _github_anchor(heading_text: str) -> str:
     return slug
 
 
+def _architecture_set_paths() -> list[Path]:
+    """The root plus the detail docs it links to, as injection discovers them."""
+    members = _linked_detail_paths(ARCHITECTURE.read_text(encoding="utf-8"), "ARCHITECTURE.md")
+    assert members is not None, "the CommonMark parser is required to discover members"
+    return [ARCHITECTURE, *(REPO_ROOT / member for member in members)]
+
+
+def _architecture_set_text() -> str:
+    return "\n\n".join(path.read_text(encoding="utf-8") for path in _architecture_set_paths())
+
+
 def test_architecture_is_discoverable_from_existing_guides():
     assert "(ARCHITECTURE.md)" in README.read_text(encoding="utf-8")
     for path in (LOCAL_AGENT_LOOP_DOC, SKILL_MODE_DOC):
@@ -36,19 +55,79 @@ def test_architecture_is_discoverable_from_existing_guides():
 
 
 def test_architecture_links_and_component_paths_exist():
-    text = ARCHITECTURE.read_text(encoding="utf-8")
-    for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
-        if target.startswith("https://"):
-            continue
-        path_text, _, anchor = target.partition("#")
-        path = ARCHITECTURE.parent / path_text
-        assert path.exists(), target
-        if anchor:
-            headings = re.findall(r"^#+ (.+)$", path.read_text(encoding="utf-8"), re.M)
-            assert anchor in {_github_anchor(heading) for heading in headings}, target
-    table = text.split("## Component Map\n", 1)[1].split("## Main Lifecycle\n", 1)[0]
-    for module in re.findall(r"`([\w/]+\.py)`", table):
+    for document in _architecture_set_paths():
+        text = document.read_text(encoding="utf-8")
+        for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+            if target.startswith("https://"):
+                continue
+            path_text, _, anchor = target.partition("#")
+            path = document.parent / path_text if path_text else document
+            assert path.exists(), (document.name, target)
+            if anchor:
+                headings = re.findall(r"^#+ (.+)$", path.read_text(encoding="utf-8"), re.M)
+                assert anchor in {_github_anchor(heading) for heading in headings}, (document.name, target)
+    root_map = ARCHITECTURE.read_text(encoding="utf-8").split("## Component map\n", 1)[1].split("\n## ", 1)[0]
+    components = (REPO_ROOT / "docs" / "architecture" / "components.md").read_text(encoding="utf-8")
+    table = components.split("## Component Map\n", 1)[1].split("\n## ", 1)[0]
+    for module in re.findall(r"`([\w/]+\.py)`", root_map + table):
         assert (REPO_ROOT / "src" / "coding_review_agent_loop" / module).is_file(), module
+
+
+def test_architecture_root_is_a_bounded_overview_linking_every_detail_doc():
+    root = ARCHITECTURE.read_text(encoding="utf-8")
+    assert len(root) <= 10_000
+    assert not re.search(r"#\d+", root)
+    detail_dir = REPO_ROOT / "docs" / "architecture"
+    on_disk = {path.relative_to(REPO_ROOT).as_posix() for path in detail_dir.glob("*.md")}
+    members = {path.relative_to(REPO_ROOT).as_posix() for path in _architecture_set_paths()[1:]}
+    assert on_disk and members == on_disk
+    for name in ("README.md", "docs/local_agent_loop.md", "docs/skill_mode.md"):
+        assert f"]({name})" in root
+
+
+def test_architecture_detail_docs_share_one_shape():
+    for path in _architecture_set_paths()[1:]:
+        raw = path.read_bytes()
+        assert len(raw) < 65_536, path.name
+        paragraphs = [block.strip() for block in raw.decode("utf-8").split("\n\n") if block.strip()]
+        assert paragraphs[0].startswith("# ") and "\n" not in paragraphs[0], path.name
+        assert not paragraphs[1].startswith(("#", "Source paths:")), path.name
+        assert paragraphs[2].startswith("Source paths: "), path.name
+        for source in re.findall(r"`([^`]+)`", paragraphs[2]):
+            assert (REPO_ROOT / source).exists(), (path.name, source)
+        h2 = re.findall(r"^## (.+)$", raw.decode("utf-8"), re.M)
+        assert h2 and h2[-1] == "Decisions", path.name
+        decisions = raw.decode("utf-8").rsplit("\n## Decisions\n", 1)[1]
+        bullets = [line for line in decisions.splitlines() if line.startswith("- ")]
+        assert bullets and all(re.search(r"\(#\d+(, #\d+)*\)\.$", line) for line in bullets), path.name
+
+
+def test_default_render_injects_the_whole_root_and_every_detail_doc(tmp_path):
+    def git(*args):
+        return subprocess.run(
+            ("git", *args), cwd=tmp_path, text=True, capture_output=True, check=True
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    for path in _architecture_set_paths():
+        target = tmp_path / path.relative_to(REPO_ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(path.read_bytes())
+    git("add", "-A")
+    git("commit", "-qm", "architecture set")
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=git("rev-parse", "HEAD")
+    )
+    assert snapshot.availability == "available"
+    rendered = render_architecture_snapshot(snapshot)
+    assert "Overview status: truncated" not in rendered
+    assert "Architecture overview truncated" not in rendered
+    assert _sanitize_architecture_text(ARCHITECTURE.read_text(encoding="utf-8")) in rendered
+    assert "Detail documents in the architecture set" in rendered
+    for path in _architecture_set_paths()[1:]:
+        assert f"- {path.relative_to(REPO_ROOT).as_posix()} — " in rendered
 
 
 def test_local_agent_loop_doc_has_decision_heading_and_table():
@@ -63,7 +142,7 @@ def test_local_agent_loop_doc_has_decision_heading_and_table():
 def test_docs_explain_reviewed_child_execution_dispositions():
     local = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
     for text in (local, readme, architecture):
         assert "direct-implementation" in text
         assert "requires-child-planning" in text
@@ -384,7 +463,7 @@ def test_cli_help_documents_ci_queued_grace_seconds():
 def test_architecture_states_cross_row_selector_reuse_policy():
     # #865: cross-row reuse is valid; #927: repetition within one claim drops
     # that claim instead of rejecting the response.
-    text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    text = " ".join(_architecture_set_text().split())
     assert "duplicate admissible selectors" not in text
     assert "One admissible selector may be cited by several rows" in text
     assert "an admissible selector repeated within one claim" in text
@@ -413,7 +492,7 @@ def test_docs_list_tool_owned_machine_readable_record_types():
 
 
 def test_architecture_records_label_and_read_back_invariants():
-    text = ARCHITECTURE.read_text(encoding="utf-8")
+    text = _architecture_set_text()
     assert "deterministic visible-label invariant" in text
     assert "shared write read-back verifier" in text
     assert "historical bare-marker body" in text
@@ -474,7 +553,7 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
     )
     assert "joins the first item" not in normalized
 
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
     assert "Reviewer repair is refused fail-closed" in architecture
     assert "a refusal is a reviewer unavailability, never a synthesized verdict" in architecture
     assert "proposal to evaluate, never an" in architecture
@@ -483,7 +562,7 @@ def test_docs_describe_reviewer_repair_admission_and_grounding():
 def test_docs_describe_conflict_round_continuity_exception():
     # #829: the conflict-resolution round advances the head with no reviewer,
     # so both the canonical and operator contracts must name that transition.
-    arch_text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    arch_text = " ".join(_architecture_set_text().split())
     doc_text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
     assert "merge-conflict resolution round" in arch_text
     assert "tool-owned merge-conflict obligation" in arch_text
@@ -504,7 +583,7 @@ def test_docs_describe_conflict_round_continuity_exception():
 def test_docs_describe_rejected_coder_recovery_continuity_exception():
     # #1367: the rejected-coder recovery across a fresh grant is the third
     # continuity exception, and its chain is authenticated end to end.
-    arch_text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    arch_text = " ".join(_architecture_set_text().split())
     doc_text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
     assert "A rejected-coder recovery across a fresh grant is the third exception" in doc_text
     assert "The predecessor cutoff is not relaxed" in doc_text
@@ -525,7 +604,7 @@ def test_architecture_documents_the_planning_scheduler():
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    text = (root / "ARCHITECTURE.md").read_text()
+    text = _architecture_set_text()
 
     assert "plan_review_scheduling.py" in text
     assert "exact-plan candidate key" in text
@@ -535,7 +614,7 @@ def test_architecture_documents_the_planning_scheduler():
     assert "only a transport extraction failure stops the" in text
     assert "run, checked at startup and at every round boundary" in text
     assert "--plan-review-policy" in text
-    assert "docs/local_agent_loop.md#staged-issue-plan-review" in text
+    assert "](../local_agent_loop.md#staged-issue-plan-review)" in text
 
 
 def test_operator_docs_document_the_staged_planning_flags_and_limits():
@@ -563,7 +642,7 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     assert "#### Primary-phase stall stop" in text
     assert "**Upgrade note:**" in text
     assert "contract identity" in text
-    architecture = (root / "ARCHITECTURE.md").read_text()
+    architecture = _architecture_set_text()
     assert "primary-phase stall stop" in architecture
     assert "--plan-primary-stall-rounds" in architecture
     assert "scheduler_issue_digest" in architecture
@@ -602,7 +681,7 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
 
 def test_docs_document_the_flow_aware_planning_policy_evaluation():
     text = LOCAL_AGENT_LOOP_DOC.read_text()
-    architecture = ARCHITECTURE.read_text()
+    architecture = _architecture_set_text()
     readme = README.read_text()
 
     # The flow dimension, its backward-compatible default, and per-flow
@@ -624,7 +703,7 @@ def test_docs_document_the_flow_aware_planning_policy_evaluation():
 
 def test_docs_document_the_review_contract_dimension_and_freezing_procedure():
     text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text().split())
-    architecture = " ".join(ARCHITECTURE.read_text().split())
+    architecture = " ".join(_architecture_set_text().split())
     readme = " ".join(README.read_text().split())
 
     # The reviewer rule (#894) and that it changes no schema.
@@ -726,7 +805,7 @@ def test_readme_sandboxed_step_documents_requirements_and_limits():
     reference = text.split("### Sandboxed role permissions", 1)[1].split("\n### ", 1)[0]
     for phrase in ("GIT_CONFIG_GLOBAL=/dev/null", "%G", "remote.<name>.{url,pushurl,fetch,gh-resolved}", "--git=", "--gh="):
         assert phrase in reference, phrase
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
     for phrase in ("agent_permissions.py", "inspect_tool.py", "same OS user", "no network"):
         assert phrase in architecture, phrase
 
@@ -800,7 +879,7 @@ def test_cli_help_and_docs_describe_the_exact_head_evidence_freeze():
     assert "answersanexact-headevidencefreeze" in pr_help
     readme = " ".join(README.read_text(encoding="utf-8").split())
     assert "**exact-head evidence freeze**" in readme
-    architecture = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    architecture = " ".join(_architecture_set_text().split())
     assert "`human-exact-head-evidence`" in architecture
     assert "review-and-feedback decision boundary" in architecture
     guide = " ".join(
@@ -819,7 +898,7 @@ def test_docs_describe_trusted_human_reviewer_identities():
     """#1022: the signature's trust model is documented plainly."""
     readme = README.read_text(encoding="utf-8")
     local = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
     for text in (readme, local, architecture):
         assert "--human-reviewer-trusted-actor" in text
         assert "honour-system" in text or "honour system" in text
@@ -841,7 +920,7 @@ def test_failed_managed_activation_state_report_is_documented():
     # #1067: the re-entry abort sentence is qualified for a failed activation,
     # the report is limited to post-mutation failures, and pre-write refusals
     # are explicitly reportless.
-    arch = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    arch = " ".join(_architecture_set_text().split())
     assert "except when managed-CI activation itself fails" in arch
     assert "only under the guarded, read-back-verified restoration rule" in arch
     assert (
@@ -872,7 +951,7 @@ def test_antigravity_quota_group_docs_describe_five_model_chain():
         assert expected in guide
     for doc in (README, SKILL, SKILL_MODE_DOC):
         assert "Claude Opus 5.5 (Medium)" in doc.read_text(encoding="utf-8")
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
     assert "Antigravity quota-group fallback" in architecture
     assert "reset_parsing.py" in architecture
 
@@ -883,7 +962,7 @@ def test_operator_docs_document_the_plan_step_back_mechanism():
     root = pathlib.Path(__file__).resolve().parent.parent
     text = (root / "docs" / "local_agent_loop.md").read_text()
     readme = (root / "README.md").read_text()
-    architecture = (root / "ARCHITECTURE.md").read_text()
+    architecture = _architecture_set_text()
 
     for flag in ("--plan-step-back-rounds", "--plan-step-back-escalation-rounds"):
         assert flag in text and flag in readme and flag in architecture
@@ -900,7 +979,7 @@ def test_operator_docs_document_the_pr_step_back_mechanism():
     root = pathlib.Path(__file__).resolve().parent.parent
     text = (root / "docs" / "local_agent_loop.md").read_text()
     readme = (root / "README.md").read_text()
-    architecture = (root / "ARCHITECTURE.md").read_text()
+    architecture = _architecture_set_text()
 
     for flag in ("--pr-step-back-rounds", "--pr-step-back-line-window"):
         assert flag in text and flag in readme and flag in architecture
@@ -918,7 +997,7 @@ def test_operator_docs_document_the_pr_evidence_stall_stop():
     root = pathlib.Path(__file__).resolve().parent.parent
     text = (root / "docs" / "local_agent_loop.md").read_text()
     readme = (root / "README.md").read_text()
-    architecture = (root / "ARCHITECTURE.md").read_text()
+    architecture = _architecture_set_text()
 
     assert "#### PR evidence-only stall stop" in text
     for document in (text, readme, architecture):
@@ -938,7 +1017,7 @@ def test_operator_docs_document_evidence_conversion_and_the_stall_option():
     root = pathlib.Path(__file__).resolve().parent.parent
     text = (root / "docs" / "local_agent_loop.md").read_text()
     readme = (root / "README.md").read_text()
-    architecture = (root / "ARCHITECTURE.md").read_text()
+    architecture = _architecture_set_text()
     for document in (text, readme, architecture):
         assert "--pr-evidence-capture-attempts" in document
         assert "--pr-convert-evidence-rows" in document
@@ -962,9 +1041,7 @@ def test_docs_name_decompose_only_as_review_before_implementation_mode():
     assert "`--plan-narrow-staged`" in text
     assert "review-before-implementation mode" in text
     assert "recorded only" in text
-    architecture = (LOCAL_AGENT_LOOP_DOC.parent.parent / "ARCHITECTURE.md").read_text(
-        encoding="utf-8"
-    )
+    architecture = _architecture_set_text()
     assert "Staged-plan mode conflict" in architecture
     from coding_review_agent_loop.cli import build_parser
 
@@ -982,7 +1059,7 @@ def test_docs_name_decompose_only_as_review_before_implementation_mode():
 def test_docs_describe_trusted_integration_bases_and_their_limitation():
     doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     readme = README.read_text(encoding="utf-8")
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
 
     assert "AGENT_LOOP_TRUSTED_BASES" in doc
     assert "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1" in doc
@@ -1162,7 +1239,7 @@ def test_long_suite_attainability_is_documented():
     anchor = f"docs/local_agent_loop.md#{_github_anchor(heading)}"
     readme = README.read_text(encoding="utf-8")
     assert "`--test-python PATH`" in readme and anchor in readme
-    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    architecture = _architecture_set_text()
     assert "`--test-python`" in architecture and "AGENT_LOOP_SHELL_CAP_MS" in architecture
     assert "--test-python" in build_parser().format_help() or any(
         "--test-python" in action.option_strings
@@ -1174,8 +1251,12 @@ def test_long_suite_attainability_is_documented():
 
 def test_ssh_transport_identity_contract_is_documented():
     """#1380: the honoured ~/.ssh/config subset replaces the 'ignored entirely' claim."""
-    for path in (README, LOCAL_AGENT_LOOP_DOC, ARCHITECTURE):
-        text = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
+    for name, document in (
+        ("README.md", README.read_text(encoding="utf-8")),
+        ("local_agent_loop.md", LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")),
+        ("architecture set", _architecture_set_text()),
+    ):
+        text = re.sub(r"\s+", " ", document)
         assert "ignores the user's SSH config" not in text
         assert "ignores user SSH configuration" not in text
         for phrase in (
@@ -1184,7 +1265,7 @@ def test_ssh_transport_identity_contract_is_documented():
             "--git-ssh-identity", "AGENT_LOOP_GIT_SSH_IDENTITY", "StrictHostKeyChecking=yes",
             "ssh -G", "Windows", "#1371", "authentication failure", "host-key",
         ):
-            assert phrase in text, (path.name, phrase)
+            assert phrase in text, (name, phrase)
         assert "HTTPS fallback is attempted" not in text.replace("No HTTPS fallback is attempted", "")
     readme = re.sub(r"\s+", " ", README.read_text(encoding="utf-8"))
     assert "single `UserKnownHostsFile`" in readme
@@ -1257,7 +1338,7 @@ def test_operator_docs_document_the_pr_non_convergence_stop():
     root = pathlib.Path(__file__).resolve().parent.parent
     text = (root / "docs" / "local_agent_loop.md").read_text()
     readme = (root / "README.md").read_text()
-    architecture = (root / "ARCHITECTURE.md").read_text()
+    architecture = _architecture_set_text()
 
     assert "#### PR non-convergence stop" in text
     for document in (text, readme, architecture):
@@ -1292,7 +1373,7 @@ def test_fixture_hook_contract_is_documented_and_linked():
         assert required in section, required
     assert "--fixture" in FIXTURE_CODER_GUIDANCE
     assert FIXTURE_CODER_GUIDANCE in _coder_test_reporting_guidance()
-    assert "fixture_supervisor.py" in ARCHITECTURE.read_text(encoding="utf-8")
+    assert "fixture_supervisor.py" in _architecture_set_text()
     help_text = build_parser().format_help()
     run_tests = next(
         action for action in build_parser()._subparsers._group_actions[0].choices["run-tests"]._actions

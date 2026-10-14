@@ -1002,7 +1002,7 @@ The tool shells out to authenticated agent and GitHub CLIs. Durable round,
 plan, handoff, and CI metadata is recorded on GitHub; response files, subprocess
 logs, salvage, and advisory memory are local. The orchestrator validates agent
 responses, owns bounded format repair, and revalidates live state before
-qualification or merge. See [state and recovery](../ARCHITECTURE.md#state-and-recovery).
+qualification or merge. See [state and recovery](architecture/round-state-and-resume.md).
 
 ### Architecture context
 
