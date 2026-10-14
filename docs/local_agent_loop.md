@@ -4805,8 +4805,23 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   an accepted plan, settled (merged or closed) linked PRs, a
   closed issue, or a recognized stop as the newest workflow event (operator
   comments from the same account are not workflow events). Without one, the
-  value is `null`, never a zero. Step-backs are also `unavailable` unless
-  every counted round has a record written after step-back recording existed.
+  value is `null`, never a zero.
+- `step_backs` classifies each counted round. A round is in the step-back era
+  when one of its records carries step-back data or a field that postdates
+  step-back recording. It is pre-feature when every record comment of the
+  round was both created and last edited on GitHub before the step-back
+  feature cutoff, 2026-10-04T00:00:00Z (step-backs arrived with #1264 and
+  #1265 that day). The export decodes a comment's current body, so a comment
+  edited after the cutoff, or one with no known edit time, is not proof. Any
+  other round is uncovered. For a bounded history, `step_backs` is
+  `{"value": 0, "evidence": "not-applicable-pre-feature"}` when every counted
+  round of every flow is pre-feature, and `verified` when every round is
+  covered and at least one is in the era: a mixed flow counts its era
+  step-backs and its pre-feature rounds add 0. It stays `unavailable` when
+  the history is unbounded or any counted round is uncovered, such as a
+  post-cutoff round without era evidence, a round whose records straddle the
+  cutoff, or a pre-cutoff comment edited after the cutoff. Missing era fields
+  alone never prove pre-feature.
 - A plan counts as accepted only when the orchestrator recorded its own
   post-approval record for the newest planner candidate: the plan-approval
   announcement every approved plan-first round posts (including `plan-only`
@@ -4942,6 +4957,9 @@ checked before the first provider call.
   (`infrastructure-coverage-partial`), or when one of `human_decision_stops`,
   `step_backs`, `plan_rounds`, `pr_rounds` or `merged` is unavailable
   (`count-unavailable:<column>`; an unavailable count is never read as zero).
+  A `step_backs` pair with `not-applicable-pre-feature` evidence and value 0
+  counts as 0. That evidence on any other column or with any other value,
+  and every other non-verified evidence, is still `count-unavailable`.
   Then `discuss-first` for any human-decision stop or step-back, or at least
   `--discuss-min-plan-rounds` plan rounds; no label for an unmerged outcome
   (`no-delivery-outcome`); `direct` for a merged outcome with at most one plan

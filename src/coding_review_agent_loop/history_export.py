@@ -10,7 +10,9 @@ agent.
 Every count column is a ``{"value": ..., "evidence": ...}`` pair.  ``verified``
 means a recognized terminal state (plan approval, a merge or close, a closed
 issue, or a recognized stop) bounds the history; ``unavailable`` carries a
-``None`` value and is never a zero.
+``None`` value and is never a zero.  ``step_backs`` alone may also carry
+``not-applicable-pre-feature`` with value ``0``: every counted round's record
+comments were created and last edited before the step-back feature existed.
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ SCHEMA_VERSION = 1
 
 EVIDENCE_VERIFIED = "verified"
 EVIDENCE_UNAVAILABLE = "unavailable"
+EVIDENCE_PRE_FEATURE = "not-applicable-pre-feature"
 
 ROUTE_DISCUSS = "discuss"
 ROUTE_PLAN_FIRST = "plan-first"
@@ -99,6 +102,12 @@ UNEXPLAINED_CAUSES = frozenset({CAUSE_UNKNOWN, CAUSE_PENDING})
 _PLAN_STEP_BACK_ERA_FIELDS = ("plan_execution_mode", "scheduler_execution_mode", "plan_issue_digest")
 # PR board lineage (#1376) postdates PR step-back entries.
 _PR_STEP_BACK_ERA_FIELDS = ("pr_board_root", "pr_board_identity")
+
+# Step-backs arrived with #1264 (plan, commit c3ce75426) and #1265 (PR, commit
+# 5dcb96763), both on 2026-10-04.  The start of that UTC day predates both, so a
+# record comment created and last edited before it was written by a tool that
+# could not step back.  Anything touched later must prove era coverage instead.
+STEP_BACK_FEATURE_CUTOFF = datetime.datetime(2026, 10, 4, tzinfo=datetime.timezone.utc)
 
 _REVIEW_ROLES = frozenset({"coder", "reviewer"})
 
@@ -708,27 +717,49 @@ def _final_candidate_hash(records: Sequence[PostedRoundRecord]) -> str | None:
 _ERA_FIELDS = {"plan": _PLAN_STEP_BACK_ERA_FIELDS, "pr": _PR_STEP_BACK_ERA_FIELDS}
 
 
-def _era_covers(ledger: _FlowLedger) -> bool:
-    """Every counted round carries a record written in the step-back era.
+def _predates_step_backs(thread: _Thread, index: int) -> bool:
+    """The comment's current body existed in full before step-backs existed.
 
-    A newer record never vouches for older rounds, so one legacy round leaves
-    the whole step-back count unavailable.
+    The export decodes the current body, so ``created_at`` alone dates only the
+    comment container: a later edit may have written the decoded record.  An
+    unknown modification time is not proof.
+    """
+    updated_at = thread.comments[index].updated_at
+    return (
+        thread.created(index) < STEP_BACK_FEATURE_CUTOFF
+        and updated_at is not None
+        and parse_comment_timestamp(updated_at) < STEP_BACK_FEATURE_CUTOFF
+    )
+
+
+def _step_back_round_coverage(ledger: _FlowLedger) -> tuple[int, int, bool]:
+    """Classify each counted round as era-covered, pre-feature or uncovered.
+
+    Returns ``(pre_feature_rounds, era_rounds, all_covered)``.  A round is
+    era-covered when one of its records carries step-back data or an era field,
+    and pre-feature when every one of its record comments predates the feature.
+    A newer record never vouches for an older round, and absent era fields alone
+    never prove pre-feature.
     """
     fields = _ERA_FIELDS[ledger.flow]
     records = ledger.thread.records.get(ledger.flow, ())
+    pre_feature = era = 0
+    all_covered = True
     for round_number in ledger.rounds:
         if round_number in ledger.infra_rounds:
             continue
-        if not any(
-            record.metadata.round_number == round_number
-            and (
-                record.metadata.step_back_status != "absent"
-                or any(getattr(record.metadata, name) is not None for name in fields)
-            )
-            for record in records
+        round_records = [record for record in records if record.metadata.round_number == round_number]
+        if any(
+            record.metadata.step_back_status != "absent"
+            or any(getattr(record.metadata, name) is not None for name in fields)
+            for record in round_records
         ):
-            return False
-    return True
+            era += 1
+        elif round_records and all(_predates_step_backs(ledger.thread, record.index) for record in round_records):
+            pre_feature += 1
+        else:
+            all_covered = False
+    return pre_feature, era, all_covered
 
 
 def _step_back_keys(records: Iterable[PostedRoundRecord], excluded_rounds: frozenset[int]) -> set:
@@ -886,8 +917,14 @@ def derive_history_row(
         len([r for r in ledger.rounds if r not in ledger.infra_rounds]) for ledger in pr_ledgers
     )
 
-    # Step-backs: era-gated so legacy histories stay unavailable, not zero.
-    step_back_era = all(_era_covers(ledger) for ledger in ledgers)
+    # Step-backs: era-gated so legacy histories stay unavailable, not zero,
+    # except that rounds predating the feature count as a provable zero.
+    coverage_by_ledger = [_step_back_round_coverage(ledger) for ledger in ledgers]
+    step_back_covered = all(covered for _pre, _era, covered in coverage_by_ledger)
+    pre_feature_only = (
+        sum(era for _pre, era, _covered in coverage_by_ledger) == 0
+        and sum(pre for pre, _era, _covered in coverage_by_ledger) > 0
+    )
     step_backs = len(_step_back_keys(plan_records, plan_ledger.infra_rounds)) + sum(
         len(_step_back_keys(ledger.thread.records.get("pr", ()), ledger.infra_rounds))
         for ledger in pr_ledgers
@@ -949,7 +986,11 @@ def derive_history_row(
         "route_taken": route_taken,
         "route": " then ".join(route_taken) if route_taken else EVIDENCE_UNAVAILABLE,
         "plan_rounds": _pair(plan_round_count, plan_terminal if plan_records else bounded),
-        "step_backs": _pair(step_backs, bounded and step_back_era),
+        "step_backs": (
+            {"value": 0, "evidence": EVIDENCE_PRE_FEATURE}
+            if bounded and step_back_covered and pre_feature_only
+            else _pair(step_backs, bounded and step_back_covered)
+        ),
         "human_decision_stops": _pair(human_stops, bounded),
         "final_plan_size": _pair(
             plan_size, plan_size is not None and (plan_terminal if plan_records else bounded)
