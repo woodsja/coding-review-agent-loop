@@ -4135,7 +4135,9 @@ def test_other_xdist_failures_get_the_advisory_and_todays_classification(tmp_pat
     )
 
 
-def test_advisory_names_test_python_only_when_it_is_set(tmp_path):
+def test_advisory_names_test_python_only_when_it_is_set(tmp_path, monkeypatch):
+    # The unset case must not inherit the variable from an agent-loop launch.
+    monkeypatch.delenv(runtime.ENV_TEST_PYTHON, raising=False)
     root = _xa_project(tmp_path / "project")
     env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", runtime.ENV_TEST_PYTHON: "/opt/venv/bin/python"}
     _result, output = _xa_run(root, ["test_x.py"], env=env)
