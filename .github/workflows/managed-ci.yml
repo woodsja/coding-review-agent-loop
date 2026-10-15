@@ -130,9 +130,119 @@ jobs:
           import re
           import sys
           import time
-          from urllib.error import HTTPError, URLError
           from urllib.parse import urljoin
-          from urllib.request import Request, urlopen
+          from urllib.request import Request
+
+          # BEGIN MANAGED_CI_HTTP_RETRY
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci.yml
+          # Extraction boundary: GitHubApiUnavailable through github_request().
+          # Bounded GitHub API retry for every managed-CI read and status POST. Each
+          # attempt opens the request, reads the body and parses it inside one try
+          # boundary. Only exhausted transient failures (network, timeout, transport,
+          # 5xx, 429, a rate-limited 403, an empty or truncated JSON body) raise
+          # GitHubApiUnavailable. A definitive answer (401, 404, 422, a 403 that is not a
+          # rate limit, any other 4xx) raises GitHubApiRejected after exactly one call.
+          # Messages name the method, URL and last status; they never carry the token.
+          import http.client
+          import json
+          import random
+          import socket
+          import time
+          import urllib.error
+          import urllib.request
+
+          class GitHubApiFailure(ValueError):
+              def __init__(self, method, url, detail, attempts, status=None):
+                  self.method = method
+                  self.url = url
+                  self.detail = detail
+                  self.attempts = attempts
+                  self.status = status
+                  super().__init__(
+                      method + ' ' + url + ' failed: ' + detail + ' after ' + str(attempts)
+                      + (' attempt' if attempts == 1 else ' attempts')
+                  )
+
+          class GitHubApiUnavailable(GitHubApiFailure):
+              """Retryable failures were exhausted: infrastructure, not a verdict."""
+
+          class GitHubApiRejected(GitHubApiFailure):
+              """GitHub gave a definitive non-retryable answer."""
+
+          class _GitHubApiEmptyBody(Exception):
+              pass
+
+          def annotation_text(value):
+              text = str(value)
+              return text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+          def _retry_after_seconds(headers):
+              value = headers.get('Retry-After') if headers is not None else None
+              try:
+                  return max(0.0, float(value)) if value is not None else None
+              except (TypeError, ValueError):
+                  return None
+
+          def _is_rate_limited(error, retry_after):
+              headers = error.headers
+              if retry_after is not None:
+                  return True
+              if headers is not None and str(headers.get('x-ratelimit-remaining', '')).strip() == '0':
+                  return True
+              try:
+                  body = error.read() or b''
+              except Exception:
+                  body = b''
+              if isinstance(body, bytes):
+                  body = body.decode('utf-8', 'replace')
+              return 'rate limit' in str(body).lower()
+
+          def github_request(request, *, read_json, attempts=4, timeout=30, sleep=None, opener=None):
+              method = request.get_method()
+              url = request.full_url
+              detail = 'no attempt made'
+              status = None
+              for attempt in range(1, attempts + 1):
+                  retry_after = None
+                  try:
+                      open_url = opener if opener is not None else urllib.request.urlopen
+                      with open_url(request, timeout=timeout) as response:
+                          body = response.read()
+                          headers = getattr(response, 'headers', None)
+                      if not read_json:
+                          return None, headers
+                      if not body or not body.strip():
+                          raise _GitHubApiEmptyBody('empty response body')
+                      return json.loads(body), headers
+                  except urllib.error.HTTPError as exc:
+                      status = exc.code
+                      detail = 'HTTP ' + str(exc.code)
+                      retry_after = _retry_after_seconds(exc.headers)
+                      retryable = exc.code >= 500 or exc.code == 429 or (
+                          exc.code == 403 and _is_rate_limited(exc, retry_after)
+                      )
+                      if not retryable:
+                          raise GitHubApiRejected(method, url, detail, attempt, status) from exc
+                  except _GitHubApiEmptyBody:
+                      status = None
+                      detail = 'empty response body'
+                  except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                      status = None
+                      detail = 'truncated or invalid JSON body (' + type(exc).__name__ + ')'
+                  except (
+                      urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError,
+                      http.client.HTTPException, OSError,
+                  ) as exc:
+                      status = None
+                      detail = type(exc).__name__
+                  if attempt < attempts:
+                      delay = min(30.0, 2.0 * 2 ** (attempt - 1)) + random.uniform(0.0, 1.0)
+                      if retry_after is not None:
+                          delay = max(delay, min(60.0, retry_after))
+                      (sleep if sleep is not None else time.sleep)(delay)
+              raise GitHubApiUnavailable(method, url, detail, attempts, status)
+          # END MANAGED_CI_HTTP_RETRY
 
           # BEGIN MANAGED_CI_TRUSTED_BASES
           # Source repository: wwind123/coding-review-agent-loop
@@ -392,17 +502,22 @@ jobs:
               return validated[0]
           # END MANAGED_CI_V2_VALIDATOR
 
-          def api_json(path):
-              request = Request(
-                  urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/')),
+          def api_request(url):
+              return Request(
+                  url,
                   headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
                            'Accept': 'application/vnd.github+json'},
               )
-              try:
-                  with urlopen(request, timeout=30) as response:
-                      payload = json.load(response)
-              except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-                  raise ValueError('GitHub API read failed for ' + path) from exc
+
+          # Every read goes through github_request(): transient failures retry,
+          # exhaustion raises GitHubApiUnavailable and a definitive 4xx raises
+          # GitHubApiRejected. Both are ValueErrors, so validate_dispatch() still
+          # fails closed on either; the step below labels them distinctly.
+          def api_json(path):
+              payload, _headers = github_request(
+                  api_request(urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/'))),
+                  read_json=True,
+              )
               if not isinstance(payload, (dict, list)):
                   raise ValueError('GitHub API returned an invalid payload for ' + path)
               return payload
@@ -411,17 +526,8 @@ jobs:
               url = urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/'))
               pages = []
               while url:
-                  request = Request(
-                      url,
-                      headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                               'Accept': 'application/vnd.github+json'},
-                  )
-                  try:
-                      with urlopen(request, timeout=30) as response:
-                          page = json.load(response)
-                          link = response.headers.get('Link', '')
-                  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-                      raise ValueError('GitHub API pagination failed for ' + path) from exc
+                  page, headers = github_request(api_request(url), read_json=True)
+                  link = (headers.get('Link') if headers is not None else None) or ''
                   if not isinstance(page, list):
                       raise ValueError('GitHub API page is not an array for ' + path)
                   pages.append(page)
@@ -548,24 +654,35 @@ jobs:
               }
           # END MANAGED_CI_V2_DISPATCH_VALIDATOR
 
-          validated = validate_dispatch(
-              protocol=os.environ['INPUT_PROTOCOL_VERSION'],
-              pr_number_text=os.environ['INPUT_PR_NUMBER'],
-              expected_head=os.environ['INPUT_EXPECTED_HEAD_SHA'],
-              nonce=os.environ['INPUT_MANAGED_NONCE'],
-              repo=os.environ['GH_REPOSITORY'],
-              ref=os.environ.get('GH_REF'),
-              configured_actor=os.environ.get('CONFIGURED_ACTOR'),
-              initiating_actor=os.environ.get('GH_ACTOR'),
-              rerun_actor=os.environ.get('GH_TRIGGERING_ACTOR'),
-              current_run_id=os.environ.get('GH_RUN_ID'),
-              current_run_attempt=os.environ.get('GH_RUN_ATTEMPT'),
-              current_time=int(time.time()),
-              api_json=api_json,
-              api_pages=api_pages,
-              validate=validate,
-              trusted_bases=os.environ.get('TRUSTED_BASES', ''),
-          )
+          # "Could not read the API" and "found the request invalid" fail the job
+          # with distinct annotations. Neither writes target_sha, so no status can
+          # be authorized: there is no validated, correlated target to post to.
+          try:
+              validated = validate_dispatch(
+                  protocol=os.environ['INPUT_PROTOCOL_VERSION'],
+                  pr_number_text=os.environ['INPUT_PR_NUMBER'],
+                  expected_head=os.environ['INPUT_EXPECTED_HEAD_SHA'],
+                  nonce=os.environ['INPUT_MANAGED_NONCE'],
+                  repo=os.environ['GH_REPOSITORY'],
+                  ref=os.environ.get('GH_REF'),
+                  configured_actor=os.environ.get('CONFIGURED_ACTOR'),
+                  initiating_actor=os.environ.get('GH_ACTOR'),
+                  rerun_actor=os.environ.get('GH_TRIGGERING_ACTOR'),
+                  current_run_id=os.environ.get('GH_RUN_ID'),
+                  current_run_attempt=os.environ.get('GH_RUN_ATTEMPT'),
+                  current_time=int(time.time()),
+                  api_json=api_json,
+                  api_pages=api_pages,
+                  validate=validate,
+                  trusted_bases=os.environ.get('TRUSTED_BASES', ''),
+              )
+          except GitHubApiUnavailable as exc:
+              print('::error title=managed-ci infrastructure::GitHub API unavailable during '
+                    'validation; no status can be authorized: ' + annotation_text(exc))
+              raise SystemExit(2)
+          except ValueError as exc:
+              print('::error title=managed-ci validation rejected::' + annotation_text(exc))
+              raise SystemExit(1)
 
           output_path = os.environ['GITHUB_OUTPUT']
           with open(output_path, 'a', encoding='utf-8') as output:
@@ -736,7 +853,118 @@ jobs:
           import json
           import os
           import re
-          from urllib.request import Request, urlopen
+          from urllib.request import Request
+
+          # BEGIN MANAGED_CI_HTTP_RETRY
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci.yml
+          # Extraction boundary: GitHubApiUnavailable through github_request().
+          # Bounded GitHub API retry for every managed-CI read and status POST. Each
+          # attempt opens the request, reads the body and parses it inside one try
+          # boundary. Only exhausted transient failures (network, timeout, transport,
+          # 5xx, 429, a rate-limited 403, an empty or truncated JSON body) raise
+          # GitHubApiUnavailable. A definitive answer (401, 404, 422, a 403 that is not a
+          # rate limit, any other 4xx) raises GitHubApiRejected after exactly one call.
+          # Messages name the method, URL and last status; they never carry the token.
+          import http.client
+          import json
+          import random
+          import socket
+          import time
+          import urllib.error
+          import urllib.request
+
+          class GitHubApiFailure(ValueError):
+              def __init__(self, method, url, detail, attempts, status=None):
+                  self.method = method
+                  self.url = url
+                  self.detail = detail
+                  self.attempts = attempts
+                  self.status = status
+                  super().__init__(
+                      method + ' ' + url + ' failed: ' + detail + ' after ' + str(attempts)
+                      + (' attempt' if attempts == 1 else ' attempts')
+                  )
+
+          class GitHubApiUnavailable(GitHubApiFailure):
+              """Retryable failures were exhausted: infrastructure, not a verdict."""
+
+          class GitHubApiRejected(GitHubApiFailure):
+              """GitHub gave a definitive non-retryable answer."""
+
+          class _GitHubApiEmptyBody(Exception):
+              pass
+
+          def annotation_text(value):
+              text = str(value)
+              return text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+          def _retry_after_seconds(headers):
+              value = headers.get('Retry-After') if headers is not None else None
+              try:
+                  return max(0.0, float(value)) if value is not None else None
+              except (TypeError, ValueError):
+                  return None
+
+          def _is_rate_limited(error, retry_after):
+              headers = error.headers
+              if retry_after is not None:
+                  return True
+              if headers is not None and str(headers.get('x-ratelimit-remaining', '')).strip() == '0':
+                  return True
+              try:
+                  body = error.read() or b''
+              except Exception:
+                  body = b''
+              if isinstance(body, bytes):
+                  body = body.decode('utf-8', 'replace')
+              return 'rate limit' in str(body).lower()
+
+          def github_request(request, *, read_json, attempts=4, timeout=30, sleep=None, opener=None):
+              method = request.get_method()
+              url = request.full_url
+              detail = 'no attempt made'
+              status = None
+              for attempt in range(1, attempts + 1):
+                  retry_after = None
+                  try:
+                      open_url = opener if opener is not None else urllib.request.urlopen
+                      with open_url(request, timeout=timeout) as response:
+                          body = response.read()
+                          headers = getattr(response, 'headers', None)
+                      if not read_json:
+                          return None, headers
+                      if not body or not body.strip():
+                          raise _GitHubApiEmptyBody('empty response body')
+                      return json.loads(body), headers
+                  except urllib.error.HTTPError as exc:
+                      status = exc.code
+                      detail = 'HTTP ' + str(exc.code)
+                      retry_after = _retry_after_seconds(exc.headers)
+                      retryable = exc.code >= 500 or exc.code == 429 or (
+                          exc.code == 403 and _is_rate_limited(exc, retry_after)
+                      )
+                      if not retryable:
+                          raise GitHubApiRejected(method, url, detail, attempt, status) from exc
+                  except _GitHubApiEmptyBody:
+                      status = None
+                      detail = 'empty response body'
+                  except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                      status = None
+                      detail = 'truncated or invalid JSON body (' + type(exc).__name__ + ')'
+                  except (
+                      urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError,
+                      http.client.HTTPException, OSError,
+                  ) as exc:
+                      status = None
+                      detail = type(exc).__name__
+                  if attempt < attempts:
+                      delay = min(30.0, 2.0 * 2 ** (attempt - 1)) + random.uniform(0.0, 1.0)
+                      if retry_after is not None:
+                          delay = max(delay, min(60.0, retry_after))
+                      (sleep if sleep is not None else time.sleep)(delay)
+              raise GitHubApiUnavailable(method, url, detail, attempts, status)
+          # END MANAGED_CI_HTTP_RETRY
 
           # BEGIN MANAGED_CI_V2_PUBLISHER
           # Source repository: wwind123/coding-review-agent-loop
@@ -829,7 +1057,13 @@ jobs:
                   'Content-Type': 'application/json',
               },
           )
-          with urlopen(request, timeout=30):
-              pass
+          # The POST is retried; repeating the same state and description for the
+          # required context is idempotent (the latest status wins). Exhaustion or
+          # a definitive rejection fails the job loudly instead of a silent pending.
+          try:
+              github_request(request, read_json=False)
+          except GitHubApiFailure as exc:
+              print('::error title=managed-ci status publish failed::' + annotation_text(exc))
+              raise SystemExit(1)
           print('Published correlated final-ci/exact-head status for the validated SHA.')
           PY
