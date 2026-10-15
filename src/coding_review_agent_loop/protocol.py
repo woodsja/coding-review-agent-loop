@@ -418,34 +418,6 @@ class ParsedPlanReview:
 
 
 @dataclass(frozen=True)
-class StructuredPrReview:
-    schema_version: int
-    kind: str
-    state: str
-    summary: str
-    blocking_items: tuple[str, ...]
-    same_pr_followups: tuple[str, ...]
-    future_followups: tuple[str, ...]
-    prior_item_dispositions: tuple[ReviewItemDisposition, ...]
-    architecture_impact: ArchitectureImpact | None = None
-    exact_head_evidence_requests: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class StructuredPlanReview:
-    schema_version: int
-    kind: str
-    state: str
-    summary: str
-    blocking_plan_issues: tuple[str, ...]
-    same_plan_followups: tuple[str, ...]
-    future_followups: tuple[str, ...]
-    prior_plan_item_dispositions: tuple[ReviewItemDisposition, ...]
-    human_requirement_dispositions: tuple["HumanRequirementDisposition", ...] = ()
-    architecture_impact: ArchitectureImpact | None = None
-
-
-@dataclass(frozen=True)
 class StructuredHumanRequirementsPayload:
     addressed_ids: tuple[str, ...]
     checked_discussion_directly: bool
