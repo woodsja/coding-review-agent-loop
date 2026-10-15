@@ -350,6 +350,45 @@ def test_antigravity_backend_cleans_up_gemini_md_on_exception(tmp_path):
     assert after == original_content
     assert "Do NOT spawn" not in after
 
+
+# Bound for every main-thread rendezvous wait and join in the flock
+# serialization tests (#1473, following #1471). Event.wait and Thread.join
+# return as soon as the peer arrives, so a green run pays nothing; the bound
+# only caps how long a real serialization regression takes to fail.
+_LOCK_PEER_WAIT_TIMEOUT_SECONDS = 60.0
+# Bound for the lock holder's own self-release wait (#1473). It must exceed the
+# main-thread peer waits that run before the release (at most two sequential
+# waits), so a slow contender fails as a named rendezvous timeout instead of a
+# holder that released the lock by itself and let the LOCK_NB probe succeed.
+_LOCK_HOLDER_RELEASE_TIMEOUT_SECONDS = 4 * _LOCK_PEER_WAIT_TIMEOUT_SECONDS
+
+_LOCK_SERIALIZATION_TEST_NAMES = (
+    "test_antigravity_backend_gemini_md_lock_serializes_concurrent_access",
+    "test_antigravity_settings_lock_serializes_reviewer_vs_reviewer",
+    "test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders",
+    "test_antigravity_settings_lock_restoration_precedes_unlock_on_exception",
+)
+
+
+def _release_and_join(events, threads):
+    """Release every holder event, then join every started worker with a bound.
+
+    Called from a ``finally`` block so a failing assertion cannot leave a thread
+    holding a flock or still restoring settings while monkeypatch teardown runs.
+    It never raises, so the original test failure is reported unmasked.
+    """
+    for event in events:
+        try:
+            event.set()
+        except Exception:
+            pass
+    for thread in threads:
+        try:
+            thread.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+
 def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_path):
     """flock on GEMINI.md.lock prevents a second run from starting until the first
     completes its inject→run→strip sequence."""
@@ -377,14 +416,10 @@ def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_pat
         fcntl.flock(lf, fcntl.LOCK_EX)
         order.append("A-holds")
         lock_acquired.set()
-        lock_released.wait()
+        lock_released.wait(timeout=_LOCK_HOLDER_RELEASE_TIMEOUT_SECONDS)
         order.append("A-releases")
         fcntl.flock(lf, fcntl.LOCK_UN)
         lf.close()
-
-    t = threading.Thread(target=hold_lock, daemon=True)
-    t.start()
-    lock_acquired.wait()
 
     # Thread B (main): tries to run AntigravityBackend — should block on LOCK_EX
     # until Thread A releases.
@@ -404,22 +439,36 @@ def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_pat
         )
         order.append("B-done")
 
-    backend_thread = threading.Thread(target=run_backend, daemon=True)
-    backend_thread.start()
+    started: list[threading.Thread] = []
+    try:
+        t = threading.Thread(target=hold_lock, daemon=True)
+        t.start()
+        started.append(t)
+        assert lock_acquired.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+            "holder never acquired GEMINI.md lock"
+        )
 
-    # Give the backend thread a moment to block on the lock, then release it.
-    import time
-    time.sleep(0.05)
-    lock_released.set()
-    t.join(timeout=5)
-    backend_thread.join(timeout=10)
+        backend_thread = threading.Thread(target=run_backend, daemon=True)
+        backend_thread.start()
+        started.append(backend_thread)
 
-    # A-holds must precede B-run and A-releases must precede B-run
-    assert "A-holds" in order
-    assert "A-releases" in order
-    assert "B-run" in order
-    assert order.index("A-holds") < order.index("B-run")
-    assert order.index("A-releases") < order.index("B-run")
+        # Give the backend thread a moment to block on the lock, then release it.
+        import time
+        time.sleep(0.05)
+        lock_released.set()
+        t.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
+        backend_thread.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
+
+        assert not t.is_alive(), "Lock holder deadlocked"
+        assert not backend_thread.is_alive(), "Backend thread deadlocked"
+        # A-holds must precede B-run and A-releases must precede B-run
+        assert "A-holds" in order
+        assert "A-releases" in order
+        assert "B-run" in order
+        assert order.index("A-holds") < order.index("B-run")
+        assert order.index("A-releases") < order.index("B-run")
+    finally:
+        _release_and_join([lock_released], started)
 
 def test_antigravity_module_imports_without_fcntl():
     """Antigravity module must import cleanly even when fcntl is unavailable (Windows)."""
@@ -1012,7 +1061,7 @@ def test_antigravity_settings_lock_serializes_reviewer_vs_reviewer(tmp_path, mon
         def run_with_log(self, args, *, cwd, **kwargs):
             order.append("a_in_runner")
             a_in_runner.set()
-            a_release.wait(timeout=10)
+            a_release.wait(timeout=_LOCK_HOLDER_RELEASE_TIMEOUT_SECONDS)
             return super().run_with_log(args, cwd=cwd, **kwargs)
 
     class RunnerB(FakeRunner):
@@ -1027,23 +1076,33 @@ def test_antigravity_settings_lock_serializes_reviewer_vs_reviewer(tmp_path, mon
     def run_b():
         AntigravityBackend().run(RunnerB(antigravity_outputs=[("ok", 0)]), config, "PromptB", role="reviewer")
 
-    ta = threading.Thread(target=run_a, daemon=True)
-    ta.start()
-    a_in_runner.wait(timeout=10)
+    started: list[threading.Thread] = []
+    try:
+        ta = threading.Thread(target=run_a, daemon=True)
+        ta.start()
+        started.append(ta)
+        assert a_in_runner.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+            "Thread A never entered runner"
+        )
 
-    tb = threading.Thread(target=run_b, daemon=True)
-    tb.start()
+        tb = threading.Thread(target=run_b, daemon=True)
+        tb.start()
+        started.append(tb)
 
-    a_release.set()
-    b_in_runner.wait(timeout=10)
+        a_release.set()
+        assert b_in_runner.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+            "Thread B never entered runner"
+        )
 
-    ta.join(timeout=10)
-    tb.join(timeout=10)
+        ta.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
+        tb.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
 
-    assert not ta.is_alive(), "Thread A deadlocked"
-    assert not tb.is_alive(), "Thread B deadlocked"
-    assert order == ["a_in_runner", "b_in_runner"]
-    assert settings_file.read_text(encoding="utf-8") == '{"k": "v"}'
+        assert not ta.is_alive(), "Thread A deadlocked"
+        assert not tb.is_alive(), "Thread B deadlocked"
+        assert order == ["a_in_runner", "b_in_runner"]
+        assert settings_file.read_text(encoding="utf-8") == '{"k": "v"}'
+    finally:
+        _release_and_join([a_release], started)
 
 def test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders(
     tmp_path, monkeypatch
@@ -1106,7 +1165,7 @@ def test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders(
         class HolderRunner(FakeRunner):
             def run_with_log(self, args, *, cwd, **kwargs):
                 holder_in_runner.set()
-                release_holder.wait(timeout=10)
+                release_holder.wait(timeout=_LOCK_HOLDER_RELEASE_TIMEOUT_SECONDS)
                 return super().run_with_log(args, cwd=cwd, **kwargs)
 
         class ContenderRunner(FakeRunner):
@@ -1128,30 +1187,45 @@ def test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders(
                 config, "Contender", role=role,
             )
 
-        th = threading.Thread(target=run_holder, daemon=True)
-        th.start()
-        holder_in_runner.wait(timeout=10)
+        roles = f"holder_role={holder_role!r}, contender_role={contender_role!r}"
+        started: list[threading.Thread] = []
+        try:
+            th = threading.Thread(target=run_holder, daemon=True)
+            th.start()
+            started.append(th)
+            assert holder_in_runner.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+                f"holder never entered runner ({roles})"
+            )
 
-        tc = threading.Thread(target=run_contender, daemon=True)
-        tc.start()
+            tc = threading.Thread(target=run_contender, daemon=True)
+            tc.start()
+            started.append(tc)
 
-        contender_attempting_lock.wait(timeout=10)
-        contender_probe_done.wait(timeout=10)
-        release_holder.set()
-        contender_in_runner.wait(timeout=10)
+            assert contender_attempting_lock.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+                f"contender never attempted the settings lock ({roles})"
+            )
+            assert contender_probe_done.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+                f"contender LOCK_NB probe never completed ({roles})"
+            )
+            release_holder.set()
+            assert contender_in_runner.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+                f"contender never entered runner ({roles})"
+            )
 
-        th.join(timeout=10)
-        tc.join(timeout=10)
+            th.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
+            tc.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
 
-        assert not th.is_alive(), f"Holder deadlocked (holder_role={holder_role!r})"
-        assert not tc.is_alive(), f"Contender deadlocked (contender_role={contender_role!r})"
-        assert contender_in_runner.is_set()
-        assert len(nb_probe_results) == 1
-        assert isinstance(nb_probe_results[0], BlockingIOError), (
-            f"LOCK_NB probe should have failed with BlockingIOError "
-            f"but got {nb_probe_results[0]!r} "
-            f"(holder_role={holder_role!r}, contender_role={contender_role!r})"
-        )
+            assert not th.is_alive(), f"Holder deadlocked (holder_role={holder_role!r})"
+            assert not tc.is_alive(), f"Contender deadlocked (contender_role={contender_role!r})"
+            assert contender_in_runner.is_set()
+            assert len(nb_probe_results) == 1
+            assert isinstance(nb_probe_results[0], BlockingIOError), (
+                f"LOCK_NB probe should have failed with BlockingIOError "
+                f"but got {nb_probe_results[0]!r} "
+                f"(holder_role={holder_role!r}, contender_role={contender_role!r})"
+            )
+        finally:
+            _release_and_join([release_holder], started)
 
 def test_antigravity_settings_lock_restoration_precedes_unlock_on_exception(
     tmp_path, monkeypatch
@@ -1186,7 +1260,7 @@ def test_antigravity_settings_lock_restoration_precedes_unlock_on_exception(
     class InjectingRunner(FakeRunner):
         def run_with_log(self, args, *, cwd, **kwargs):
             injected_event.set()
-            contention_confirmed_event.wait(timeout=10)
+            contention_confirmed_event.wait(timeout=_LOCK_HOLDER_RELEASE_TIMEOUT_SECONDS)
             raise RuntimeError("simulated reviewer failure")
 
     def run_a():
@@ -1214,25 +1288,74 @@ def test_antigravity_settings_lock_restoration_precedes_unlock_on_exception(
             fcntl_mod.flock(lock_f, fcntl_mod.LOCK_UN)
             lock_f.close()
 
-    ta = threading.Thread(target=run_a, daemon=True)
-    ta.start()
-    injected_event.wait(timeout=10)
+    started: list[threading.Thread] = []
+    try:
+        ta = threading.Thread(target=run_a, daemon=True)
+        ta.start()
+        started.append(ta)
+        assert injected_event.wait(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS), (
+            "Thread A never injected settings"
+        )
 
-    tb = threading.Thread(target=run_b, daemon=True)
-    tb.start()
+        tb = threading.Thread(target=run_b, daemon=True)
+        tb.start()
+        started.append(tb)
 
-    ta.join(timeout=10)
-    tb.join(timeout=10)
+        ta.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
+        tb.join(timeout=_LOCK_PEER_WAIT_TIMEOUT_SECONDS)
 
-    assert not ta.is_alive(), "Thread A deadlocked"
-    assert not tb.is_alive(), "Thread B deadlocked"
-    assert isinstance(thread_a_exc[0], RuntimeError)
-    assert isinstance(thread_b_nb_error[0], BlockingIOError), (
-        f"LOCK_NB should have raised BlockingIOError; got {thread_b_nb_error[0]!r}"
-    )
-    assert thread_b_result[0] == original_text, (
-        f"Settings must be restored before the lock is released; got {thread_b_result[0]!r}"
-    )
+        assert not ta.is_alive(), "Thread A deadlocked"
+        assert not tb.is_alive(), "Thread B deadlocked"
+        assert isinstance(thread_a_exc[0], RuntimeError)
+        assert isinstance(thread_b_nb_error[0], BlockingIOError), (
+            f"LOCK_NB should have raised BlockingIOError; got {thread_b_nb_error[0]!r}"
+        )
+        assert thread_b_result[0] == original_text, (
+            f"Settings must be restored before the lock is released; got {thread_b_result[0]!r}"
+        )
+    finally:
+        _release_and_join([contention_confirmed_event], started)
+
+
+def test_antigravity_lock_serialization_tests_use_named_wait_bounds():
+    """Static guard (#1473): the flock serialization tests keep named, bounded
+    waits and a release-then-join cleanup in ``finally``."""
+    import ast
+    import inspect
+    import textwrap
+
+    assert _LOCK_HOLDER_RELEASE_TIMEOUT_SECONDS > 2 * _LOCK_PEER_WAIT_TIMEOUT_SECONDS
+
+    for name in _LOCK_SERIALIZATION_TEST_NAMES:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(globals()[name])))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("wait", "join")
+        ]
+        assert calls, name
+        for call in calls:
+            timeout_args = list(call.args) + [
+                kw.value for kw in call.keywords if kw.arg == "timeout"
+            ]
+            assert timeout_args, f"{name}: unbounded .{call.func.attr}() at line {call.lineno}"
+            for arg in timeout_args:
+                assert not isinstance(arg, ast.Constant), (
+                    f"{name}: literal timeout in .{call.func.attr}() at line {call.lineno}"
+                )
+        finally_calls_cleanup = any(
+            isinstance(node, ast.Try)
+            and any(
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id == "_release_and_join"
+                for stmt in node.finalbody
+                for sub in ast.walk(stmt)
+            )
+            for node in ast.walk(tree)
+        )
+        assert finally_calls_cleanup, f"{name}: missing finally with _release_and_join"
 
 def test_gemini_retirement_signal():
     from coding_review_agent_loop.agents.gemini import _gemini_retirement_signal
