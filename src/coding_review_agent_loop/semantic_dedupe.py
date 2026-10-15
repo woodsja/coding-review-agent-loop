@@ -17,7 +17,8 @@ from typing import Callable, Literal, TYPE_CHECKING
 
 from .agents.base import AgentName
 from .agents.registry import run_agent_result
-from .errors import AgentLoopError
+from .errors import AgentLoopError, QuotaResetExceededError
+from .logging import log
 from .protocol_markers import sanitize_historical_text
 
 if TYPE_CHECKING:
@@ -191,54 +192,62 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
     isolated: Path | None = None
     try:
         isolated = Path(tempfile.mkdtemp(prefix="coding-review-followup-dedupe-"))
-        from .config import (
-            DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
-            DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
-            DEFAULT_PLAN_STEP_BACK_ROUNDS,
-        )
+        # ``mkdtemp`` above stays outside this classification because an
+        # OSError there is environmental.  Anything raised while deriving the
+        # clone is a deterministic configuration/programming defect (#884).
+        try:
+            from .config import (
+                DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
+                DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
+                DEFAULT_PLAN_STEP_BACK_ROUNDS,
+            )
 
-        values: dict[str, object] = {
-            "coder": backend,
-            "reviewer": (backend,),
-            "claude_dir": isolated,
-            "codex_dir": isolated,
-            "gemini_dir": isolated,
-            "antigravity_dir": isolated,
-            "claude_args": (),
-            "codex_args": (),
-            "gemini_args": (),
-            "antigravity_args": (),
-            "dry_run": False,
-            # This classification turn schedules no reviews, so panel-scheduling
-            # fields are reset to their defaults rather than inherited.  The
-            # single-reviewer board above is otherwise coupled to reviewer-count
-            # validation: ``primary-then-panel`` requires two reviewers, and a
-            # lingering primary reviewer is rejected under any other policy, so
-            # the three fields must be neutralized together.
-            "pr_review_policy": "all-reviewers",
-            "primary_reviewer": None,
-            "pr_review_force_full": False,
-            # Planning scheduling is coupled to the same reviewer-count
-            # validation, so the planning fields are neutralized alongside it.
-            "plan_review_policy": "all-reviewers",
-            "primary_plan_reviewer": None,
-            "plan_review_force_full": False,
-            "plan_reset_stall_streak": False,
-            "plan_resume_keep_on_issue_edit": False,
-            "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
-            "plan_step_back_rounds": DEFAULT_PLAN_STEP_BACK_ROUNDS,
-            "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
-        }
-        if backend == "claude":
-            values["claude_model"] = model
-        elif backend == "codex":
-            values["codex_model"] = model
-        elif backend == "gemini":
-            values["gemini_model"] = model
-        elif backend == "antigravity":
-            values["antigravity_model"] = None
-            values["antigravity_models"] = (model or config.antigravity_models[0],)
-        return replace(config, **values), isolated
+            values: dict[str, object] = {
+                "coder": backend,
+                "reviewer": (backend,),
+                "claude_dir": isolated,
+                "codex_dir": isolated,
+                "gemini_dir": isolated,
+                "antigravity_dir": isolated,
+                "claude_args": (),
+                "codex_args": (),
+                "gemini_args": (),
+                "antigravity_args": (),
+                "dry_run": False,
+                # This classification turn schedules no reviews, so panel-scheduling
+                # fields are reset to their defaults rather than inherited.  The
+                # single-reviewer board above is otherwise coupled to reviewer-count
+                # validation: ``primary-then-panel`` requires two reviewers, and a
+                # lingering primary reviewer is rejected under any other policy, so
+                # the three fields must be neutralized together.
+                "pr_review_policy": "all-reviewers",
+                "primary_reviewer": None,
+                "pr_review_force_full": False,
+                # Planning scheduling is coupled to the same reviewer-count
+                # validation, so the planning fields are neutralized alongside it.
+                "plan_review_policy": "all-reviewers",
+                "primary_plan_reviewer": None,
+                "plan_review_force_full": False,
+                "plan_reset_stall_streak": False,
+                "plan_resume_keep_on_issue_edit": False,
+                "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
+                "plan_step_back_rounds": DEFAULT_PLAN_STEP_BACK_ROUNDS,
+                "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
+            }
+            if backend == "claude":
+                values["claude_model"] = model
+            elif backend == "codex":
+                values["codex_model"] = model
+            elif backend == "gemini":
+                values["gemini_model"] = model
+            elif backend == "antigravity":
+                values["antigravity_model"] = None
+                values["antigravity_models"] = (model or config.antigravity_models[0],)
+            return replace(config, **values), isolated
+        except Exception as exc:
+            raise SemanticDedupeConfigurationError(
+                f"semantic dedupe isolated provider config is invalid for backend {backend!r}: {exc}"
+            ) from exc
     except Exception:
         if isolated is not None:
             import shutil
@@ -294,6 +303,40 @@ class SemanticDedupeMatcher:
         self.transport = transport or default_semantic_transport
         self.usage_context = usage_context
         self.calls = 0
+
+    def preflight(self) -> bool:
+        """Build and discard the isolated provider config before any GitHub write.
+
+        A :class:`SemanticDedupeConfigurationError` (and a quota-reset stop)
+        propagates.  Any other failure, such as a ``mkdtemp`` OSError, is
+        environmental: it is logged, ``False`` is returned, and per-call
+        deterministic fallback stays in effect.  No provider is invoked and the
+        semantic call budget is not consumed.
+        """
+        if self.transport is not default_semantic_transport:
+            return True
+        isolated_dir: Path | None = None
+        try:
+            _isolated_config, isolated_dir = _isolated_provider_config(
+                self.config,
+                self.config.semantic_followup_backend,
+                self.config.semantic_followup_model.strip(),
+            )
+        except (SemanticDedupeConfigurationError, QuotaResetExceededError):
+            raise
+        except Exception as exc:
+            log(
+                self.config,
+                f"Approved follow-up semantic dedupe preflight hit an environmental failure ({exc}); "
+                "per-call deterministic fallback remains in effect",
+            )
+            return False
+        finally:
+            if isolated_dir is not None:
+                import shutil
+
+                shutil.rmtree(isolated_dir, ignore_errors=True)
+        return True
 
     def match(
         self,
@@ -370,10 +413,20 @@ class BudgetExhausted(AgentLoopError):
     """Local semantic budget exhaustion; callers retain deterministic behavior."""
 
 
+class SemanticDedupeConfigurationError(AgentLoopError):
+    """A deterministic defect in deriving the isolated semantic-dedupe provider config.
+
+    Unlike a provider, transport, or environmental failure, this recurs on every
+    call for the same configuration, so callers must not treat it as provider
+    unavailability or degrade to deterministic grouping; it propagates (#884).
+    """
+
+
 __all__ = [
     "BudgetExhausted",
     "SemanticCandidate",
     "SemanticConfidence",
+    "SemanticDedupeConfigurationError",
     "SemanticDedupeMatcher",
     "SemanticMatch",
     "SemanticProviderResult",
