@@ -5379,3 +5379,128 @@ def test_antigravity_format_repair_launch_carries_guard_only_when_guarded(tmp_pa
             _assert_guarded_env(env, gh)
         else:
             assert not any(name in env for name in _GUARD_VARS)
+
+
+# --- #999: a repair candidate's semantic evidence rejection stops the chain ---
+
+_EVIDENCE_REJECTED = "EVIDENCE rejected candidate"
+
+
+def _evidence_rejecting_validate(text):
+    from coding_review_agent_loop.errors import NonRepairableEvidenceRejection
+
+    if text.startswith("EVIDENCE"):
+        raise NonRepairableEvidenceRejection(
+            "selected observation is not an admissible passing observation",
+            reason="non-passing-selector",
+        )
+    return _accept_valid_repair(text)
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude", "gemini"])
+def test_execute_repair_stops_chain_on_candidate_evidence_rejection(
+    tmp_path, monkeypatch, backend
+):
+    import coding_review_agent_loop.repair as repair_module
+    from coding_review_agent_loop.usage import RunUsageContext
+
+    calls = []
+
+    def fake_cli_repair(runner, config, prompt, *, model, log_path):
+        calls.append(model)
+        return SimpleNamespace(
+            text=_EVIDENCE_REJECTED if len(calls) == 1 else _VALID_REPAIR,
+            returncode=0, raw_output="", usage=None, raw_usage=None,
+            observed_model=None, text_source="stdout",
+        )
+
+    def fake_subprocess_run(args, **kwargs):
+        model = args[args.index("--model") + 1]
+        calls.append(model)
+        text = _EVIDENCE_REJECTED if len(calls) == 1 else _VALID_REPAIR
+        return SimpleNamespace(returncode=0, stdout=text, stderr="")
+
+    monkeypatch.setattr(repair_module, "run_cli_repair", fake_cli_repair)
+    monkeypatch.setattr(repair_module.subprocess, "run", fake_subprocess_run)
+    usage = RunUsageContext("evidence", tmp_path / "usage.json")
+    config = make_config(
+        tmp_path, repair_backend=backend, repair_models=("model-a", "model-b")
+    )
+    repaired, marker, attempts = execute_repair(
+        malformed_pr_review_source(state="approved"), runner=FakeRunner(), config=config,
+        run_id="evidence", usage_context=usage, validate=_evidence_rejecting_validate,
+        expected_kind="pr_review",
+    )
+    assert (repaired, marker) == (None, None)
+    assert calls == ["model-a"]
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt.outcome == "semantic_evidence_rejection"
+    assert attempt.fallback_planned is False
+    assert attempt.evidence_rejection is not None
+    assert attempt.evidence_rejection.reason == "non-passing-selector"
+    assert "admissible passing observation" in attempt.diagnostic
+    assert [r.outcome for r in usage.records] == ["semantic_evidence_rejection"]
+    assert usage.records[0].validation_status == "invalid"
+    assert usage.records[0].fallback_planned is False
+
+
+@pytest.mark.parametrize(
+    "returncode, transport_outcome", [(None, "timeout"), (1, "nonzero_exit")]
+)
+def test_antigravity_response_file_evidence_rejection_is_reclassified_and_stops(
+    tmp_path, monkeypatch, returncode, transport_outcome
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    runner = FakeRunner(
+        antigravity_catalog_outputs=[("Available models:\nModelA\nModelB\n", 0)],
+        # The provider channel also carries a transient signature: the
+        # rejection must still never become transient_provider_error.
+        antigravity_outputs=[(_MODEL_ACCESS_FAILURE, returncode), (_VALID_REPAIR, 0)],
+        public_response_outputs=[{"text": _EVIDENCE_REJECTED}],
+    )
+    config = make_config(tmp_path, repair_models=("ModelA",), antigravity_models=("ModelB",))
+    repaired, _, attempts = execute_repair(
+        malformed_pr_review_source(state="approved"), runner=runner, config=config,
+        run_id="agy-evidence", usage_context=None, validate=_evidence_rejecting_validate,
+        expected_kind="pr_review",
+    )
+    invocations = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"] and "models" not in cmd]
+    assert repaired is None
+    assert [(a.model, a.outcome) for a in attempts] == [
+        ("ModelA", "semantic_evidence_rejection")
+    ]
+    assert attempts[0].outcome not in {transport_outcome, "transient_provider_error"}
+    assert attempts[0].returncode == returncode
+    assert attempts[0].fallback_planned is False
+    assert attempts[0].evidence_rejection.reason == "non-passing-selector"
+    assert len(invocations) == 1
+
+
+def test_execute_repair_non_evidence_invalid_candidate_still_falls_back(tmp_path, monkeypatch):
+    import coding_review_agent_loop.repair as repair_module
+
+    calls = []
+
+    def fake_cli_repair(runner, config, prompt, *, model, log_path):
+        calls.append(model)
+        return SimpleNamespace(
+            text="broken candidate" if len(calls) == 1 else _VALID_REPAIR,
+            returncode=0, raw_output="", usage=None, raw_usage=None,
+            observed_model=None, text_source="stdout",
+        )
+
+    monkeypatch.setattr(repair_module, "run_cli_repair", fake_cli_repair)
+    config = make_config(tmp_path, repair_backend="codex", repair_models=("model-a", "model-b"))
+    repaired, _, attempts = execute_repair(
+        malformed_pr_review_source(state="approved"), runner=FakeRunner(), config=config,
+        run_id="invalid", usage_context=None, validate=_evidence_rejecting_validate,
+        expected_kind="pr_review",
+    )
+    assert repaired == _VALID_REPAIR
+    assert calls == ["model-a", "model-b"]
+    assert [a.outcome for a in attempts] == ["invalid_output", "succeeded"]
+    assert attempts[0].evidence_rejection is None
+    assert attempts[0].fallback_planned is True

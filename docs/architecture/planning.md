@@ -226,7 +226,11 @@ non-authoritative selector rejections: it quotes the sanitized, bounded
 rejection, resumes the rejected acquisition's session when the provider supports
 it, and requires a rerun and a citation from the re-ask turn's invocation-local
 catalog, outside `agent_max_retries`, model fallback, and repair. A second
-rejection stops with the same classification.
+rejection stops with the same classification. A rejection exposed only by a
+structured repair candidate, after normalization could not fix the envelope,
+stops the repair chain on that candidate with no fallback model and takes the
+same route (one opted-in re-ask, otherwise a `semantic-evidence-rejection`
+stop), whatever the repair transport outcome (#999).
 
 Inner-launcher authentication also covers a local Playwright spelling:
 `npx [--no-install|--no] playwright test ...` is recognized only when
