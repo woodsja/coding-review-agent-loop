@@ -106,6 +106,15 @@ def _issue_implementation_text(**overrides):
     return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Coder"
 
 
+@pytest.mark.parametrize("name", ["StructuredPrReview", "StructuredPlanReview"])
+def test_removed_legacy_review_carriers_stay_absent(name):
+    # ParsedReview and ParsedPlanReview are the only live review carriers;
+    # the uninstantiated legacy carriers were removed in #928.
+    from coding_review_agent_loop import protocol
+
+    assert not hasattr(protocol, name)
+
+
 def test_issue_implementation_protocol_accepts_null_pr_and_nullable_tests():
     parsed = validate_structured_issue_implementation(_issue_implementation_text())
 
