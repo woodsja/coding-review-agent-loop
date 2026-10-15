@@ -237,6 +237,43 @@ def test_environment_identity_uses_exact_exclusions_and_keeps_other_variables():
         canonical_environment_bytes({"Path": "one", "PATH": "two"}, case_insensitive=True)
 
 
+PER_TURN_SESSION_VARIABLES = (
+    "CLAUDE_PID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "SYSTEMD_EXEC_PID",
+)
+
+
+def test_per_turn_session_variables_keep_environment_identity_equivalent():
+    assert set(PER_TURN_SESSION_VARIABLES) <= ENVIRONMENT_EXCLUSIONS
+    stable = {"PATH": "/usr/bin", "CLAUDE_EFFORT": "medium"}
+    first = {**stable, **{name: f"first-{name}" for name in PER_TURN_SESSION_VARIABLES}}
+    second = {**stable, **{name: f"second-{name}" for name in PER_TURN_SESSION_VARIABLES}}
+    assert canonical_environment_bytes(first) == canonical_environment_bytes(second)
+
+    registry = EnvironmentIdentityRegistry()
+    assert registry.compare(registry.capture(first), registry.capture(second)) == "equivalent"
+
+    reconfigured = {**second, "CLAUDE_EFFORT": "high"}
+    assert registry.compare(registry.capture(first), registry.capture(reconfigured)) == "different"
+
+
+@pytest.mark.parametrize(
+    "lookalike", ["CLAUDE_CODE_MESSAGING_OTHER", "CLAUDE_PID_SUFFIX", "INVOCATION_ID_X"]
+)
+def test_lookalike_session_variable_names_remain_in_environment_identity(lookalike):
+    assert lookalike not in ENVIRONMENT_EXCLUSIONS
+    base = {"PATH": "/usr/bin", lookalike: "one"}
+    changed = {"PATH": "/usr/bin", lookalike: "two"}
+    assert canonical_environment_bytes(base) != canonical_environment_bytes(changed)
+    registry = EnvironmentIdentityRegistry()
+    assert registry.compare(registry.capture(base), registry.capture(changed)) == "different"
+
+
 def test_restart_evidence_is_identity_unknown_and_never_supersedes():
     registry = EnvironmentIdentityRegistry()
     failure = _observation(

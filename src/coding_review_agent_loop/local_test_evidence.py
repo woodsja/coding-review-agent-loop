@@ -151,6 +151,18 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "CLAUDE_CODE_CHILD_SESSION",
         "CODEX_SESSION_ID",
         "CODEX_THREAD_ID",
+        # Per-process and per-session agent and systemd values (#1346): they
+        # change with every coder process or systemd invocation and would split
+        # identity between turns running the same command, the #1329 deadlock
+        # class. Exact names only; stable configuration such as CLAUDE_EFFORT
+        # stays in the identity.
+        "CLAUDE_PID",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "INVOCATION_ID",
+        "JOURNAL_STREAM",
+        "SYSTEMD_EXEC_PID",
         "SSH_CLIENT",
         "SSH_CONNECTION",
         "SSH_TTY",

@@ -8725,6 +8725,15 @@ identity. Changing interpreters changes the command argv, so a failure under
 one interpreter is not superseded by a pass under another; use one interpreter
 consistently.
 
+Per-process and per-session agent and systemd variables (`CLAUDE_PID`,
+`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`,
+`CLAUDE_CODE_BRIDGE_SESSION_ID`, `INVOCATION_ID`, `JOURNAL_STREAM` and
+`SYSTEMD_EXEC_PID`) are also exact-name exclusions, so a fresh coder process or
+systemd invocation running the same command keeps the same identity and a later
+same-command pass can supersede an earlier failure. No prefix matching is used:
+a look-alike name such as `CLAUDE_CODE_MESSAGING_OTHER` still changes the
+identity.
+
 Broker-owned detached runs (submit, then wait across several shell calls) are
 deferred: they need a new authenticated request type, pending receipts and
 turn-end semantics. Until then a serial suite that exceeds the watchdog
