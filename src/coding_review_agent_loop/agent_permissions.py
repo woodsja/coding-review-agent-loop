@@ -985,6 +985,18 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
     if not is_sandboxed(config):
         return ()
     permission_class = permission_class_for_role(role)
+    # Refuse before acquiring the response root: a refusal needs no scratch
+    # tree, and must not be masked by its boundary check (#1253).
+    if provider not in SANDBOXED_PROVIDERS:
+        raise AgentLoopError(
+            f"--agent-permissions sandboxed supports only Claude and Codex, not {provider!r}: "
+            f"{_unsupported_provider_reason(provider)}."
+        )
+    if provider == "codex" and permission_class == PERMISSION_CLASS_CODER:
+        raise AgentLoopError(
+            "--agent-permissions sandboxed cannot run Codex as a committing coder "
+            "(its sandbox keeps .git read-only); use --coder claude."
+        )
     root = sandboxed_response_root(config)
     if provider == "claude":
         prefix = inspect_prefix(config)
@@ -1038,17 +1050,7 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
             "--allowedTools",
             *rules,
         )
-    if provider == "codex":
-        if permission_class == PERMISSION_CLASS_CODER:
-            raise AgentLoopError(
-                "--agent-permissions sandboxed cannot run Codex as a committing coder "
-                "(its sandbox keeps .git read-only); use --coder claude."
-            )
-        return ("--sandbox", "read-only", "-c", 'approval_policy="never"')
-    raise AgentLoopError(
-        f"--agent-permissions sandboxed supports only Claude and Codex, not {provider!r}: "
-        f"{_unsupported_provider_reason(provider)}."
-    )
+    return ("--sandbox", "read-only", "-c", 'approval_policy="never"')
 
 
 def role_permission_env(config: AgentLoopConfig, provider: str, role: str | None) -> dict[str, str]:

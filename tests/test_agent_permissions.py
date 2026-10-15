@@ -303,6 +303,15 @@ def test_codex_coder_role_is_refused_at_runtime(tmp_path, sandbox):
         ap.role_permission_args(config, "codex", "coder")
 
 
+def test_codex_coder_refusal_precedes_response_root(tmp_path, sandbox):
+    # #1253: the refusal needs no scratch tree, so it must not create one.
+    config = sandboxed_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="read-only"):
+        ap.role_permission_args(config, "codex", "coder")
+    assert not ap.response_root(config).exists()
+    assert ap._STATES == {}
+
+
 # ------------------------------------------------------ coder test resolver
 
 
@@ -1120,6 +1129,32 @@ def test_unsandboxable_refusal_ignores_group_writable_host_scratch(tmp_path, mon
     # Control: the decoy really is hostile when it is the scratch root.
     monkeypatch.setattr(tempfile, "tempdir", str(decoy_base))
     ap.reset_sandbox_state()
+    with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
+        ap.establish_response_root_boundary(config)
+
+
+@pytest.mark.parametrize("provider", ["antigravity", "gemini"])
+def test_unsandboxable_refusal_precedes_hostile_response_root(
+    tmp_path, sandbox, monkeypatch, provider
+):
+    # #1253: the provider refusal wins over a hostile scratch root and
+    # touches nothing.  The tempfile base itself is not validated, so the
+    # hostile mode goes on the first validated component.
+    base = tmp_path / "hostile-base"
+    component = base / "coding-review-agent-loop"
+    component.mkdir(parents=True)
+    component.chmod(0o775)
+    monkeypatch.setattr(tempfile, "tempdir", str(base))
+    ap.reset_sandbox_state()
+    config = sandboxed_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="has no CLI-enforced read-only grant") as info:
+        ap.role_permission_args(config, provider, "reviewer")
+    assert not isinstance(info.value, ap.SandboxBoundaryError)
+    assert stat.S_IMODE(component.stat().st_mode) == 0o775
+    assert not (component / "responses").exists()
+    assert ap._STATES == {}
+
+    # Control: the same tree really is hostile.
     with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
         ap.establish_response_root_boundary(config)
 
