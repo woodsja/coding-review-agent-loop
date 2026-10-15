@@ -383,3 +383,131 @@ def test_stderr_verdict_text_keeps_decisive_middle() -> None:
     v = transient.classify_codex_failure(_stream(_ev(type="thread.started", thread_id="t"), stderr))
     assert (v.source, v.category) == ("stderr", "non-retryable")
     assert "401 Unauthorized" in v.text
+
+
+# ---------------------------------------------------------------------------
+# Authoritative Codex structured error (#1280)
+# ---------------------------------------------------------------------------
+
+_MCP_AUTH = "MCP server failed to start: authentication required"
+
+
+def test_auth_warning_then_capacity_terminal_is_transient() -> None:
+    raw = _stream(
+        _ev(type="error", message=_MCP_AUTH),
+        _ev(type="turn.failed", error={"message": _CAP}),
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert (verdict.source, verdict.category, verdict.billing) == ("structured", "transient", False)
+    assert verdict.text.startswith(f"message: {_CAP}")
+    assert _MCP_AUTH in verdict.text.splitlines()[1]
+
+
+def test_billing_warning_then_503_terminal_is_transient_without_billing() -> None:
+    raw = _stream(
+        _ev(type="error", message="billing notice: credit balance low"),
+        _ev(type="turn.failed", error={"message": "request failed", "status": 503}),
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert (verdict.category, verdict.billing) == ("transient", False)
+    assert verdict.text.startswith("message: request failed")
+
+
+def test_transient_warnings_then_auth_terminal_is_non_retryable() -> None:
+    raw = _stream(
+        _ev(type="error", message="Reconnecting... 1/5 (429 rate limit)"),
+        _ev(type="error", message="Reconnecting... 2/5 (stream disconnected)"),
+        _ev(type="turn.failed", error={"message": "401 Unauthorized"}),
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert (verdict.category, verdict.billing) == ("non-retryable", False)
+    assert verdict.text.startswith("message: 401 Unauthorized")
+
+
+def test_transient_warnings_then_generic_terminal_is_deterministic() -> None:
+    raw = _stream(
+        _ev(type="error", message="Reconnecting... 1/5 (429 rate limit)"),
+        _ev(type="turn.failed", error={"message": "request failed"}),
+    )
+    assert transient.classify_codex_failure(raw).category == "deterministic"
+
+
+def test_last_of_several_turn_failed_decides() -> None:
+    raw = _stream(
+        _ev(type="turn.failed", error={"message": "401 Unauthorized"}),
+        _ev(type="turn.failed", error={"message": _CAP}),
+    )
+    channel = transient.extract_codex_error_channel(raw)
+    assert channel.authoritative_index == 1
+    assert transient.classify_codex_failure(raw).category == "transient"
+    reverse = _stream(
+        _ev(type="turn.failed", error={"message": _CAP}),
+        _ev(type="turn.failed", error={"message": "401 Unauthorized"}),
+    )
+    assert transient.classify_codex_failure(reverse).category == "non-retryable"
+
+
+def test_deduplicated_terminal_keeps_authority() -> None:
+    raw = _stream(
+        _ev(type="error", message=_CAP),
+        _ev(type="error", message="401 Unauthorized"),
+        _ev(type="turn.failed", error={"type": "error", "message": _CAP}),
+    )
+    channel = transient.extract_codex_error_channel(raw)
+    assert len(channel.structured_errors) == 2
+    assert channel.authoritative_index == 0
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict.category == "transient" and not verdict.billing
+    assert verdict.text.startswith(channel.structured_errors[0].rendered)
+
+
+def test_non_equal_capacity_pair_indexes_turn_failed_entry() -> None:
+    raw = _stream(
+        _ev(type="error", message=_CAP),
+        _ev(type="turn.failed", error={"message": _CAP}),
+    )
+    channel = transient.extract_codex_error_channel(raw)
+    assert len(channel.structured_errors) == 2
+    assert channel.authoritative_index == 1
+    assert transient.classify_codex_failure(raw).category == "transient"
+
+
+def test_last_error_occurrence_decides_without_turn_failed() -> None:
+    raw = _stream(
+        _ev(type="error", message=_CAP),
+        _ev(type="error", message="401 Unauthorized"),
+        _ev(type="error", message=_CAP),
+    )
+    channel = transient.extract_codex_error_channel(raw)
+    assert len(channel.structured_errors) == 2
+    assert channel.authoritative_index == 0
+    verdict = transient.classify_codex_failure(raw)
+    assert (verdict.category, verdict.billing) == ("transient", False)
+    assert verdict.text.startswith(channel.structured_errors[0].rendered)
+
+
+def test_auth_warning_then_final_capacity_error_without_turn_failed() -> None:
+    raw = _stream(_ev(type="error", message=_MCP_AUTH), _ev(type="error", message=_CAP))
+    channel = transient.extract_codex_error_channel(raw)
+    assert channel.authoritative_index == 1
+    assert transient.classify_codex_failure(raw).category == "transient"
+
+
+def test_authoritative_index_is_none_without_structured_errors() -> None:
+    channel = transient.extract_codex_error_channel(_stream(_TOOL, _ev(type="turn.started")))
+    assert channel.structured_errors == () and channel.authoritative_index is None
+
+
+def test_agent_failure_uses_authoritative_codex_error() -> None:
+    from coding_review_agent_loop import agent_failure
+    from coding_review_agent_loop.agents.base import AgentResult
+
+    raw = _stream(
+        _ev(type="thread.started", thread_id="t"),
+        _ev(type="error", message=_MCP_AUTH),
+        _ev(type="turn.failed", error={"message": _CAP}),
+    )
+    result = AgentResult(text="", raw_output=raw, returncode=1, provider="codex")
+    text, verdict = agent_failure._agent_failure_classification(result, phase="command")
+    assert verdict is not None and verdict.category == "transient"
+    assert agent_failure._failure_category(text, provider_verdict=verdict) == "transient"

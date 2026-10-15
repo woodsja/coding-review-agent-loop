@@ -45,6 +45,9 @@ def is_transient_agent_output(text: str) -> bool:
 
 
 # --- Codex provider error channel (#1269) -----------------------------------
+# One structured error is authoritative (#1280): the last turn.failed error, else
+# the last structured error occurrence. Only it decides the category and billing
+# flag; earlier errors (e.g. tool or MCP start-up warnings) are supporting context.
 
 _CODEX_EVENT_SHAPED_RE = re.compile(r'^\s*\{\s*"(?:type|id|item|thread_id)"\s*:')
 _CODEX_STDIN_BANNER = "Reading prompt from stdin..."
@@ -76,6 +79,9 @@ class CodexStructuredError:
 class CodexErrorChannel:
     structured_errors: tuple[CodexStructuredError, ...]
     stderr_lines: tuple[str, ...]
+    # Index into structured_errors of the authoritative error (#1280); None only
+    # when there are no structured errors.
+    authoritative_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,8 @@ def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
     structured: list[CodexStructuredError] = []
     stderr: list[str] = []
     event_shaped = False
+    last_error_index: int | None = None
+    terminal_index: int | None = None
     for line in (raw_output or "").splitlines():
         stripped = line.strip()
         if not stripped:
@@ -158,8 +166,17 @@ def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
                     rendered = _render_codex_error(event)
                 elif kind == "turn.failed":
                     rendered = _render_codex_error(event.get("error"))
-                if rendered is not None and rendered not in structured:
-                    structured.append(rendered)
+                if rendered is not None:
+                    # Deduplicate entries but track every occurrence, so a later
+                    # repeat of an earlier error still points back at it.
+                    if rendered in structured:
+                        index = structured.index(rendered)
+                    else:
+                        index = len(structured)
+                        structured.append(rendered)
+                    last_error_index = index
+                    if kind == "turn.failed":
+                        terminal_index = index
             elif _CODEX_EVENT_SHAPED_RE.match(stripped):
                 event_shaped = True
             continue
@@ -169,7 +186,8 @@ def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
             stderr.append(stripped)
     if not event_shaped:
         return None
-    return CodexErrorChannel(tuple(structured), tuple(stderr))
+    authoritative = terminal_index if terminal_index is not None else last_error_index
+    return CodexErrorChannel(tuple(structured), tuple(stderr), authoritative)
 
 
 def _classify_structured_provider_error(err: CodexStructuredError) -> tuple[str, bool]:
@@ -186,21 +204,27 @@ def _classify_structured_provider_error(err: CodexStructuredError) -> tuple[str,
 
 
 def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
-    """Provider-channel verdict for a failed Codex invocation, or None (legacy path)."""
+    """Provider-channel verdict for a failed Codex invocation, or None (legacy path).
+
+    With structured errors, only the authoritative one (the last turn.failed
+    error, else the last error occurrence; #1280) decides the category and
+    billing flag. The text lists it first, then the other structured errors in
+    order of first appearance, untruncated, as supporting context.
+    """
     channel = extract_codex_error_channel(raw_output)
     if channel is None:
         return None
     if channel.structured_errors:
-        results = [_classify_structured_provider_error(e) for e in channel.structured_errors]
-        text = "\n".join(e.rendered for e in channel.structured_errors)
-        bad = [r for r in results if r[0] == "non-retryable"]
-        if bad:
-            return ProviderFailureVerdict(
-                "non-retryable", any(r[1] for r in bad), text, "structured"
-            )
-        if any(r[0] == "transient" for r in results):
-            return ProviderFailureVerdict("transient", False, text, "structured")
-        return ProviderFailureVerdict("deterministic", False, text, "structured")
+        index = channel.authoritative_index
+        if index is None:
+            index = len(channel.structured_errors) - 1
+        authoritative = channel.structured_errors[index]
+        category, billing = _classify_structured_provider_error(authoritative)
+        ordered = [authoritative] + [
+            e for i, e in enumerate(channel.structured_errors) if i != index
+        ]
+        text = "\n".join(e.rendered for e in ordered)
+        return ProviderFailureVerdict(category, billing, text, "structured")
     if channel.stderr_lines:
         # Never truncate: consumers re-classify this text, so decisive evidence
         # in the middle must survive (the capture itself is already bounded).
