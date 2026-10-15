@@ -2148,13 +2148,20 @@ def _records_ci_repair_transitions(
         for item in items:
             if not isinstance(item, Mapping):
                 continue
+            # Items are arbitrary JSON from any commenter and are decoded before
+            # author filtering, so raw fields are type-checked before they are
+            # hashed by a membership test (#1370).
+            obligation_kind = item.get("obligation_kind")
+            status = item.get("status")
             failed = item.get("failed_head_sha")
             candidate = item.get("candidate_head_sha")
             if (
                 item.get("authority") == MACHINE_AUTHORITY
-                and item.get("obligation_kind") in CI_MACHINE_OBLIGATION_KINDS
+                and isinstance(obligation_kind, str)
+                and obligation_kind in CI_MACHINE_OBLIGATION_KINDS
                 and item.get("lifecycle") == "awaiting_current_head_review"
-                and item.get("status") in {"blocking", "same-pr"}
+                and isinstance(status, str)
+                and status in {"blocking", "same-pr"}
                 and isinstance(failed, str)
                 and isinstance(candidate, str)
                 and failed

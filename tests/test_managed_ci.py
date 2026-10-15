@@ -1676,6 +1676,116 @@ def test_ci_repair_continuity_publication_writes_nothing_for_an_invalid_record(t
     assert [record.kind for _comment_id, record in before] == ["creation"]
 
 
+# --- #1370: wrongly typed CI-obligation fields never crash continuity ---
+
+
+def _hostile_ci_repair_round_comment(comment_id, *, field, value, author):
+    """A coder round whose CI obligation carries a raw, wrongly typed field.
+
+    The dataclass path cannot carry a list-typed field, so the valid record is
+    decoded, the item is edited as raw JSON, and the payload is re-encoded.
+    """
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        decode_mapping,
+        encode_mapping,
+    )
+
+    valid = _ci_repair_round_comment(comment_id)
+    (match,) = ROUND_RESUME_MARKER_RE.finditer(valid["body"])
+    payload = dict(decode_mapping(match.group("payload")))
+    (item,) = payload["prior_items"]
+    item = dict(item)
+    assert item["authority"] == managed_ci.MACHINE_AUTHORITY
+    item[field] = value
+    payload["prior_items"] = [item]
+    login, user_id = ("mallory", 9) if author == "foreign" else ("agent-loop", 1)
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": user_id},
+        "body": f"coder round\n<!-- AGENT_LOOP_META: {encode_mapping(payload)} -->",
+    }
+
+
+_WRONGLY_TYPED_CI_FIELDS_1370 = [
+    ("obligation_kind", []), ("obligation_kind", {}), ("obligation_kind", ["final-ci"]),
+    ("obligation_kind", 7),
+    ("status", []), ("status", {}), ("status", ["blocking"]), ("status", True),
+]
+
+
+@pytest.mark.parametrize("author", ["foreign", "actor"])
+@pytest.mark.parametrize("field,value", _WRONGLY_TYPED_CI_FIELDS_1370)
+def test_m1370_wrongly_typed_ci_obligation_fields_never_crash_continuity(
+    tmp_path, author, field, value,
+):
+    comment = _hostile_ci_repair_round_comment(61, field=field, value=value, author=author)
+    by_index = managed_ci._continuity_round_records([comment])
+    assert by_index[0]["ci_repair_transitions"] == frozenset()
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(comment)
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            after_comment_id=50,
+        )
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [comment], authorization=_ci_repair_continuity()
+    ) is False
+
+
+@pytest.mark.parametrize("author", ["foreign", "actor"])
+@pytest.mark.parametrize("field,value", _WRONGLY_TYPED_CI_FIELDS_1370)
+def test_m1370_publication_writes_nothing_for_wrongly_typed_ci_fields(
+    tmp_path, author, field, value,
+):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    initial = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.intent_comments.append(
+        _hostile_ci_repair_round_comment(61, field=field, value=value, author=author)
+    )
+    runner.rest_pr["head"]["sha"] = "ci-fix-head"
+    before = _authorization_records(runner)
+
+    with pytest.raises(AgentLoopError, match="authenticated, correlated round metadata"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=initial, predecessor_head="abc123",
+            new_head="ci-fix-head", round_comment_ids=(61,),
+        )
+
+    assert _authorization_records(runner) == before
+    assert [record.kind for _comment_id, record in before] == ["creation"]
+
+
+@pytest.mark.parametrize("field,value", _WRONGLY_TYPED_CI_FIELDS_1370)
+def test_m1370_hostile_foreign_ci_record_does_not_block_a_valid_repair_round(
+    tmp_path, field, value,
+):
+    hostile = _hostile_ci_repair_round_comment(55, field=field, value=value, author="foreign")
+    valid = _ci_repair_round_comment(61)
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.extend([hostile, valid])
+
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+        actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+        after_comment_id=50,
+    )
+
+    assert selected == (61,)
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [hostile, valid], authorization=_ci_repair_continuity()
+    ) is True
+
+
 class _OrchestratorRoundCommentRunner(AuthorizationCommentRunner):
     """Mirror orchestrator-posted PR comments into the actor's REST comment list.
 
