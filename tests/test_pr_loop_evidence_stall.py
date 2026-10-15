@@ -820,7 +820,7 @@ def test_step_back_sibling_escalation_takes_precedence_over_a_filled_stall_windo
         ],
     )
     config = _config(tmp_path, pr_evidence_stall_rounds=3)
-    with pytest.raises(AgentLoopError) as raised:
+    with pytest.raises(HumanDecisionRequiredError) as raised:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
     message = str(raised.value)
     assert "human decision required" in message and "--pr-step-back-rounds 0" in message

@@ -158,8 +158,8 @@ clearance: for a mappable anchor, the mapped path within the mapped span +/- the
 window; for an `UNMAPPABLE` anchor, the logged conservative fallback of any
 finding on the original or rename-destination path. If the sweep review, or any
 later review in the active episode, introduces a new mandatory finding that is a
-member (located in the parent text or only in a sub-item), the loop raises a
-human-decision error before any further coder invocation, naming the cluster, the
+member (located in the parent text or only in a sub-item), the loop raises
+`HumanDecisionRequiredError` (exit code 4) before any further coder invocation, naming the cluster, the
 mapping outcome, the siblings, and the coder's `Generalization:` excerpt rebuilt
 from the stored structured response. A carried item is not a sibling; it keeps the
 episode open while it is a member. The episode closes on the reviewer's approval
