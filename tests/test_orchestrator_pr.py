@@ -65,6 +65,8 @@ from coding_review_agent_loop.orchestrator import (
     PostedRoundMetadata,
     ValidatedAgentResponse,
     _attach_round_metadata,
+    _pending_ci_stop_guidance,
+    _pending_ci_stop_message,
     _decode_round_metadata,
     _reconcile_human_requirements_ack_item,
     _resume_pr_round,
@@ -6434,6 +6436,50 @@ def test_pr_loop_stops_gracefully_when_github_checks_pending_without_auto_merge(
         in captured.out
     )
     _assert_pending_ci_stop_guidance(captured.out)
+    # #1477: the watch stays opt-in, so the stop names the flag and its bound.
+    hint = (
+        "Rerun with --watch-pending-ci to watch CI (bounded by --ci-timeout-seconds) and "
+        "re-run plumbing-only failures automatically."
+    )
+    assert hint in stop_comment
+    assert hint in captured.out
+
+
+@pytest.mark.parametrize("auto_merge", [False, True])
+def test_pending_ci_watch_hint_is_not_emitted_when_the_watch_was_active(
+    tmp_path, monkeypatch, capsys, auto_merge
+):
+    runner = FakeRunner(
+        codex_outputs=["Looks good locally.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        pr_check_runs_payload={"check_runs": []},
+        pr_status_payload={"state": "pending", "statuses": []},
+        pr_branch_protection_payload={"contexts": ["test"]},
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *args, **kwargs: CiWatchOutcome(
+            status="timeout", pr_checks=_watch_check_board("pending"), head_sha="abc123",
+            attempts_used=1,
+        ),
+    )
+    config = make_config(tmp_path, watch_pending_ci=True, auto_merge=auto_merge)
+
+    if auto_merge:
+        with pytest.raises(AgentLoopError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    captured = capsys.readouterr()
+    assert "Rerun with --watch-pending-ci" not in captured.out
+    assert not any("Rerun with --watch-pending-ci" in comment for comment in runner.comments)
+
+
+def test_pending_ci_stop_guidance_hint_is_opt_in():
+    assert "--watch-pending-ci" not in _pending_ci_stop_guidance("pending")
+    assert "--watch-pending-ci" in _pending_ci_stop_guidance("pending", watch_hint=True)
+    assert "--ci-timeout-seconds" in _pending_ci_stop_message(77, "unavailable", [], watch_hint=True)
 
 _QUEUED_TOO_LONG_CHECK_RUNS_PAYLOAD = {
     "check_runs": [

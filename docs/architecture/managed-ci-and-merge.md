@@ -11,6 +11,30 @@ review feedback without waiting for unfinished checks. Post-approval watching
 and automatic merging use bounded gates, including infrastructure-failure
 classification and fresh mergeability checks.
 
+Post-approval failures are classified before any coder routing (#1477). The
+plumbing catalog lives once in `managed_ci.py` (`MANAGED_PLUMBING_JOB_NAMES`
+plus `final-ci/exact-head`, extended only by `--ci-plumbing-check`). Matching
+is by exact whole name or final ` / ` segment; a workflow-contract test pins
+the job names to the managed workflows. `ci_health.classify_watch_failure` is
+pure. It gives test failures precedence, and it requires an authoritative
+complete board (query `ok`, complete listing, readable protection, no missing
+required check) before it reports plumbing-only. Plumbing that failed while
+tests still run is held, not routed. `github.watch_pr_checks` also confirms
+stuck-pending required statuses: their target-URL Actions run reads
+`completed` on two consecutive polls. Such statuses are plumbing by cause. It
+polls through evidence from before a rerun. The ordinary route re-runs the
+one resolved PR-head run's failed jobs once (`rerun_ordinary_failed_jobs`). The
+managed route re-runs the attached v2 run fully (`rerun_managed_attempt`),
+only after re-reading the authenticated audit record's completed `no-status`
+transition for the current attempt, because the split publisher rejects
+carried-over validation. A managed failure that published a failure status is
+refused. Second plumbing failures and refused reruns end in
+`pr_loop_support._stop_on_ci_plumbing_failure`. That stop records no coder
+obligation, attempts no merge, and reports the run URL and the
+`final-ci/exact-head` state. The rerun budget is invocation-local per head and
+adds no persistence. `--watch-pending-ci` stays opt-in; an ordinary
+non-auto-merge pending stop names it as a hint.
+
 The counted board is the current-head board minus check runs positively
 identified as ad hoc `workflow_dispatch` runs (operator diagnostics such as a
 deliberate negative-evidence dispatch). `github.get_pr_checks` applies one
@@ -371,3 +395,4 @@ unchanged.
 - The exact-head CI repair round is authorized by the tool-minted CI obligation, because it has no blocking review to pair with (#1024).
 - A rejected-coder recovery across a fresh grant is a third accepted continuity shape, walked through one shared chain authentication (#1367).
 - Coder and format-repair turns on a managed PR run under a `gh` guard that refuses CI dispatch before approval, plus a post-turn dispatch audit (#1366).
+- Post-approval CI watching stays opt-in without auto-merge (an end-of-run hint names `--watch-pending-ci`). Plumbing-only failures on a complete board are re-run once before any coder round, then stop on infrastructure (#1477).

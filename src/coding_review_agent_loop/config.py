@@ -465,6 +465,9 @@ class AgentLoopConfig:
     # its effective value so auto-merge can warn when the old opt-out no longer
     # changes the full-board gate.
     watch_pending_ci_explicit: bool = False
+    # Caller-defined plumbing job/status names (#1477), appended to the managed
+    # catalog for post-approval failure classification (exact names only).
+    ci_plumbing_checks: tuple[str, ...] = ()
     # The first source that resolved ``base``.  This is carried across an
     # issue-to-PR handoff so a repository-default base cannot silently replace
     # the live PR base on a later invocation.
@@ -2315,6 +2318,13 @@ def config_from_args(
             else bool(args.watch_pending_ci)
         ),
         watch_pending_ci_explicit=getattr(args, "watch_pending_ci", None) is not None,
+        ci_plumbing_checks=tuple(
+            dict.fromkeys(
+                name.strip()
+                for name in (getattr(args, "ci_plumbing_check", None) or ())
+                if isinstance(name, str) and name.strip()
+            )
+        ),
         managed_ci_trusted_actor=getattr(args, "managed_ci_trusted_actor", None),
         human_reviewer_trusted_actors=parse_human_reviewer_trusted_actors(
             getattr(args, "human_reviewer_trusted_actor", None)

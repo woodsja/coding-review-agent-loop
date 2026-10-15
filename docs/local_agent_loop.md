@@ -6938,7 +6938,8 @@ it does not weaken that gate. An explicit
 `--watch-pending-ci` without `--auto-merge` watches ordinary checks after
 approval and reports merge-ready without merging. It does not activate
 suppression or replace managed exact-head qualification; when `--managed-ci` is
-active it is inert for that managed route.
+active it is inert for that managed route, which always waits for
+`final-ci/exact-head` itself.
 
 When active, it foreground-polls the full PR check/status/required-check board
 using the existing timeout and poll interval controls. It does not call
@@ -6965,6 +6966,124 @@ bounded and print a shell-quoted rerun command only locally; GitHub comments do
 not repeat invocation arguments. Dry-run previews the watch without polling,
 sleeping, resuming agents, or merging. `--no-watch-pending-ci` does not disable
 the ordinary auto-merge watcher.
+
+#### Default decision and end-of-run hint
+
+`--watch-pending-ci` stays off by default without `--auto-merge`. Turning it
+on would make every non-auto-merge run block in the foreground for up to
+`--ci-timeout-seconds`, which would change behaviour for existing scripted
+callers. Instead, when an ordinary non-auto-merge run stops because checks are
+pending or unavailable and no watch was active, the stop comment and the
+printed message add this hint: "Rerun with --watch-pending-ci to watch CI
+(bounded by --ci-timeout-seconds) and re-run plumbing-only failures
+automatically." The hint is not emitted when the watch was active, under
+`--auto-merge`, or on the managed route. Managed CI (`--managed-ci`) always
+waits for `final-ci/exact-head` after approval through its own qualification
+wait, with or without `--auto-merge`; it never takes the ordinary pending stop.
+
+#### Final `final-ci/exact-head` state
+
+Terminal watch reports name the observed `final-ci/exact-head` state whenever
+that context is on the board, required, or expected by the managed route. The
+state is one of `success`, `failure`, `pending`, `stuck-pending` or `absent`.
+These reports are the merge-ready message, failing-CI comments, timeout
+details, plumbing infrastructure stops and the managed manual-merge message.
+
+#### Plumbing failures and the rerun-once rule
+
+Some CI jobs publish statuses, route or attest rather than test. When only
+those fail, the coder cannot fix the failure. The plumbing catalog is defined
+once, in `managed_ci.py` next to `FINAL_CONTEXT`, and contains the exact
+managed workflow job names `Validate managed exact-head dispatch`, `Verify
+split attestations` and `Publish final exact-head status`, plus the
+`final-ci/exact-head` status context. A contract test pins each job name to
+the managed workflows. Callers add their own job or status names with the
+repeatable `--ci-plumbing-check NAME` option (for example a caller job named
+`route`). Matching compares the whole check name, or the final ` / `-separated
+segment of a reusable-workflow check name, exactly. It never matches a
+substring, so `router` is not `route`.
+
+Before the coder is resumed, every post-approval failure is classified. This
+applies both to failures found by the watcher and to failures already visible
+in the approval snapshot:
+
+- **Test failure.** Any failing non-plumbing check keeps today's behaviour:
+  the failing-checks comment, a `github-pr-checks` obligation and a coder
+  round. Test failures take precedence over plumbing failures and stuck
+  statuses.
+- **Completeness prerequisite.** A board is classified plumbing-only only
+  when the check query is `ok`, the listing is complete, branch protection is
+  `configured` or `not_found`, and no required check is missing. A partial or
+  unavailable board keeps today's routing.
+- **Plumbing-only.** Every failing (or confirmed stuck) check is plumbing and
+  every test check passed, with nothing skipped. The loop re-runs the failed
+  jobs once (`gh run rerun <run_id> --failed`), posts an audit comment, and
+  keeps watching under the same deadline and attempt budget. The run ID is
+  resolved from the check run's `check_suite_id`, or from a status context's
+  Actions target URL. All observations must resolve to one completed run whose
+  `head_sha` is the approved PR head and whose event is not
+  `workflow_dispatch`. The rerun is never issued in dry-run.
+- **Plumbing awaiting tests.** If plumbing failed while test checks are still
+  running, the watcher holds and keeps polling. It reruns once if the tests
+  then pass, and resumes the coder if a test fails. If the budget expires, it
+  takes the timeout path, never a coder obligation. Without a watch, the
+  approval snapshot takes the pending stop with the hint.
+- **Stale evidence.** After the rerun, failures from the earlier attempt are
+  polled through: the same failed check-run IDs, or the same status context,
+  run and `created_at`. Only a fresh-attempt plumbing failure counts as the
+  second failure. A fresh test failure still reaches the coder at once.
+- **Infrastructure stop.** The loop stops with an infrastructure message that
+  names the run URL, the plumbing checks and the `final-ci/exact-head` state.
+  This happens when plumbing fails again after the single rerun, or when the
+  rerun cannot be performed safely (the run is unresolvable, its head does
+  not match, the actions write is denied, or `gh run rerun` fails). No coder
+  obligation is recorded and no merge is attempted. Like the
+  infrastructure-stall stop, it exits zero and is resumable. Without a watch,
+  a plumbing-only approval snapshot stops this way and names
+  `--watch-pending-ci`.
+
+The rerun budget is one per approved head per invocation and is not
+persisted, so each operator rerun of the command may spend one rerun. A head
+change during or after the rerun keeps the existing re-review path.
+
+#### Stuck pending statuses
+
+A required status (or a catalogued plumbing status) that stays `pending` after
+its producing workflow run completed is a plumbing failure by cause, not
+"still running", whatever its name. For a pending status whose target URL
+names an Actions run, the watcher reads the run. When the same (context, run,
+attempt) reads `completed` on two consecutive polls, the status is
+`stuck-pending`. A status whose run is still in progress, whose run is
+unreadable, or that has no Actions run URL stays ordinary pending. A stuck
+status feeds the classification above. The loop re-runs once when the run has
+failed jobs, and otherwise stops on infrastructure, because a `--failed`
+rerun of a run with no failed job would do nothing.
+
+#### Managed route
+
+A managed run that completes without publishing its correlated
+`final-ci/exact-head` status (terminal without status) gains the same
+rerun-once rule. The run's complete job listing must show only plumbing jobs
+failing and every test job successful. The loop re-reads the authenticated
+audit record and requires the completed `no-status` transition for the run's
+current attempt N, which the dispatch validator accepts for attempt N+1. It
+then verifies the attached run against the contract (workflow revision, run
+name and nonce, trusted actor) and requires the authenticated `gh` user to be
+the trusted actor. Only then does it issue one full `gh run rerun <run_id>`
+without `--failed`. The split publisher deliberately rejects a validation job
+carried over from an earlier attempt, so the managed rerun is full and
+validation runs again. The qualification wait then ignores attempt N until
+attempt N+1 is observed. A second plumbing failure, or a refused rerun, stops
+on infrastructure.
+
+A managed run that published a failure status although only plumbing jobs
+failed leaves a plain `completed` audit record, which the validator rejects
+for N+1. The loop therefore stops on infrastructure without a rerun or a
+record rewrite. Rerunning the command on the same head reattaches the same
+failed run and reaches the same stop. Recovery needs a new head commit on the
+PR, which re-enters current-head review and mints a fresh head-scoped managed
+intent and dispatch, or the managed resume and ordinary-recovery options in
+this guide.
 
 ### External CI infrastructure stalls
 

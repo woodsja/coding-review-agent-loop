@@ -995,3 +995,193 @@ def test_operator_early_ci_dispatch_stays_diagnostic_and_never_qualifies(tmp_pat
     details = "\n".join(_pr_check_details(checks))
     assert "Excluded ad hoc workflow_dispatch checks (operator diagnostics, not PR checks)" in details
     assert "7000" in details
+
+
+# --- Post-approval plumbing classification (#1477) --------------------------
+
+from coding_review_agent_loop.ci_health import check_name_matches, classify_watch_failure
+from coding_review_agent_loop.managed_ci import (
+    MANAGED_PLUMBING_JOB_NAMES,
+    PLUMBING_STATUS_CONTEXTS,
+    is_plumbing_check,
+    plumbing_check_names,
+)
+
+PLUMBING = MANAGED_PLUMBING_JOB_NAMES | PLUMBING_STATUS_CONTEXTS | {"route"}
+
+
+def test_ci_plumbing_check_option_extends_the_catalog(tmp_path):
+    assert plumbing_check_names(make_config(tmp_path, ci_plumbing_checks=("route",))) == PLUMBING
+
+
+def _plumbing_board(*, failing=(), passing=(), pending=(), missing=(), query="ok",
+                    complete=True, protection="configured", required=()):
+    return PullRequestChecks(
+        state="failing" if failing else "pending" if pending else "passing",
+        required_checks=tuple(required),
+        passing=tuple(passing),
+        pending=tuple(pending),
+        failing=tuple(failing),
+        missing_required=tuple(missing),
+        branch_protection_status=protection,
+        check_query_status=query,
+        listing_complete=complete,
+    )
+
+
+def _pcheck(name, status):
+    return PullRequestCheck(name=name, kind="check_run", status=status)
+
+
+_PUBLISH_FAILED = _pcheck("managed / Publish final exact-head status", "failure")
+_TEST_PASSED = _pcheck("tests", "success")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Publish final exact-head status", True),
+        ("managed / Publish final exact-head status", True),
+        ("final-ci/exact-head", True),
+        ("route", True),
+        ("caller / route", True),
+        ("Publish final exact-head status extra", False),
+        ("router", False),
+        ("route / tests", False),
+        ("Validate managed exact-head dispatch tests", False),
+    ],
+)
+def test_plumbing_catalog_matches_whole_name_or_final_segment_only(name, expected):
+    assert check_name_matches(name, PLUMBING) is expected
+    assert is_plumbing_check(name, ("route",)) is expected
+
+
+def test_classifier_plumbing_only_on_complete_board_with_passing_tests():
+    board = _plumbing_board(failing=(_PUBLISH_FAILED,), passing=(_TEST_PASSED,))
+    assert classify_watch_failure(board, PLUMBING) == "plumbing-only"
+
+
+def test_classifier_mixed_test_and_plumbing_failure_is_test_failure():
+    board = _plumbing_board(
+        failing=(_PUBLISH_FAILED, _pcheck("tests", "failure")), passing=(),
+    )
+    assert classify_watch_failure(board, PLUMBING) == "test-failure"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"query": "partial"},
+        {"query": "unavailable"},
+        {"complete": False},
+        {"protection": "forbidden"},
+        {"protection": "unavailable"},
+        {"missing": ("tests",)},
+    ],
+)
+def test_classifier_never_plumbing_only_on_partial_or_unreliable_board(overrides):
+    board = _plumbing_board(failing=(_PUBLISH_FAILED,), passing=(_TEST_PASSED,), **overrides)
+    assert classify_watch_failure(board, PLUMBING) == "not-classifiable"
+
+
+def test_classifier_skipped_tests_did_not_pass():
+    board = _plumbing_board(
+        failing=(_pcheck("Validate managed exact-head dispatch", "failure"),),
+        passing=(_pcheck("tests", "skipped"),),
+    )
+    assert classify_watch_failure(board, PLUMBING) == "not-classifiable"
+
+
+def test_classifier_holds_plumbing_failure_while_tests_are_pending():
+    board = _plumbing_board(
+        failing=(_PUBLISH_FAILED,), passing=(_TEST_PASSED,),
+        pending=(_pcheck("slow tests", "in_progress"),),
+    )
+    assert classify_watch_failure(board, PLUMBING) == "plumbing-awaiting-tests"
+
+
+def test_classifier_stuck_status_is_plumbing_by_cause_even_outside_the_catalog():
+    stuck = PullRequestCheck(
+        name="ci/summary", kind="status_context", status="pending",
+        url="https://github.com/OWNER/REPO/actions/runs/9",
+    )
+    board = _plumbing_board(passing=(_TEST_PASSED,), pending=(stuck,), required=("ci/summary",))
+    assert classify_watch_failure(board, PLUMBING, (stuck,)) == "plumbing-only"
+    assert classify_watch_failure(
+        board, PLUMBING, (stuck,), stuck_without_failed_jobs=("ci/summary",)
+    ) == "stuck-infrastructure"
+    # A genuine test failure keeps precedence over the stuck status.
+    with_test_failure = _plumbing_board(
+        failing=(_pcheck("tests", "failure"),), pending=(stuck,), required=("ci/summary",),
+    )
+    assert classify_watch_failure(with_test_failure, PLUMBING, (stuck,)) == "test-failure"
+
+
+class _RunsRunner(Runner):
+    """Answers ``actions/runs/<id>`` reads from a scripted sequence per run."""
+
+    def __init__(self, runs):
+        super().__init__(dry_run=False)
+        self.runs = {key: list(value) for key, value in runs.items()}
+        self.commands = []
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        args = list(args)
+        self.commands.append(args)
+        endpoint = args[2] if len(args) > 2 else ""
+        if "/actions/runs/" in endpoint:
+            run_id = endpoint.rsplit("/", 1)[-1]
+            sequence = self.runs.get(run_id)
+            if not sequence:
+                return CommandResult(args, cwd, "", "HTTP 404", 1)
+            payload = sequence.pop(0) if len(sequence) > 1 else sequence[0]
+            return CommandResult(args, cwd, json.dumps({"id": int(run_id), **payload}), "", 0)
+        return CommandResult(args, cwd, "", "", 0)
+
+
+def _pending_status(url):
+    return PullRequestCheck(name="final-ci/exact-head", kind="status_context", status="pending", url=url)
+
+
+@pytest.mark.parametrize(
+    ("url", "runs"),
+    [
+        # Producing run still in progress on every poll.
+        ("https://github.com/OWNER/REPO/actions/runs/5", {"5": [{"status": "in_progress", "run_attempt": 1}]}),
+        # No Actions run URL: the producing run cannot be identified.
+        ("https://ci.example/builds/5", {}),
+        (None, {}),
+        # Unreadable run: fails closed to ordinary pending.
+        ("https://github.com/OWNER/REPO/actions/runs/6", {}),
+    ],
+)
+def test_pending_status_with_running_or_unidentifiable_run_stays_pending(tmp_path, url, runs):
+    config = make_config(tmp_path)
+    runner = _RunsRunner(runs)
+    board = _plumbing_board(passing=(_TEST_PASSED,), pending=(_pending_status(url),),
+                            required=("final-ci/exact-head",))
+    tracker = {}
+    for _poll in range(3):
+        stuck, _no_jobs, _attempts = github_module._confirm_stuck_statuses(
+            runner, config, board, PLUMBING, tracker
+        )
+        assert stuck == ()
+    assert classify_watch_failure(board, PLUMBING, stuck) == "not-classifiable"
+
+
+def test_pending_status_confirmed_stuck_only_after_one_confirmation_poll(tmp_path):
+    config = make_config(tmp_path)
+    runner = _RunsRunner({"7": [{"status": "completed", "conclusion": "failure", "run_attempt": 1}]})
+    board = _plumbing_board(
+        passing=(_TEST_PASSED,),
+        pending=(_pending_status("https://github.com/OWNER/REPO/actions/runs/7"),),
+        required=("final-ci/exact-head",),
+    )
+    tracker = {}
+    first, _, _ = github_module._confirm_stuck_statuses(runner, config, board, PLUMBING, tracker)
+    second, no_jobs, attempts = github_module._confirm_stuck_statuses(
+        runner, config, board, PLUMBING, tracker
+    )
+    assert first == ()
+    assert [check.name for check in second] == ["final-ci/exact-head"]
+    assert no_jobs == set() and attempts == {"final-ci/exact-head": 1}

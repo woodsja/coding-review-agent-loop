@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from .checkout_verification import gate_window
-from .ci_health import CiInfrastructureStall, partition_exclusion_notes
+from collections.abc import Sequence
+
+from .ci_health import CiInfrastructureStall, PullRequestCheck, partition_exclusion_notes
 from .config import AgentLoopConfig
 from .github import PullRequestChecks
 from .logging import log
+from .managed_ci import FINAL_CONTEXT
 from .errors import AgentLoopError
 from .runner import Runner
 from .test_runtime import launch_integrity_state, launch_state_fields, record_launcher_health, record_test_observation
@@ -171,7 +174,9 @@ def _pr_check_blocking_review(pr_number: int, state: str, details: list[str]) ->
     return "\n".join(lines)
 
 
-def _pending_ci_stop_message(pr_number: int, state: str, details: list[str]) -> str:
+def _pending_ci_stop_message(
+    pr_number: int, state: str, details: list[str], *, watch_hint: bool = False
+) -> str:
     headline = {
         "pending": f"Reviewers approved PR #{pr_number}, but GitHub checks are still pending.",
         "unavailable": (
@@ -181,7 +186,7 @@ def _pending_ci_stop_message(pr_number: int, state: str, details: list[str]) -> 
     lines = [
         headline,
         "",
-        _pending_ci_stop_guidance(state),
+        _pending_ci_stop_guidance(state, watch_hint=watch_hint),
         "",
     ]
     lines.extend(f"- {detail}" for detail in details)
@@ -213,7 +218,13 @@ def _pending_ci_status_summary(state: str) -> str:
     }[state]
 
 
-def _pending_ci_stop_guidance(state: str) -> str:
+WATCH_PENDING_CI_HINT = (
+    "Rerun with --watch-pending-ci to watch CI (bounded by --ci-timeout-seconds) and "
+    "re-run plumbing-only failures automatically."
+)
+
+
+def _pending_ci_stop_guidance(state: str, *, watch_hint: bool = False) -> str:
     wait = {
         "pending": "Wait for CI.",
         "unavailable": "Wait for GitHub check status to become available.",
@@ -223,7 +234,69 @@ def _pending_ci_stop_guidance(state: str) -> str:
         f"{wait} If checks pass, you can merge manually; no rerun is required. "
         "Rerun only if you want agent-loop to re-check or automate the final step. "
         "If checks fail, inspect/fix the failure or rerun so the loop can drive a fix."
+        + (f" {WATCH_PENDING_CI_HINT}" if watch_hint else "")
     )
+
+
+def final_context_state_line(
+    checks: PullRequestChecks | None,
+    *,
+    stuck: Sequence[PullRequestCheck] = (),
+    managed_status: str | None = None,
+    expected: bool = False,
+) -> str | None:
+    """Render the observed final-ci/exact-head state for a terminal report.
+
+    ``None`` when the context is neither on the board, required, nor expected
+    (the managed route always expects it).
+    """
+    if managed_status is not None:
+        return f"{FINAL_CONTEXT}: {managed_status}"
+    if any(check.name == FINAL_CONTEXT for check in stuck):
+        return f"{FINAL_CONTEXT}: stuck-pending"
+    if checks is not None:
+        for bucket, label in ((checks.failing, "failure"), (checks.pending, "pending"), (checks.passing, "success")):
+            if any(check.name == FINAL_CONTEXT for check in bucket):
+                return f"{FINAL_CONTEXT}: {label}"
+        if FINAL_CONTEXT in checks.required_checks or FINAL_CONTEXT in checks.missing_required:
+            return f"{FINAL_CONTEXT}: absent"
+    return f"{FINAL_CONTEXT}: absent" if expected else None
+
+
+CI_PLUMBING_STOP_HEADLINE = (
+    "PR #{pr_number} CI failed only in plumbing jobs, not in tests; stopping on infrastructure."
+)
+
+
+def _ci_plumbing_stop_message(
+    pr_number: int,
+    *,
+    reason: str,
+    run_urls: Sequence[str],
+    plumbing: Sequence[str],
+    final_line: str | None,
+    recovery: str | None = None,
+    watch_hint: bool = False,
+) -> str:
+    lines = [
+        CI_PLUMBING_STOP_HEADLINE.format(pr_number=pr_number),
+        "",
+        f"{reason} No coder round was started, no code change is required by this "
+        "failure, and no merge was attempted.",
+        "",
+    ]
+    lines.extend(f"- Run: {url}" for url in run_urls)
+    if not run_urls:
+        lines.append("- Run: unavailable")
+    lines.extend(f"- Plumbing: {item}" for item in plumbing)
+    if final_line:
+        lines.append(f"- {final_line}")
+    if recovery:
+        lines.extend(["", recovery])
+    if watch_hint:
+        lines.extend(["", WATCH_PENDING_CI_HINT])
+    lines.extend(["", "-- coding-review-agent-loop"])
+    return "\n".join(lines)
 
 
 def _pr_check_details(pr_checks: PullRequestChecks) -> list[str]:

@@ -24,6 +24,9 @@ from .ci_health import (
     EXCLUSION_NOTE_SUFFIX,
     V2_RUN_NAME_PREFIX,
     _extract_run_id,
+    WatchFailureClass,
+    check_name_matches,
+    classify_watch_failure,
     decode_concatenated_json_objects,
     classify_ci_infrastructure_stall,
     is_wholly_infrastructure_blocked,
@@ -5026,6 +5029,7 @@ class CiWatchOutcome:
         "passed",
         "not_started",
         "failed",
+        "plumbing_failure",
         "timeout",
         "infrastructure_stall",
         "merge_conflict",
@@ -5039,6 +5043,170 @@ class CiWatchOutcome:
     head_sha: str | None = None
     stall: CiInfrastructureStall | None = None
     attempts_used: int = 0
+    # Plumbing classification (#1477).  ``stuck_checks`` are required statuses
+    # confirmed pending after their producing run completed; ``hold_reason``
+    # names why a timeout expired while a plumbing failure was being held.
+    classification: WatchFailureClass | None = None
+    stuck_checks: tuple[PullRequestCheck, ...] = ()
+    hold_reason: Literal["plumbing-awaiting-tests", "stale-after-rerun"] | None = None
+    run_urls: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlumbingRerunState:
+    """Invocation-local record of the single plumbing rerun for one head."""
+
+    head_sha: str
+    run_id: int
+    run_url: str | None
+    prior_attempt: int
+    # ("check", check_id) and ("status", context, run_id, created_at) keys of
+    # the pre-rerun observations; they stay stale until a new one replaces them.
+    stale_keys: frozenset[tuple[object, ...]] = frozenset()
+
+
+@dataclass(frozen=True)
+class OrdinaryRerunResult:
+    status: Literal["rerun_started", "unresolvable", "head_mismatch", "command_failed", "dry_run"]
+    run_id: int | None = None
+    run_url: str | None = None
+    prior_attempt: int | None = None
+    stale_keys: frozenset[tuple[object, ...]] = frozenset()
+    reason: str = ""
+
+    def state(self, head_sha: str) -> PlumbingRerunState | None:
+        if self.status != "rerun_started" or self.run_id is None or self.prior_attempt is None:
+            return None
+        return PlumbingRerunState(
+            head_sha=head_sha,
+            run_id=self.run_id,
+            run_url=self.run_url,
+            prior_attempt=self.prior_attempt,
+            stale_keys=self.stale_keys,
+        )
+
+
+def plumbing_observation_key(check: PullRequestCheck) -> tuple[object, ...] | None:
+    """Stable identity of one failed/stuck observation for stale filtering."""
+    if check.kind == "check_run":
+        return ("check", check.check_id) if check.check_id is not None else None
+    return ("status", check.name, _extract_run_id(check.url), check.created_at)
+
+
+def read_actions_run(runner: Runner, config: AgentLoopConfig, run_id: int | str) -> dict | None:
+    """Read one Actions run (read-retried); ``None`` when unreadable."""
+    result = run_gh_read(
+        runner,
+        [config.gh_cmd, "api", f"repos/{config.repo}/actions/runs/{run_id}"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or str(payload.get("id")) != str(run_id):
+        return None
+    return payload
+
+
+def _run_id_for_check_suite(runner: Runner, config: AgentLoopConfig, suite_id: int) -> str | None:
+    result = run_gh_read(
+        runner,
+        [config.gh_cmd, "api", f"repos/{config.repo}/actions/runs?check_suite_id={suite_id}"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if not isinstance(runs, list) or len(runs) != 1 or not isinstance(runs[0], dict):
+        return None
+    run_id = runs[0].get("id")
+    return str(run_id) if isinstance(run_id, int) and not isinstance(run_id, bool) else None
+
+
+def rerun_ordinary_failed_jobs(
+    runner: Runner,
+    config: AgentLoopConfig,
+    observations: Sequence[PullRequestCheck],
+    expected_head_sha: str | None,
+) -> OrdinaryRerunResult:
+    """Re-run the failed jobs of the one ordinary run behind ``observations``.
+
+    Every observation resolves through one path: a check run by its
+    ``check_suite_id``, a status context by its target-URL Actions run.  The
+    single resolved run must be completed, for the approved head, and not a
+    ``workflow_dispatch`` run before ``gh run rerun --failed`` is issued.
+    """
+    if config.dry_run:
+        return OrdinaryRerunResult(status="dry_run", reason="dry-run never re-runs CI")
+    if not observations or not expected_head_sha:
+        return OrdinaryRerunResult(status="unresolvable", reason="no plumbing observation to resolve")
+    run_ids: set[str] = set()
+    for check in observations:
+        if check.kind == "check_run":
+            run_id = (
+                _run_id_for_check_suite(runner, config, check.check_suite_id)
+                if check.check_suite_id is not None
+                else None
+            )
+        else:
+            run_id = _extract_run_id(check.url)
+        if run_id is None:
+            return OrdinaryRerunResult(
+                status="unresolvable",
+                reason=f"{check.name} has no resolvable GitHub Actions run",
+            )
+        run_ids.add(run_id)
+    if len(run_ids) != 1:
+        return OrdinaryRerunResult(
+            status="unresolvable",
+            reason="plumbing failures belong to different runs: " + ", ".join(sorted(run_ids)),
+        )
+    (run_id_text,) = run_ids
+    run = read_actions_run(runner, config, run_id_text)
+    if run is None:
+        return OrdinaryRerunResult(status="unresolvable", reason=f"run {run_id_text} is unreadable")
+    run_url = run.get("html_url") if isinstance(run.get("html_url"), str) else None
+    run_id = int(run_id_text)
+    attempt = run.get("run_attempt")
+    if run.get("head_sha") != expected_head_sha or run.get("event") == "workflow_dispatch":
+        return OrdinaryRerunResult(
+            status="head_mismatch", run_id=run_id, run_url=run_url,
+            reason=(
+                f"run {run_id} is for {run.get('head_sha') or 'an unknown head'} "
+                f"({run.get('event') or 'unknown event'}), not an ordinary run of {expected_head_sha}"
+            ),
+        )
+    if run.get("status") != "completed" or not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        return OrdinaryRerunResult(
+            status="unresolvable", run_id=run_id, run_url=run_url,
+            reason=f"run {run_id} is not a completed run with a readable attempt",
+        )
+    result = runner.run(
+        [config.gh_cmd, "run", "rerun", str(run_id), "--failed", "--repo", config.repo],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return OrdinaryRerunResult(
+            status="command_failed", run_id=run_id, run_url=run_url, prior_attempt=attempt,
+            reason=f"gh run rerun failed{_failure_detail(result)}",
+        )
+    stale = frozenset(
+        key for key in (plumbing_observation_key(check) for check in observations) if key is not None
+    )
+    return OrdinaryRerunResult(
+        status="rerun_started", run_id=run_id, run_url=run_url, prior_attempt=attempt,
+        stale_keys=stale,
+    )
 
 
 def board_protection_is_reliable(
@@ -5111,11 +5279,19 @@ def watch_pr_checks(
     metadata: PullRequestMetadata,
     deadline: float | None = None,
     attempts: int | None = None,
+    plumbing_names: frozenset[str] | None = None,
+    rerun_state: PlumbingRerunState | None = None,
 ) -> CiWatchOutcome:
     """Synchronously watch the complete current-head check board.
 
     It has no worker or persisted process; interrupting the foreground runner
     stops it immediately and a later invocation simply fetches fresh state.
+
+    With ``plumbing_names`` a failure is classified before it is reported
+    (#1477): a fresh test failure returns ``failed``; a complete board whose
+    failures are all plumbing returns ``plumbing_failure``; plumbing that
+    failed while tests still run, and evidence from the attempt before
+    ``rerun_state``'s rerun, are polled through under the same budget.
     """
     if config.dry_run:
         return CiWatchOutcome(status="dry_run", head_sha=metadata.head_sha)
@@ -5131,6 +5307,9 @@ def watch_pr_checks(
         (config.ci_startup_timeout_seconds + config.ci_poll_interval_seconds - 1)
         // config.ci_poll_interval_seconds,
     )
+    stuck_tracker: dict[str, tuple[int, int]] = {}
+    stuck: tuple[PullRequestCheck, ...] = ()
+    hold_reason: Literal["plumbing-awaiting-tests", "stale-after-rerun"] | None = None
     for attempt in range(limit):
         # A flaky head probe is diagnostic only.  The full-board and
         # mergeability probes already degrade transient API failures safely.
@@ -5167,7 +5346,49 @@ def watch_pr_checks(
         # was partial or a required check has not materialized yet. Those
         # conditions can delay a passing decision, but they must not hide a
         # concrete failing check from the coder.
-        if snapshot.state == "failing":
+        hold_reason = None
+        if plumbing_names is not None:
+            stuck, stuck_without_failed_jobs, stuck_attempts = _confirm_stuck_statuses(
+                runner, config, snapshot, plumbing_names, stuck_tracker
+            )
+            if snapshot.state == "failing" or stuck:
+                fresh_failing = tuple(
+                    check for check in snapshot.failing
+                    if not _observation_is_stale(check, rerun_state, None)
+                )
+                fresh_stuck = tuple(
+                    check for check in stuck
+                    if not _observation_is_stale(check, rerun_state, stuck_attempts.get(check.name))
+                )
+                if rerun_state is not None and not fresh_failing and not fresh_stuck:
+                    # Prior-attempt evidence: wait for the rerun's own result.
+                    hold_reason = "stale-after-rerun"
+                else:
+                    classification = classify_watch_failure(
+                        replace(snapshot, failing=fresh_failing),
+                        plumbing_names,
+                        fresh_stuck,
+                        stuck_without_failed_jobs=tuple(stuck_without_failed_jobs),
+                    )
+                    if classification == "test-failure" or (
+                        classification == "not-classifiable" and fresh_failing
+                    ):
+                        return CiWatchOutcome(
+                            status="failed", pr_checks=snapshot, failed_checks=snapshot.failing,
+                            head_sha=current_head, attempts_used=attempt + 1,
+                            classification=classification, stuck_checks=stuck,
+                        )
+                    if classification in {"plumbing-only", "stuck-infrastructure"}:
+                        return CiWatchOutcome(
+                            status="plumbing_failure", pr_checks=snapshot,
+                            failed_checks=fresh_failing, head_sha=current_head,
+                            attempts_used=attempt + 1, classification=classification,
+                            stuck_checks=fresh_stuck,
+                            run_urls=observation_run_urls((*fresh_failing, *fresh_stuck)),
+                        )
+                    if classification == "plumbing-awaiting-tests":
+                        hold_reason = "plumbing-awaiting-tests"
+        elif snapshot.state == "failing":
             return CiWatchOutcome(
                 status="failed", pr_checks=snapshot, failed_checks=snapshot.failing,
                 head_sha=current_head, attempts_used=attempt + 1,
@@ -5214,9 +5435,96 @@ def watch_pr_checks(
                 mergeability=mergeability if unverified_green_attempts else None,
                 head_sha=current_head,
                 attempts_used=attempt + 1,
+                stuck_checks=stuck,
+                hold_reason=hold_reason,
+                run_urls=(
+                    observation_run_urls((*snapshot.failing, *stuck))
+                    if hold_reason is not None else ()
+                ),
             )
         runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
     raise AssertionError("CI watch loop must return a terminal outcome")
+
+
+_RUN_CONCLUSIONS_WITHOUT_FAILED_JOBS = frozenset({"success", "neutral", "skipped"})
+
+
+def _confirm_stuck_statuses(
+    runner: Runner,
+    config: AgentLoopConfig,
+    snapshot: PullRequestChecks,
+    plumbing_names: frozenset[str],
+    tracker: dict[str, tuple[int, int]],
+) -> tuple[tuple[PullRequestCheck, ...], set[str], dict[str, int]]:
+    """Confirm required statuses left pending after their run completed.
+
+    A candidate is a pending status context that is required (or a catalogued
+    plumbing status) whose target URL names an Actions run.  The same
+    (context, run, attempt) must read ``completed`` on two consecutive polls.
+    An unreadable run or a status without a run URL stays ordinary pending.
+    """
+    required = set(snapshot.required_checks)
+    confirmed: list[PullRequestCheck] = []
+    without_failed_jobs: set[str] = set()
+    attempts: dict[str, int] = {}
+    seen: dict[str, tuple[int, int]] = {}
+    for check in snapshot.pending:
+        if check.kind != "status_context":
+            continue
+        if check.name not in required and not check_name_matches(check.name, plumbing_names):
+            continue
+        run_id = _extract_run_id(check.url)
+        if run_id is None:
+            continue
+        run = read_actions_run(runner, config, run_id)
+        attempt = run.get("run_attempt") if run is not None else None
+        if (
+            run is None
+            or run.get("status") != "completed"
+            or not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+        ):
+            continue
+        key = (int(run_id), attempt)
+        seen[check.name] = key
+        if tracker.get(check.name) == key:
+            confirmed.append(replace(check, run_id=run_id))
+            attempts[check.name] = attempt
+            if str(run.get("conclusion") or "").lower() in _RUN_CONCLUSIONS_WITHOUT_FAILED_JOBS:
+                without_failed_jobs.add(check.name)
+    tracker.clear()
+    tracker.update(seen)
+    return tuple(confirmed), without_failed_jobs, attempts
+
+
+def _observation_is_stale(
+    check: PullRequestCheck,
+    rerun_state: PlumbingRerunState | None,
+    stuck_attempt: int | None,
+) -> bool:
+    if rerun_state is None:
+        return False
+    if stuck_attempt is not None:
+        return (
+            _extract_run_id(check.url) == str(rerun_state.run_id)
+            and stuck_attempt <= rerun_state.prior_attempt
+        )
+    key = plumbing_observation_key(check)
+    return key is not None and key in rerun_state.stale_keys
+
+
+def observation_run_urls(checks: Sequence[PullRequestCheck]) -> tuple[str, ...]:
+    urls: list[str] = []
+    for check in checks:
+        run_id = check.run_id or _extract_run_id(check.url)
+        if not check.url:
+            continue
+        url = check.url
+        if run_id is not None and f"/actions/runs/{run_id}" in url:
+            url = url[: url.index(f"/actions/runs/{run_id}") + len(f"/actions/runs/{run_id}")]
+        if url not in urls:
+            urls.append(url)
+    return tuple(urls)
 
 
 def _read_pr_view_json(

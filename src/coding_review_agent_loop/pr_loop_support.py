@@ -108,6 +108,7 @@ from .workdir_guard import (
     partition_reported_tests_by_workdir,
 )
 from .checks import (
+    _ci_plumbing_stop_message,
     _pending_ci_stop_message,
     _pr_check_details,
     _unreadable_protection_stop_message,
@@ -771,6 +772,53 @@ def _stop_on_terminal_without_status(
         f"`{conclusion}` without publishing its correlated status. No merge was "
         "attempted; rerun after a legitimate GitHub rerun or fresh same-nonce "
         "dispatch (or restart review if the head changed)."
+    )
+    return 0
+
+
+def _stop_on_ci_plumbing_failure(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    reason: str,
+    run_urls: Sequence[str],
+    plumbing: Sequence[str],
+    final_line: str | None,
+    recovery: str | None = None,
+    watch_hint: bool = False,
+) -> int:
+    """Stop on a plumbing-only CI failure without a coder obligation (#1477).
+
+    Exit semantics match the infrastructure-stall stop: a clean, resumable
+    stop with no coder round and no merge.
+    """
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_ci_plumbing_stop_message(
+            pr_number,
+            reason=reason,
+            run_urls=run_urls,
+            plumbing=plumbing,
+            final_line=final_line,
+            recovery=recovery,
+            watch_hint=watch_hint,
+        ),
+    )
+    log(
+        config,
+        f"Round {round_number}: PR #{pr_number} CI failed only in plumbing jobs ({reason}); "
+        "stopping on infrastructure without a coder round or merge",
+    )
+    print(
+        f"PR #{pr_number} CI stopped on infrastructure: {reason} "
+        f"Run: {', '.join(run_urls) or 'unavailable'}."
+        + (f" {final_line}." if final_line else "")
+        + " No coder round was started and no merge was attempted."
+        + (f" {recovery}" if recovery else "")
     )
     return 0
 

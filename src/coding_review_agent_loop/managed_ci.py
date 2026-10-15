@@ -21,6 +21,7 @@ from urllib.parse import quote, urlparse
 
 from .ci_health import (
     CiInfrastructureStall,
+    check_name_matches,
     PullRequestCheck,
     PullRequestChecks,
     V2_RUN_NAME_PREFIX,
@@ -30,6 +31,8 @@ from .ci_health import (
 from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .github import (
+    _fetch_protocol_comment_envelope,
+    read_actions_run,
     PullRequestMergeability,
     reconciled_pr_ready,
     resolve_authenticated_github_actor,
@@ -78,6 +81,16 @@ MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
 QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
 FINAL_CONTEXT = "final-ci/exact-head"
+# Plumbing job identity (#1477): the exact managed workflow job names that
+# validate, attest and publish rather than test.  A contract test pins each
+# name to a ``name:`` in the managed workflows; callers extend the catalog
+# only with explicit --ci-plumbing-check names, never by substring.
+MANAGED_PLUMBING_JOB_NAMES = frozenset({
+    "Validate managed exact-head dispatch",
+    "Verify split attestations",
+    "Publish final exact-head status",
+})
+PLUMBING_STATUS_CONTEXTS = frozenset({FINAL_CONTEXT})
 READINESS_CONTEXT = "agent-loop/round-readiness"
 WORKFLOW_FILE = "ci.yml"
 _CONTRACT_MARKERS = (MANAGED_LABEL, FINAL_CONTEXT, "expected_head_sha")
@@ -785,6 +798,10 @@ class ManagedCiOutcome:
     run_attempt: int | None = None
     workflow_status: str | None = None
     workflow_conclusion: str | None = None
+    # Structured job listing of the attached run (#1477): (name, conclusion,
+    # url) per job; ``None`` when the listing was not read or was unreadable.
+    jobs: tuple[tuple[str, str, str], ...] | None = None
+    attempts_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -4594,7 +4611,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-test-gate-memory-high", "--containment-test-gate-memory-max",
     "--containment-test-gate-memory-swap-max", "--containment-test-gate-tasks-max",
     "--test-workers", "--test-worker-memory", "--test-worker-enforcement",
-    "--worktree-link",
+    "--worktree-link", "--ci-plumbing-check",
 })
 _RECOVERY_NARGS_VALUE_OPTIONS = frozenset({
     "--antigravity-models", "--antigravity-quota-signatures", "--agent-retry-backoff-seconds",
@@ -4706,6 +4723,29 @@ def _human_reviewer_trust_args(config: AgentLoopConfig) -> list[str]:
     return args
 
 
+def plumbing_check_names(config: AgentLoopConfig | None = None) -> frozenset[str]:
+    """The managed plumbing catalog plus explicit --ci-plumbing-check names."""
+    extra = tuple(getattr(config, "ci_plumbing_checks", ()) or ()) if config is not None else ()
+    return MANAGED_PLUMBING_JOB_NAMES | PLUMBING_STATUS_CONTEXTS | frozenset(
+        name for name in extra if name
+    )
+
+
+def is_plumbing_check(name: str, extra_names: Iterable[str] = ()) -> bool:
+    """Exact whole-name or final-segment catalog membership; never a substring."""
+    return check_name_matches(
+        name,
+        MANAGED_PLUMBING_JOB_NAMES | PLUMBING_STATUS_CONTEXTS | frozenset(extra_names),
+    )
+
+
+def _ci_plumbing_check_args(config: AgentLoopConfig) -> list[str]:
+    args: list[str] = []
+    for name in getattr(config, "ci_plumbing_checks", ()) or ():
+        args.extend(("--ci-plumbing-check", name))
+    return args
+
+
 def _render_recovery_command(
     config: AgentLoopConfig,
     *,
@@ -4731,6 +4771,7 @@ def _render_recovery_command(
             elif config.watch_pending_ci:
                 command.append("--watch-pending-ci")
             command.extend(_human_reviewer_trust_args(config))
+            command.extend(_ci_plumbing_check_args(config))
             return shlex.join(command)
         command = ["agent-loop", target, str(identifier), "--repo", config.repo]
         if config.base:
@@ -4740,6 +4781,7 @@ def _render_recovery_command(
             command.append("--auto-merge")
         if config.watch_pending_ci and not config.auto_merge:
             command.append("--watch-pending-ci")
+        command.extend(_ci_plumbing_check_args(config))
         if managed_ci:
             command.append("--managed-ci")
             if config.managed_ci_trusted_actor:
@@ -9624,7 +9666,15 @@ def wait_for_final_qualification(
     pr_number: int,
     metadata: PullRequestMetadata,
     contract: ManagedCiContract | None = None,
+    attempts: int | None = None,
+    min_run_attempt: int | None = None,
 ) -> ManagedCiOutcome:
+    """Wait for the correlated managed exact-head result.
+
+    ``min_run_attempt`` (#1477) ignores correlated terminal statuses and the
+    terminal-without-status confirmation until the attached run reaches that
+    attempt, so a plumbing rerun is judged only on its own attempt.
+    """
     expected_head = metadata.head_sha
     if not expected_head:
         raise AgentLoopError(f"PR #{pr_number} has no approved head SHA.")
@@ -9638,14 +9688,19 @@ def wait_for_final_qualification(
             f"managed-CI intent/attempt is bound to head {contract.expected_head_sha or 'unknown'}, "
             f"not {expected_head}; no qualification outcome is reported for this head"
         )
-    attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
+    if attempts is None:
+        attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
+    attempts = max(1, attempts)
     latest: PullRequestChecks | None = None
     terminal_confirmation: tuple[int, int | None] | None = None
     terminal_confirmation_seen = False
     for attempt in range(attempts):
         live_head = get_pr_head_sha(runner, config, pr_number)
         if live_head != expected_head:
-            return ManagedCiOutcome(status="head_changed", checks=latest, head_sha=live_head)
+            return ManagedCiOutcome(
+                status="head_changed", checks=latest, head_sha=live_head,
+                attempts_used=attempt + 1,
+            )
         mergeability = get_pr_mergeability(runner, config=config, pr_number=pr_number)
         if mergeability.state == "conflicted":
             return ManagedCiOutcome(
@@ -9653,6 +9708,7 @@ def wait_for_final_qualification(
                 checks=latest,
                 mergeability=mergeability,
                 head_sha=live_head,
+                attempts_used=attempt + 1,
             )
         latest = get_pr_checks(runner, config=config, metadata=metadata)
         run_snapshot: ManagedCiRunSnapshot | None = None
@@ -9693,6 +9749,15 @@ def wait_for_final_qualification(
                 )
         else:
             final = _find_context(latest, FINAL_CONTEXT)
+        stale_attempt = (
+            min_run_attempt is not None
+            and contract is not None
+            and (not isinstance(contract.run_attempt, int) or contract.run_attempt < min_run_attempt)
+        )
+        if stale_attempt:
+            # The pre-rerun attempt's result is not this attempt's evidence.
+            final = None
+            run_snapshot = None
         status = final.status.lower() if final is not None else "pending"
         log(config, f"Managed CI context '{FINAL_CONTEXT}' status: {status}")
         complete_board = (
@@ -9706,7 +9771,9 @@ def wait_for_final_qualification(
         if status == "success" and complete_board:
             if contract is not None and contract.protocol_version == 2:
                 _patch_intent(runner, config=config, contract=contract, state="completed")
-            return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+            return ManagedCiOutcome(
+                status="passed", checks=latest, head_sha=live_head, attempts_used=attempt + 1,
+            )
         correlated_terminal = final is not None and final.status.lower() in _TERMINAL_CI_STATUSES
         if (
             contract is not None and contract.protocol_version == 2
@@ -9728,7 +9795,10 @@ def wait_for_final_qualification(
                     status = final.status.lower()
                     if status == "success" and complete_board:
                         _patch_intent(runner, config=config, contract=contract, state="completed")
-                        return ManagedCiOutcome(status="passed", checks=latest, head_sha=live_head)
+                        return ManagedCiOutcome(
+                            status="passed", checks=latest, head_sha=live_head,
+                            attempts_used=attempt + 1,
+                        )
                 else:
                     terminal_confirmation_seen = True
             elif terminal_confirmation_seen:
@@ -9743,14 +9813,23 @@ def wait_for_final_qualification(
                     status="terminal_without_status", checks=latest, head_sha=live_head,
                     run_id=run_snapshot.run_id, run_attempt=run_snapshot.run_attempt,
                     workflow_status=run_snapshot.status, workflow_conclusion=run_snapshot.conclusion,
+                    jobs=_v2_jobs(runner, config=config, run_id=run_snapshot.run_id),
+                    attempts_used=attempt + 1,
                 )
         if status in _TERMINAL_CI_STATUSES - {"success"}:
             details = ()
+            jobs = None
+            run_id = None
             if contract is not None and contract.protocol_version == 2:
                 _patch_intent(runner, config=config, contract=contract, state="completed")
-                details = _v2_failed_jobs(runner, config=config, run_id=contract.attached_run_id)
+                run_id = contract.attached_run_id
+                jobs = _v2_jobs(runner, config=config, run_id=run_id)
+                details = _format_v2_failed_jobs(run_id, jobs)
             return ManagedCiOutcome(
-                status="failed", checks=latest, head_sha=live_head, failure_details=details
+                status="failed", checks=latest, head_sha=live_head, failure_details=details,
+                run_id=run_id,
+                run_attempt=contract.run_attempt if contract is not None else None,
+                jobs=jobs, attempts_used=attempt + 1,
             )
         stall_checks = intermediate_managed_checks(latest)
         if is_wholly_infrastructure_blocked(stall_checks):
@@ -9760,10 +9839,13 @@ def wait_for_final_qualification(
                 checks=latest,
                 head_sha=live_head,
                 stall=stall,
+                attempts_used=attempt + 1,
             )
         if attempt < attempts - 1:
             runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
-    return ManagedCiOutcome(status="timeout", checks=latest, head_sha=expected_head)
+    return ManagedCiOutcome(
+        status="timeout", checks=latest, head_sha=expected_head, attempts_used=attempts,
+    )
 
 
 def _v2_correlated_status(
@@ -9899,37 +9981,211 @@ def _v2_attempt_is_correlatable(attempt: object) -> bool:
     return type(attempt) is int and attempt > 0
 
 
-def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | None) -> tuple[str, ...]:
+_FAILED_JOB_CONCLUSIONS = frozenset(
+    {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+)
+
+
+def _v2_jobs(
+    runner: Runner, *, config: AgentLoopConfig, run_id: int | None
+) -> tuple[tuple[str, str, str], ...] | None:
+    """Return the run's latest-attempt jobs as (name, conclusion, url); ``None`` if unreadable."""
     if run_id is None:
-        return ()
+        return None
     result = runner.run(
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100"],
         cwd=active_workdir(config), check=False,
     )
     if result.returncode != 0:
-        return (f"Managed CI run {run_id} failed; job details were unavailable.",)
-    raw = result.stdout or ""
+        return None
     # Without --slurp, gh 2.45 concatenates object pages. Decode every object
     # instead of accepting only the first page (or treating the stream as bad).
-    pages = decode_concatenated_json_objects(raw)
+    pages = decode_concatenated_json_objects(result.stdout or "")
     if pages is None:
-        return (f"Managed CI run {run_id} failed; job details were unavailable.",)
-    jobs: list[object] = []
+        return None
+    jobs: list[tuple[str, str, str]] = []
+    total: int | None = None
     for payload in pages:
         page_jobs = payload.get("jobs")
         if not isinstance(page_jobs, list):
-            return (f"Managed CI run {run_id} failed; job details were unavailable.",)
-        jobs.extend(page_jobs)
-    terminal = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
-    details = []
-    for job in jobs if isinstance(jobs, list) else []:
-        if not isinstance(job, dict) or str(job.get("conclusion") or "").lower() not in terminal:
-            continue
-        name = job.get("name") if isinstance(job.get("name"), str) else "unnamed job"
-        conclusion = str(job.get("conclusion"))
-        url = job.get("html_url") if isinstance(job.get("html_url"), str) else ""
-        details.append(f"{name}: {conclusion}" + (f" ({url})" if url else ""))
+            return None
+        page_total = payload.get("total_count")
+        if isinstance(page_total, int) and not isinstance(page_total, bool):
+            total = page_total
+        for job in page_jobs:
+            if not isinstance(job, dict):
+                return None
+            name = job.get("name") if isinstance(job.get("name"), str) else "unnamed job"
+            conclusion = str(job.get("conclusion") or job.get("status") or "").lower()
+            url = job.get("html_url") if isinstance(job.get("html_url"), str) else ""
+            jobs.append((name, conclusion, url))
+    if total is not None and total != len(jobs):
+        return None
+    return tuple(jobs)
+
+
+def _format_v2_failed_jobs(
+    run_id: int | None, jobs: tuple[tuple[str, str, str], ...] | None
+) -> tuple[str, ...]:
+    if run_id is None:
+        return ()
+    if jobs is None:
+        return (f"Managed CI run {run_id} failed; job details were unavailable.",)
+    details = [
+        f"{name}: {conclusion}" + (f" ({url})" if url else "")
+        for name, conclusion, url in jobs
+        if conclusion in _FAILED_JOB_CONCLUSIONS
+    ]
     return tuple(details) or (f"Managed CI run {run_id} failed; no failed job was exposed.",)
+
+
+def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | None) -> tuple[str, ...]:
+    return _format_v2_failed_jobs(run_id, _v2_jobs(runner, config=config, run_id=run_id))
+
+
+def classify_managed_jobs(
+    jobs: tuple[tuple[str, str, str], ...] | None, plumbing_names: frozenset[str]
+) -> Literal["plumbing-only", "test-failure", "not-classifiable"]:
+    """Classify a completed managed run from its complete jobs listing (#1477).
+
+    Plumbing-only needs at least one failed job, every failed job catalogued
+    plumbing, and every non-plumbing (test) job successful.  An unreadable
+    listing, a skipped/pending test or no failed job is not classifiable.
+    """
+    if not jobs:
+        return "not-classifiable"
+    failed = [job for job in jobs if job[1] in _FAILED_JOB_CONCLUSIONS]
+    if any(not check_name_matches(name, plumbing_names) for name, _c, _u in failed):
+        return "test-failure"
+    tests = [job for job in jobs if not check_name_matches(job[0], plumbing_names)]
+    if not failed or not tests or any(conclusion != "success" for _n, conclusion, _u in tests):
+        return "not-classifiable"
+    return "plumbing-only"
+
+
+@dataclass(frozen=True)
+class ManagedRerunResult:
+    status: Literal["rerun_started", "refused", "command_failed"]
+    run_id: int | None = None
+    run_url: str | None = None
+    prior_attempt: int | None = None
+    reason: str = ""
+
+
+def managed_run_url(config: AgentLoopConfig, run_id: int | None) -> str | None:
+    return f"https://github.com/{config.repo}/actions/runs/{run_id}" if run_id is not None else None
+
+
+def rerun_managed_attempt(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    contract: ManagedCiContract,
+    expected_head_sha: str | None,
+) -> ManagedRerunResult:
+    """Fully re-run the attached managed v2 run once, from terminal-without-status only.
+
+    The dispatch validator accepts attempt N+1 only against a completed
+    ``no-status`` audit record bound to (run, N), so the authenticated record
+    is re-read and required to hold exactly that transition before the write.
+    The rerun is full (no ``--failed``): the split publisher rejects a
+    validation job carried over from an earlier attempt.
+    """
+    run_id = contract.attached_run_id
+    run_url = managed_run_url(config, run_id)
+
+    def refuse(reason: str, attempt: int | None = None) -> ManagedRerunResult:
+        return ManagedRerunResult(
+            status="refused", run_id=run_id, run_url=run_url, prior_attempt=attempt, reason=reason,
+        )
+
+    if config.dry_run:
+        return refuse("dry-run never re-runs CI")
+    if contract.protocol_version != 2 or run_id is None or not contract.nonce:
+        return refuse("no attached managed v2 run is available")
+    if not expected_head_sha or contract.expected_head_sha != expected_head_sha:
+        return refuse("the managed contract is not bound to the approved head")
+    if contract.intent_comment_id is None:
+        return refuse("the managed audit record is unavailable")
+    try:
+        envelope = _fetch_protocol_comment_envelope(
+            runner, config=config, comment_id=contract.intent_comment_id,
+            context="Managed-CI audit record",
+        )
+    except AgentLoopError as error:
+        return refuse(f"the managed audit record could not be re-read ({error})")
+    user = envelope.get("user") if isinstance(envelope.get("user"), dict) else {}
+    try:
+        producer_ok = (
+            user.get("login") == _intent_producer_login(contract)
+            and user.get("id") == _intent_producer_id(contract)
+        )
+    except AgentLoopError:
+        producer_ok = False
+    match = match_intent_envelope(
+        envelope.get("body"),
+        visible_capable=contract.visible_intent_capable,
+        host_footer_capable=contract.host_footer_capable,
+    )
+    if not producer_ok or match is None:
+        return refuse("the managed audit record is not the authenticated producer's record")
+    try:
+        record = json.loads(match.group("payload"))
+    except json.JSONDecodeError:
+        return refuse("the managed audit record is unreadable")
+    if not isinstance(record, dict) or validate_intent_record(
+        record, match, binding=_intent_binding(contract, nonce=contract.nonce)
+    ) is not None:
+        return refuse("the managed audit record does not validate for this contract")
+    attempt = record.get("run_attempt")
+    history = [
+        item.get("run_attempt") for item in record.get("terminal_attempts") or []
+        if isinstance(item, dict) and item.get("run_id") == run_id
+    ]
+    if not (
+        record.get("state") == "completed"
+        and record.get("terminal_outcome") == "no-status"
+        and record.get("run_id") == run_id
+        and record.get("terminal_run_id") == run_id
+        and isinstance(attempt, int)
+        and record.get("terminal_run_attempt") == attempt
+        and history
+        and max(history) == attempt
+    ):
+        return refuse(
+            "the managed audit record does not hold the completed no-status transition "
+            "for the run's current attempt"
+        )
+    run = read_actions_run(runner, config, run_id)
+    if (
+        run is None
+        or not _is_v2_intent_run(run, contract=contract, run_name=_v2_run_name(contract))
+        or run.get("status") != "completed"
+        or run.get("run_attempt") != attempt
+    ):
+        return refuse("the attached run does not match the authenticated contract", attempt)
+    try:
+        login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    except AgentLoopError as error:
+        return refuse(f"the authenticated actor is unavailable ({error})", attempt)
+    if (
+        (login or "").casefold() != (contract.trusted_actor_login or "").casefold()
+        or actor_id != contract.trusted_actor_id
+    ):
+        return refuse("the authenticated actor is not the managed trusted actor", attempt)
+    result = runner.run(
+        [config.gh_cmd, "run", "rerun", str(run_id), "--repo", config.repo],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return ManagedRerunResult(
+            status="command_failed", run_id=run_id, run_url=run_url, prior_attempt=attempt,
+            reason="gh run rerun failed" + failure_suffix(result),
+        )
+    return ManagedRerunResult(
+        status="rerun_started", run_id=run_id, run_url=run_url, prior_attempt=attempt,
+    )
 
 
 @_surfaces_list_failures

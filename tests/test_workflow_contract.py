@@ -2327,3 +2327,97 @@ def test_validate_step_semantic_rejection_is_labelled_rejected(monkeypatch, tmp_
     assert "::error title=managed-ci validation rejected::" in out
     assert "managed-ci infrastructure" not in out
     assert "target_sha" not in outputs
+
+
+# --- Post-approval plumbing catalog and managed rerun contract (#1477) -------
+
+from fixtures.managed_ci import split_status_guard  # noqa: E402
+
+MANAGED_WORKFLOWS = (WORKFLOW, VALIDATE, PUBLISH)
+
+
+def test_plumbing_catalog_job_names_appear_in_the_managed_workflows():
+    job_names = {
+        job.get("name")
+        for path in MANAGED_WORKFLOWS
+        for job in _load(path)["jobs"].values()
+        if isinstance(job, dict)
+    }
+    assert managed_ci.MANAGED_PLUMBING_JOB_NAMES <= job_names
+    assert managed_ci.PLUMBING_STATUS_CONTEXTS == {managed_ci.FINAL_CONTEXT}
+    # The test jobs are never catalogued, and matching is exact, not substring.
+    assert not managed_ci.is_plumbing_check("Test validated exact head")
+    assert not managed_ci.is_plumbing_check("Publish final exact-head status (retry)")
+    assert managed_ci.is_plumbing_check("managed / Publish final exact-head status")
+
+
+def _guard(*, validation_attempt, run_attempt):
+    event = {
+        "protocol_version": "2", "pr_number": "7",
+        "expected_head_sha": "b" * 40, "managed_nonce": "n" * 32,
+    }
+    return split_status_guard.correlation_matches(
+        forwarded=dict(event), event=event, target_sha="b" * 40, nonce="n" * 32,
+        validation_result="success", validation_run_id="200",
+        validation_attempt=validation_attempt, run_id="200", run_attempt=run_attempt,
+    )
+
+
+def test_split_guard_rejects_carried_over_validation_so_the_managed_rerun_is_full():
+    # "Re-run failed jobs" carries validation attempt 1 into run attempt 2.
+    assert _guard(validation_attempt="1", run_attempt="2") is False
+    # A full rerun re-executes validation in the same attempt.
+    assert _guard(validation_attempt="2", run_attempt="2") is True
+
+
+def _written_record(contract, state):
+    body = managed_ci._intent_body(
+        contract, pr_number=7, expected_head_sha="b" * 40, state=state,
+    )
+    payload = str(body).split(managed_ci.INTENT_MARKER, 1)[1].rsplit("-->", 1)[0]
+    return json.loads(payload)
+
+
+def _terminal_contract(**overrides):
+    fields = {
+        "protocol_version": 2, "repository": "OWNER/REPO", "pr_number": 7,
+        "expected_head_sha": "b" * 40, "base_ref": "main", "workflow_revision": "a" * 40,
+        "intent_generation": "generation-803", "nonce": "n" * 32, "created_at": 1,
+        "attached_run_id": 200, "run_attempt": 1,
+    }
+    fields.update(overrides)
+    return managed_ci.ManagedCiContract(**fields)
+
+
+def test_dispatch_validator_accepts_the_rerun_attempt_before_and_after_the_watcher_refresh():
+    # Exactly the transition wait_for_final_qualification writes for a
+    # terminal-without-status attempt before returning.
+    contract = _terminal_contract(
+        terminal_run_id=200, terminal_run_attempt=1, terminal_attempts=((200, 1),),
+        terminal_outcome="no-status",
+    )
+    before_refresh = _written_record(contract, "completed")
+    result, _ = _dispatch_validate(record=before_refresh, current_run_attempt="2")
+    assert result["record"]["terminal_outcome"] == "no-status"
+    # The post-rerun refresh then patches the record to attached at N+1.
+    contract.run_attempt = 2
+    contract.terminal_outcome = None
+    after_refresh = _written_record(contract, "attached")
+    result, _ = _dispatch_validator_attached(after_refresh)
+    assert result["record"]["run_attempt"] == 2
+
+
+def _dispatch_validator_attached(record):
+    return _dispatch_validate(record=record, current_run_attempt="2")
+
+
+def test_dispatch_validator_rejects_the_rerun_attempt_against_a_published_failure_record():
+    # The correlated-failure path marks the record plain completed without
+    # adding the attempt to terminal history, so attempt N+1 is refused; the
+    # loop therefore stops on infrastructure instead of re-running.
+    contract = _terminal_contract()
+    published_failure = _written_record(contract, "completed")
+    assert published_failure["terminal_outcome"] is None
+    assert published_failure["terminal_attempts"] == []
+    with pytest.raises(ValueError):
+        _dispatch_validate(record=published_failure, current_run_attempt="2")
