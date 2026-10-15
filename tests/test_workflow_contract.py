@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import re
 import textwrap
@@ -1522,7 +1523,7 @@ def test_verify_job_is_always_gated_on_validation_and_ends_with_a_literal_check(
     names = [step.get("name", step.get("uses")) for step in verify["steps"]]
     assert names[0] == "Require the reusable workflow revision"
     text = PUBLISH.read_text(encoding="utf-8")
-    assert "attempts/$RUN_ATTEMPT/jobs" in text
+    assert "'/attempts/' + os.environ['RUN_ATTEMPT']" in text and "'/jobs?per_page=100'" in text
     assert "ref: ${{ job.workflow_sha }}" in text
 
 
@@ -1603,13 +1604,59 @@ def test_attest_action_rejects_non_sha_refs_and_requires_the_artifact():
 # -- status-step behaviour: the real publish step against a recording stub ----
 
 
-def _run_status_step(monkeypatch, *, forwarded=None, event=None, **overrides):
-    import io
+def _heredoc(run):
+    """The ``python - <<'PY'`` body of a workflow step's run script."""
+    return run.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+
+class _Response(io.BytesIO):
+    def __init__(self, body=b"{}", headers=None):
+        super().__init__(body)
+        self.headers = headers or {}
+
+
+def _http_error(url, code, body=b""):
+    import email.message
+    import urllib.error
+
+    return urllib.error.HTTPError(url, code, "error", email.message.Message(), io.BytesIO(body))
+
+
+def _exec_step_script(monkeypatch, script, env, respond, *, name="workflow-step"):
+    """Exec a step's Python with a fake ``urlopen`` and a recording ``sleep``.
+
+    ``respond(request, call_index)`` returns a response or an exception to
+    raise. Returns (requests, exit code, stdout, sleeps).
+    """
+    import contextlib
     import os
+    import time
     import urllib.request
 
-    step = _load(PUBLISH)["jobs"]["publish"]["steps"][0]
-    script = step["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    requests = []
+    sleeps = []
+
+    def fake_urlopen(request, timeout=None):
+        requests.append(request)
+        outcome = respond(request, len(requests) - 1)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+    monkeypatch.setattr(os, "environ", env)
+    out = io.StringIO()
+    code = 0
+    with contextlib.redirect_stdout(out):
+        try:
+            exec(compile(script, name, "exec"), {"__name__": "__main__"})
+        except SystemExit as exc:
+            code = 0 if exc.code is None else exc.code
+    return requests, code, out.getvalue(), sleeps
+
+
+def _status_step_env(*, forwarded=None, event=None, **overrides):
     tuple_ = {
         "protocol_version": "2", "pr_number": "7",
         "expected_head_sha": "b" * 40, "managed_nonce": "n" * 32,
@@ -1626,18 +1673,23 @@ def _run_status_step(monkeypatch, *, forwarded=None, event=None, **overrides):
     env.update(overrides)
     env.setdefault("VALIDATION_RUN_ID", env["RUN_ID"])
     env.setdefault("VALIDATION_ATTEMPT", env["RUN_ATTEMPT"])
-    requests = []
+    return env
 
-    def fake_urlopen(request, timeout=None):
-        requests.append(request)
-        return io.BytesIO(b"{}")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(os, "environ", env)
-    try:
-        exec(compile(script, "publish-step", "exec"), {"__name__": "__main__"})
-    except SystemExit as exc:
-        assert exc.code in (0, None)
+def _status_step_result(monkeypatch, *, respond=None, forwarded=None, event=None, **overrides):
+    step = _load(PUBLISH)["jobs"]["publish"]["steps"][0]
+    env = _status_step_env(forwarded=forwarded, event=event, **overrides)
+    return _exec_step_script(
+        monkeypatch, _heredoc(step["run"]), env,
+        respond or (lambda _request, _index: _Response()), name="publish-step",
+    )
+
+
+def _run_status_step(monkeypatch, *, forwarded=None, event=None, **overrides):
+    requests, code, _out, _sleeps = _status_step_result(
+        monkeypatch, forwarded=forwarded, event=event, **overrides
+    )
+    assert code == 0
     return requests
 
 
@@ -1828,76 +1880,450 @@ def test_unauthorized_reruns_are_rejected_before_any_verifier_or_status(monkeypa
     assert _run_status_step(monkeypatch, VALIDATION_RESULT="failure", TEST_RESULT="skipped") == []
 
 
-# -- preparation path: the real jobs-listing step against a stubbed `gh` -------
+# -- bounded GitHub API retry (#1476) -----------------------------------------
 
-_GOOD_PAGE = json.dumps({"jobs": [
-    {"name": "services", "conclusion": "success"},
-    {"name": "unit (a)", "conclusion": "success"},
-]})
-_OBJECT_JOBS_PAGE = json.dumps({"jobs": {
-    "x": {"name": "services", "conclusion": "success"},
-    "y": {"name": "unit (a)", "conclusion": "success"},
-}})
+HTTP_RETRY_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "http_retry.py"
+STATUS_URL = "https://api.github.com/repos/OWNER/REPO/statuses/" + "b" * 40
 
 
-def _run_jobs_listing_step(tmp_path, *, gh_stdout, gh_exit):
-    """Run the publish workflow's own listing step; return the step exit code."""
+def _retry_block_copies():
+    """Every inlined MANAGED_CI_HTTP_RETRY copy, keyed by workflow and step."""
+    copies = {}
+    for path, job_id, step_name in (
+        (WORKFLOW, "validate-managed", "Validate live PR and handoff record"),
+        (WORKFLOW, "publish-exact-head", "Publish correlated terminal status"),
+        (VALIDATE, "validate", "Validate live PR and handoff record"),
+        (PUBLISH, "verify", "List current-attempt jobs from the API"),
+        (PUBLISH, "publish", "Publish correlated terminal status"),
+    ):
+        run = _step_by_name(_load(path)["jobs"][job_id], step_name)["run"]
+        assert run.count("# BEGIN MANAGED_CI_HTTP_RETRY") == 1
+        copies[(path.name, job_id)] = _extraction_block(run, "MANAGED_CI_HTTP_RETRY")
+    return copies
+
+
+def test_every_retry_block_copy_equals_the_pinned_fixture_and_its_digest():
+    fixture_text = HTTP_RETRY_FIXTURE.read_text(encoding="utf-8")
+    fixture_block = _extraction_block(fixture_text, "MANAGED_CI_HTTP_RETRY")
+    digest = _fixture_source_digest(fixture_text)
+    assert hashlib.sha256(fixture_block.encode("utf-8")).hexdigest() == digest
+    copies = _retry_block_copies()
+    assert len(copies) == 5
+    for key, block in copies.items():
+        assert block == fixture_block, key
+    # The raw workflow text holds exactly the five copies and nothing else.
+    total = sum(
+        path.read_text(encoding="utf-8").count("# BEGIN MANAGED_CI_HTTP_RETRY")
+        for path in (WORKFLOW, VALIDATE, PUBLISH)
+    )
+    assert total == 5
+
+
+def test_retry_block_sits_outside_every_pinned_block():
+    for path in (WORKFLOW, VALIDATE, PUBLISH):
+        text = path.read_text(encoding="utf-8")
+        retry_starts = [m.start() for m in re.finditer("# BEGIN MANAGED_CI_HTTP_RETRY", text)]
+        for marker in (
+            "MANAGED_CI_V2_PUBLISHER", "MANAGED_CI_SPLIT_STATUS_GUARD", "MANAGED_CI_V2_VALIDATOR",
+            "MANAGED_CI_V2_DISPATCH_VALIDATOR", "MANAGED_CI_TRUSTED_BASES",
+        ):
+            for begin in re.finditer(f"# BEGIN {marker}\n", text):
+                end = text.index(f"# END {marker}", begin.start())
+                assert not any(begin.start() < start < end for start in retry_starts), (path, marker)
+                assert "github_request" not in text[begin.start():end]
+
+
+def test_no_single_shot_api_call_remains_in_the_managed_paths():
+    for path in (WORKFLOW, VALIDATE, PUBLISH):
+        text = path.read_text(encoding="utf-8")
+        assert "with urlopen(" not in text, path
+        assert "gh api" not in text, path
+        assert "from urllib.request import Request, urlopen" not in text, path
+
+
+# -- publish steps: retrying POST and loud failure ---------------------------
+
+
+def _v2_publish_result(monkeypatch, *, respond=None, **overrides):
+    step = _step_by_name(_load(WORKFLOW)["jobs"]["publish-exact-head"], "Publish correlated terminal status")
+    env = {
+        "GH_TOKEN": "t", "GH_API_URL": "https://api.github.com", "GH_REPOSITORY": "OWNER/REPO",
+        "TARGET_SHA": "b" * 40, "VALIDATION_RESULT": "success", "TEST_RESULT": "success",
+        "NONCE": "n" * 32, "RUN_ID": "200", "RUN_ATTEMPT": "1", "SERVER_URL": "https://github.com",
+    }
+    env.update(overrides)
+    return _exec_step_script(
+        monkeypatch, _heredoc(step["run"]), env,
+        respond or (lambda _request, _index: _Response()), name="v2-publish-step",
+    )
+
+
+_PUBLISHERS = {"split": _status_step_result, "v2": _v2_publish_result}
+
+
+def _transient_then_ok(request, index):
+    return _http_error(request.full_url, 502) if index == 0 else _Response()
+
+
+@pytest.mark.parametrize("layout", sorted(_PUBLISHERS))
+def test_status_post_recovers_from_a_transient_failure_with_one_unchanged_status(monkeypatch, layout):
+    requests, code, out, sleeps = _PUBLISHERS[layout](monkeypatch, respond=_transient_then_ok)
+    assert code == 0 and len(requests) == 2 and len(sleeps) == 1
+    assert {r.full_url for r in requests} == {STATUS_URL}
+    assert {r.get_method() for r in requests} == {"POST"}
+    assert requests[0].data == requests[1].data
+    body = json.loads(requests[1].data)
+    assert body == {
+        "state": "success", "context": "final-ci/exact-head",
+        "description": "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=success",
+        "target_url": "https://github.com/OWNER/REPO/actions/runs/200",
+    }
+    assert "Published correlated final-ci/exact-head status" in out
+
+
+@pytest.mark.parametrize("layout", sorted(_PUBLISHERS))
+def test_status_post_exhausted_fails_loudly_with_url_and_status(monkeypatch, layout):
+    requests, code, out, _sleeps = _PUBLISHERS[layout](
+        monkeypatch, respond=lambda request, _i: _http_error(request.full_url, 502),
+    )
+    assert code == 1 and len(requests) == 4
+    assert (
+        "::error title=managed-ci status publish failed::POST " + STATUS_URL
+        + " failed: HTTP 502 after 4 attempts"
+    ) in out
+    assert "Published" not in out
+
+
+@pytest.mark.parametrize("layout", sorted(_PUBLISHERS))
+def test_status_post_rejection_fails_after_exactly_one_attempt(monkeypatch, layout):
+    requests, code, out, sleeps = _PUBLISHERS[layout](
+        monkeypatch, respond=lambda request, _i: _http_error(request.full_url, 422),
+    )
+    assert code == 1 and len(requests) == 1 and sleeps == []
+    assert "POST " + STATUS_URL + " failed: HTTP 422 after 1 attempt" in out
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"TARGET_SHA": "c" * 40},
+        {"VALIDATION_RESULT": "failure"},
+        {"VALIDATION_ATTEMPT": "2"},
+        {"FORWARDED_PR_NUMBER": "8"},
+        {"FORWARDED_MANAGED_NONCE": "m" * 32},
+    ],
+)
+@pytest.mark.parametrize("api_status", [None, "unavailable"])
+def test_rejected_correlation_never_reaches_the_retry_helper(monkeypatch, overrides, api_status):
+    extra = {} if api_status is None else {"VERIFY_API_STATUS": api_status}
+    requests, code, out, sleeps = _status_step_result(
+        monkeypatch, TEST_RESULT="failure", **extra, **overrides,
+    )
+    assert (requests, code, sleeps) == ([], 0, [])
+    assert "no status written" in out
+
+
+@pytest.mark.parametrize("overrides", [{"TARGET_SHA": ""}, {"VALIDATION_RESULT": "failure"}, {"NONCE": "short"}])
+def test_v2_publisher_writes_nothing_for_an_unvalidated_target(monkeypatch, overrides):
+    requests, code, out, _ = _v2_publish_result(monkeypatch, TEST_RESULT="failure", **overrides)
+    assert (requests, code) == ([], 0)
+    assert "no status written" in out
+
+
+def test_split_unreadable_jobs_listing_on_an_authorized_target_posts_error(monkeypatch):
+    requests, code, _out, _ = _status_step_result(
+        monkeypatch, TEST_RESULT="failure", VERIFY_API_STATUS="unavailable",
+    )
+    assert code == 0 and len(requests) == 1
+    assert requests[0].full_url == STATUS_URL
+    assert json.loads(requests[0].data) == {
+        "state": "error", "context": "final-ci/exact-head",
+        "description": "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=error",
+        "target_url": "https://github.com/OWNER/REPO/actions/runs/200",
+    }
+
+
+@pytest.mark.parametrize("api_status", ["ok", "rejected", "", "garbage", "UNAVAILABLE", None])
+def test_split_semantic_verify_failure_keeps_failure(monkeypatch, api_status):
+    extra = {} if api_status is None else {"VERIFY_API_STATUS": api_status}
+    requests, code, _out, _ = _status_step_result(monkeypatch, TEST_RESULT="failure", **extra)
+    assert code == 0
+    assert [json.loads(r.data)["state"] for r in requests] == ["failure"]
+    assert json.loads(requests[0].data)["description"].endswith(";result=failure")
+
+
+@pytest.mark.parametrize("test_result", ["cancelled", "skipped"])
+def test_split_error_override_needs_an_actual_verify_failure(monkeypatch, test_result):
+    requests, _code, _out, _ = _status_step_result(
+        monkeypatch, TEST_RESULT=test_result, VERIFY_API_STATUS="unavailable",
+    )
+    assert [json.loads(r.data)["state"] for r in requests] == ["failure"]
+
+
+@pytest.mark.parametrize("api_status", ["ok", "unavailable", "rejected", ""])
+def test_split_success_ignores_api_status(monkeypatch, api_status):
+    requests, _code, _out, _ = _status_step_result(
+        monkeypatch, TEST_RESULT="success", VERIFY_API_STATUS=api_status,
+    )
+    assert [json.loads(r.data)["state"] for r in requests] == ["success"]
+
+
+def test_v2_single_workflow_publisher_ignores_verify_api_status(monkeypatch):
+    requests, _code, _out, _ = _v2_publish_result(
+        monkeypatch, TEST_RESULT="failure", VERIFY_API_STATUS="unavailable",
+    )
+    assert [json.loads(r.data)["state"] for r in requests] == ["failure"]
+    step = _step_by_name(_load(WORKFLOW)["jobs"]["publish-exact-head"], "Publish correlated terminal status")
+    assert "VERIFY_API_STATUS" not in step["run"] and "VERIFY_API_STATUS" not in step["env"]
+
+
+def test_split_error_override_runs_after_the_guard_and_builder_and_outside_pinned_blocks():
+    step = _load(PUBLISH)["jobs"]["publish"]["steps"][0]
+    script = step["run"]
+    assert step["env"]["VERIFY_API_STATUS"] == "${{ needs.verify.outputs.api_status }}"
+    override = script.index("os.environ.get('VERIFY_API_STATUS', '')")
+    assert script.index("if not correlation_matches(") < override
+    assert script.index("if request_plan is None:") < override
+    assert override < script.index("github_request(request, read_json=False)")
+    assert script.index("# END MANAGED_CI_V2_PUBLISHER") < override
+
+
+# -- split verify job: retrying jobs listing with a trusted api_status ---------
+
+_JOBS_URL = "https://api.github.com/repos/OWNER/REPO/actions/runs/200/attempts/1/jobs?per_page=100"
+_JOBS_PAGE_2 = "https://api.github.com/repositories/1/actions/runs/200/attempts/1/jobs?per_page=100&page=2"
+
+
+def _run_jobs_listing_step(monkeypatch, tmp_path, respond):
+    """Run the verify job's listing step: its Python in-process, then its shell tail.
+
+    Returns (exit code, api_status output, jobs.json path, requests, stdout).
+    """
     import os
-    import stat
     import subprocess
 
     step = _step_by_name(_load(PUBLISH)["jobs"]["verify"], "List current-attempt jobs from the API")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    payload = tmp_path / "gh_payload.txt"
-    payload.write_text(gh_stdout, encoding="utf-8")
-    stub = bin_dir / "gh"
-    stub.write_text(f'#!/bin/sh\ncat "{payload}"\nexit {gh_exit}\n', encoding="utf-8")
-    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    run = step["run"]
+    head, rest = run.split("python3 - <<'PY'\n", 1)
+    tail = rest.split("\nPY\n", 1)[1]
     work = tmp_path / "work"
     work.mkdir()
     (work / ".managed-ci").symlink_to(ROOT)
     runner_temp = tmp_path / "runner"
     runner_temp.mkdir()
+    output = tmp_path / "github_output"
+    output.write_text("", encoding="utf-8")
     env = {
-        **os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GH_TOKEN": "t",
-        "GH_REPOSITORY": "OWNER/REPO", "RUN_ID": "200", "RUN_ATTEMPT": "1",
-        "RUNNER_TEMP": str(runner_temp),
+        "GH_TOKEN": "t", "GH_API_URL": "https://api.github.com", "GH_REPOSITORY": "OWNER/REPO",
+        "RUN_ID": "200", "RUN_ATTEMPT": "1", "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_OUTPUT": str(output),
     }
-    done = subprocess.run(
-        ["bash", "-e", "-c", step["run"]], cwd=work, env=env, capture_output=True, text=True,
+    shell_env = {**os.environ, **env}
+    assert head.strip() == 'rm -f "$RUNNER_TEMP/jobs-pages.json"'
+    requests, code, out, _sleeps = _exec_step_script(
+        monkeypatch, _heredoc(run), env, respond, name="jobs-listing-step",
     )
-    return done.returncode, runner_temp / "jobs.json"
+    if code == 0:
+        code = subprocess.run(
+            ["bash", "-e", "-c", tail], cwd=work, env=shell_env, capture_output=True, text=True,
+        ).returncode
+    statuses = re.findall(r"^api_status=(.*)$", output.read_text(encoding="utf-8"), re.MULTILINE)
+    return code, statuses, runner_temp / "jobs.json", requests, out
+
+
+def _page_response(body, next_url=None):
+    headers = {"Link": f'<{next_url}>; rel="next"'} if next_url else {}
+    return _Response(body.encode("utf-8"), headers)
+
+
+def test_jobs_listing_retries_each_page_and_records_ok(monkeypatch, tmp_path):
+    page1 = json.dumps({"jobs": [{"name": "services", "conclusion": "success"}]})
+    page2 = json.dumps({"jobs": [{"name": "unit (a)", "conclusion": "success"}]})
+
+    def respond(request, index):
+        return [
+            _http_error(request.full_url, 502),
+            _page_response(page1, _JOBS_PAGE_2),
+            _Response(b""),  # an empty body on page 2 is retried too
+            _page_response(page2),
+        ][index]
+
+    code, statuses, jobs_file, requests, _ = _run_jobs_listing_step(monkeypatch, tmp_path, respond)
+    assert code == 0 and statuses == ["ok"]
+    assert [r.full_url for r in requests] == [_JOBS_URL, _JOBS_URL, _JOBS_PAGE_2, _JOBS_PAGE_2]
+    assert [j["name"] for j in json.loads(jobs_file.read_text())] == ["services", "unit (a)"]
+
+
+def test_jobs_listing_exhausted_records_unavailable_and_the_require_step_fails(monkeypatch, tmp_path):
+    code, statuses, jobs_file, requests, out = _run_jobs_listing_step(
+        monkeypatch, tmp_path, lambda request, _i: _http_error(request.full_url, 503),
+    )
+    assert code == 0 and statuses == ["unavailable"] and len(requests) == 4
+    assert "::error title=managed-ci infrastructure::" in out
+    assert not jobs_file.exists()
+    verify = _load(PUBLISH)["jobs"]["verify"]
+    names = [step.get("name") for step in verify["steps"]]
+    require = _step_by_name(verify, "Require readable jobs listing")
+    assert names.index("Require readable jobs listing") == names.index("List current-attempt jobs from the API") + 1
+    assert require["run"] == 'test "$API_STATUS" = ok'
+    assert require["env"]["API_STATUS"] == "${{ steps.jobs.outputs.api_status }}"
+
+
+@pytest.mark.parametrize("status", [401, 404])
+def test_jobs_listing_rejection_records_rejected_and_fails_after_one_call(monkeypatch, tmp_path, status):
+    code, statuses, jobs_file, requests, out = _run_jobs_listing_step(
+        monkeypatch, tmp_path, lambda request, _i: _http_error(request.full_url, status),
+    )
+    assert code == 1 and statuses == ["rejected"] and len(requests) == 1
+    assert f"::error title=managed-ci jobs listing rejected::GET {_JOBS_URL} failed: HTTP {status}" in out
+    assert "managed-ci infrastructure" not in out
+    assert not jobs_file.exists()
 
 
 @pytest.mark.parametrize(
-    ("gh_stdout", "gh_exit", "prep_ok"),
+    "body",
     [
-        (_GOOD_PAGE, 0, True),
-        (_OBJECT_JOBS_PAGE, 0, False),  # object-valued jobs must not flatten into a list
-        ("not json", 0, False),
-        ("", 0, False),
-        (_GOOD_PAGE, 1, False),  # valid output but the API command failed: pipefail propagates
+        json.dumps({"jobs": {"x": {"name": "services"}}}),  # object-valued jobs
+        json.dumps({"total_count": 1}),
+        json.dumps([1, 2]),
     ],
-    ids=["well-formed", "object-valued-jobs", "non-json", "empty", "api-exit-nonzero"],
+    ids=["object-valued-jobs", "no-jobs-key", "array-page"],
 )
-def test_jobs_listing_failure_becomes_a_guarded_failure_status(
-    monkeypatch, tmp_path, gh_stdout, gh_exit, prep_ok
-):
-    code, jobs_file = _run_jobs_listing_step(tmp_path, gh_stdout=gh_stdout, gh_exit=gh_exit)
-    assert (code == 0) is prep_ok
-    if prep_ok:
-        assert [j["name"] for j in json.loads(jobs_file.read_text())] == ["services", "unit (a)"]
-    # The verify job fails when its preparation step fails; the status job then
-    # publishes exactly one failure on the validated event SHA.
+def test_jobs_listing_malformed_but_readable_payload_fails_without_unavailable(monkeypatch, tmp_path, body):
+    code, statuses, _jobs, requests, _ = _run_jobs_listing_step(
+        monkeypatch, tmp_path, lambda _request, _i: _Response(body.encode()),
+    )
+    assert code != 0 and statuses == ["ok"] and len(requests) == 1
+
+
+def test_verify_job_exposes_api_status_and_keeps_read_only_permissions():
+    verify = _load(PUBLISH)["jobs"]["verify"]
+    assert verify["outputs"] == {"api_status": "${{ steps.jobs.outputs.api_status }}"}
+    assert _perms(verify) == {"actions": "read", "contents": "read"}
+    step = _step_by_name(verify, "List current-attempt jobs from the API")
+    assert step["id"] == "jobs"
+    assert step["env"]["GH_API_URL"] == "${{ github.api_url }}"
+
+
+@pytest.mark.parametrize(
+    ("prep_ok", "api_status", "state"),
+    [(True, "ok", "success"), (False, "rejected", "failure"), (False, "ok", "failure"),
+     (False, "unavailable", "error")],
+    ids=["listed", "rejected", "malformed", "unavailable"],
+)
+def test_jobs_listing_outcome_becomes_one_guarded_status(monkeypatch, prep_ok, api_status, state):
     validated, _ = _dispatch_validate()
-    errors = [] if prep_ok else ["jobs listing failed"]
-    requests = _publish_after_verify(monkeypatch, validated, 1, errors)
+    tuple_ = {
+        "protocol_version": "2", "pr_number": validated["pr_number"],
+        "expected_head_sha": validated["target_sha"], "managed_nonce": validated["managed_nonce"],
+    }
+    requests = _run_status_step(
+        monkeypatch, forwarded=tuple_, event=tuple_,
+        TARGET_SHA=validated["target_sha"], NONCE=validated["managed_nonce"],
+        TEST_RESULT="success" if prep_ok else "failure", VERIFY_API_STATUS=api_status,
+    )
     assert len(requests) == 1
     assert requests[0].full_url.endswith("/statuses/" + validated["target_sha"])
     body = json.loads(requests[0].data)
-    assert body["state"] == ("success" if prep_ok else "failure")
-    assert body["description"] == (
-        "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=" + body["state"]
+    assert body["state"] == state
+    assert body["description"] == "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=" + state
+
+
+# -- validate steps: unreadable API versus rejected request -------------------
+
+
+def _validate_step_result(monkeypatch, tmp_path, path, respond, **overrides):
+    import time
+
+    job_id = "validate-managed" if path == WORKFLOW else "validate"
+    step = _step_by_name(_load(path)["jobs"][job_id], "Validate live PR and handoff record")
+    output = tmp_path / "github_output"
+    output.write_text("", encoding="utf-8")
+    env = {
+        "GH_TOKEN": "t", "GH_API_URL": "https://api.github.com", "GH_REPOSITORY": "OWNER/REPO",
+        "GH_REF": "refs/heads/main", "GH_ACTOR": "agent-loop", "GH_TRIGGERING_ACTOR": "agent-loop",
+        "GH_RUN_ID": "200", "GH_RUN_ATTEMPT": "1", "CONFIGURED_ACTOR": "agent-loop",
+        "TRUSTED_BASES": "", "INPUT_PROTOCOL_VERSION": "2", "INPUT_PR_NUMBER": "7",
+        "INPUT_EXPECTED_HEAD_SHA": "b" * 40, "INPUT_MANAGED_NONCE": "n" * 32,
+        "GITHUB_OUTPUT": str(output),
+    }
+    env.update(overrides)
+    monkeypatch.setattr(time, "time", lambda: 100.0)
+    requests, code, out, sleeps = _exec_step_script(
+        monkeypatch, _heredoc(step["run"]), env, respond, name="validate-step",
     )
-    assert body["target_url"] == "https://github.com/OWNER/REPO/actions/runs/200"
+    return requests, code, out, output.read_text(encoding="utf-8"), sleeps
+
+
+def _live_api(request, _index):
+    path = urllib.parse.urlsplit(request.full_url).path.lstrip("/")
+    records = {
+        "users/agent-loop": {"login": "agent-loop", "id": 7},
+        "repos/OWNER/REPO": {"full_name": "OWNER/REPO", "default_branch": "main"},
+        "repos/OWNER/REPO/pulls/7": _pr(base={"ref": "main"}),
+        "repos/OWNER/REPO/commits/main": {"sha": "a" * 40},
+        "repos/OWNER/REPO/issues/7/comments": _pages(_record())[0],
+    }
+    return _Response(json.dumps(records[path]).encode("utf-8"))
+
+
+_VALIDATE_STEPS = pytest.mark.parametrize("path", [WORKFLOW, VALIDATE], ids=["legacy", "split"])
+
+
+@_VALIDATE_STEPS
+def test_validate_step_recovers_from_transient_reads_and_emits_the_target(monkeypatch, tmp_path, path):
+    def respond(request, index):
+        return _Response(b"") if index in (0, 3) else _live_api(request, index)
+
+    requests, code, out, outputs, sleeps = _validate_step_result(monkeypatch, tmp_path, path, respond)
+    assert code == 0, out
+    assert "target_sha=" + "b" * 40 in outputs
+    assert len(sleeps) == 2 and len(requests) == 7
+
+
+@_VALIDATE_STEPS
+@pytest.mark.parametrize("failure", ["empty", "502"])
+def test_validate_step_unreadable_api_fails_with_infrastructure_annotation(monkeypatch, tmp_path, path, failure):
+    def respond(request, _index):
+        return _Response(b"") if failure == "empty" else _http_error(request.full_url, 502)
+
+    requests, code, out, outputs, _ = _validate_step_result(monkeypatch, tmp_path, path, respond)
+    assert code == 2
+    assert len(requests) == 4  # the first read, retried to exhaustion; nothing else is read
+    assert "::error title=managed-ci infrastructure::GitHub API unavailable during validation" in out
+    assert "validation rejected" not in out
+    assert "target_sha" not in outputs
+
+
+@_VALIDATE_STEPS
+@pytest.mark.parametrize(
+    ("missing", "status"),
+    [("users/agent-loop", 404), ("repos/OWNER/REPO/pulls/7", 404), ("users/agent-loop", 401)],
+)
+def test_validate_step_api_rejection_is_a_validation_rejection(monkeypatch, tmp_path, path, missing, status):
+    def respond(request, index):
+        if urllib.parse.urlsplit(request.full_url).path.lstrip("/") == missing:
+            return _http_error(request.full_url, status)
+        return _live_api(request, index)
+
+    requests, code, out, outputs, sleeps = _validate_step_result(monkeypatch, tmp_path, path, respond)
+    assert code == 1 and sleeps == []
+    urls = [r.full_url for r in requests]
+    assert urls.count("https://api.github.com/" + missing) == 1
+    assert (
+        f"::error title=managed-ci validation rejected::GET https://api.github.com/{missing} "
+        f"failed: HTTP {status} after 1 attempt"
+    ) in out
+    assert "managed-ci infrastructure" not in out
+    assert "target_sha" not in outputs
+
+
+@_VALIDATE_STEPS
+def test_validate_step_semantic_rejection_is_labelled_rejected(monkeypatch, tmp_path, path):
+    requests, code, out, outputs, _ = _validate_step_result(
+        monkeypatch, tmp_path, path, _live_api, INPUT_EXPECTED_HEAD_SHA="c" * 40,
+    )
+    assert code == 1
+    assert "::error title=managed-ci validation rejected::" in out
+    assert "managed-ci infrastructure" not in out
+    assert "target_sha" not in outputs

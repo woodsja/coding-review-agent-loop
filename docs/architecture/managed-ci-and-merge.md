@@ -137,6 +137,23 @@ run ID, attempt, and Actions URL. Authorization failures before target
 establishment produce no status; downstream checkout/test failures cannot
 produce success.
 
+Every managed-CI GitHub API read and status POST goes through one bounded
+retry helper, the `MANAGED_CI_HTTP_RETRY` block (#1476). It is inlined
+byte-identically in the validate, verify and publish steps, outside the pinned
+publisher, guard and validator blocks. Transient failures retry with backoff:
+network, timeout, 5xx, 429, a rate-limited 403, and an empty or truncated body.
+Only their exhaustion counts as infrastructure. A definitive 4xx is a
+rejection after one call. When initial validation cannot read the API, no
+status is written, because there is no validated target. The job fails with a
+distinct `managed-ci infrastructure` annotation and the existing no-status
+retry path recovers. When an authorized split target's verify jobs listing is
+exhausted, the publisher posts `error` instead of `failure`, and it chooses
+`error` only after the correlation guard passes. A status POST that still
+fails after retries fails the job with the URL and HTTP status. Having the
+loop's CI watch classify these runs as infrastructure is a companion loop-side
+change. See
+[GitHub API retry and outcomes](../local_agent_loop.md#managed-ci-github-api-retry-and-outcomes).
+
 This adds no application persistence or public Python API: the handoff record,
 workflow run metadata, and terminal status remain GitHub audit records, while
 the local producer continues to own lifecycle creation and exact-head merge

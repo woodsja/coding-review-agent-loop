@@ -5801,8 +5801,13 @@ commit SHA the release tag resolves to.
   inputs and `validation_result` must be `success`; otherwise it writes no
   status. Once the guard passes, any verify failure, skip or cancellation
   publishes `failure` on the validated target, and only a fully verified run
-  publishes `success`. The status context, description and target URL are the
-  same as the single-job publisher's.
+  publishes `success`. The one exception is infrastructure: when the verify
+  job failed only because its own jobs-API listing stayed unreadable after
+  bounded retries (`api_status=unavailable`), the publisher posts `error`
+  (description `…;result=error`) instead. See
+  [GitHub API retry and outcomes](#managed-ci-github-api-retry-and-outcomes).
+  The status context, description tokens and target URL are the same as the
+  single-job publisher's.
 - The expected set is a **literal** in the default-branch caller; it is never
   computed from job outputs. An empty, malformed, duplicated or oversized set
   fails closed.
@@ -5816,6 +5821,69 @@ expected job from the earlier attempt fails as missing. Every other rerun
 (after a published status, with a stale intent, or with an unmatched attempt) is
 rejected by `validate` and writes no status. Recover with a fresh managed
 dispatch.
+
+#### Managed-CI GitHub API retry and outcomes
+
+Every GitHub API read in the managed-CI workflows and every
+`final-ci/exact-head` status POST goes through one inline helper, the
+`MANAGED_CI_HTTP_RETRY` block (#1476). This covers the validate step in both
+`managed-ci.yml` and `managed-ci-validate.yml`, the split verify job's
+jobs-API listing, and both publishers. The block is byte-identical in all five
+places and is pinned by `tests/fixtures/managed_ci/http_retry.py` and its
+`Source block SHA-256`. It sits outside the pinned publisher, guard and
+validator blocks, which are unchanged.
+
+- **Retry policy.** Up to 4 attempts, with exponential backoff of 2, 4 and
+  8 seconds plus up to one second of jitter. A `Retry-After` header is honoured
+  up to 60 seconds. Opening the request, reading the body and parsing JSON all
+  happen inside each attempt.
+- **Retried:** network and transport errors (including `IncompleteRead` and
+  `RemoteDisconnected`), timeouts, 5xx, 429, a rate-limited 403, and an empty
+  or truncated JSON body.
+- **Not retried:** 401, 404, 422, a 403 that is not a rate limit, and any other
+  4xx. These raise `GitHubApiRejected` after exactly one call.
+- **Infrastructure versus rejection.** Only exhausted transient failures count
+  as infrastructure (`GitHubApiUnavailable`). A definitive HTTP answer from
+  GitHub is a rejection. Error messages name the method, URL, last HTTP status
+  and attempt count, and never contain the token.
+
+Outcomes:
+
+| Situation | Status written | Job outcome |
+| --- | --- | --- |
+| Validation cannot read the API (retries exhausted) | none (stays pending) | Fails (exit 2), annotated `managed-ci infrastructure` |
+| Validation rejects the request, including a definitive API 4xx such as a 404 for the PR or actor, or a 401 | none | Fails, annotated `managed-ci validation rejected` with the reason, or with the method, URL and status |
+| Split verify jobs listing exhausted after the target was authorized | `error` (`result=error`) on the correlated target | Verify fails; publish succeeds |
+| Split verify jobs listing rejected with a 4xx, or a semantic attestation or test failure | `failure` | Verify fails; publish succeeds |
+| Status POST exhausted or rejected | none | Publish fails, annotated `managed-ci status publish failed` with the URL and HTTP status |
+
+When validation cannot read the API, `pending` is the only safe outcome.
+Validation never produced a validated, correlated target SHA. Writing any state
+there, `error` included, would break the rule that an uncorrelated or forged
+tuple never receives a status. The job therefore fails loudly with its own
+annotation, so it is never a silent pending. The driver's existing completed-run
+no-status confirmation and authorized retry path then takes over. Having the
+loop's CI watch label this case, and the split `error` status, as
+infrastructure rather than a test failure is the companion loop-side issue.
+
+The correlation guard is unchanged. A rejected correlation or authorization
+still exits before the retry helper runs, with zero HTTP calls. In the split
+publisher, `error` is chosen only after the guard and the builder have accepted
+the tuple, and only when the verify result is `failure` and `api_status` is
+exactly `unavailable`. `api_status` is an output of the reusable workflow's own
+verify job, not a caller input. Retrying a status POST is idempotent: the same
+state and description go to the same context, and the latest status wins.
+
+**Migration note for repositories that inline the v2 workflow.** Some
+repositories inline the v2 validator or publisher instead of calling the
+reusable entry points, for example llm-dialectic. They do not pick up this fix
+automatically. Choose one of these:
+
+- Copy the `MANAGED_CI_HTTP_RETRY` block byte-for-byte, together with the new
+  call sites: `api_json`/`api_pages` on `github_request`, the classified
+  `validate_dispatch` call, and the retried POST.
+- Move to the split entry points, `managed-ci-validate.yml` and
+  `managed-ci-publish.yml` (#1383 / PR #1406), which carry the fix.
 
 **Migration notes: a routed matrix plus a separate admission run
 (llm-dialectic).** llm-dialectic routes a `suite` (docs-contract, smoke, full or
