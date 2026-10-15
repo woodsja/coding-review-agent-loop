@@ -3710,9 +3710,9 @@ def _pr_step_back_decision(
     """Escalate on a clustered sibling or non-convergence, else name the clusters.
 
     Evaluated at the coder dispatch from freshly read history so a live run and
-    a resumed run agree.  Raises ``AgentLoopError`` (a human-decision stop) before
-    any coder invocation when a reviewer's step-back still produced a sibling,
-    and ``HumanDecisionRequiredError`` (exit 4) when a tracked reviewer kept the
+    a resumed run agree.  Raises ``HumanDecisionRequiredError`` (exit 4) before
+    any coder invocation for either stop: when a reviewer's step-back still
+    produced a clustered sibling (#1408), and when a tracked reviewer kept the
     same items blocking across ``--pr-non-convergence-rounds`` code-changing
     coder turns (#1372).  Each gate keeps its own K, so disabling one never
     disables the other.
@@ -3760,7 +3760,7 @@ def _pr_step_back_decision(
                     f"PR step-back: escalating {reviewer} on the unmappable-anchor same-path "
                     "fallback",
                 )
-            raise AgentLoopError(
+            raise HumanDecisionRequiredError(
                 f"PR #{pr_number}: "
                 + _step_back.render_pr_step_back_human_decision(
                     reviewer=reviewer,

@@ -17612,7 +17612,7 @@ def _run_to_sibling(tmp_path, sibling, **runner_kwargs):
         codex_outputs=[*_three_clustered_blocks(), _sb_review([sibling], resolved=["item-3"])],
         **runner_kwargs,
     )
-    with pytest.raises(AgentLoopError) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
     return runner, str(excinfo.value)
 
@@ -17625,6 +17625,30 @@ def test_a_sibling_in_the_sweep_review_stops_for_a_human_decision_before_another
     assert "--pr-step-back-rounds 0" in message and "accept a stated limitation" in message
     assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the sweep
     assert len(_sb_codex_prompts(runner)) == 4
+
+
+def test_the_cli_maps_a_sibling_escalation_to_the_human_decision_exit_code(tmp_path, capsys):
+    """`sibling-cli-exit-code`: the live sibling stop exits 4, not the generic 1."""
+    import coding_review_agent_loop.cli as cli_module
+
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
+        ],
+    )
+    config = _sb_config(tmp_path)
+
+    def drive_the_fixture(*_args, **_kwargs):
+        return run_pr_loop(runner, pr_number=77, config=config)
+
+    with patch.object(cli_module, "run_pr_loop", side_effect=drive_the_fixture):
+        assert cli_module.main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
+    stderr = capsys.readouterr().err
+    assert "HUMAN DECISION REQUIRED" in stderr
+    assert "--pr-step-back-rounds 0" in stderr
+    assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the sweep
 
 
 def test_a_sweep_sibling_located_only_in_a_sub_item_escalates(tmp_path):
@@ -17822,7 +17846,7 @@ def test_a_carried_in_window_item_keeps_the_episode_open_and_a_later_sibling_esc
             _sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]),
         ],
     )
-    with pytest.raises(AgentLoopError) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
     assert "human decision required" in str(excinfo.value)
     assert len(_sb_coder_prompts(runner)) == 4  # no fifth coder turn
@@ -17836,7 +17860,7 @@ def test_a_sweep_sibling_arriving_exactly_at_the_round_limit_still_stops_for_a_h
         claude_outputs=_step_back_coders(),
         codex_outputs=[*_three_clustered_blocks(), _sb_review(["sibling at src/spool.py:134"], resolved=["item-3"])],
     )
-    with pytest.raises(AgentLoopError) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=4))
     message = str(excinfo.value)
     assert "human decision required" in message and "Reached max rounds" not in message
@@ -17875,7 +17899,7 @@ def test_resume_after_a_carried_in_window_sweep_review_keeps_the_episode_and_sto
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(_sb_coder_prompts(runner)) == 4
     runner.codex_outputs.append(_sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]))
-    with pytest.raises(AgentLoopError) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     message = str(excinfo.value)
     assert "human decision required" in message
@@ -17926,6 +17950,34 @@ def test_a_rerun_after_a_sibling_stop_does_not_repeat_the_stop_for_the_old_sibli
     assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
     assert len(_sb_coder_prompts(runner)) == 5  # three before the stop, two after the push
     assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner)[3:])
+
+
+def test_malformed_step_back_history_suppresses_the_sibling_stop(tmp_path, monkeypatch, capsys):
+    """`sibling-no-stop-paths`: a decode failure logs and suppresses, never stops."""
+    import coding_review_agent_loop.pr_loop_support as support
+    from coding_review_agent_loop import review_step_back
+
+    real_history = review_step_back.pr_step_back_history
+
+    def degraded_once_recorded(records, reviewer):
+        entries, degraded = real_history(records, reviewer)
+        # Once the step-back entry is recorded, report its history as malformed.
+        return entries, degraded or bool(entries)
+
+    monkeypatch.setattr(support._step_back, "pr_step_back_history", degraded_once_recorded)
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-4"])],
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
+            _sb_review(resolved=["item-4"]),
+        ],
+    )
+    config = _sb_config(tmp_path, pr_non_convergence_rounds=0, quiet=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = _sb_coder_prompts(runner)
+    assert len(prompts) == 4 and "STEP-BACK TURN" not in prompts[3]
+    assert "PR step-back suppressed for Codex: malformed step-back history" in capsys.readouterr().err
 
 
 def _external_push_after_the_kth_review(tmp_path, hunks):
@@ -21239,7 +21291,7 @@ def test_a_clustered_sibling_escalation_stops_before_non_convergence(tmp_path):
             _sb_review(["another branch at src/spool.py:134"], carried=["item-3"]),
         ],
     )
-    with pytest.raises(AgentLoopError) as excinfo:
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=1))
     message = str(excinfo.value)
     assert "still raised a new sibling finding" in message
