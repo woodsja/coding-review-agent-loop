@@ -58,6 +58,7 @@ from .protocol import (
 from .errors import (
     AgentSettingsLockWaitTimeout,
     FreshContractIntegrityError,
+    NonRepairableEvidenceRejection,
     ReviewSubstanceIntegrityError,
 )
 
@@ -1344,7 +1345,7 @@ RepairOutcome = Literal[
     "unavailable_model", "accepted_nonzero_exit", "accepted_timeout",
     "transient_provider_error", "fresh_contract_integrity", "semantic_patch_integrity",
     "review_substance_integrity", "architecture_contract_unsatisfied",
-    "settings_lock_contention",
+    "settings_lock_contention", "semantic_evidence_rejection",
 ]
 
 
@@ -1364,6 +1365,9 @@ class RepairAttemptResult:
     # Out-of-band parse degradation records derived by pre-repair
     # normalization.  They never appear in any text a repair model sees.
     architecture_impact_degradations: tuple = ()
+    # The candidate's semantic evidence rejection (#999), carried as the
+    # original exception so callers route on ``reason`` without parsing text.
+    evidence_rejection: NonRepairableEvidenceRejection | None = None
 
 
 @dataclass(frozen=True)
@@ -1987,6 +1991,24 @@ def execute_repair(
                         evidence_row_id_universe=prompt_kwargs.get("evidence_row_id_universe"),
                         forbid_architecture_impact=forbid_architecture_impact,
                     )
+                except NonRepairableEvidenceRejection as exc:
+                    # Repair preserves the coder's own claims, so every later
+                    # model would re-present the same rejected selector: the
+                    # chain stops whatever the transport outcome was (#999).
+                    attempt.outcome = "semantic_evidence_rejection"
+                    attempt.evidence_rejection = exc
+                    attempt.diagnostic = "\n".join(
+                        part for part in (
+                            attempt.diagnostic, _sanitize_diagnostic(str(exc), config=config)
+                        ) if part
+                    )
+                    attempt.fallback_planned = False
+                    if usage_record is not None:
+                        usage_record.validation_status = "invalid"
+                        usage_record.outcome = attempt.outcome
+                        usage_record.fallback_planned = False
+                    attempts.append(attempt)
+                    return None, None, attempts
                 except Exception as exc:
                     if outcome == "succeeded":
                         attempt.outcome = "invalid_output"

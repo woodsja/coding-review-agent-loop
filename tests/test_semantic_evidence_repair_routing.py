@@ -410,3 +410,272 @@ def test_approved_plan_call_site_enables_reask():
 
     source = inspect.getsource(issue_implementation)
     assert "reask_on_evidence_rejection=True" in source
+
+
+# --- #999: a rejection exposed only by a repair candidate ---
+
+# A blank summary is an envelope defect normalization cannot fix, so the
+# response reaches structured repair; the repaired candidate restores the
+# summary and re-presents the coder's own (rejected) selector.
+_MASKED = _implementation_with_claim(summary="")
+_REJECTED_CANDIDATE = _implementation_with_claim()
+
+
+@pytest.fixture
+def real_repair(monkeypatch):
+    """Undo the suite-wide legacy hook so the real execute_repair chain runs."""
+    from coding_review_agent_loop import validated_agent
+
+    monkeypatch.setattr(
+        orchestrator_module, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR
+    )
+
+
+def _cli_repair(monkeypatch, outputs):
+    """Script the codex repair chain: one ``(text, returncode)`` per model call."""
+    import coding_review_agent_loop.repair as repair_module
+    from types import SimpleNamespace
+
+    scripted = list(outputs)
+    calls: list[str] = []
+
+    def fake_cli_repair(runner, config, prompt, *, model, log_path):
+        calls.append(model)
+        text, returncode = scripted.pop(0)
+        return SimpleNamespace(
+            text=text, returncode=returncode, raw_output="", usage=None, raw_usage=None,
+            observed_model=None, text_source="stdout",
+        )
+
+    monkeypatch.setattr(repair_module, "run_cli_repair", fake_cli_repair)
+    return calls
+
+
+def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config_overrides):
+    config = make_config(tmp_path, agent_max_retries=retries, **config_overrides)
+    logged: list[str] = []
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=list(results)) as invoke:
+        with patch.object(
+            orchestrator_module, "log", lambda config, text, *a, **k: logged.append(str(text))
+        ):
+            try:
+                response = _run_validated_agent(
+                    FakeRunner(),
+                    agent="claude",
+                    config=config,
+                    prompt="Implement the issue.",
+                    marker_description="structured issue_implementation result",
+                    validate=_sequenced_validator(catalogs, invoke),
+                    role="coder",
+                    use_repair=True,
+                    repair_expected_kind="issue_implementation",
+                    reask_on_evidence_rejection=reask,
+                )
+                error = None
+            except AgentInvocationError as exc:
+                response, error = None, exc
+    return response, error, invoke, logged
+
+
+def _codex_repair(**overrides):
+    return {"repair_backend": "codex", "repair_models": ("model-a", "model-b"), **overrides}
+
+
+def _assert_semantic_stop(error):
+    assert error is not None
+    assert error.failure_category == "deterministic"
+    assert error.plan_validation_exhaustion is None
+    message = str(error)
+    assert "Failure category: semantic-evidence-rejection" in message
+    assert "Failure category: timeout" not in message
+    assert "repair-provider-failure" not in message
+    assert "repair invocation failure" not in message
+    assert "repair pass produced invalid output" not in message
+    assert "semantic evidence rejection; repair chain stopped" in message
+    return message
+
+
+@pytest.mark.parametrize(
+    "chain",
+    [
+        pytest.param([(_REJECTED_CANDIDATE, 0)], id="first-model"),
+        pytest.param([(_MASKED, 0), (_REJECTED_CANDIDATE, 0)], id="after-invalid"),
+        pytest.param([("", None), (_REJECTED_CANDIDATE, 0)], id="after-timeout"),
+    ],
+)
+def test_repair_surfaced_collision_stops_with_semantic_classification(
+    tmp_path, monkeypatch, real_repair, chain
+):
+    calls = _cli_repair(monkeypatch, chain)
+    collision = [_observation(), _observation()]
+    response, error, invoke, logged = _run_masked(
+        tmp_path, [collision], [_result(_MASKED)] * 3, **_codex_repair()
+    )
+    assert response is None
+    # No coder retry, and the chain ran exactly the scripted models.
+    assert invoke.call_count == 1
+    assert calls == ["model-a", "model-b"][: len(chain)]
+    message = _assert_semantic_stop(error)
+    assert _SELECTOR in message
+    # Earlier attempts reach the operator log, never the final reason.
+    assert "invalid_output" not in message
+    assert any("outcome=semantic_evidence_rejection" in line for line in logged)
+    assert any("repair chain stopped" in line for line in logged)
+
+
+def test_all_invalid_repair_chain_keeps_repair_invocation_failure_text(
+    tmp_path, monkeypatch, real_repair
+):
+    _cli_repair(monkeypatch, [(_MASKED, 0), (_MASKED, 0)])
+    response, error, invoke, _ = _run_masked(
+        tmp_path, [[_observation()]], [_result(_MASKED)] * 2, retries=0, **_codex_repair()
+    )
+    assert response is None
+    message = str(error)
+    assert "repair invocation failure" in message
+    assert "semantic-evidence-rejection" not in message
+
+
+def test_antigravity_timeout_repair_candidate_reports_semantic_rejection(
+    tmp_path, monkeypatch, real_repair
+):
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    runner = FakeRunner(
+        antigravity_catalog_outputs=[("Available models:\nModelA\nModelB\n", 0)],
+        antigravity_outputs=[("", None), ("", None)],
+        public_response_outputs=[{"text": _REJECTED_CANDIDATE}],
+    )
+    config = make_config(
+        tmp_path, agent_max_retries=1, repair_models=("ModelA",), antigravity_models=("ModelB",)
+    )
+    collision = [_observation(), _observation()]
+    with patch.object(
+        orchestrator_module, "run_agent_result", return_value=_result(_MASKED)
+    ) as invoke:
+        with pytest.raises(AgentInvocationError) as excinfo:
+            _run_validated_agent(
+                runner,
+                agent="claude",
+                config=config,
+                prompt="Implement the issue.",
+                marker_description="structured issue_implementation result",
+                validate=_sequenced_validator([collision], invoke),
+                role="coder",
+                use_repair=True,
+                repair_expected_kind="issue_implementation",
+            )
+    assert invoke.call_count == 1
+    _assert_semantic_stop(excinfo.value)
+    repairs = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"] and "models" not in cmd]
+    assert len(repairs) == 1
+
+
+def test_repair_surfaced_reaskable_rejection_reasks_coder_once_on_primary_session(
+    tmp_path, monkeypatch, real_repair
+):
+    calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
+    bad = [_observation(suite_start="unknown")]
+    response, error, invoke, logged = _run_masked(
+        tmp_path,
+        [bad, [_observation()]],
+        [_result(_MASKED, session_id="primary"), _result()],
+        reask=True,
+        retries=0,
+        **_codex_repair(),
+    )
+    assert error is None
+    assert calls == ["model-a"]
+    assert invoke.call_count == 2
+    second = invoke.call_args_list[1].kwargs
+    assert second["session_id"] == "primary"
+    assert "Previous response not accepted: test evidence" in second["prompt"]
+    assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
+    assert any("re-asking the coder once" in line for line in logged)
+
+
+def test_repair_surfaced_rejection_after_consumed_reask_stops(tmp_path, monkeypatch, real_repair):
+    calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0), (_REJECTED_CANDIDATE, 0)])
+    bad = [_observation(suite_start="unknown")]
+    response, error, invoke, _ = _run_masked(
+        tmp_path,
+        [bad],
+        [_result(_MASKED), _result(_MASKED), _result(_MASKED)],
+        reask=True,
+        retries=1,
+        **_codex_repair(),
+    )
+    assert response is None
+    # One primary turn plus the single re-ask; agent_max_retries is unspent.
+    assert invoke.call_count == 2
+    assert calls == ["model-a", "model-a"]
+    _assert_semantic_stop(error)
+
+
+def test_repair_surfaced_collision_is_never_reasked(tmp_path, monkeypatch, real_repair):
+    _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
+    collision = [_observation(), _observation()]
+    response, error, invoke, _ = _run_masked(
+        tmp_path, [collision], [_result(_MASKED), _result()], reask=True, **_codex_repair()
+    )
+    assert invoke.call_count == 1
+    _assert_semantic_stop(error)
+
+
+def _legacy_hook(candidate):
+    return lambda raw, cmd, **kwargs: candidate
+
+
+def test_legacy_hook_candidate_rejection_is_terminal_semantic_attempt(tmp_path, monkeypatch):
+    from coding_review_agent_loop.validated_agent import _run_structured_repair
+
+    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    repaired, marker, attempts = _run_structured_repair(
+        _MASKED,
+        runner=FakeRunner(),
+        config=make_config(tmp_path),
+        usage_context=None,
+        validate=_validator([_observation(outcome="failed")]),
+        repair_kwargs={"expected_kind": "issue_implementation"},
+    )
+    assert (repaired, marker) == (None, None)
+    assert [a.outcome for a in attempts] == ["semantic_evidence_rejection"]
+    assert attempts[0].evidence_rejection.reason == "non-passing-selector"
+    assert attempts[0].fallback_planned is False
+
+
+def test_legacy_hook_non_evidence_failure_stays_invalid_output(tmp_path, monkeypatch):
+    from coding_review_agent_loop.validated_agent import _run_structured_repair
+
+    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_MASKED))
+    repaired, marker, attempts = _run_structured_repair(
+        _MASKED,
+        runner=FakeRunner(),
+        config=make_config(tmp_path),
+        usage_context=None,
+        validate=_validator([_observation()]),
+        repair_kwargs={"expected_kind": "issue_implementation"},
+    )
+    assert repaired == _MASKED
+    assert marker is None
+    assert [a.outcome for a in attempts] == ["invalid_output"]
+    assert attempts[0].evidence_rejection is None
+
+
+def test_legacy_hook_rejection_routes_through_validated_agent(tmp_path, monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    collision = [_observation(), _observation()]
+    response, error, invoke, _ = _run_masked(tmp_path, [collision], [_result(_MASKED)] * 3)
+    assert invoke.call_count == 1
+    _assert_semantic_stop(error)
+
+
+def test_legacy_hook_reaskable_rejection_reasks_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    bad = [_observation(suite_start="unknown")]
+    response, error, invoke, _ = _run_masked(
+        tmp_path, [bad, [_observation()]], [_result(_MASKED), _result()], reask=True, retries=0
+    )
+    assert error is None
+    assert invoke.call_count == 2

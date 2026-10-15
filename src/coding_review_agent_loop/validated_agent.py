@@ -402,6 +402,23 @@ def _run_structured_repair(
                 )
             elif forbid:
                 require_repair_architecture_impact_absent(repaired)
+        except NonRepairableEvidenceRejection as exc:
+            # Same terminal shape as execute_repair (#999): the rejection is an
+            # authority decision on the coder's claims, not invalid output.
+            return None, None, [
+                RepairAttemptResult(
+                    backend="gemini",
+                    model="legacy-test-hook",
+                    prompt="",
+                    output=repaired,
+                    returncode=0,
+                    outcome="semantic_evidence_rejection",
+                    diagnostic=str(exc),
+                    log_path=None,
+                    fallback_planned=False,
+                    evidence_rejection=exc,
+                )
+            ]
         except AgentLoopError as exc:
             return repaired, None, [
                 RepairAttemptResult(
@@ -447,6 +464,55 @@ def _run_structured_repair(
         forbid_architecture_impact=forbid,
         candidate_refusal=candidate_refusal,
         **repair_kwargs,
+    )
+
+
+def _terminal_repair_evidence_rejection(
+    attempts: Sequence[RepairAttemptResult],
+) -> NonRepairableEvidenceRejection | None:
+    """Return the evidence rejection that stopped a repair chain, if any (#999).
+
+    Every repair entry point converts a candidate-side
+    ``NonRepairableEvidenceRejection`` into the same terminal
+    ``semantic_evidence_rejection`` attempt; this is the one recognition point.
+    """
+    if not attempts:
+        return None
+    terminal = attempts[-1]
+    if terminal.outcome != "semantic_evidence_rejection":
+        return None
+    return terminal.evidence_rejection
+
+
+def _evidence_reask_eligible(
+    rejection: NonRepairableEvidenceRejection,
+    *,
+    opted_in: bool,
+    already_used: bool,
+    blocked: bool,
+) -> bool:
+    """Whether a semantic evidence rejection earns the single coder re-ask (#1240).
+
+    Shared by the direct path and a repair-surfaced rejection (#999), so both
+    spend the same one-per-invocation budget.
+    """
+    return (
+        opted_in
+        and not already_used
+        and rejection.reason in CITATION_REASKABLE_REASONS
+        and not blocked
+    )
+
+
+def _semantic_evidence_last_error(
+    rejection: NonRepairableEvidenceRejection, *, repair_surfaced: bool
+) -> str:
+    action = (
+        "repair chain stopped" if repair_surfaced else "repair skipped"
+    )
+    return (
+        f"{rejection} (semantic evidence rejection; "
+        f"{action} because reformatting cannot change it)"
     )
 
 
@@ -2391,13 +2457,15 @@ def _run_validated_agent(
                         # the coder's claims, so it cannot satisfy this; running
                         # it (and its fallback chain) only burns its timeout and
                         # then misreports the stop as that timeout (#990).
-                        if (
-                            reask_on_evidence_rejection
-                            and not evidence_reask_used
-                            and evidence_rejection.reason in CITATION_REASKABLE_REASONS
-                            and not public_text_is_transient
-                            and not marker_safety_failure
-                            and not response_failure_is_unsupported
+                        if _evidence_reask_eligible(
+                            evidence_rejection,
+                            opted_in=reask_on_evidence_rejection,
+                            already_used=evidence_reask_used,
+                            blocked=(
+                                public_text_is_transient
+                                or marker_safety_failure
+                                or response_failure_is_unsupported
+                            ),
                         ):
                             # A non-citable selected observation is missing
                             # judgement only the coder can supply (rerun and
@@ -2425,9 +2493,8 @@ def _run_validated_agent(
                             f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
                             "not repairable by reformatting, skipping repair pass",
                         )
-                        last_error = (
-                            f"{evidence_rejection} (semantic evidence rejection; "
-                            "repair skipped because reformatting cannot change it)"
+                        last_error = _semantic_evidence_last_error(
+                            evidence_rejection, repair_surfaced=False
                         )
                         last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
                         should_retry = False
@@ -2535,14 +2602,69 @@ def _run_validated_agent(
                         )
                         _log_repair_attempts(config, agent_name, repair_attempts)
                         terminal_repair = repair_attempts[-1] if repair_attempts else None
+                        # A repair candidate that exposed a semantic evidence
+                        # rejection stopped the chain (#999); it takes the same
+                        # #990/#1240 route as a direct rejection and outranks
+                        # every other post-repair classification.
+                        terminal_evidence_rejection = _terminal_repair_evidence_rejection(
+                            repair_attempts
+                        )
                         # A refused contract candidate outranks every later
                         # non-accepting failure in the same chain: it is a complete
                         # response whose only defect is the contract.
                         refused_contract = (
                             _refused_contract_attempt(repair_attempts)
-                            if repaired_marker is None else None
+                            if repaired_marker is None and terminal_evidence_rejection is None
+                            else None
                         )
-                        if refused_contract is not None:
+                        if terminal_evidence_rejection is not None:
+                            # The rejected candidate is never a plan-validation
+                            # exhaustion; earlier attempts were already logged
+                            # by _log_repair_attempts above.
+                            plan_validation_exhaustion = None
+                            plan_validation_capture_eligible = False
+                            if _evidence_reask_eligible(
+                                terminal_evidence_rejection,
+                                opted_in=reask_on_evidence_rejection,
+                                already_used=evidence_reask_used,
+                                blocked=(
+                                    public_text_is_transient
+                                    or marker_safety_failure
+                                    or response_failure_is_unsupported
+                                ),
+                            ):
+                                # Repair preserved the coder's own claims, so
+                                # the coder is re-asked on the primary turn's
+                                # session, never the repair session.
+                                evidence_reask_used = True
+                                pending_evidence_reask_detail = str(terminal_evidence_rejection)
+                                pending_evidence_reask_session = result.session_id or session_id
+                                if usage_record is not None:
+                                    usage_record.validation_status = "invalid"
+                                log(
+                                    config,
+                                    f"{agent_name}: semantic evidence rejected by the repair "
+                                    f"candidate ({terminal_evidence_rejection}); re-asking the "
+                                    "coder once to cite a verified passing observation"
+                                    + (
+                                        "; resuming session"
+                                        if pending_evidence_reask_session
+                                        else "; fresh turn"
+                                    ),
+                                )
+                                continue
+                            log(
+                                config,
+                                f"{agent_name}: semantic evidence rejected by the repair "
+                                f"candidate ({terminal_evidence_rejection}); repair chain stopped",
+                            )
+                            last_error = _semantic_evidence_last_error(
+                                terminal_evidence_rejection, repair_surfaced=True
+                            )
+                            last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
+                            should_retry = False
+                            last_failure_category = "deterministic"
+                        elif refused_contract is not None:
                             # Deterministic, never a repair-provider failure; the
                             # planning capture is built from the refused candidate
                             # itself so the retained candidate and records are kept.
@@ -2662,7 +2784,7 @@ def _run_validated_agent(
                                     # resumable provider failure, not a
                                     # deterministic plan-validation rejection.
                                     last_failure_category = "repair-provider-failure"
-                        if repaired is not None:
+                        if terminal_evidence_rejection is None and repaired is not None:
                             if repaired_marker is None:
                                 repair_detail = (
                                     repair_attempts[-1].diagnostic
@@ -2710,7 +2832,7 @@ def _run_validated_agent(
                                     model_used=result.model_used,
                                     **_response_identity_fields(result),
                                 )
-                        elif repair_attempts:
+                        elif terminal_evidence_rejection is None and repair_attempts:
                             details = "; ".join(
                                 f"{attempt.backend}/{attempt.model}: {attempt.outcome}"
                                 + (f" ({attempt.diagnostic})" if attempt.diagnostic else "")

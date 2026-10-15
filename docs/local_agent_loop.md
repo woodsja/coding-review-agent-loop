@@ -2083,7 +2083,11 @@ Catalog collisions and non-passing or non-authoritative in-catalog selectors
 are not repairable by reformatting, so they skip the structured repair pass
 and its model fallback chain entirely. The run reports `Failure category:
 semantic-evidence-rejection` with the selector named, rather than a repair
-timeout (#990).
+timeout (#990). If such a rejection is exposed only after a structured repair
+reshapes an envelope that normalization could not fix, the repair chain stops on
+that candidate, no fallback model runs, and the run is classified the same way
+(or takes the single opted-in coder re-ask), whatever the repair transport
+outcome was, including an Antigravity timeout or nonzero exit (#999).
 
 A PR review that leaves a carried prior item without a disposition is missing a
 judgement, not a format, so repair cannot supply it. The same reviewer is
