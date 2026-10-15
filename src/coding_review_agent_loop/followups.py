@@ -34,6 +34,7 @@ from .protocol_markers import TrustedBody, sanitize_historical_text
 from .semantic_dedupe import (
     BudgetExhausted,
     SemanticCandidate,
+    SemanticDedupeConfigurationError,
     SemanticDedupeMatcher,
     SemanticMatch,
     SemanticTransport,
@@ -801,10 +802,16 @@ def _semantic_batch_matcher(
             )
         except QuotaResetExceededError:
             raise
+        except SemanticDedupeConfigurationError:
+            raise
         except BudgetExhausted as exc:
             log(matcher.config, f"Approved follow-up semantic batch budget exhausted ({exc}); retaining deterministic groups")
         except Exception as exc:
-            log(matcher.config, f"Approved follow-up semantic batch matcher unavailable ({exc}); retaining deterministic groups")
+            log(
+                matcher.config,
+                f"Approved follow-up semantic batch matcher provider/environment failure ({exc}); "
+                "retaining deterministic groups",
+            )
         return None
 
     return match
@@ -1176,11 +1183,13 @@ def _find_existing_for_group(
         )
     except QuotaResetExceededError:
         raise
+    except SemanticDedupeConfigurationError:
+        raise
     except BudgetExhausted as exc:
         log(config, f"Approved follow-up semantic candidate budget exhausted ({exc}); using deterministic fallback")
         return "new", None, None
     except Exception as exc:
-        log(config, f"Approved follow-up semantic matcher unavailable ({exc}); using deterministic fallback")
+        log(config, f"Approved follow-up semantic matcher provider/environment failure ({exc}); using deterministic fallback")
         return "new", None, None
     if match.duplicate_of is None:
         return "new", None, None
@@ -1438,6 +1447,9 @@ def _publish_approved_followups(
             usage_context=usage_context,
             transport=semantic_transport,
         )
+        # Surface a clone configuration defect before any tracker search,
+        # issue creation, or audit comment (#884).
+        matcher.preflight()
         semantic_provider_matcher = matcher
         semantic_matcher = _semantic_batch_matcher(matcher, source_context=source_context)
     reconciliation = reconcile_approved_followups(
@@ -1730,6 +1742,10 @@ def _publish_plan_approved_followups(
             usage_context=usage_context,
             transport=semantic_transport,
         )
+        # Mirror the ``if sources`` reconciliation guard: a plan without future
+        # follow-ups never builds the clone and still posts its announcement.
+        if sources:
+            semantic_provider_matcher.preflight()
         semantic_matcher = _semantic_batch_matcher(
             semantic_provider_matcher,
             source_context=source_context,

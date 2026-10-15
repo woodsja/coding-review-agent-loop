@@ -1306,3 +1306,360 @@ def test_missing_body_key_on_a_later_page_fails_closed(tmp_path, issue_env):
     with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
         create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
     assert len(hub.creates) == 1
+
+
+# --- #884: configuration defects in the isolated dedupe clone fail loudly ---
+
+from coding_review_agent_loop import semantic_dedupe as _semantic_dedupe_module
+from coding_review_agent_loop.followups import (
+    _find_existing_for_group,
+    _publish_plan_approved_followups,
+)
+from coding_review_agent_loop.semantic_dedupe import (
+    BudgetExhausted,
+    SemanticDedupeConfigurationError,
+)
+
+
+def _break_isolated_clone(monkeypatch, calls: list[object] | None = None):
+    """Make deriving the isolated clone fail like the #856 validation defect."""
+
+    def failing_replace(config, **values):
+        if calls is not None:
+            calls.append(values)
+        raise AgentLoopError("primary-then-panel requires at least two reviewers")
+
+    monkeypatch.setattr(_semantic_dedupe_module, "replace", failing_replace)
+
+
+def _record_mkdtemp(monkeypatch) -> list[str]:
+    created: list[str] = []
+    real_mkdtemp = _semantic_dedupe_module.tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(
+        _semantic_dedupe_module,
+        "tempfile",
+        SimpleNamespace(mkdtemp=recording_mkdtemp),
+    )
+    return created
+
+
+def _fail_mkdtemp(monkeypatch):
+    def failing_mkdtemp(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(
+        _semantic_dedupe_module,
+        "tempfile",
+        SimpleNamespace(mkdtemp=failing_mkdtemp),
+    )
+
+
+def test_isolated_config_defect_is_classified_and_cleans_up(tmp_path, monkeypatch):
+    """`clone-config-defect-classified` (#884)."""
+    import os
+
+    created = _record_mkdtemp(monkeypatch)
+    _break_isolated_clone(monkeypatch)
+
+    with pytest.raises(SemanticDedupeConfigurationError) as raised:
+        _isolated_provider_config(make_config(tmp_path), "claude", "")
+
+    assert isinstance(raised.value, AgentLoopError)
+    assert isinstance(raised.value.__cause__, AgentLoopError)
+    assert "two reviewers" in str(raised.value.__cause__)
+    assert "'claude'" in str(raised.value)
+    assert len(created) == 1
+    assert not os.path.exists(created[0])
+
+
+def test_isolated_config_does_not_classify_mkdtemp_oserror(tmp_path, monkeypatch):
+    """`clone-config-defect-classified` (#884): environmental failures stay unwrapped."""
+    _fail_mkdtemp(monkeypatch)
+
+    with pytest.raises(OSError) as raised:
+        _isolated_provider_config(make_config(tmp_path), "claude", "")
+
+    assert not isinstance(raised.value, SemanticDedupeConfigurationError)
+
+
+def test_preflight_raises_for_broken_clone_with_default_transport(tmp_path, monkeypatch):
+    _break_isolated_clone(monkeypatch)
+    matcher = SemanticDedupeMatcher(runner=FakeRunner(), config=make_config(tmp_path))
+
+    with pytest.raises(SemanticDedupeConfigurationError):
+        matcher.preflight()
+    assert matcher.calls == 0
+
+
+def test_preflight_is_inert_for_injected_transport(tmp_path, monkeypatch):
+    """`preflight-injected-and-valid` (#884)."""
+    clone_calls: list[object] = []
+    _break_isolated_clone(monkeypatch, clone_calls)
+    transport_calls: list[object] = []
+    runner = FakeRunner()
+    matcher = SemanticDedupeMatcher(
+        runner=runner,
+        config=make_config(tmp_path),
+        transport=lambda *args: transport_calls.append(args),
+    )
+
+    assert matcher.preflight() is True
+    assert transport_calls == []
+    assert clone_calls == []
+    assert matcher.calls == 0
+    assert runner.commands == []
+
+
+def test_preflight_passes_valid_primary_then_panel_config(tmp_path, monkeypatch):
+    """`preflight-injected-and-valid` (#884): the #856 configuration preflights cleanly."""
+    import os
+
+    created = _record_mkdtemp(monkeypatch)
+    runner = FakeRunner()
+    config = make_config(
+        tmp_path,
+        reviewer=("codex", "claude"),
+        pr_review_policy="primary-then-panel",
+        primary_reviewer="codex",
+        semantic_followup_backend="claude",
+    )
+    matcher = SemanticDedupeMatcher(runner=runner, config=config)
+
+    assert matcher.transport is default_semantic_transport
+    assert matcher.preflight() is True
+    assert matcher.calls == 0
+    assert runner.commands == []
+    assert len(created) == 1
+    assert not os.path.exists(created[0])
+
+
+def test_preflight_logs_environmental_failure_and_returns_false(tmp_path, monkeypatch, capsys):
+    _fail_mkdtemp(monkeypatch)
+    matcher = SemanticDedupeMatcher(runner=FakeRunner(), config=make_config(tmp_path, quiet=False))
+
+    assert matcher.preflight() is False
+    assert matcher.calls == 0
+    assert "preflight hit an environmental failure" in capsys.readouterr().err
+
+
+def _two_batch_groups():
+    return (
+        GroupedApprovedFollowup(
+            text="Preserve recovery artifacts for files that never enter the index.",
+            items=(ApprovedFollowup(reviewer="Gemini", text="Preserve recovery artifacts."),),
+        ),
+    )
+
+
+def _raising_matcher(tmp_path, error, *, quiet=True):
+    def transport(*_args):
+        raise error
+
+    return SemanticDedupeMatcher(
+        runner=FakeRunner(),
+        config=make_config(tmp_path, approved_followups="issue", quiet=quiet),
+        transport=transport,
+    )
+
+
+def test_semantic_batch_matcher_reraises_configuration_error(tmp_path):
+    """`callsite-reraise` (#884): the batch call site."""
+    error = SemanticDedupeConfigurationError("broken clone")
+    match = _semantic_batch_matcher(_raising_matcher(tmp_path, error), source_context=_source(parent=473))
+
+    with pytest.raises(SemanticDedupeConfigurationError) as raised:
+        match(ApprovedFollowup(reviewer="Claude", text="later"), _two_batch_groups())
+    assert raised.value is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    (RuntimeError("provider timed out"), AgentLoopError("invalid semantic dedupe JSON")),
+)
+def test_semantic_batch_matcher_keeps_provider_failure_fallback(tmp_path, capsys, error):
+    """`provider-failure-fallback` (#884): the batch call site."""
+    match = _semantic_batch_matcher(
+        _raising_matcher(tmp_path, error, quiet=False),
+        source_context=_source(parent=473),
+    )
+
+    assert match(ApprovedFollowup(reviewer="Claude", text="later"), _two_batch_groups()) is None
+    assert "provider/environment failure" in capsys.readouterr().err
+
+
+def test_semantic_batch_matcher_budget_and_quota_unchanged(tmp_path):
+    """`provider-failure-fallback` (#884): budget and quota handling are unchanged."""
+    budget = _semantic_batch_matcher(
+        _raising_matcher(tmp_path, BudgetExhausted("spent")), source_context=_source(parent=473)
+    )
+    assert budget(ApprovedFollowup(reviewer="Claude", text="later"), _two_batch_groups()) is None
+    quota = _semantic_batch_matcher(
+        _raising_matcher(tmp_path, QuotaResetExceededError("far")), source_context=_source(parent=473)
+    )
+    with pytest.raises(QuotaResetExceededError):
+        quota(ApprovedFollowup(reviewer="Claude", text="later"), _two_batch_groups())
+
+
+def _find_existing_with(tmp_path, matcher):
+    from coding_review_agent_loop.github import FoundIssue
+
+    return _find_existing_for_group(
+        FakeRunner(),
+        config=matcher.config,
+        followup=ApprovedFollowup(reviewer="Claude", text="Capture salvage recovery artifacts"),
+        candidates=(
+            FoundIssue(
+                number=484,
+                title="Follow up future plan-review note: salvage recovery",
+                url="https://github.com/OWNER/REPO/issues/484",
+                body="Future follow-up from approved planning for issue #473. salvage recovery artifacts",
+            ),
+        ),
+        source_context=_source(parent=473),
+        matcher=matcher,
+        revalidated=set(),
+    )
+
+
+def test_find_existing_for_group_reraises_configuration_error(tmp_path):
+    """`callsite-reraise` (#884): the existing-issue call site."""
+    error = SemanticDedupeConfigurationError("broken clone")
+    matcher = _raising_matcher(tmp_path, error)
+
+    with pytest.raises(SemanticDedupeConfigurationError) as raised:
+        _find_existing_with(tmp_path, matcher)
+    assert raised.value is error
+    assert matcher.calls == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    (RuntimeError("provider timed out"), AgentLoopError("invalid semantic dedupe JSON")),
+)
+def test_find_existing_for_group_keeps_provider_failure_fallback(tmp_path, capsys, error):
+    """`provider-failure-fallback` (#884): the existing-issue call site."""
+    matcher = _raising_matcher(tmp_path, error, quiet=False)
+
+    assert _find_existing_with(tmp_path, matcher) == ("new", None, None)
+    assert matcher.calls == 1
+    assert "provider/environment failure" in capsys.readouterr().err
+
+
+def test_find_existing_for_group_budget_and_quota_unchanged(tmp_path):
+    """`provider-failure-fallback` (#884): budget and quota handling are unchanged."""
+    assert _find_existing_with(tmp_path, _raising_matcher(tmp_path, BudgetExhausted("spent"))) == (
+        "new",
+        None,
+        None,
+    )
+    with pytest.raises(QuotaResetExceededError):
+        _find_existing_with(tmp_path, _raising_matcher(tmp_path, QuotaResetExceededError("far")))
+
+
+_ENV_FOLLOWUPS = (
+    "Preserve recovery artifacts for files that never enter the index.",
+    "Bound the remaining tool-created comment bodies.",
+)
+
+
+def _publish_pr_followups(runner, config, texts=_ENV_FOLLOWUPS):
+    return _publish_approved_followups(
+        runner,
+        config=config,
+        pr_number=488,
+        head_sha="head-488",
+        pr_comments=[],
+        followups=[ApprovedFollowup(reviewer="Claude", text=text) for text in texts],
+        source_context=_source(parent=473),
+    )
+
+
+def _publish_plan_followups(runner, config, *, sources=None, texts=_ENV_FOLLOWUPS):
+    from coding_review_agent_loop.followups import PlanApprovedFollowupSource
+
+    if sources is None:
+        sources = [
+            PlanApprovedFollowupSource(item_id=f"item-{index}", reviewer="codex", source_round=1, text=text)
+            for index, text in enumerate(texts, start=1)
+        ]
+    return _publish_plan_approved_followups(
+        runner,
+        config=config,
+        issue_number=884,
+        approved_plan="Approved plan summary.",
+        plan_hash="5bc5e322dc57a74d",
+        plan_subject="subject-884",
+        issue_comments=[],
+        sources=sources,
+        source_context=_source(parent=884),
+    )
+
+
+@pytest.mark.parametrize("entry", ("pr", "plan"))
+def test_publication_preflight_stops_before_github_side_effects(tmp_path, monkeypatch, entry):
+    """`preflight-before-writes` (#884)."""
+    _break_isolated_clone(monkeypatch)
+    # A single follow-up never reaches the batch matcher, and the tracker
+    # search would run before any per-call matcher, so only the preflight
+    # can stop publication before the first GitHub call.
+    runner = FakeRunner()
+    config = make_config(tmp_path, approved_followups="issue")
+    assert config.semantic_followup_dedupe
+
+    with pytest.raises(SemanticDedupeConfigurationError):
+        if entry == "pr":
+            _publish_pr_followups(runner, config, texts=_ENV_FOLLOWUPS[:1])
+        else:
+            _publish_plan_followups(runner, config, texts=_ENV_FOLLOWUPS[:1])
+
+    assert runner.search_issues_calls == []
+    assert runner.issues == []
+    assert runner.comments == []
+    assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("entry", ("pr", "plan"))
+def test_publication_environmental_preflight_failure_keeps_fallback(tmp_path, monkeypatch, capsys, entry):
+    """`preflight-environmental-fallback` (#884)."""
+    _fail_mkdtemp(monkeypatch)
+    runner = FakeRunner(issue_urls=[
+        "https://github.com/OWNER/REPO/issues/901",
+        "https://github.com/OWNER/REPO/issues/902",
+    ])
+    config = make_config(tmp_path, approved_followups="issue", quiet=False)
+
+    if entry == "pr":
+        assert _publish_pr_followups(runner, config) is True
+        record = "AGENT_APPROVED_FOLLOWUPS"
+    else:
+        assert _publish_plan_followups(runner, config) is True
+        record = "AGENT_PLAN_APPROVED_FOLLOWUPS"
+
+    err = capsys.readouterr().err
+    assert "preflight hit an environmental failure" in err
+    # The per-call matcher hit the same OSError and kept deterministic groups.
+    assert "provider/environment failure" in err
+    assert len(runner.issues) == len(_ENV_FOLLOWUPS)
+    assert runner.comments
+    assert record in runner.comments[-1]
+
+
+def test_plan_publication_without_sources_skips_preflight(tmp_path, monkeypatch):
+    """`plan-preflight-empty-sources` (#884)."""
+    clone_calls: list[object] = []
+    _break_isolated_clone(monkeypatch, clone_calls)
+    runner = FakeRunner()
+    config = make_config(tmp_path, approved_followups="issue")
+
+    assert _publish_plan_followups(runner, config, sources=[]) is True
+
+    assert clone_calls == []
+    assert runner.issues == []
+    assert runner.comments
+    assert runner.comments[-1].startswith("Planning complete for issue #884.")
