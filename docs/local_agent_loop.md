@@ -4025,6 +4025,68 @@ as a reviewer-owned `step_back_entries` field on the planner record; a malformed
 entry suppresses the trigger and the stop with a log line rather than failing the
 run.
 
+#### Plan sweep trigger and finding provenance
+
+The step-back arms only after a one-shot plan crosses a plan-growth signal, so a
+primary that raises new findings round after round on a plan that stays below
+the signals is never stopped by it (#1505). Under `--plan-review-policy
+primary-then-panel` two more flags address that pattern. Neither stops a run.
+
+- `--plan-sweep-rounds K` (default 2, `0` disables). Once the primary has
+  blocked K consecutive primary-phase rounds with new mandatory findings, its
+  next review prompt carries a sweep request. The request lists the finding
+  classes it already raised (the newest 12 IDs and first lines, with an
+  `and N more` line for the rest) and asks for one exhaustive pass over the
+  whole plan that reports every remaining in-scope defect, including siblings
+  of the listed classes, in that review. The blocking-scope rules, the
+  same-plan/future classification and the approval rules are unchanged. The
+  request is repeated on every later primary round while the streak continues.
+  It is independent of the plan-growth gate and of `--plan-step-back-rounds`;
+  when both apply in one round the reviewer sees the step-back notice and the
+  sweep request, and the step-back counts are unaffected. The planner and the
+  secondary panel never see it, and it stops once the panel opens.
+- `--plan-sweep-reasoning-effort LEVEL` (off by default). Runs only the
+  primary's sweep turn at this effort, in a fresh provider session, and its
+  signature reports that effort. Every other turn keeps its configured effort.
+  The value must be supported by the primary's backend (Codex or Claude) and is
+  rejected before any agent turn otherwise; a Gemini or Antigravity primary
+  ignores it with a log line.
+
+Both flags require `--plan-review-policy primary-then-panel` when set to a
+non-default value, and child-planning cycles inherit them.
+
+A review counts toward K when the primary blocked and at least one of its new
+`blocking`/`same-plan` items counts. Future follow-ups never count, and neither
+does a new finding whose normalized text repeats a carried unresolved item: the
+orchestrator marks it at minting with `repeat_of` (the duplicate stays an
+ordinary finding for the planner). On a review after the primary's first, a
+finding tagged `revision_introduced` does not count; untagged findings do, so
+omitting the tag cannot suppress the trigger. On the primary's first review
+every mandatory finding counts whatever its tag. A repeat-only, future-only,
+approved or unresolvable review ends the streak, and so does a round with no
+counted primary review. The streak uses the step-back's retirement rules: an
+issue edit, a `--plan-reset-stall-streak` checkpoint (the reset round itself
+gets no sweep), a panel opening, a phase-advance or invalid scheduler record, or
+a review without its same-round primary checkpoint retires it. The decision is
+derived from durable round records, so a resumed run asks for the same sweep.
+The orchestrator records `plan_sweep: true` on the swept primary review record.
+
+**Finding provenance.** Under `primary-then-panel`, each plan review prompt
+after the reviewer's first carries a previous-plan baseline: a unified diff
+(3 context lines, at most 12000 characters) from the plan that reviewer last
+reviewed, resolved from the durable planner record by plan subject and hash,
+to the current plan. It is rebuilt from GitHub records, so compact prompts,
+fresh sessions and resumed runs get the same baseline. Reviewers tag each new
+`blocking_plan_issues` and `same_plan_followups` finding object with
+`"provenance": "revision_introduced"` (a change in the diff introduced it) or
+`"pre_existing"` (it was already in the plan they last reviewed). A first
+review, an unavailable or oversized baseline, and future follow-ups carry no
+tag. The tag is advisory telemetry: it never changes classification or
+approval, it is persisted on the minted item as `provenance`, and each plan
+round logs, per reviewer, its new mandatory findings by provenance with the
+repeat count, the first-review flag and the sweep flag. The
+[outcome history export](#outcome-history-export) reports the counts.
+
 #### Proactive generalization guidance and finding history
 
 The step-back trigger above is reactive. Independently of it, every planner
@@ -4868,6 +4930,16 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   closed issue, or a recognized stop as the newest workflow event (operator
   comments from the same account are not workflow events). Without one, the
   value is `null`, never a zero.
+- `plan_findings_pre_existing`, `plan_findings_revision_introduced` and
+  `plan_findings_untagged` (#1505) count the new mandatory plan findings each
+  reviewer raised on its non-first plan reviews (the latest record per reviewer
+  and round), by their `provenance` tag. First reviews are excluded, since
+  nothing they raise can have been drip-fed, and so are future follow-ups and
+  findings marked `repeat_of`. Unlike the sweep trigger, `revision_introduced`
+  findings are counted in their own column. `plan_sweep_reviews` counts the
+  reviews whose record carries `plan_sweep: true`. All four follow the
+  `plan_rounds` evidence rule; the three finding counts are `unavailable` when a
+  provisional publication record has no later reconciliation.
 - `step_backs` classifies each counted round. A round is in the step-back era
   when one of its records carries step-back data or a field that postdates
   step-back recording. It is pre-feature when every record comment of the
@@ -7768,6 +7840,13 @@ after the text fields and before `Sub-items:`, as lines such as
 so unknown IDs never fail. A finding with only reference keys still has no text
 field and is rejected. `depends_on_stage_ids` is deliberately not accepted
 (it is a stage-to-stage relation; use `stage_ids`).
+
+A finding object may also carry an optional `provenance` key (#1505) with
+exactly `revision_introduced` or `pre_existing`. It is never folded into the
+finding text. Any other value, or a non-string, drops only the tag (the finding
+stays, untagged) with a logged parse degradation; it never rejects the review.
+PR review findings do not accept it. See
+[plan sweep trigger and finding provenance](#plan-sweep-trigger-and-finding-provenance).
 
 #### Unknown finding keys (#1328)
 

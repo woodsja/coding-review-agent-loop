@@ -2388,3 +2388,421 @@ def test_resolving_one_sub_item_per_turn_is_progress_not_non_convergence():
     stuck[1] = reviews[1]
     result = _nc_find(_nc_history(stuck))
     assert result is not None and [i.item_id for i in result.items] == ["item-1"]
+
+
+# --- Plan sweep trigger and finding provenance (#1505) -----------------------
+
+from coding_review_agent_loop.prompts import build_plan_review_prompt  # noqa: E402
+from coding_review_agent_loop.review_step_back import (  # noqa: E402
+    BASELINE_STATUS_AVAILABLE,
+    BASELINE_STATUS_FIRST_REVIEW,
+    BASELINE_STATUS_UNAVAILABLE,
+    PROVENANCE_BASELINE_DIFF_LIMIT,
+    PlanBaseline,
+    classify_sweep_review,
+    count_sweep_items,
+    derive_plan_sweep_state,
+    eligible_new_mandatory_items,
+    plan_sweep_due,
+    plan_sweep_finding_classes,
+    render_plan_sweep_guidance,
+    render_provenance_baseline_block,
+    reviewer_previous_plan_baseline,
+)
+from coding_review_agent_loop.round_state import _plan_subject  # noqa: E402
+from dataclasses import replace as dataclasses_replace  # noqa: E402
+
+PRE = "pre_existing"
+INTRO = "revision_introduced"
+
+
+def _tagged(n, *, provenance=None, repeat_of=None, status="blocking", reviewer=PRIMARY):
+    return UnresolvedReviewItem(
+        item_id=f"item-{n}",
+        reviewer=reviewer,
+        source_round=n,
+        text=f"Gap {n}\nmore detail",
+        status=status,
+        provenance=provenance,
+        repeat_of=repeat_of,
+    )
+
+
+def _sweep_chain(spec):
+    """``spec`` is ``[(round, review_kwargs), ...]``; each review gets its checkpoint."""
+    records = []
+    index = 0
+    for number, kwargs in spec:
+        records.append(_checkpoint(index, number, digest=DIGEST))
+        records.append(_review(index + 1, number, **kwargs))
+        index += 2
+    return records
+
+
+def _sweep(records, **kwargs):
+    kwargs.setdefault("current_issue_digest", DIGEST)
+    return derive_plan_sweep_state(records, primary=PRIMARY, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("items", "first_review", "expected_eligible", "expected_count"),
+    [
+        ([_tagged(1, provenance=PRE)], False, 1, 1),
+        ([_tagged(1)], False, 1, 1),
+        ([_tagged(1, provenance=INTRO)], False, 1, 0),
+        # A first review counts every eligible finding whatever its tag.
+        ([_tagged(1, provenance=INTRO)], True, 1, 1),
+        ([_tagged(1, repeat_of="item-0")], False, 0, 0),
+        ([_tagged(1, repeat_of="item-0"), _tagged(2, provenance=PRE)], False, 1, 1),
+        ([_tagged(1, status="future")], False, 0, 0),
+        ([_tagged(1, status="same-plan", provenance=PRE)], False, 1, 1),
+        ([_tagged(1, reviewer="Gemini")], False, 0, 0),
+    ],
+)
+def test_sweep_counting_shares_eligibility_and_excludes_only_later_revision_items(
+    items, first_review, expected_eligible, expected_count
+):
+    """`streak-breakers`, `first-review-normalization`: the counting predicate."""
+    assert len(eligible_new_mandatory_items(items, reviewer=PRIMARY)) == expected_eligible
+    assert (
+        count_sweep_items(items, reviewer=PRIMARY, first_review=first_review)
+        == expected_count
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "items", "first_review", "expected"),
+    [
+        ("blocking", [_tagged(1, provenance=PRE)], False, CLASS_NEW_FINDING),
+        ("blocking", [_tagged(1)], False, CLASS_NEW_FINDING),
+        ("blocking", [_tagged(1, provenance=INTRO)], False, CLASS_REPEAT_ONLY),
+        ("blocking", [_tagged(1, provenance=INTRO)], True, CLASS_NEW_FINDING),
+        ("blocking", [_tagged(1, repeat_of="item-0")], False, CLASS_REPEAT_ONLY),
+        ("blocking", [_tagged(1, status="future")], False, CLASS_REPEAT_ONLY),
+        ("blocking", [], False, CLASS_REPEAT_ONLY),
+        ("blocking", None, False, CLASS_BLOCKING_UNRESOLVED),
+        ("approved", [], False, CLASS_APPROVED),
+        ("needs-human", [], False, CLASS_OTHER),
+    ],
+)
+def test_classify_sweep_review(state, items, first_review, expected):
+    metadata = _review(0, 2, state=state).metadata
+    assert classify_sweep_review(metadata, items, first_review=first_review) == expected
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_sweep_streak_is_due_after_k_counting_blocks(k):
+    records = _sweep_chain(
+        [(n, {"items": [_tagged(n, provenance=PRE if n > 1 else None)]}) for n in (1, 2, 3)]
+    )
+    state = _sweep(records)
+    assert [state.streak_before(r) for r in (1, 2, 3, 4)] == [0, 1, 2, 3]
+    assert plan_sweep_due(state, round_number=k + 1, sweep_rounds=k)
+    assert not plan_sweep_due(state, round_number=k, sweep_rounds=k)
+    assert not plan_sweep_due(state, round_number=4, sweep_rounds=0)
+
+
+@pytest.mark.parametrize(
+    "breaker",
+    [
+        {"items": [_tagged(2, repeat_of="item-1")]},  # re-emitted carried item
+        {"items": [_tagged(2, status="future")]},  # future-only
+        {"items": []},  # repeat-only: carried blocker kept, nothing new
+        {"state": "approved"},
+        {"items": [_tagged(2, provenance=INTRO)]},  # revision-introduced only
+    ],
+)
+def test_non_counting_primary_reviews_end_the_sweep_streak(breaker):
+    """`streak-breakers`."""
+    records = _sweep_chain(
+        [
+            (1, {"items": [_tagged(1)]}),
+            (2, breaker),
+            (3, {"items": [_tagged(3, provenance=PRE)]}),
+        ]
+    )
+    state = _sweep(records)
+    assert state.streak_before(3) == 0
+    assert state.streak_before(4) == 1
+    assert not plan_sweep_due(state, round_number=4, sweep_rounds=2)
+
+
+def test_an_unresolvable_publication_record_ends_the_sweep_streak():
+    publication = PostedRoundRecord(
+        index=3,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="reviewer", agent=PRIMARY, round_number=2,
+            subject="plan", state="blocking", phase="publication",
+        ),
+        body="",
+    )
+    records = [
+        *_sweep_chain([(1, {"items": [_tagged(1)]})]),
+        _checkpoint(2, 2, digest=DIGEST),
+        publication,
+    ]
+    state = _sweep(records)
+    assert state.reviews[-1].classification == CLASS_BLOCKING_UNRESOLVED
+    assert state.streak_before(3) == 0
+
+
+def test_a_round_without_a_counted_primary_review_ends_the_sweep_streak():
+    records = _sweep_chain(
+        [(1, {"items": [_tagged(1)]}), (3, {"items": [_tagged(3, provenance=PRE)]})]
+    )
+    assert _sweep(records).streak_before(4) == 1
+
+
+def test_first_review_revision_tags_are_ignored_for_the_sweep_count():
+    """`first-review-normalization`: round 1 counts despite its revision tags."""
+    records = _sweep_chain(
+        [
+            (1, {"items": [_tagged(1, provenance=INTRO), _tagged(2, provenance=INTRO)]}),
+            (2, {"items": [_tagged(3, provenance=PRE)]}),
+        ]
+    )
+    state = _sweep(records)
+    assert state.streak_before(3) == 2
+    assert plan_sweep_due(state, round_number=3, sweep_rounds=2)
+
+
+def _two_counting_rounds():
+    return _sweep_chain(
+        [(1, {"items": [_tagged(1)]}), (2, {"items": [_tagged(2, provenance=PRE)]})]
+    )
+
+
+def test_sweep_retirement_matches_the_step_back_rules():
+    """`retirement-rules`: edit, reset, panel opening, phase advance, missing checkpoint."""
+    base = _two_counting_rounds()
+    assert _sweep(base).streak_before(3) == 2
+
+    # An issue edit retires reviews judged against the older text.
+    assert _sweep(base, current_issue_digest="fedcba9876543210").streak_before(3) == 0
+    # The operator reset checkpoint of round 3 retires every earlier round.
+    reset = [*base, _checkpoint(10, 3, digest=DIGEST, reset=True)]
+    assert _sweep(reset).streak_before(3) == 0
+    # Nothing at or after a panel opening counts (the loop also never sweeps
+    # once the panel is open).
+    assert _sweep(base, panel_opening_index=2).streak_before(3) == 1
+    assert _sweep(base, panel_opening_index=0).streak_before(3) == 0
+    # A phase-advance record is a history boundary.
+    advance = PostedRoundRecord(
+        index=10,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=2,
+            subject="plan", phase="plan-phase-advance",
+        ),
+        body="",
+    )
+    assert _sweep([*base, advance]).streak_before(3) == 0
+    # A review without its same-round primary checkpoint ends the streak.
+    unqualified = [record for record in base if record.index != 2]
+    assert _sweep(unqualified).streak_before(3) == 0
+    for records, kwargs in (
+        (base, {}),
+        (base, {"current_issue_digest": "fedcba9876543210"}),
+        (reset, {}),
+        (base, {"panel_opening_index": 2}),
+        ([*base, advance], {}),
+        (unqualified, {}),
+    ):
+        step_back_kwargs = {"current_issue_digest": DIGEST, **kwargs}
+        assert (
+            derive_plan_step_back_state(records, primary=PRIMARY, **step_back_kwargs).streak_since(1)
+            == _sweep(records, **kwargs).streak_before(3)
+        )
+
+
+def test_degraded_history_suppresses_the_sweep():
+    records = [*_two_counting_rounds(), _coder(10, 3, status="invalid")]
+    state = _sweep(records)
+    assert state.degraded
+    assert not plan_sweep_due(state, round_number=3, sweep_rounds=2)
+
+
+def test_step_back_state_is_unchanged_by_the_shared_walk_and_sweep_fields():
+    """`growth-independence` (B): provenance and sweep fields never move the step-back."""
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
+    plain = [
+        *_chain([1, 2]),
+        _coder(10, 3, entries=[entry]),
+        _checkpoint(11, 3, digest=DIGEST),
+        _review(12, 3, items=[_new(3)]),
+    ]
+    tagged = [
+        PostedRoundRecord(
+            index=record.index,
+            metadata=dataclasses_replace(
+                record.metadata,
+                plan_sweep=record.metadata.role == "reviewer",
+                new_items=tuple(
+                    dataclasses_replace(item, provenance=INTRO) for item in record.metadata.new_items
+                ),
+            ),
+            body=record.body,
+        )
+        for record in plain
+    ]
+    expected = derive_plan_step_back_state(plain, primary=PRIMARY, current_issue_digest=DIGEST)
+    assert expected.episode is not None and expected.episode.candidate_round == 3
+    assert expected.escalation_count == 1
+    assert [r.classification for r in expected.reviews] == [CLASS_NEW_FINDING] * 3
+    assert (
+        derive_plan_step_back_state(tagged, primary=PRIMARY, current_issue_digest=DIGEST)
+        == expected
+    )
+
+
+def test_sweep_is_independent_of_the_plan_growth_gate(tmp_path):
+    """`growth-independence` (A): no crossing, so no step-back, yet the sweep is due."""
+    records = _two_counting_rounds()
+    step_back = plan_stall_step_back_disposition(
+        derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=DIGEST),
+        round_number=3,
+        crossing_round=None,
+        growth_gate_enforced=True,
+        step_back_rounds=2,
+        escalation_rounds=2,
+    )
+    assert step_back.kind == DISPOSITION_NOT_APPLICABLE
+    assert plan_sweep_due(_sweep(records), round_number=3, sweep_rounds=2)
+
+
+def test_sweep_and_step_back_notice_coexist_in_the_primary_prompt(tmp_path):
+    """`growth-independence` (B): both blocks render in one primary prompt."""
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    prompt = build_plan_review_prompt(
+        56, 3, "Plan text.", config, reviewer="codex",
+        step_back_review_notice=True,
+        plan_sweep_classes=("[item-1] (round 1) Gap 1",),
+    )
+    assert "Step-back notice" in prompt
+    assert "PRIMARY SWEEP REQUEST" in prompt
+
+
+def test_sweep_finding_classes_skip_repeats_and_bound_the_list():
+    records = _sweep_chain(
+        [
+            (1, {"items": [_tagged(1)]}),
+            (2, {"items": [_tagged(n, provenance=PRE) for n in range(2, 16)]
+                 + [_tagged(99, repeat_of="item-1")]}),
+        ]
+    )
+    classes = plan_sweep_finding_classes(records, primary=PRIMARY, first_round=1)
+    assert len(classes) == 13
+    assert classes[-1] == "and 3 more earlier finding(s) not shown"
+    assert not any("item-99" in line for line in classes)
+    assert classes[0] == "[item-4] (round 2) Gap 4"
+    short = plan_sweep_finding_classes(records, primary=PRIMARY, first_round=2, limit=20)
+    assert short[0] == "[item-2] (round 2) Gap 2"
+    assert len(short) == 14
+
+
+def test_sweep_guidance_text_is_pinned():
+    text = render_plan_sweep_guidance(["[item-1] (round 1) Gap 1", "and 2 more earlier finding(s) not shown"])
+    assert text.startswith("PRIMARY SWEEP REQUEST (orchestrator guidance, not a reviewer finding")
+    assert "this round only" in text
+    assert "- [item-1] (round 1) Gap 1\n- and 2 more earlier finding(s) not shown\n" in text
+    assert "one exhaustive pass over the whole current plan" in text
+    assert "siblings of the listed classes" in text
+    assert "other entry points, call sites, tests, docs and flows of the same kind" in text
+    assert "rather than across later rounds" in text
+    assert (
+        "The blocking-scope rules, the same-plan/future classification and the approval "
+        "rules are unchanged" in text
+    )
+    assert "out-of-scope findings stay future follow-ups or are omitted" in text
+    assert "not a reason to block an otherwise acceptable plan" in text
+    assert "`provenance`" in text
+
+
+# --- previous-plan baseline (`provenance-baseline`) --------------------------
+
+
+def _planner(index, round_number, text, *, subject=None):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=round_number,
+            subject=subject if subject is not None else _plan_subject(text),
+            canonical_plan=text,
+        ),
+        body="",
+    )
+
+
+def _reviewed(index, round_number, text, *, agent=PRIMARY):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="reviewer", agent=agent, round_number=round_number,
+            subject=_plan_subject(text), state="blocking",
+        ),
+        body="",
+    )
+
+
+PLAN_1 = "Step 1.\nStep 2.\nStep 3."
+PLAN_2 = "Step 1.\nStep 2, revised.\nStep 3."
+PLAN_3 = "Step 1.\nStep 2, revised again.\nStep 3.\nStep 4."
+
+
+def test_baseline_is_the_reviewers_latest_reviewed_plan_even_after_a_skipped_round():
+    records = [
+        _planner(0, 1, PLAN_1),
+        _reviewed(1, 1, PLAN_1),
+        _planner(2, 2, PLAN_2),
+        _reviewed(3, 2, PLAN_2, agent="Gemini"),
+        _planner(4, 3, PLAN_3),
+    ]
+    baseline = reviewer_previous_plan_baseline(records, reviewer=PRIMARY, before_round=3)
+    assert baseline.status == BASELINE_STATUS_AVAILABLE
+    assert baseline.round_number == 1
+    assert baseline.text == PLAN_1
+    gemini = reviewer_previous_plan_baseline(records, reviewer="Gemini", before_round=3)
+    assert gemini.round_number == 2 and gemini.text == PLAN_2
+    block = render_provenance_baseline_block(baseline, PLAN_3)
+    assert "you last reviewed the plan of round 1" in block
+    assert "--- plan reviewed in round 1" in block
+    assert "+++ current plan" in block
+    assert "-Step 2." in block and "+Step 4." in block
+    assert "`revision_introduced`" in block and "`pre_existing`" in block
+
+
+def test_baseline_first_review_and_unavailable_variants():
+    records = [_planner(0, 1, PLAN_1), _reviewed(1, 1, PLAN_1)]
+    first = reviewer_previous_plan_baseline(records, reviewer=PRIMARY, before_round=1)
+    assert first.status == BASELINE_STATUS_FIRST_REVIEW
+    assert "first plan review" in render_provenance_baseline_block(first, PLAN_1)
+    assert "omit `provenance`" in render_provenance_baseline_block(first, PLAN_1)
+
+    # A subject no planner record matches.
+    unmatched = reviewer_previous_plan_baseline(
+        [_reviewed(1, 1, PLAN_1)], reviewer=PRIMARY, before_round=2
+    )
+    assert unmatched.status == BASELINE_STATUS_UNAVAILABLE
+    # A planner record whose canonical plan does not hash to its subject.
+    mismatch = reviewer_previous_plan_baseline(
+        [_planner(0, 1, PLAN_2, subject=_plan_subject(PLAN_1)), _reviewed(1, 1, PLAN_1)],
+        reviewer=PRIMARY, before_round=2,
+    )
+    assert mismatch.status == BASELINE_STATUS_UNAVAILABLE
+    block = render_provenance_baseline_block(mismatch, PLAN_2)
+    assert "the comparison baseline is unavailable" in block
+    assert "omit `provenance` on every finding, leaving it untagged, rather than guess" in block
+
+
+def test_baseline_diff_cap_and_identical_plan():
+    same = PlanBaseline(status=BASELINE_STATUS_AVAILABLE, round_number=2, text=PLAN_2)
+    assert "identical to the plan you reviewed in round 2" in render_provenance_baseline_block(same, PLAN_2)
+    huge = "\n".join(f"Line {n} " + "x" * 80 for n in range(400))
+    big = PlanBaseline(status=BASELINE_STATUS_AVAILABLE, round_number=1, text="Start.")
+    block = render_provenance_baseline_block(big, huge)
+    assert "the comparison baseline is unavailable" in block
+    assert f"exceeds {PROVENANCE_BASELINE_DIFF_LIMIT} characters" in block
+    assert "Line 5 " not in block
+    assert render_provenance_baseline_block(None, PLAN_1) == ""

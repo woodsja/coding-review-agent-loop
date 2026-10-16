@@ -141,6 +141,7 @@ class PlanVerificationContext:
             DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
             DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
             DEFAULT_PLAN_STEP_BACK_ROUNDS,
+            DEFAULT_PLAN_SWEEP_ROUNDS,
         )
         from .reviewer_seats import SeatAgent
 
@@ -176,6 +177,12 @@ class PlanVerificationContext:
             plan_step_back_escalation_rounds=(
                 config.plan_step_back_escalation_rounds
                 if staged else DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
+            ),
+            plan_sweep_rounds=(
+                config.plan_sweep_rounds if staged else DEFAULT_PLAN_SWEEP_ROUNDS
+            ),
+            plan_sweep_reasoning_effort=(
+                config.plan_sweep_reasoning_effort if staged else ""
             ),
             pr_review_policy="all-reviewers",
             primary_reviewer=None,

@@ -1075,6 +1075,31 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-sweep-rounds",
+            type=int,
+            default=None,
+            metavar="K",
+            help=(
+                "Under --plan-review-policy primary-then-panel, once the primary has blocked "
+                "K consecutive primary-phase rounds with new mandatory findings, ask its next "
+                "review for one exhaustive sweep of the whole plan (default: 2; 0 disables). "
+                "Independent of the plan-growth gate and of --plan-step-back-rounds; it never "
+                "stops a run. Repeats of unresolved items (including re-emitted text), future "
+                "follow-ups and later-review findings tagged revision_introduced do not count."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-sweep-reasoning-effort",
+            default=None,
+            metavar="LEVEL",
+            help=(
+                "Under --plan-review-policy primary-then-panel, run only the primary's sweep "
+                "turn at this reasoning effort (off by default). The value must be supported "
+                "by the primary's backend (Codex or Claude); backends without effort control "
+                "ignore it with a log line."
+            ),
+        )
+        subparser.add_argument(
             "--plan-step-back-escalation-rounds",
             type=int,
             default=None,

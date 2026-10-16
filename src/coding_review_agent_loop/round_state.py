@@ -63,6 +63,7 @@ from .protocol import (
     MACHINE_LIFECYCLE_STATES,
     MACHINE_OBLIGATION_KINDS,
     UNKNOWN_MACHINE_AUTHORITY,
+    PLAN_REVIEW_PROVENANCE_VALUES,
     failed_discuss_review_placeholder,
     failed_discuss_answer_placeholder,
     parse_structured_discuss_agenda,
@@ -349,6 +350,11 @@ class PostedRoundMetadata:
     # record, so the step-back trigger can be suppressed for that history.
     step_back_entries: tuple[Mapping[str, object], ...] = ()
     step_back_status: str = "absent"
+    # Orchestrator-written plan sweep marker (#1505) on the primary's plan
+    # reviewer record of a round whose prompt carried the sweep request; never
+    # taken from agent output.  Omitted when False, and a malformed stored value
+    # decodes as False.
+    plan_sweep: bool = False
     # Coder-recovery and head-review-recovery records (#1292).  All are
     # optional and omitted from the encoding when unset, so every historical
     # record re-encodes byte-identically.  A malformed scalar decodes as
@@ -1712,6 +1718,12 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
     if item.converted_row_id is not None:
         payload["converted_row_id"] = item.converted_row_id
         payload["converted_matrix_identity"] = item.converted_matrix_identity
+    # Plan review telemetry (#1505): omitted when unset so legacy items
+    # re-encode byte-identically.
+    if item.provenance is not None:
+        payload["provenance"] = item.provenance
+    if item.repeat_of is not None:
+        payload["repeat_of"] = item.repeat_of
     return payload
 
 
@@ -1780,6 +1792,28 @@ def _deserialize_evidence_row_ids(payload: dict) -> tuple[str, ...]:
         logger.warning("Ignoring malformed evidence_row_ids on a persisted review item")
         return ()
     return tuple(raw)
+
+
+def _deserialize_item_provenance(payload: dict) -> str | None:
+    """Decode a persisted finding provenance tag; malformed is untagged (#1505)."""
+    raw = payload.get("provenance")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or raw not in PLAN_REVIEW_PROVENANCE_VALUES:
+        logger.warning("Ignoring malformed provenance on a persisted review item")
+        return None
+    return raw
+
+
+def _deserialize_repeat_of(payload: dict) -> str | None:
+    """Decode a persisted repeat marker; malformed is absent (#1505)."""
+    raw = payload.get("repeat_of")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        logger.warning("Ignoring malformed repeat_of on a persisted review item")
+        return None
+    return raw
 
 
 def _serialize_sub_item(sub: ReviewSubItem) -> dict[str, object]:
@@ -1928,6 +1962,8 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
         sub_items=_deserialize_sub_items(payload),
         evidence_row_ids=evidence_row_ids,
         converted_row_ids=converted_row_ids,
+        provenance=_deserialize_item_provenance(payload),
+        repeat_of=_deserialize_repeat_of(payload),
     )
 
 
@@ -2865,6 +2901,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["evidence_stall"] = dict(metadata.evidence_stall)
     if metadata.step_back_entries:
         payload["step_back_entries"] = [dict(entry) for entry in metadata.step_back_entries]
+    if metadata.plan_sweep:
+        payload["plan_sweep"] = True
     if metadata.risk_test_matrix_evidence_full_round is not None:
         payload["risk_test_matrix_evidence_full_round"] = (
             metadata.risk_test_matrix_evidence_full_round
@@ -3150,6 +3188,20 @@ def _decode_step_back_fields(payload: Mapping[str, object]) -> dict[str, object]
         "step_back_entries": tuple(dict(entry) for entry in value),
         "step_back_status": "valid",
     }
+
+
+def _decode_plan_sweep(payload: Mapping[str, object]) -> bool:
+    """Decode the optional plan sweep marker (#1505); malformed is absent, never raises."""
+    if "plan_sweep" not in payload:
+        return False
+    if (
+        payload["plan_sweep"] is True
+        and payload.get("flow") == "plan"
+        and payload.get("role") == "reviewer"
+    ):
+        return True
+    logger.warning("Ignoring a malformed plan_sweep marker on a persisted round record")
+    return False
 
 
 def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
@@ -3513,6 +3565,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             plan_issue_digest=_decode_plan_issue_digest(payload),
             **_decode_recovery_fields(payload),
             **_decode_step_back_fields(payload),
+            plan_sweep=_decode_plan_sweep(payload),
             **_decode_evidence_fields(payload),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),

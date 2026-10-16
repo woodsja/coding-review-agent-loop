@@ -2274,7 +2274,7 @@ def test_parse_structured_plan_review_rejects_malformed_finding_objects_957(item
 _ALIAS_LOGGER_1169 = "coding_review_agent_loop.protocol"
 _ALLOWED_KEYS_1169 = (
     "constraint_id, constraint_ids, covered_scope_item_ids, description, evidence, finding, "
-    "id, impact, issue, item_id, location, rationale, recommendation, required_change, "
+    "id, impact, issue, item_id, location, provenance, rationale, recommendation, required_change, "
     "row_id, row_ids, scope_item_id, scope_item_ids, stage_id, stage_ids, sub_items, "
     "suggested_fix, summary, text, title"
 )
@@ -7717,3 +7717,101 @@ def test_fold_helper_reuses_flat_object_helpers_1328():
         "_expect_review_finding_list",
     ):
         assert "payload-bound" in SHAPE_CHECK_AUDIT[name].clauses
+
+
+# --- Plan review finding provenance (#1505) ---------------------------------
+
+from coding_review_agent_loop.protocol import parse_structured_pr_review  # noqa: E402
+
+
+def _provenance_plan_review(blocking, *, same_plan=(), future=()):
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "plan_review",
+                "state": "blocking",
+                "summary": "Plan has gaps.",
+                "blocking_plan_issues": list(blocking),
+                "same_plan_followups": list(same_plan),
+                "future_followups": list(future),
+                "prior_plan_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+def test_plan_review_provenance_is_kept_and_never_folded_into_text():
+    """`provenance-parse`: valid tags on every list, strings untagged."""
+    parsed = parse_structured_plan_review(
+        _provenance_plan_review(
+            [
+                {"finding": "Step 2 skips resume.", "provenance": "pre_existing"},
+                "Plain string finding.",
+            ],
+            same_plan=[{"text": "Name the flag.", "provenance": "revision_introduced"}],
+            future=[{"finding": "Later cleanup.", "provenance": "pre_existing"}],
+        ),
+        reviewer="OpenAI Codex",
+    )
+    assert [(item.text, item.provenance) for item in parsed.items.blocking] == [
+        ("Step 2 skips resume.", "pre_existing"),
+        ("Plain string finding.", None),
+    ]
+    assert [(item.text, item.provenance) for item in parsed.items.same_plan] == [
+        ("Name the flag.", "revision_introduced"),
+    ]
+    assert parsed.items.future[0].provenance == "pre_existing"
+    assert all(
+        "provenance" not in item.text and "pre_existing" not in item.text
+        for group in (parsed.items.blocking, parsed.items.same_plan, parsed.items.future)
+        for item in group
+    )
+    assert parsed.provenance_degradations == ()
+
+
+@pytest.mark.parametrize("bad", ["unknown", "", 3, None, ["pre_existing"], {"x": 1}])
+def test_plan_review_invalid_provenance_degrades_to_untagged(bad, caplog):
+    """`provenance-parse`: a bad tag drops only the tag, with a degradation record."""
+    with caplog.at_level("WARNING"):
+        parsed = parse_structured_plan_review(
+            _provenance_plan_review(
+                [{"finding": "Step 2 skips resume.", "provenance": bad}, "Other gap."]
+            ),
+            reviewer="OpenAI Codex",
+        )
+    assert parsed.state == "blocking"
+    assert [(item.text, item.provenance) for item in parsed.items.blocking] == [
+        ("Step 2 skips resume.", None),
+        ("Other gap.", None),
+    ]
+    assert len(parsed.provenance_degradations) == 1
+    record = parsed.provenance_degradations[0]
+    assert record.element_path == "plan_review.blocking_plan_issues[0].provenance"
+    assert record.rule == "provenance-not-an-allowed-value"
+    assert record.outcome == "tag-dropped"
+    assert any("provenance" in message for message in caplog.messages)
+
+
+def test_pr_review_parsing_is_unchanged_by_plan_provenance():
+    """`provenance-parse`: PR findings keep folding an unknown provenance key."""
+    text = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": "blocking",
+                "summary": "One gap.",
+                "blocking_items": [{"text": "Fix the guard.", "provenance": "pre_existing"}],
+                "same_pr_followups": [],
+                "future_followups": [],
+                "prior_item_dispositions": [],
+            }
+        )
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+    parsed = parse_structured_pr_review(text, reviewer="OpenAI Codex")
+    finding = parsed.blocking_items[0]
+    assert finding.provenance is None
+    assert "pre_existing" in finding.text

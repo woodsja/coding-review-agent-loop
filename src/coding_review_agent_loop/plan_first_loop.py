@@ -16,6 +16,7 @@ from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .config import (
     AgentLoopConfig,
+    _validate_effort_value,
     reviewers,
 )
 from .board_amendment import (
@@ -246,6 +247,7 @@ from .unresolved_items import (
     _next_unresolved_item,
     _record_prior_item_disposition,
     _validate_plan_review_response,
+    carried_item_repeated_by,
 )
 from .agent_failure import (
     ValidatedAgentResponse,
@@ -307,8 +309,15 @@ from .review_step_back import (
     PlanStepBackAnchor,
     PlanStepBackContext,
     StallStepBackDisposition,
+    PlanBaseline,
     derive_plan_step_back_state,
+    derive_plan_sweep_state,
     entry_payload_for_plan,
+    first_plan_review_round,
+    plan_round_provenance_counts,
+    plan_sweep_due,
+    plan_sweep_finding_classes,
+    reviewer_previous_plan_baseline,
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
     plan_stall_step_back_disposition,
@@ -806,6 +815,47 @@ def _typed_deferred_work_titles(sidecar: object | None) -> tuple[str, ...]:
     return ()
 
 
+def _plan_review_item_tags(
+    item: object, prior_items: Sequence[UnresolvedReviewItem]
+) -> dict[str, object]:
+    """Minting-time provenance and repeat tags of a plan review finding (#1505).
+
+    Shared by every plan review minting path.  ``repeat_of`` is computed here
+    from the carried ledger the reviewer was shown, never read from agent output.
+    """
+    return {
+        "provenance": getattr(item, "provenance", None),
+        "repeat_of": carried_item_repeated_by(item.text, prior_items),  # type: ignore[attr-defined]
+    }
+
+
+def _plan_sweep_turn_inputs(
+    reviewer: AgentName, config: AgentLoopConfig, effort: str | None
+) -> tuple[AgentName, AgentLoopConfig]:
+    """The agent and config of the primary's sweep turn under an effort override (#1505).
+
+    Turn-local: the run's config and seat are untouched, and because the
+    signature and usage resolve from the same values they report the effort
+    that ran.  ``effort`` of ``None`` returns the inputs unchanged.
+    """
+    from .reviewer_seats import SeatAgent
+
+    if not effort:
+        return reviewer, config
+    if isinstance(reviewer, SeatAgent):
+        seat = str.__new__(SeatAgent, str(reviewer))
+        seat.backend = reviewer.backend
+        seat.model_chain = reviewer.model_chain
+        seat.effort = effort
+        seat.workdir = reviewer.workdir
+        return seat, config
+    if reviewer == "codex":
+        return reviewer, dataclasses_replace(config, reviewer_codex_reasoning_effort=effort)
+    if reviewer == "claude":
+        return reviewer, dataclasses_replace(config, reviewer_claude_effort=effort)
+    return reviewer, config
+
+
 # Invocation board fields re-pointed at an approved plan's approving board for
 # the planning phase only, and restored before implementation (#1377).
 _PLAN_BOARD_CONFIG_FIELDS = (
@@ -821,6 +871,8 @@ _PLAN_BOARD_CONFIG_FIELDS = (
     "plan_primary_stall_rounds",
     "plan_step_back_rounds",
     "plan_step_back_escalation_rounds",
+    "plan_sweep_rounds",
+    "plan_sweep_reasoning_effort",
 )
 
 
@@ -1611,6 +1663,31 @@ def _run_plan_first_loop_body(
         plan_scheduler_contract.primary_reviewer if plan_scheduler_contract is not None else None
     )
     plan_operator_force_full = bool(config.plan_review_force_full)
+    # The sweep-turn effort override (#1505) is validated against the primary's
+    # backend before any agent turn; a backend without effort control ignores it.
+    plan_sweep_effort: str | None = None
+    if (
+        config.plan_sweep_reasoning_effort
+        and staged_planning
+        and config.primary_plan_reviewer is not None
+    ):
+        from .reviewer_seats import seat_backend
+
+        sweep_backend = seat_backend(config.primary_plan_reviewer)
+        if sweep_backend in {"codex", "claude"}:
+            _validate_effort_value(
+                sweep_backend,
+                config.plan_sweep_reasoning_effort,
+                "--plan-sweep-reasoning-effort",
+            )
+            plan_sweep_effort = config.plan_sweep_reasoning_effort
+        else:
+            log(
+                config,
+                f"--plan-sweep-reasoning-effort {config.plan_sweep_reasoning_effort} is "
+                f"ignored: the primary plan reviewer's {sweep_backend} backend has no "
+                "effort control",
+            )
     plan_lineage_links = any(
         element.kind == "link" for element in plan_contract_lineage.elements
     )
@@ -2441,6 +2518,10 @@ def _run_plan_first_loop_body(
         pre_round_step_back_episode = None
         step_back_history_intact = False
         step_back_history_class = "unclassified"
+        # Plan sweep and provenance baseline inputs (#1505), derived from the
+        # pre-round durable records only, so a resumed run decides identically.
+        plan_sweep_classes: tuple[str, ...] | None = None
+        plan_baseline_records: tuple[PostedRoundRecord, ...] | None = None
         plan_posted_checkpoint: PostedRoundMetadata | None = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
@@ -2634,6 +2715,53 @@ def _run_plan_first_loop_body(
                     if not plan_reset_round:
                         step_back_review_anchor = plan_step_back_anchor(
                             plan_records, pre_round_state.episode
+                        )
+            plan_baseline_records = tuple(plan_records)
+            if (
+                config.plan_sweep_rounds > 0
+                and plan_primary_name is not None
+                and not plan_panel_evidence.opened
+            ):
+                if not step_back_history_intact:
+                    log(
+                        config,
+                        f"Planning round {round_number}: primary sweep suppressed: degraded "
+                        f"planning history ({step_back_history_class})",
+                    )
+                elif plan_reset_round:
+                    log(
+                        config,
+                        f"Planning round {round_number}: primary sweep not requested: the "
+                        "stall-streak reset retires earlier rounds",
+                    )
+                else:
+                    sweep_state = derive_plan_sweep_state(
+                        plan_records,
+                        primary=plan_primary_name,
+                        panel_opening_index=plan_panel_evidence.opening_index,
+                        current_issue_digest=plan_issue_digest,
+                    )
+                    sweep_streak = sweep_state.streak_before(round_number)
+                    if sweep_state.degraded:
+                        log(
+                            config,
+                            f"Planning round {round_number}: primary sweep suppressed: a "
+                            "malformed step-back history entry degrades the planning history",
+                        )
+                    elif plan_sweep_due(
+                        sweep_state,
+                        round_number=round_number,
+                        sweep_rounds=config.plan_sweep_rounds,
+                    ):
+                        first_round = sweep_state.streak_first_round(round_number)
+                        assert first_round is not None
+                        plan_sweep_classes = plan_sweep_finding_classes(
+                            plan_records, primary=plan_primary_name, first_round=first_round
+                        )
+                        log(
+                            config,
+                            f"Planning round {round_number}: primary sweep requested (streak "
+                            f"{sweep_streak} >= {config.plan_sweep_rounds})",
                         )
             if (
                 config.plan_step_back_rounds > 0
@@ -3065,6 +3193,45 @@ def _run_plan_first_loop_body(
             current_plan
         )
 
+        def _plan_sweep_requested(reviewer_name: str) -> bool:
+            """Whether this round's prompt for ``reviewer_name`` carries the sweep (#1505)."""
+            return plan_sweep_classes is not None and reviewer_name == plan_primary_name
+
+        def _plan_provenance_baseline(reviewer: AgentName) -> PlanBaseline | None:
+            if plan_baseline_records is None:
+                return None
+            return reviewer_previous_plan_baseline(
+                plan_baseline_records,
+                reviewer=agent_display_name(reviewer),
+                before_round=round_number,
+            )
+
+        def _plan_review_turn(reviewer: AgentName) -> tuple[AgentName, AgentLoopConfig, bool]:
+            """The agent, config and fresh-session flag of a reviewer's turn (#1505)."""
+            if plan_sweep_effort is None or not _plan_sweep_requested(
+                agent_display_name(reviewer)
+            ):
+                return reviewer, config, False
+            log(
+                config,
+                f"Planning round {round_number}: running {agent_display_name(reviewer)}'s "
+                f"sweep turn at effort {plan_sweep_effort} in a fresh session",
+            )
+            turn_agent, turn_config = _plan_sweep_turn_inputs(
+                reviewer, config, plan_sweep_effort
+            )
+            return turn_agent, turn_config, True
+
+        def _record_plan_review_session(reviewer: AgentName, session_id: str | None) -> None:
+            # A sweep turn at an overridden effort ran in a fresh session; no
+            # later turn at the ordinary effort may resume it (#1505).
+            if plan_sweep_effort is not None and _plan_sweep_requested(
+                agent_display_name(reviewer)
+            ):
+                reviewer_session_ids.pop(reviewer, None)
+                return
+            reviewer_session_ids[reviewer] = session_id
+
         def _build_plan_review_prompt(reviewer: AgentName) -> str:
             # Built once per reviewer from pre-round state only, so the same
             # prompt is produced regardless of sequential or parallel launch.
@@ -3097,6 +3264,12 @@ def _run_plan_first_loop_body(
                 plan_growth_measurements=plan_growth_measurements,
                 step_back_review_notice=step_back_candidate_review,
                 step_back_anchor=step_back_review_anchor,
+                plan_sweep_classes=(
+                    plan_sweep_classes
+                    if _plan_sweep_requested(agent_display_name(reviewer))
+                    else None
+                ),
+                provenance_baseline=_plan_provenance_baseline(reviewer),
                 prior_execution_mode=prior_execution_mode,
                 execution_mode_history_present=execution_mode_history_present,
             )
@@ -3186,6 +3359,7 @@ def _run_plan_first_loop_body(
                         acquisition_returncode=acquisition_returncode,
                         **_architecture_metadata_fields(config, result=parsed),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
+                        plan_sweep=_plan_sweep_requested(reviewer_name),
                     ),
                 ),
             )
@@ -3319,13 +3493,16 @@ def _run_plan_first_loop_body(
 
                 def _plan_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                     reviewer_name = agent_display_name(reviewer)
+                    turn_agent, turn_config, fresh_session = _plan_review_turn(reviewer)
                     try:
                         response = _run_validated_agent(
                             runner,
-                            agent=reviewer,
-                            config=config,
+                            agent=turn_agent,
+                            config=turn_config,
                             prompt=plan_prompts[reviewer],
-                            session_id=reviewer_session_ids.get(reviewer),
+                            session_id=(
+                                None if fresh_session else reviewer_session_ids.get(reviewer)
+                            ),
                             marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                             **_plan_review_validators(reviewer_name),
                             usage_context=usage_context,
@@ -3475,7 +3652,7 @@ def _run_plan_first_loop_body(
                 review_model_used = review_response.model_used
                 review_acquisition_outcome = review_response.acquisition_outcome
                 review_acquisition_returncode = review_response.acquisition_returncode
-                reviewer_session_ids[reviewer] = review_response.session_id
+                _record_plan_review_session(reviewer, review_response.session_id)
                 parsed_review = review_response.marker_value
                 assert isinstance(parsed_review, ParsedPlanReview)
                 parsed_review = dataclasses_replace(
@@ -3512,12 +3689,12 @@ def _run_plan_first_loop_body(
                     public_peers=plan_round_public_peers,
                     recovery=_plan_round_recovery,
                     validators=sequential_plan_validators,
-                    invoke=lambda reviewer=reviewer, validators=sequential_plan_validators: _run_validated_agent(
+                    invoke=lambda reviewer=reviewer, validators=sequential_plan_validators, turn=_plan_review_turn(reviewer): _run_validated_agent(
                         runner,
-                        agent=reviewer,
-                        config=config,
+                        agent=turn[0],
+                        config=turn[1],
                         prompt=_build_plan_review_prompt(reviewer),
-                        session_id=reviewer_session_ids.get(reviewer),
+                        session_id=None if turn[2] else reviewer_session_ids.get(reviewer),
                         marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                         **validators,
                         usage_context=usage_context,
@@ -3539,7 +3716,7 @@ def _run_plan_first_loop_body(
                 review_model_used = review_response.model_used
                 review_acquisition_outcome = review_response.acquisition_outcome
                 review_acquisition_returncode = review_response.acquisition_returncode
-                reviewer_session_ids[reviewer] = review_response.session_id
+                _record_plan_review_session(reviewer, review_response.session_id)
                 parsed_review = review_response.marker_value
                 assert isinstance(parsed_review, ParsedPlanReview)
                 parsed_review = dataclasses_replace(
@@ -3598,6 +3775,7 @@ def _run_plan_first_loop_body(
                         source_round=round_number,
                         text=item.text,
                         status="blocking",
+                        **_plan_review_item_tags(item, prior_unresolved_items),
                     )
                     round_new_unresolved_items.append(tracked_item)
                     reviewer_new_unresolved_items.append(tracked_item)
@@ -3609,6 +3787,7 @@ def _run_plan_first_loop_body(
                         source_round=round_number,
                         text=item.text,
                         status="same-plan",
+                        **_plan_review_item_tags(item, prior_unresolved_items),
                     )
                     round_new_unresolved_items.append(tracked_item)
                     reviewer_new_unresolved_items.append(tracked_item)
@@ -3620,6 +3799,7 @@ def _run_plan_first_loop_body(
                         source_round=round_number,
                         text=item.text,
                         status="future",
+                        **_plan_review_item_tags(item, prior_unresolved_items),
                     )
                     round_new_unresolved_items.append(tracked_item)
                     reviewer_new_unresolved_items.append(tracked_item)
@@ -3636,6 +3816,24 @@ def _run_plan_first_loop_body(
             else:
                 round_new_unresolved_items.extend(reviewer_new_unresolved_items)
 
+        if plan_baseline_records is not None:
+            # Live measurement of drip-fed findings (#1505), one line per reviewer.
+            for reviewer_name, _output in (*blocking_reviews, *approved_review_outputs):
+                first_round = first_plan_review_round(
+                    plan_baseline_records, reviewer=reviewer_name
+                )
+                counts = plan_round_provenance_counts(
+                    round_new_unresolved_items, reviewer=reviewer_name
+                )
+                log(
+                    config,
+                    f"Planning round {round_number}: {reviewer_name} new mandatory finding "
+                    f"provenance: pre_existing={counts['pre_existing']} "
+                    f"revision_introduced={counts['revision_introduced']} "
+                    f"untagged={counts['untagged']} repeats={counts['repeats']}; "
+                    f"first_review={first_round is None or first_round >= round_number}; "
+                    f"sweep={_plan_sweep_requested(reviewer_name)}",
+                )
         if not plan_fatal_errors:
             # Every same-round outcome is now published; a sequential resume
             # that replayed withheld reviews no longer needs them.
@@ -3912,6 +4110,7 @@ def _run_plan_first_loop_body(
                                     source_round=round_number,
                                     text=item.text,
                                     status="blocking",
+                                    **_plan_review_item_tags(item, prior_unresolved_items),
                                 )
                                 round_new_unresolved_items.append(new_item)
                                 unresolved_items = [*unresolved_items, new_item]
@@ -3923,6 +4122,7 @@ def _run_plan_first_loop_body(
                                     source_round=round_number,
                                     text=item.text,
                                     status="same-plan",
+                                    **_plan_review_item_tags(item, prior_unresolved_items),
                                 )
                                 round_new_unresolved_items.append(new_item)
                                 unresolved_items = [*unresolved_items, new_item]
