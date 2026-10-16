@@ -6399,6 +6399,69 @@ def test_set_guidance_appears_only_with_members_or_oversized_root(tmp_path, buil
     assert _SET_GUIDANCE_FRAGMENT not in _SET_BUILDERS[builder](disabled)
 
 
+@pytest.mark.parametrize("builder", sorted(_SET_BUILDERS))
+def test_set_guidance_names_the_configured_detail_dirs(tmp_path, builder):
+    member = _SetMember("docs/design/a.md", "c" * 40, "available", 20, "Design A", "A owns intake.")
+    config = make_config(
+        tmp_path, architecture_context=_set_snapshot(members=(member,)),
+        architecture_detail_dirs=("docs/design",),
+    )
+    prompt = _SET_BUILDERS[builder](config)
+    guidance = prompts_module._architecture_impact_guidance(required=True, config=config)
+    assert "a linked .md detail doc under docs/design/)" in guidance
+    assert "docs/architecture" not in guidance
+    assert "excluded history (decision logs, ADRs) is never a member" in guidance
+    assert "docs/architecture/*" not in prompt
+    # The guidance and the rendered member index agree.
+    assert "- docs/design/a.md — Design A: A owns intake." in prompt
+    default = make_config(tmp_path, architecture_context=_set_snapshot(members=(member,)))
+    assert "a linked .md detail doc under docs/architecture/)" in (
+        prompts_module._architecture_impact_guidance(required=True, config=default)
+    )
+    many = make_config(
+        tmp_path, architecture_context=_set_snapshot(members=(member,)),
+        architecture_detail_dirs=tuple(f"d{index}" for index in range(6)),
+    )
+    assert "under d0/, d1/, d2/, d3/ or [2 more])" in (
+        prompts_module._architecture_impact_guidance(required=True, config=many)
+    )
+
+
+def test_oversized_diagnostic_names_the_configured_detail_dir(tmp_path):
+    import subprocess
+
+    from coding_review_agent_loop.architecture_context import (
+        ArchitectureMembershipPolicy,
+        acquire_architecture_snapshot,
+    )
+    from coding_review_agent_loop.runner import Runner
+
+    def git(*args):
+        subprocess.run(("git", *args), cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (tmp_path / "ARCHITECTURE.md").write_text("# System\n\n" + "detail " * 200, encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "root")
+    revision = subprocess.run(
+        ("git", "rev-parse", "HEAD"), cwd=tmp_path, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    snapshot = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=revision, max_bytes=64,
+        policy=ArchitectureMembershipPolicy(detail_dirs=("docs/design",)),
+    )
+    assert "short root overview plus docs/design/* detail docs" in snapshot.diagnostic
+    config = make_config(tmp_path, architecture_context=snapshot, architecture_detail_dirs=("docs/design",))
+    block = prompts_module._architecture_context_block(config)
+    assert "docs/design/* detail docs" in block and "docs/architecture" not in block
+    default = acquire_architecture_snapshot(
+        Runner(), checkout=tmp_path, repository="owner/repo", revision=revision, max_bytes=64,
+    )
+    assert "short root overview plus docs/architecture/* detail docs" in default.diagnostic
+
+
 def _pair_of(base, candidate, change="unchanged"):
     return _SetPair(
         repository="owner/repo", path="ARCHITECTURE.md", target_revision="main",

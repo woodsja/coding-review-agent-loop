@@ -244,6 +244,7 @@ def _coder_repo(tmp_path, files, **config_overrides):
     context = freeze_architecture_context(
         Runner(), checkout=repo, repository=config.repo,
         path=config.architecture_path, read_size=config.architecture_read_size,
+        policy=config.architecture_membership_policy,
     )
     from dataclasses import replace
 
@@ -461,3 +462,52 @@ def test_a_link_inside_an_image_description_is_rejected(tmp_path, root):
     response = _run(runner, tmp_path, "task", _hook(config))
     prompts = _prompts(runner)
     assert len(prompts) == 2 and SECTION in prompts[1] and _path_of(response) is None
+
+
+# ---------------------------------------------------------------------------
+# Configured membership policy (#1499)
+# ---------------------------------------------------------------------------
+
+DECISIONS = "docs/architecture/decisions/billing.md"
+
+
+def test_an_excluded_decision_log_is_rejected_as_canonical_document(tmp_path):
+    config, _repo = _coder_repo(tmp_path, {
+        "ARCHITECTURE.md": f"# Root\n\n- [Billing]({BILLING})\n- [Log]({DECISIONS})\n",
+        BILLING: "# Billing\n",
+        DECISIONS: "# Billing decisions\n",
+    })
+    assert architecture_set_paths(config.architecture_context) == MEMBERS
+    hook = _hook(config)
+    assert DECISIONS not in hook()
+    runner = FakeRunner(claude_outputs=[_task_output(DECISIONS), _task_output(BILLING)])
+    response = _run(runner, tmp_path, "task", hook)
+    _first, second = _prompts(runner)
+    assert SECTION in second
+    assert _path_of(response) == BILLING
+
+
+def test_a_custom_detail_dir_member_is_accepted_through_the_coder_head_hook(tmp_path):
+    design = "docs/design/a.md"
+    config, repo = _coder_repo(
+        tmp_path,
+        {"ARCHITECTURE.md": f"# Root\n\n- [A]({design})\n", design: "# A\n"},
+        architecture_detail_dirs=("docs/design",),
+    )
+    assert architecture_set_paths(config.architecture_context) == {"ARCHITECTURE.md", design}
+    _commit(repo, {
+        "ARCHITECTURE.md": f"# Root\n\n- [A]({design})\n- [B](docs/design/b.md)\n",
+        "docs/design/b.md": "# B\n",
+    }, "new member")
+    # The coder-HEAD acquisition uses the configured policy, not the default.
+    hook = _hook(config)
+    assert hook() == {"ARCHITECTURE.md", design, "docs/design/b.md"}
+    runner = FakeRunner(claude_outputs=[_task_output("docs/design/b.md")])
+    response = _run(runner, tmp_path, "task", hook)
+    assert len(_prompts(runner)) == 1
+    assert _path_of(response) == "docs/design/b.md"
+    # The same repository under the default policy has no design members.
+    default_config, _ = _coder_repo(tmp_path / "default", {
+        "ARCHITECTURE.md": f"# Root\n\n- [A]({design})\n", design: "# A\n",
+    })
+    assert architecture_set_paths(default_config.architecture_context) == frozenset({"ARCHITECTURE.md"})

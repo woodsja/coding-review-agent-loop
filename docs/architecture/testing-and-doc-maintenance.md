@@ -23,10 +23,19 @@ paths, and fresh turns with an acquired architecture snapshot use the versioned
 architecture-impact assessment. Legacy records remain decodable without
 inventing a snapshot or assessment; source inspection remains required.
 
-The architecture path names the root of an architecture set: the root
-plus the `docs/architecture/*.md` files it links to, one level only. Member
-blob identities join the snapshot and PR-pair identity only when members
-exist, so root-only identities are unchanged. An oversized root is injected as
+The architecture path names the root of an architecture set: the root plus
+the `.md` files it links to under the configured detail directories (default
+`docs/architecture/`), one level only. An `ArchitectureMembershipPolicy`
+built from the configuration decides membership: a linked document is a
+member when it lies under a detail directory and under no history exclusion
+(default `*/decisions/`, `doc/adr/`, `docs/adr/`), and an exclusion always
+wins. The prompt freeze and the coder-HEAD membership hook use the same
+policy, and managed recovery preserves the flags. The policy is never part of
+an identity: member blob identities join the snapshot and PR-pair identity
+only when members exist, so root-only and default-layout identities are
+unchanged. The detail-doc index carries each member's path, first heading and
+a bounded first-sentence summary; summaries are rendering detail only, and
+they are dropped before entries, section indexes or overview text. An oversized root is injected as
 identity, size and heading index with a split recommendation; coder
 `canonical_document_path` values are validated against the set by a semantic
 re-ask; and the PR comparison reports a detail-doc-only edit as a set change.

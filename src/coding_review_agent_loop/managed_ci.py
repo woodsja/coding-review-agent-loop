@@ -4561,7 +4561,8 @@ def authenticate_source_managed_resume(
 _RECOVERY_VALUE_OPTIONS = frozenset({
     "--repo", "--base", "--trusted-local-origin", "--trusted-origin-protocol", "--git-ssh-identity",
     "--claude-dir", "--codex-dir", "--gemini-dir", "--antigravity-dir",
-    "--architecture-path", "--architecture-read-size", "--architecture-snapshot-max-chars",
+    "--architecture-path", "--architecture-detail-dir", "--architecture-exclude",
+    "--architecture-read-size", "--architecture-snapshot-max-chars",
     "--architecture-aggregate-max-chars", "--managed-context-max-chars",
     "--coder", "--reviewer", "--reviewer-seat", "--seat-model", "--seat-effort", "--seat-dir",
     "--primary-reviewer-seat", "--primary-plan-reviewer-seat",

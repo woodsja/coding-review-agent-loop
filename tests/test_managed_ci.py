@@ -5046,6 +5046,25 @@ def test_recovery_renderer_keeps_git_ssh_identity_value(tmp_path):
     assert args.git_ssh_identity == Path(identity)
 
 
+def test_recovery_renderer_keeps_architecture_membership_values(tmp_path):
+    parser = build_parser()
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "--architecture-detail-dir", "docs/design",
+            "--architecture-detail-dir", "packages/core/docs",
+            "--architecture-exclude", "docs/design/history",
+            "--no-default-architecture-excludes", "643",
+        ),
+    )
+    rendered = render_managed_ci_resume_command(config, pr_number=7, managed_ci=True)
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.issue_number == 643
+    assert args.architecture_detail_dirs == ["docs/design", "packages/core/docs"]
+    assert args.architecture_excludes == ["docs/design/history"]
+    assert args.architecture_default_excludes is False
+
+
 def test_recovery_value_option_table_covers_all_recovery_subparsers():
     parser = build_parser()
     subparsers = next(action for action in parser._actions if action.dest == "command")

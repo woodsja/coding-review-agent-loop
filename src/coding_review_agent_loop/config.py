@@ -519,6 +519,12 @@ class AgentLoopConfig:
     # frozen, successfully acquired snapshot is attached by orchestration.
     architecture_context_enabled: bool = True
     architecture_path: str = "ARCHITECTURE.md"
+    # Architecture-set membership policy (#1499): detail directories replace
+    # the default list; extra exclusions add to the default history
+    # exclusions unless ``architecture_default_excludes`` is False.
+    architecture_detail_dirs: tuple[str, ...] = ("docs/architecture/",)
+    architecture_excludes: tuple[str, ...] = ()
+    architecture_default_excludes: bool = True
     architecture_read_size: int = 64 * 1024
     architecture_snapshot_max_chars: int = 12_000
     architecture_aggregate_max_chars: int = 24_000
@@ -530,6 +536,21 @@ class AgentLoopConfig:
     agent_permissions: str = "default"
 
     @property
+    def architecture_membership_policy(self):
+        """The validated architecture-set membership policy for this invocation."""
+        from .architecture_context import (
+            DEFAULT_ARCHITECTURE_EXCLUDES,
+            ArchitectureMembershipPolicy,
+        )
+
+        excludes = (
+            (*DEFAULT_ARCHITECTURE_EXCLUDES, *self.architecture_excludes)
+            if self.architecture_default_excludes
+            else tuple(self.architecture_excludes)
+        )
+        return ArchitectureMembershipPolicy(self.architecture_detail_dirs, excludes)
+
+    @property
     def effective_managed_ci(self) -> bool:
         """Whether this invocation requested the managed-CI protocol."""
         return self.managed_ci or self.auto_merge
@@ -537,9 +558,24 @@ class AgentLoopConfig:
     def __post_init__(self) -> None:
         if isinstance(self.reviewer, str):
             object.__setattr__(self, "reviewer", (self.reviewer,))
-        from .architecture_context import normalize_architecture_path
+        from .architecture_context import (
+            normalize_architecture_detail_dir,
+            normalize_architecture_exclude,
+            normalize_architecture_path,
+        )
 
         object.__setattr__(self, "architecture_path", normalize_architecture_path(self.architecture_path))
+        for field_name, normalize in (
+            ("architecture_detail_dirs", normalize_architecture_detail_dir),
+            ("architecture_excludes", normalize_architecture_exclude),
+        ):
+            values = getattr(self, field_name)
+            if isinstance(values, str):
+                values = (values,)
+            object.__setattr__(self, field_name, tuple(dict.fromkeys(normalize(item) for item in values)))
+        # Builds and validates the policy (caps and contradictory dir/exclude
+        # pairs) before any agent invocation.
+        self.architecture_membership_policy
         for option_name, value in (
             ("--architecture-read-size", self.architecture_read_size),
             ("--architecture-snapshot-max-chars", self.architecture_snapshot_max_chars),
@@ -2399,6 +2435,11 @@ def config_from_args(
         pr_review_context_mode=getattr(args, "pr_review_context_mode", None) or "full",
         architecture_context_enabled=getattr(args, "architecture_context_enabled", True),
         architecture_path=getattr(args, "architecture_path", "ARCHITECTURE.md"),
+        architecture_detail_dirs=tuple(
+            getattr(args, "architecture_detail_dirs", None) or ("docs/architecture/",)
+        ),
+        architecture_excludes=tuple(getattr(args, "architecture_excludes", None) or ()),
+        architecture_default_excludes=getattr(args, "architecture_default_excludes", True),
         architecture_read_size=getattr(args, "architecture_read_size", 64 * 1024),
         architecture_snapshot_max_chars=getattr(args, "architecture_snapshot_max_chars", 12_000),
         architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),

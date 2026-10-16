@@ -229,6 +229,20 @@ def _with_architecture_context(config: AgentLoopConfig, context: object | None) 
     return dataclass_replace(config, architecture_context=context)
 
 
+_ARCHITECTURE_DETAIL_DIRS_SHOWN = 4
+
+
+def _architecture_detail_dirs_text(config: AgentLoopConfig | None) -> str:
+    """The configured detail directories, bounded, for agent-facing guidance."""
+    dirs = tuple(getattr(config, "architecture_detail_dirs", None) or ("docs/architecture/",))
+    shown = [sanitize_historical_text(item) for item in dirs[:_ARCHITECTURE_DETAIL_DIRS_SHOWN]]
+    if len(dirs) > _ARCHITECTURE_DETAIL_DIRS_SHOWN:
+        shown.append(f"[{len(dirs) - _ARCHITECTURE_DETAIL_DIRS_SHOWN} more]")
+    if len(shown) == 1:
+        return shown[0]
+    return ", ".join(shown[:-1]) + " or " + shown[-1]
+
+
 def _architecture_impact_guidance(*, required: bool = False, config: AgentLoopConfig | None = None) -> str:
     qualifier = "required" if required else "expected when architecture context is available"
     context = (
@@ -238,9 +252,11 @@ def _architecture_impact_guidance(*, required: bool = False, config: AgentLoopCo
     )
     set_guidance = (
         "`canonical_document_path` must name a document in the architecture set (the root "
-        "doc or a linked docs/architecture/*.md detail doc), or null for no change; update "
-        "the detail doc that owns the changed component, and update the root only when the "
-        "component map, invariants or main flows change.\n"
+        "doc or a linked .md detail doc under "
+        + _architecture_detail_dirs_text(config)
+        + "), or null for no change; excluded history (decision logs, ADRs) is never a "
+        "member. Update the detail doc that owns the changed component, and update the "
+        "root only when the component map, invariants or main flows change.\n"
         if architecture_set_guidance_applicable(context)
         else ""
     )

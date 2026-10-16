@@ -804,10 +804,12 @@ POSIX override, or `--no-architecture-context` to opt out. Missing, unsafe,
 binary, or unavailable documents preserve the legacy prompt path.
 
 The path names the root of an **architecture set**: the root document plus every
-repository-relative Markdown file under `docs/architecture/` that the root links
-to (inline links and reference links whose definition is actually used). Links
-are followed one level only; unlinked files under `docs/architecture/` are not
-members. Links are read with a CommonMark parser (the `markdown-it-py`
+repository-relative Markdown file under a configured detail directory (by
+default `docs/architecture/`) that the root links to (inline links and
+reference links whose definition is actually used), minus excluded history.
+Links are followed one level only; unlinked files under a detail directory are
+not members. Agents may still open deeper linked docs, and excluded history, on
+demand from the checkout. Links are read with a CommonMark parser (the `markdown-it-py`
 runtime dependency), so code, raw HTML, images (including links inside an
 image description) and unresolved references never count, and the detail-doc
 and oversized heading indexes list only real Markdown headings; without the parser, membership is reported as unknown. The recommended layout is a short root overview of at most about 10k
@@ -823,9 +825,12 @@ and restate no current values. They are append-only: a replaced entry gets
 `Superseded by #M: <clause>.` appended and is never rewritten or deleted.
 Record decisions in the log, keep the body current, and read the log before
 changing a component's behaviour. The root never links into
-`docs/architecture/decisions/`, so the logs stay outside the architecture set. When the set has detail docs, prompts
-carry the root overview followed by a short detail-doc index (path plus first
-heading). `--architecture-read-size` applies to the root and to each member.
+`docs/architecture/decisions/`, and decision logs are excluded from the set by
+default anyway. When the set has detail docs, prompts
+carry the root overview followed by a short detail-doc index: path, first
+heading and the first sentence of the doc's opening summary, bounded to about
+200 characters. Summaries are the first thing dropped under a tight budget,
+before index entries and before the root overview is truncated. `--architecture-read-size` applies to the root and to each member.
 A root larger than the read size is not dropped: the prompt carries its
 identity, size and a bounded heading index, with a diagnostic that the document
 is too large and should be split into a short root overview plus
@@ -835,7 +840,38 @@ unknown). A coder's `canonical_document_path` must be null or name a member of
 the set (normalized as a repository-relative path); an out-of-set path gets one
 bounded re-ask. The PR base/candidate comparison covers every member, so a PR
 that edits only a detail doc is reported as an architecture change; member
-paths are named but only the root documents' text is injected.
+paths are named (with their bounded summaries) but only the root documents'
+text is injected.
+
+The layout above is the recommended default, not a requirement. It has four
+layers: a short root index, detail docs that are set members, deeper docs
+linked on demand, and a decision log or ADRs kept out of the set. It follows
+matklad's `ARCHITECTURE.md` (a short map of the codebase), keeps ADR-style
+history separate from the current design, and gives each index entry a
+one-line description in the spirit of `AGENTS.md` and `llms.txt` indexes. To
+point the tool at an existing convention:
+
+- `--architecture-path design/OVERVIEW.md` names a different root.
+- `--architecture-detail-dir DIR` (repeatable) names the directories whose
+  root-linked `.md` files are members. Giving it replaces the default
+  `docs/architecture/`, so repeat that value to keep it, for example
+  `--architecture-detail-dir docs/design --architecture-detail-dir packages/core/docs`.
+  An explicit list is used rather than "any linked `.md`" so the default set,
+  and therefore its approval identity, stays unchanged, and a stray root link to
+  a README or changelog never becomes a member.
+- `--architecture-exclude DIR` (repeatable) adds a history directory that is
+  never a member, even when linked; a leading `*/` matches it at any depth. The
+  defaults are `*/decisions/`, `doc/adr/` (adr-tools) and `docs/adr/`.
+  `--no-default-architecture-excludes` drops the defaults. An adr-tools or MADR
+  repository that links its ADRs from the root needs no flag for `doc/adr/` or
+  `docs/adr/`; for MADR's `docs/decisions/` the `*/decisions/` default applies.
+
+Exclusions always win over detail directories, and a detail directory that an
+exclusion covers entirely is rejected before any agent runs. The membership
+policy is not part of the architecture identity; only the resulting member
+paths and blobs are, so default-layout repositories keep the same identity. A
+repository whose root currently links into an excluded directory loses those
+members once, which changes its identity once.
 The read and rendering budgets are configurable with `--architecture-read-size`,
 `--architecture-snapshot-max-chars`, and `--architecture-aggregate-max-chars`;
 `--managed-context-max-chars` bounds active managed prompt context and fails
