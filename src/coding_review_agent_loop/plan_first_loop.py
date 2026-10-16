@@ -4127,6 +4127,35 @@ def _run_plan_first_loop_body(
                                 round_new_unresolved_items.append(new_item)
                                 unresolved_items = [*unresolved_items, new_item]
                                 next_unresolved_item_number += 1
+                            # The record posted before the repair still says
+                            # approved; supersede it with the repaired blocking
+                            # outcome and every item this reviewer minted in the
+                            # round, so durable sweep, step-back and export
+                            # derivations see the block (#1505).
+                            repaired_reviewer_items = tuple(
+                                item for item in round_new_unresolved_items
+                                if item.reviewer == reviewer_name
+                            )
+                            _post_plan_reviewer_comment(
+                                reviewer_name,
+                                repaired_parsed,
+                                review_output=repaired_text,
+                                model_used=round_review_models.get(reviewer_name),
+                                new_items=repaired_reviewer_items,
+                            )
+                            if plan_baseline_records is not None:
+                                repaired_counts = plan_round_provenance_counts(
+                                    repaired_reviewer_items, reviewer=reviewer_name
+                                )
+                                log(
+                                    config,
+                                    f"Planning round {round_number}: {reviewer_name} repaired "
+                                    "blocking outcome new mandatory finding provenance: "
+                                    f"pre_existing={repaired_counts['pre_existing']} "
+                                    f"revision_introduced={repaired_counts['revision_introduced']} "
+                                    f"untagged={repaired_counts['untagged']} "
+                                    f"repeats={repaired_counts['repeats']}",
+                                )
                             all_approved = False
                             must_fix_items = [
                                 item for item in unresolved_items

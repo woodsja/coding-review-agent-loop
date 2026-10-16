@@ -21193,17 +21193,6 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
         return replace(context, human_requirements=(requirement,))
 
     monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
-    # Instrument minting: the repaired path's items are not re-posted on a
-    # reviewer record before this run stops.
-    minted_items = []
-    real_mint = plan_first_loop_module._next_unresolved_item
-
-    def _recording_mint(**kwargs):
-        item = real_mint(**kwargs)
-        minted_items.append(item)
-        return item
-
-    monkeypatch.setattr(plan_first_loop_module, "_next_unresolved_item", _recording_mint)
     with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
         with patch.object(
             plan_first_loop_module, "log", wraps=plan_first_loop_module.log
@@ -21215,23 +21204,40 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
                 )
     messages = [str(call.args[-1]) for call in logged.call_args_list]
     assert any("repair returned blocking for Codex" in m for m in messages)
-    from coding_review_agent_loop.review_step_back import (
-        count_sweep_items,
-        eligible_new_mandatory_items,
+    assert any(
+        "Codex repaired blocking outcome new mandatory finding provenance: "
+        f"pre_existing=0 revision_introduced=0 untagged={int(mixed)} repeats=1" in m
+        for m in messages
     )
+    from coding_review_agent_loop.history_export import _plan_provenance_counts
+    from coding_review_agent_loop.review_step_back import derive_plan_sweep_state
 
-    # The repaired blocking findings are minted as ordinary round-2 blockers.
-    repaired_items = [
-        item for item in minted_items
-        if item.source_round == 2 and item.status == "blocking" and item.reviewer == "Codex"
+    # Everything below is derived from the posted durable records only.
+    records = [
+        PostedRoundRecord(index=index, metadata=metadata, body="")
+        for index, metadata in enumerate(_plan_round_records(runner))
     ]
+    round_two = [
+        record.metadata for record in records
+        if record.metadata.role == "reviewer" and record.metadata.agent == "Codex"
+        and record.metadata.round_number == 2
+    ]
+    # The repaired blocking outcome supersedes the approval posted before it.
+    assert [metadata.state for metadata in round_two] == ["approved", "blocking"]
+    repaired_items = [item for item in round_two[-1].new_items if item.status == "blocking"]
     assert len(repaired_items) == (2 if mixed else 1)
     duplicate = next(item for item in repaired_items if item.text == "Close gap 1.")
     assert duplicate.repeat_of == "item-1"
     if mixed:
         fresh_item = next(item for item in repaired_items if item.text == "Close gap 2b.")
         assert fresh_item.repeat_of is None
-    # Excluded from the trigger and export filter; the mixed review still counts.
-    eligible = eligible_new_mandatory_items(repaired_items, reviewer="Codex")
-    assert [item.text for item in eligible] == (["Close gap 2b."] if mixed else [])
-    assert count_sweep_items(repaired_items, reviewer="Codex", first_review=False) == int(mixed)
+    # The repeat-only repair ends the streak; the mixed one extends it.
+    state = derive_plan_sweep_state(records, primary="Codex")
+    assert [review.classification for review in state.reviews][-1] == (
+        "new-finding" if mixed else "repeat-only"
+    )
+    assert state.streak_before(3) == (2 if mixed else 0)
+    # The export counts the genuinely new item and never the duplicate.
+    counts = _plan_provenance_counts(records)
+    assert counts.resolvable
+    assert (counts.pre_existing, counts.revision_introduced, counts.untagged) == (0, 0, int(mixed))
