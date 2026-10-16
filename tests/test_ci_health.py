@@ -1118,6 +1118,63 @@ def test_classifier_stuck_status_is_plumbing_by_cause_even_outside_the_catalog()
     assert classify_watch_failure(with_test_failure, PLUMBING, (stuck,)) == "test-failure"
 
 
+# --- Stuck status without a failed job waits for pending checks (#1498) ---
+
+_STUCK = PullRequestCheck(
+    name="ci/summary", kind="status_context", status="pending",
+    url="https://github.com/OWNER/REPO/actions/runs/9",
+)
+_SLOW_TESTS = _pcheck("slow tests", "in_progress")
+
+
+def test_classifier_holds_stuck_status_without_failed_jobs_while_tests_pending():
+    board = _plumbing_board(
+        passing=(_TEST_PASSED,), pending=(_STUCK, _SLOW_TESTS), required=("ci/summary",),
+    )
+    assert classify_watch_failure(
+        board, PLUMBING, (_STUCK,), stuck_without_failed_jobs=("ci/summary",)
+    ) == "plumbing-awaiting-tests"
+
+
+def test_classifier_stuck_status_without_failed_jobs_stops_once_board_settles():
+    board = _plumbing_board(
+        passing=(_TEST_PASSED, _pcheck("slow tests", "success")), pending=(_STUCK,),
+        required=("ci/summary",),
+    )
+    assert classify_watch_failure(
+        board, PLUMBING, (_STUCK,), stuck_without_failed_jobs=("ci/summary",)
+    ) == "stuck-infrastructure"
+
+
+def test_classifier_hold_never_masks_a_failing_test_beside_a_stuck_status():
+    board = _plumbing_board(
+        failing=(_pcheck("tests", "failure"),), pending=(_STUCK, _SLOW_TESTS),
+        required=("ci/summary",),
+    )
+    assert classify_watch_failure(
+        board, PLUMBING, (_STUCK,), stuck_without_failed_jobs=("ci/summary",)
+    ) == "test-failure"
+
+
+def test_classifier_stuck_run_with_failed_test_job_beats_pending_tests():
+    board = _plumbing_board(
+        passing=(_TEST_PASSED,), pending=(_STUCK, _SLOW_TESTS), required=("ci/summary",),
+    )
+    assert classify_watch_failure(
+        board, PLUMBING, (_STUCK,), stuck_with_test_failures=("ci/summary",)
+    ) == "test-failure"
+
+
+def test_classifier_non_authoritative_board_with_stuck_status_stays_unclassifiable():
+    board = _plumbing_board(
+        passing=(_TEST_PASSED,), pending=(_STUCK, _SLOW_TESTS), required=("ci/summary",),
+        complete=False,
+    )
+    assert classify_watch_failure(
+        board, PLUMBING, (_STUCK,), stuck_without_failed_jobs=("ci/summary",)
+    ) == "not-classifiable"
+
+
 class _RunsRunner(Runner):
     """Answers ``actions/runs/<id>`` reads from a scripted sequence per run."""
 

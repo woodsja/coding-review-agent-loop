@@ -7169,7 +7169,10 @@ in the approval snapshot:
   running, the watcher holds and keeps polling. It reruns once if the tests
   then pass, and resumes the coder if a test fails. If the budget expires, it
   takes the timeout path, never a coder obligation. Without a watch, the
-  approval snapshot takes the pending stop with the hint.
+  approval snapshot takes the pending stop with the hint. A confirmed stuck
+  status whose run has no failed job is held the same way while any other
+  check is still pending: the infrastructure stop applies only once they
+  settle, and a test that fails during the hold still reaches the coder.
 - **Stale evidence.** After the rerun, failures from the earlier attempt are
   polled through: the same failed check-run IDs, or the same status context,
   run and `created_at`. Only a fresh-attempt plumbing failure counts as the

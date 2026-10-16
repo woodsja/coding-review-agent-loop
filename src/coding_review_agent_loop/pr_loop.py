@@ -7169,8 +7169,10 @@ def run_pr_loop(
                         )
                         if watch_outcome.hold_reason == "plumbing-awaiting-tests":
                             details.append(
-                                "Plumbing failure awaiting tests: only plumbing checks failed while "
-                                "test checks were still running; no coder round was started."
+                                "Plumbing failure or stuck required status awaiting tests: only "
+                                "plumbing checks failed, or a required status stayed pending with "
+                                "no failed job to re-run, while other checks were still running; "
+                                "no coder round was started."
                             )
                         elif watch_outcome.hold_reason == "stale-after-rerun":
                             details.append(
