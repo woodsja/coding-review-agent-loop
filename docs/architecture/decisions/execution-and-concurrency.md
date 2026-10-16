@@ -1,0 +1,11 @@
+# Execution and concurrency — decisions
+
+Decision log for [Execution and concurrency](../execution-and-concurrency.md). Entries are append-only: a
+replaced entry gets a `Superseded by #M: <clause>.` note appended and is
+never rewritten or deleted. The detail doc describes the current design.
+
+- Concurrent default-dir invocations on one repository are supported by giving each run its own detached worktree over one shared store per repository and agent (#1162).
+- `agent-loop transport-check` runs one production fetch with the operator's credentials and is required before merging transport changes (#1383).
+- SSH transport honours a non-executing subset of `~/.ssh/config` for the literal URL host, refusing rather than escaping any unsafe value, and never runs `ssh -G` (#1380).
+- Same-UID live races against `~/.ssh` are left out of scope for the SSH transport (#1371).
+- Antigravity tracks quota exhaustion per quota group for the logical run, so a verified exhaustion skips the whole group with no retry instead of retrying each model (#1236).

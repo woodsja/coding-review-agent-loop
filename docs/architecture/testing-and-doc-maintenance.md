@@ -32,6 +32,16 @@ identity, size and heading index with a split recommendation; coder
 re-ask; and the PR comparison reports a detail-doc-only edit as a set change.
 See `docs/local_agent_loop.md` for the layout and size budget.
 
+Each detail doc's decision history lives in a paired, append-only log at
+`docs/architecture/decisions/<same-name>.md`; the detail doc's final
+Decisions section only links to it. Record new decisions there, keep the body
+current, and read the log before changing a component's behaviour so a
+rejected alternative is not proposed again. A replaced entry gets a
+supersession note appended rather than being rewritten. The root never links
+into the logs, so they stay outside the architecture set and out of prompts.
+`tests/test_docs_guidance.py` checks the pairing and that every entry carries
+an issue reference; `docs/local_agent_loop.md` gives the entry shape.
+
 Semantic-claim validation degrades the narrowest offending element instead of
 rejecting the whole response. The architecture-impact parser has three explicit
 modes. `strict` is the default and accepts only `changed` and `unchanged`.
@@ -132,6 +142,4 @@ mismatched clause, or a degrading parser that can raise or builds records.
 
 ## Decisions
 
-- The architecture path names the root of an architecture set, the root plus the `docs/architecture/*.md` files it links to one level deep, so an oversized single document can be split while root-only identities stay unchanged (#1454).
-- The `legacy` architecture-impact parser mode keeps the earlier synonym normalization, selected only where stored or historical text is decoded (#916).
-- A reviewer's own missing or invalid `architecture_impact.status` is re-asked once with the frozen prompt and session instead of being repaired, because repair cannot supply the reviewer's decision (#1185).
+[Decision log](decisions/testing-and-doc-maintenance.md)

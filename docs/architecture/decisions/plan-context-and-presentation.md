@@ -1,0 +1,9 @@
+# Plan context and presentation — decisions
+
+Decision log for [Plan context and presentation](../plan-context-and-presentation.md). Entries are append-only: a
+replaced entry gets a `Superseded by #M: <clause>.` note appended and is
+never rewritten or deleted. The detail doc describes the current design.
+
+- A structured plan comment that overflows the body budget is posted as a bounded visible digest, while round metadata and sidecars stay the complete authority, because visible plan Markdown had no spill path (#948).
+- Coder matrix evidence is shown collapsed and, on PR follow-ups, as a delta against the previous round, while canonical evidence stays complete; records written before this rendered the full list themselves (#959).
+- When the issue title or body changes under a plan that is not completely approved, a plan-first resume posts a scope-boundary record and starts a fresh plan at the next round, unless `--plan-resume-keep-on-issue-edit` is given (#1390).

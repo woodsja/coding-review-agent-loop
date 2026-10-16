@@ -391,15 +391,4 @@ unchanged.
 
 ## Decisions
 
-- Managed exact-head CI runs the complete suite as three duration-balanced shard legs of the same validated SHA, with an aggregate that keeps the original check name and proves full coverage exactly once (#1235).
-- Adopters whose tests need services or a routed matrix compose separate validate, test and publish workflows, where trust rests on the default-branch composition and API conclusions, not on attestations (#1313).
-- Managed CI may target a non-default base only when the owner-controlled trusted-bases variable allows it, while the workflow always comes from the default branch, so a branch cannot supply the workflow that qualifies it (#1285).
-- The selective-policy integration gap between machine-owned CI failures and reviewer-owned findings is tracked in #776 rather than solved here (#776).
-- Two preflight reads fall back only on a strict HTTP 403, so managed CI works where they are refused, such as Claude Code cloud sessions, while the workflow still enforces the real variable server-side (#1040).
-- A managed approved-plan PR without an issue-side handoff takes its plan binding from the PR-side authorization chain at qualification (#966).
-- Records retired by a later fresh grant are history and are ignored by the qualification chain check (#1065).
-- Records retired by a continuity record are likewise ignored, and a continuity record retires only records that cannot reach its new head (#1069).
-- The exact-head CI repair round is authorized by the tool-minted CI obligation, because it has no blocking review to pair with (#1024).
-- A rejected-coder recovery across a fresh grant is a third accepted continuity shape, walked through one shared chain authentication (#1367).
-- Coder and format-repair turns on a managed PR run under a `gh` guard that refuses CI dispatch before approval, plus a post-turn dispatch audit (#1366).
-- Post-approval CI watching stays opt-in without auto-merge (an end-of-run hint names `--watch-pending-ci`). Plumbing-only failures on a complete board are re-run once before any coder round, then stop on infrastructure (#1477).
+[Decision log](decisions/managed-ci-and-merge.md)

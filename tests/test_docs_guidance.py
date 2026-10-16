@@ -2,6 +2,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from coding_review_agent_loop.architecture_context import (
     _linked_detail_paths,
     _sanitize_architecture_text,
@@ -15,6 +17,7 @@ REPO_ROOT = Path(__file__).parent.parent
 LOCAL_AGENT_LOOP_DOC = REPO_ROOT / "docs" / "local_agent_loop.md"
 README = REPO_ROOT / "README.md"
 ARCHITECTURE = REPO_ROOT / "ARCHITECTURE.md"
+DECISIONS_DIR = REPO_ROOT / "docs" / "architecture" / "decisions"
 
 HEADING_TEXT = "Phased decomposition versus split materialization"
 CI_STALL_HEADING_TEXT = "External CI infrastructure stalls"
@@ -40,6 +43,21 @@ def _architecture_set_paths() -> list[Path]:
     members = _linked_detail_paths(ARCHITECTURE.read_text(encoding="utf-8"), "ARCHITECTURE.md")
     assert members is not None, "the CommonMark parser is required to discover members"
     return [ARCHITECTURE, *(REPO_ROOT / member for member in members)]
+
+
+_DECISION_ENTRY = re.compile(
+    r"^- (?:(?!Superseded by #)[^\n])+?\(#\d+(?:, #\d+)*(?:\)\.|, \d{4}-\d{2}-\d{2}\)\.?)"
+    r"(?: Superseded by #\d+: (?:(?!Superseded by #)[^\n])+?\.)*$"
+)
+
+
+def _decision_entry_is_valid(line: str) -> bool:
+    """A decision-log bullet: an issue reference, then only appended supersession notes."""
+    return _DECISION_ENTRY.match(line) is not None
+
+
+def _decision_log_bullets(path: Path) -> list[str]:
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("- ")]
 
 
 def _architecture_set_text() -> str:
@@ -98,8 +116,57 @@ def test_architecture_detail_docs_share_one_shape():
         h2 = re.findall(r"^## (.+)$", raw.decode("utf-8"), re.M)
         assert h2 and h2[-1] == "Decisions", path.name
         decisions = raw.decode("utf-8").rsplit("\n## Decisions\n", 1)[1]
-        bullets = [line for line in decisions.splitlines() if line.startswith("- ")]
-        assert bullets and all(re.search(r"\(#\d+(, #\d+)*\)\.$", line) for line in bullets), path.name
+        assert decisions.strip() == f"[Decision log](decisions/{path.name})", path.name
+        bullets = _decision_log_bullets(DECISIONS_DIR / path.name)
+        assert bullets and all(_decision_entry_is_valid(line) for line in bullets), path.name
+
+
+def test_architecture_decision_logs_pair_with_detail_docs():
+    detail_stems = {path.stem for path in (REPO_ROOT / "docs" / "architecture").glob("*.md")}
+    log_stems = {path.stem for path in DECISIONS_DIR.glob("*.md")}
+    assert detail_stems and log_stems == detail_stems
+    for stem in sorted(log_stems):
+        text = (DECISIONS_DIR / f"{stem}.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^(#+) ", text, re.M)
+        assert headings == ["#"], stem
+        assert f"](../{stem}.md)" in text, stem
+        assert not re.search(r"^[ \t]+[-*+] ", text, re.M), stem
+        bullets = _decision_log_bullets(DECISIONS_DIR / f"{stem}.md")
+        assert bullets, stem
+        invalid = [line for line in bullets if not _decision_entry_is_valid(line)]
+        assert not invalid, (stem, invalid)
+
+
+@pytest.mark.parametrize(
+    ("line", "valid"),
+    [
+        ("- X (#1).", True),
+        ("- X (#1, #2).", True),
+        ("- X (#1). Superseded by #3: y.", True),
+        ("- **T.** X (#1, 2026-10-15)", True),
+        ("- **T.** X (#1, 2026-10-15).", True),
+        ("- **T.** X (#1, 2026-10-15) Superseded by #3: y.", True),
+        ("- X (#1). Superseded by #3: y. Superseded by #4: z.", True),
+        ("- X no ref.", False),
+        ("- X (#1, 2026-1-5)", False),
+        ("- X. Superseded by #3: y. (#1).", False),
+        ("- X Superseded by #3: y. (#1).", False),
+        ("- X (1).", False),
+    ],
+)
+def test_decision_entry_validator_accepts_both_forms(line, valid):
+    assert _decision_entry_is_valid(line) is valid
+
+
+def test_architecture_root_never_links_into_decision_logs():
+    root = ARCHITECTURE.read_text(encoding="utf-8")
+    members = _linked_detail_paths(root, "ARCHITECTURE.md")
+    assert members is not None
+    assert not [member for member in members if member.startswith("docs/architecture/decisions/")]
+    for target in re.findall(r"\]\(([^)\s]+)", root):
+        resolved = (REPO_ROOT / target.split("#", 1)[0]).resolve()
+        assert not resolved.is_relative_to(DECISIONS_DIR.resolve()), target
+    assert "`docs/architecture/decisions/`" in root
 
 
 def test_default_render_injects_the_whole_root_and_every_detail_doc(tmp_path):
@@ -1254,7 +1321,13 @@ def test_ssh_transport_identity_contract_is_documented():
     for name, document in (
         ("README.md", README.read_text(encoding="utf-8")),
         ("local_agent_loop.md", LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")),
-        ("architecture set", _architecture_set_text()),
+        # The #1371 scope decision is history, so it lives in the paired decision log.
+        (
+            "architecture set and execution decision log",
+            _architecture_set_text()
+            + "\n\n"
+            + (DECISIONS_DIR / "execution-and-concurrency.md").read_text(encoding="utf-8"),
+        ),
     ):
         text = re.sub(r"\s+", " ", document)
         assert "ignores the user's SSH config" not in text
@@ -1394,6 +1467,10 @@ def test_docs_describe_the_architecture_set_layout_and_size_budget():
         assert "at most about 10k characters" in flat
         assert "10–30k characters" in flat
         assert "Decisions" in flat
+        assert "docs/architecture/decisions/<same-name>.md" in flat
+        assert "Superseded by #M: <clause>." in flat
+        assert "append-only" in flat
+        assert "read the log before changing" in flat
         assert "should be split into a short root overview" in flat
         assert "`--architecture-read-size`" in flat
         assert "canonical_document_path" in flat
