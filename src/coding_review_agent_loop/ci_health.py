@@ -481,6 +481,9 @@ def classify_watch_failure(
     names stuck contexts whose completed producing run has no failed job, so
     a ``--failed`` rerun would be ineffective; ``stuck_with_test_failures``
     names stuck contexts whose producing run has a failed non-plumbing job.
+    A stuck status without a failed job yields ``stuck-infrastructure`` only
+    once no other check is pending; until then it holds as
+    ``plumbing-awaiting-tests``.
     """
     stuck_keys = {(check.kind, check.name) for check in stuck_contexts}
     # (a) Test precedence: any failing non-plumbing check, or a stuck status
@@ -499,11 +502,16 @@ def classify_watch_failure(
         return "not-classifiable"
     if not board.failing and not stuck_keys:
         return "not-classifiable"
-    if stuck_keys and any(name in stuck_without_failed_jobs for _kind, name in stuck_keys):
-        return "stuck-infrastructure"
     unsettled = [
         check for check in board.pending if (check.kind, check.name) not in stuck_keys
     ]
+    if stuck_keys and any(name in stuck_without_failed_jobs for _kind, name in stuck_keys):
+        # A stuck status with no failed job to re-run stops on infrastructure,
+        # but only once every other check has settled: a test still running
+        # elsewhere may yet fail and must reach the coder (#1498).
+        if unsettled:
+            return "plumbing-awaiting-tests"
+        return "stuck-infrastructure"
     tests = [check for check in board.passing if not check_name_matches(check.name, plumbing_names)]
     if not board_tests_passed(board, plumbing_names):
         # A test skipped as a dependent of a failed plumbing job did not pass.

@@ -882,7 +882,7 @@ def test_loop_plumbing_hold_expiry_takes_timeout_path_without_coder(tmp_path, mo
     assert runner.claude_calls() == []
     out = capsys.readouterr().out
     assert "CI watch timed out" in out
-    assert "Plumbing failure awaiting tests" in out
+    assert "Plumbing failure or stuck required status awaiting tests" in out
 
 
 def test_loop_incomplete_board_with_plumbing_failure_keeps_coder_routing(tmp_path, monkeypatch):
@@ -946,6 +946,140 @@ def test_loop_stuck_pending_status_without_failed_jobs_stops_without_rerun(tmp_p
     stop = _comments_with(runner, "CI failed only in plumbing jobs")
     assert stop and "stayed pending after its producing run completed" in stop[0]
     assert "final-ci/exact-head: stuck-pending" in stop[0]
+
+
+# A stuck status whose run has no failed job waits for other checks (#1498).
+
+STUCK_RUN_URL = "https://github.com/OWNER/REPO/actions/runs/4343"
+
+
+def _slow_tests(status="in_progress"):
+    return PullRequestCheck(
+        name="slow tests", kind="check_run", status=status,
+        url="https://github.com/OWNER/REPO/actions/runs/5555/job/30", check_id=30,
+        check_suite_id=901,
+    )
+
+
+def _stuck_board_with(*others):
+    return _board(
+        _tests(), _final_status("pending"), *others,
+        required=("tests", "final-ci/exact-head", "slow tests"),
+    )
+
+
+def _no_failed_job_runner(**kwargs):
+    kwargs.setdefault("runs", {4343: _ordinary_run(4343, conclusion="success")})
+    kwargs.setdefault("suites", {})
+    return _approved_runner(**kwargs)
+
+
+def _sleeps(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
+
+
+@pytest.mark.parametrize(
+    ("settled", "status", "classification"),
+    [("success", "plumbing_failure", "stuck-infrastructure"), ("failure", "failed", "test-failure")],
+)
+def test_watch_holds_stuck_status_without_failed_jobs_until_tests_settle(
+    tmp_path, settled, status, classification
+):
+    held = _stuck_board_with(_slow_tests())
+    runner = _LoopRunner(runs={4343: _ordinary_run(4343, conclusion="success")})
+    outcome, runner = _watch(
+        tmp_path, [held, held, held, _stuck_board_with(_slow_tests(settled))], runner=runner,
+    )
+    assert outcome.status == status
+    assert outcome.classification == classification
+    assert outcome.attempts_used == 4
+    assert len(_sleeps(runner)) == 3
+    assert runner.reruns == []
+
+
+def test_watch_stuck_status_hold_expiry_takes_the_timeout_path(tmp_path):
+    held = _stuck_board_with(_slow_tests())
+    runner = _LoopRunner(runs={4343: _ordinary_run(4343, conclusion="success")})
+    outcome, runner = _watch(tmp_path, [held] * 3, runner=runner, ci_timeout_seconds=90)
+    assert outcome.status == "timeout"
+    assert outcome.hold_reason == "plumbing-awaiting-tests"
+    assert STUCK_RUN_URL in outcome.run_urls
+    assert [check.name for check in outcome.stuck_checks] == ["final-ci/exact-head"]
+    assert runner.reruns == []
+
+
+def test_loop_stuck_status_hold_then_green_stops_on_infrastructure(tmp_path, monkeypatch):
+    runner = _no_failed_job_runner()
+    held = _stuck_board_with(_slow_tests())
+    _install_boards(
+        monkeypatch, snapshot=_board(_tests("in_progress")),
+        watcher=[held, held, held, _stuck_board_with(_slow_tests("success"))],
+    )
+    monkeypatch.setattr(
+        pr_loop_module, "_merge_with_exact_head_proof",
+        lambda *a, **k: pytest.fail("no merge on an infrastructure stop"),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path)) == 0
+
+    assert runner.reruns == []
+    assert runner.claude_calls() == []
+    assert len(_sleeps(runner)) == 3
+    stop = _comments_with(runner, "CI failed only in plumbing jobs")
+    assert stop and "no failed job to re-run" in stop[0]
+
+
+def test_loop_stuck_status_hold_then_test_failure_routes_to_coder(tmp_path, monkeypatch):
+    runner = _no_failed_job_runner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved."),
+            structured_pr_review(
+                state="approved", summary="Approved again.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(state="blocking", summary="Fixed.", addressed_items=["item-1"]),
+        ],
+    )
+    held = _stuck_board_with(_slow_tests())
+    _install_boards(
+        monkeypatch, snapshot=_board(_tests("in_progress")),
+        watcher=[
+            held, held, _stuck_board_with(_slow_tests("failure")),
+            _board(
+                _tests(check_id=20), _slow_tests("success"),
+                _final_status("success", created_at="2026-10-14T19:05:00Z"),
+                required=("tests", "final-ci/exact-head", "slow tests"),
+            ),
+        ],
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path)) == 0
+
+    assert runner.reruns == []
+    assert len(runner.claude_calls()) == 1
+    assert not _comments_with(runner, "CI failed only in plumbing jobs")
+
+
+def test_loop_stuck_status_hold_expiry_takes_timeout_path_without_coder(
+    tmp_path, monkeypatch, capsys
+):
+    runner = _no_failed_job_runner()
+    held = _stuck_board_with(_slow_tests())
+    _install_boards(monkeypatch, snapshot=_board(_tests("in_progress")), watcher=[held])
+
+    assert run_pr_loop(
+        runner, pr_number=77, config=_loop_config(tmp_path, ci_timeout_seconds=90)
+    ) == 0
+
+    assert runner.reruns == []
+    assert runner.claude_calls() == []
+    assert not _comments_with(runner, "CI failed only in plumbing jobs")
+    out = capsys.readouterr().out
+    assert "CI watch timed out" in out
+    assert "stuck required status awaiting tests" in out
+    assert f"Run: {STUCK_RUN_URL}" in out
 
 
 def test_loop_stuck_status_with_genuine_test_failure_routes_to_coder(tmp_path, monkeypatch):
