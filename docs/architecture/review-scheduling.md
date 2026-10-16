@@ -229,6 +229,40 @@ crossing, already deferred, or below K). The same derivation
 runs at round start, so live and resumed runs trigger and stop at exactly K and
 M. The approval-time growth gate and scope-ledger preservation are unchanged.
 
+**Plan sweep trigger** (`--plan-sweep-rounds` K, default 2, `0` disables;
+`--plan-sweep-reasoning-effort`, off by default). The step-back arms only on a
+crossed one-shot plan, so a primary can drip-feed new findings on a plan that
+never crosses a growth signal. Under `primary-then-panel`,
+`review_step_back.derive_plan_sweep_state` counts consecutive sweep-counting
+primary reviews through the same counted-review walk as
+`derive_plan_step_back_state` (`_walk_primary_reviews`: latest record per round,
+a required same-round primary checkpoint, issue-digest and
+`scheduler_stall_reset` retirement, the panel opening, phase-advance and invalid
+scheduler boundaries, and publication records resolved through
+`effective_new_items`), so the two derivations share their retirement rules and
+differ only in the classifier. One eligibility filter,
+`eligible_new_mandatory_items` (primary-owned `blocking`/`same-plan` items not
+marked `repeat_of`), is shared with the history export; `count_sweep_items`
+additionally drops findings tagged `revision_introduced`, but only on reviews
+after the reviewer's first. When `streak_before(R) >= K` and the panel has not
+opened, the primary's round-R prompt carries `render_plan_sweep_guidance` (the
+finding classes from the streak's first round, bounded to 12 lines) in the
+volatile part of the full and compact plan review prompts, and the orchestrator
+writes the optional reviewer-record field `plan_sweep` (strict `true`, omitted
+when unset, malformed decodes as absent without degrading step-back or stall
+history). There is no episode, no planner turn and no stop, and the step-back
+counts are unaffected when both apply. The effort override builds a turn-local
+config (or seat copy) for that one primary turn in a fresh provider session; it
+is validated against the primary's backend before any agent turn and ignored with
+a log line for backends without effort control. Under the same policy, each
+reviewer's later prompts carry a previous-plan baseline
+(`reviewer_previous_plan_baseline`, resolved from the reviewer's latest earlier
+review subject and the hash-checked planner record of that subject) as a bounded
+diff, against which reviewers tag new mandatory findings with an advisory
+`provenance` (`revision_introduced` or `pre_existing`). Minting persists `provenance` and the orchestrator-computed
+`repeat_of` (a normalized-text match against the carried ledger) as optional
+item fields, omitted when unset.
+
 Planning scheduler metadata is a flow-discriminated branch of the same durable
 round-metadata transport. A planning record carries the candidate key in place
 of the PR-only SHA pair and omits the PR-only broad-rule and scope-digest state,

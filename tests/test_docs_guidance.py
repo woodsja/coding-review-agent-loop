@@ -1046,6 +1046,28 @@ def test_operator_docs_document_the_plan_step_back_mechanism():
     assert "step_back_entries" in architecture and "step_back_entries" in text
 
 
+def test_operator_docs_document_the_plan_sweep_and_finding_provenance():
+    """#1505: both flags, the counting rules, the provenance key and the export columns."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = _architecture_set_text()
+
+    for flag in ("--plan-sweep-rounds", "--plan-sweep-reasoning-effort"):
+        assert flag in text and flag in readme and flag in architecture
+    assert "#### Plan sweep trigger and finding provenance" in text
+    for phrase in ("repeat_of", "revision_introduced", "pre_existing", "plan_sweep"):
+        assert phrase in text and phrase in architecture, phrase
+    for column in (
+        "plan_findings_pre_existing", "plan_findings_revision_introduced",
+        "plan_findings_untagged", "plan_sweep_reviews",
+    ):
+        assert column in text, column
+    assert "derive_plan_sweep_state" in architecture
+
+
 def test_operator_docs_document_the_pr_step_back_mechanism():
     import pathlib
 

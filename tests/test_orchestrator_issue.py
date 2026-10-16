@@ -20671,3 +20671,573 @@ def test_named_task_reaches_pr_review_with_anchored_board(tmp_path):
         "issues/56/comments?per_page" in cmd[2]
         for cmd, _cwd in runner.commands if cmd[:2] == ["gh", "api"] and len(cmd) > 2
     )
+
+
+# --- Plan sweep trigger and finding provenance (#1505) ------------------------
+
+_SWEEP_HEADING = "PRIMARY SWEEP REQUEST"
+
+
+def _m1505_patch(base, *, resolved_items, summary):
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": summary,
+        "prior_plan_item_dispositions": [
+            {"item_id": item_id, "disposition": "resolved"} for item_id in resolved_items
+        ],
+        "base_round_number": base.round_number,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "plan_steps", "value": [f"{summary} Implement it."]}
+        ],
+    }
+    next_base = AuthenticatedPlanState.from_plan(
+        assemble_plan_revision(base, payload), round_number=base.round_number + 1
+    )
+    return (
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+        next_base,
+    )
+
+
+def _m1505_run(tmp_path, *, claude, codex, expect=AgentLoopError, **overrides):
+    values = {"max_rounds": 3}
+    values.update(overrides)
+    runner = _FakeRunner(claude_outputs=list(claude), codex_outputs=list(codex))
+    config = _staged_plan_config(tmp_path, **values)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(expect):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner, [str(call.args[-1]) for call in logged.call_args_list]
+
+
+def _m1505_primary_records(runner):
+    return [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+
+
+def _m1505_three_blocking_rounds():
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 3, base=base)
+    return [fresh, *claude], codex
+
+
+def test_primary_sweep_fires_after_k_counting_blocks(tmp_path):
+    """`sweep-fires-at-k`, `provenance-baseline`: live fake-runner plan loop."""
+    claude, codex = _m1505_three_blocking_rounds()
+    runner, messages = _m1505_run(tmp_path, claude=claude, codex=codex)
+
+    reviews = _m1251_prompts(runner, "codex")
+    assert [_SWEEP_HEADING in prompt for prompt in reviews] == [False, False, True]
+    assert "- [item-1] (round 1) Close gap 1." in reviews[2]
+    assert "- [item-2] (round 2) Close gap 2." in reviews[2]
+    assert "one exhaustive pass over the whole current plan" in reviews[2]
+    # The orchestrator-owned marker is on the swept primary record only.
+    assert [record.plan_sweep for record in _m1505_primary_records(runner)] == [
+        False, False, True,
+    ]
+    assert any("primary sweep requested (streak 2 >= 2)" in m for m in messages)
+    # Never the planner, never a step-back turn, never a stop.
+    planner = _m1251_prompts(runner, "claude")
+    assert not any(_SWEEP_HEADING in prompt for prompt in planner)
+    assert not any(_STEP_BACK_MARKER in prompt for prompt in planner)
+    assert all(record.step_back_entries == () for record in _plan_round_records(runner))
+    # The durable previous-plan baseline: first-review notice, then a diff.
+    assert "this is your first plan review of this issue" in reviews[0]
+    assert "you last reviewed the plan of round 1" in reviews[1]
+    assert "----- BEGIN BASELINE DIFF -----" in reviews[1]
+    assert "you last reviewed the plan of round 2" in reviews[2]
+    assert any(
+        "Codex new mandatory finding provenance: pre_existing=0 revision_introduced=0 "
+        "untagged=1 repeats=0; first_review=True; sweep=False" in m
+        for m in messages
+    )
+    assert any("first_review=False; sweep=True" in m for m in messages)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_resumed_run_reaches_the_same_sweep_decision(tmp_path, compact):
+    """`resume-parity`, `provenance-baseline`: durable records only, fresh sessions."""
+    claude, codex = _m1505_three_blocking_rounds()
+    overrides = {"planning_context_mode": "compact"} if compact else {}
+    # The first process dies at the planner revision after round 2's review.
+    first, _messages = _m1505_run(tmp_path, claude=claude[:2], codex=codex[:2], **overrides)
+    assert len(_m1505_primary_records(first)) == 2
+    rerun = _FakeRunner(
+        issue_comments=list(first.issue_comments),
+        claude_outputs=claude[2:],
+        codex_outputs=codex[2:],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=3, **overrides)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+
+    # Round 2's recorded review is not re-run; round 3 gets the sweep.
+    reviews = _m1251_prompts(rerun, "codex")
+    assert len(reviews) == 1
+    assert _SWEEP_HEADING in reviews[0]
+    assert "- [item-2] (round 2) Close gap 2." in reviews[0]
+    assert "you last reviewed the plan of round 2" in reviews[0]
+    assert "+++ current plan" in reviews[0]
+    if compact:
+        prefix, tail = reviews[0].split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+        assert _SWEEP_HEADING not in prefix and _SWEEP_HEADING in tail
+        assert "Finding provenance baseline" in tail
+    assert _m1505_primary_records(rerun)[-1].plan_sweep is True
+
+    live, _messages = _m1505_run(tmp_path / "live", claude=claude, codex=codex, **overrides)
+    live_sweep = _m1251_prompts(live, "codex")[2]
+    assert live_sweep.split(_SWEEP_HEADING, 1)[1].split("Finding provenance baseline")[0] == (
+        reviews[0].split(_SWEEP_HEADING, 1)[1].split("Finding provenance baseline")[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"plan_sweep_rounds": 0}, {"plan_review_policy": "all-reviewers", "primary_plan_reviewer": None}],
+)
+def test_disabled_or_full_board_planning_never_sweeps(tmp_path, overrides):
+    """`disabled-and-policy`: K=0 or the full-board policy keeps today's prompts."""
+    claude, codex = _m1505_three_blocking_rounds()
+    values = dict(overrides)
+    full_board = values.get("plan_review_policy") == "all-reviewers"
+    if full_board:
+        values["reviewer"] = ("codex",)
+    runner, _messages = _m1505_run(tmp_path, claude=claude, codex=codex, **values)
+    reviews = _m1251_prompts(runner, "codex")
+    assert len(reviews) == 3
+    assert not any(_SWEEP_HEADING in prompt for prompt in reviews)
+    assert not any(record.plan_sweep for record in _plan_round_records(runner))
+    if full_board:
+        assert not any("Finding provenance" in prompt for prompt in reviews)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"plan_sweep_rounds": 1}, "--plan-sweep-rounds requires --plan-review-policy primary-then-panel"),
+        ({"plan_sweep_reasoning_effort": "high"}, "--plan-sweep-reasoning-effort requires"),
+        ({"plan_sweep_rounds": -1}, "--plan-sweep-rounds must be a non-negative integer"),
+        ({"plan_sweep_rounds": True}, "--plan-sweep-rounds must be a non-negative integer"),
+        ({"plan_sweep_reasoning_effort": "turbo"}, "--plan-sweep-reasoning-effort value 'turbo'"),
+    ],
+)
+def test_sweep_flags_are_validated_at_config_time(tmp_path, overrides, message):
+    """`disabled-and-policy`, `sweep-effort-turn` (config unit)."""
+    values = {"reviewer": ("codex", "gemini")}
+    if "requires" not in message:
+        values.update(plan_review_policy="primary-then-panel", primary_plan_reviewer="codex")
+    values.update(overrides)
+    with pytest.raises(AgentLoopError, match=re.escape(message)):
+        make_config(tmp_path, **values)
+
+
+def test_sweep_flags_reach_the_config_from_the_cli(tmp_path):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+
+    base_argv = [
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--reviewer", "codex", "--reviewer", "gemini",
+        "--codex-dir", str(tmp_path / "codex"), "--gemini-dir", str(tmp_path / "gemini"),
+        "--dangerous-agent-permissions",
+        "--plan-review-policy", "primary-then-panel", "--primary-plan-reviewer", "codex",
+    ]
+    parser = build_parser()
+    defaults = config_from_args(parser.parse_args(base_argv), _FakeRunner())
+    assert (defaults.plan_sweep_rounds, defaults.plan_sweep_reasoning_effort) == (2, "")
+    config = config_from_args(
+        parser.parse_args(
+            [*base_argv, "--plan-sweep-rounds", "1", "--plan-sweep-reasoning-effort", "high"]
+        ),
+        _FakeRunner(),
+    )
+    assert (config.plan_sweep_rounds, config.plan_sweep_reasoning_effort) == (1, "high")
+    with pytest.raises(AgentLoopError, match="--plan-sweep-rounds must be"):
+        config_from_args(parser.parse_args([*base_argv, "--plan-sweep-rounds", "-1"]), _FakeRunner())
+
+
+def _m1505_repeat_script(*, mixed):
+    fresh, base1 = _m1103_fresh_base()
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1 remains.", blocking_plan_issues=["Close gap 1."],
+    )
+    patch1, base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    # Round 2 keeps item-1 and also re-emits its text as a "new" finding.
+    round2 = structured_plan_review(
+        state="blocking",
+        summary="Gap 1 still open.",
+        blocking_plan_issues=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "blocking"}],
+    )
+    resolved = ["item-1", "item-2", *(["item-3"] if mixed else [])]
+    patch2, base3 = _m1505_patch(base2, resolved_items=resolved, summary="Close gap 1 again.")
+    round3 = structured_plan_review(
+        state="blocking",
+        summary="Gap 3 remains.",
+        blocking_plan_issues=["Close gap 3."],
+        prior_plan_item_dispositions=[
+            {"item_id": item_id, "disposition": "resolved"} for item_id in resolved
+        ],
+    )
+    patch3, _base = _m1505_patch(base3, resolved_items=[f"item-{len(resolved) + 1}"], summary="Close gap 3.")
+    return [fresh, patch1, patch2, patch3], [round1, round2, round3]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_a_re_emitted_carried_finding_is_marked_and_not_counted(tmp_path, mixed):
+    """`repeat-reemission`: minted with repeat_of, kept on the ledger, never counted."""
+    claude, codex = _m1505_repeat_script(mixed=mixed)
+    runner, messages = _m1505_run(tmp_path, claude=claude, codex=codex)
+
+    round_two = _m1505_primary_records(runner)[1]
+    duplicate = next(item for item in round_two.new_items if item.text == "Close gap 1.")
+    assert duplicate.item_id == "item-2"
+    assert duplicate.repeat_of == "item-1"
+    assert duplicate.status == "blocking"
+    if mixed:
+        fresh_item = next(item for item in round_two.new_items if item.text == "Close gap 2b.")
+        assert fresh_item.repeat_of is None
+    # The duplicate stays an ordinary finding for the planner.
+    assert "[item-2]" in _m1251_prompts(runner, "claude")[2]
+    reviews = _m1251_prompts(runner, "codex")
+    # The repeat-only review ends the streak; the mixed one counts through item-3.
+    assert (_SWEEP_HEADING in reviews[2]) is mixed
+    assert any(
+        f"repeats=1; first_review=False" in m and "Planning round 2: Codex" in m
+        for m in messages
+    )
+
+
+def test_a_revision_introduced_only_review_breaks_the_live_streak(tmp_path):
+    """`streak-breakers` (live): later-review revision tags do not count."""
+    fresh, base1 = _m1103_fresh_base()
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1.", blocking_plan_issues=["Close gap 1."],
+    )
+    patch1, base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    round2 = structured_plan_review(
+        state="blocking", summary="The revision broke step 2.",
+        blocking_plan_issues=[{"finding": "Step 2 regressed.", "provenance": "revision_introduced"}],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )
+    patch2, base3 = _m1505_patch(base2, resolved_items=["item-2"], summary="Fix step 2.")
+    round3 = structured_plan_review(
+        state="blocking", summary="Gap 3.",
+        blocking_plan_issues=[{"finding": "Close gap 3.", "provenance": "pre_existing"}],
+        prior_plan_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+    )
+    patch3, _base = _m1505_patch(base3, resolved_items=["item-3"], summary="Close gap 3.")
+    runner, messages = _m1505_run(
+        tmp_path, claude=[fresh, patch1, patch2, patch3], codex=[round1, round2, round3],
+    )
+    assert not any(_SWEEP_HEADING in prompt for prompt in _m1251_prompts(runner, "codex"))
+    tagged = [item.provenance for record in _m1505_primary_records(runner) for item in record.new_items]
+    assert tagged == [None, "revision_introduced", "pre_existing"]
+    assert any("pre_existing=0 revision_introduced=1 untagged=0" in m for m in messages)
+
+
+def _m1505_codex_argv(runner):
+    return [argv for argv, _cwd in runner.argv_commands if argv[:1] == ["codex"]]
+
+
+def test_sweep_effort_applies_to_the_primary_sweep_turn_only(tmp_path):
+    """`sweep-effort-turn`: invocation, signature and session of the sweep turn only."""
+    claude, codex = _m1505_three_blocking_rounds()
+    runner, messages = _m1505_run(
+        tmp_path, claude=claude, codex=codex,
+        plan_sweep_reasoning_effort="high", codex_model="gpt-test",
+    )
+    efforts = [
+        next(arg for arg in argv if arg.startswith("model_reasoning_effort="))
+        for argv in _m1505_codex_argv(runner)
+    ]
+    assert efforts == [
+        'model_reasoning_effort="medium"', 'model_reasoning_effort="medium"',
+        'model_reasoning_effort="high"',
+    ]
+    # The sweep turn starts a fresh provider session.
+    assert "resume" not in _m1505_codex_argv(runner)[2]
+    assert any("sweep turn at effort high in a fresh session" in m for m in messages)
+    primary_comments = [
+        comment["body"] for comment in runner.issue_comments
+        if "AGENT_PLAN_STATE" in comment["body"]
+        and "-- OpenAI Codex: gpt-test" in comment["body"]
+    ]
+    assert len(primary_comments) == 3
+    assert primary_comments[-1].rstrip().endswith("gpt-test (high)")
+    assert all(body.rstrip().endswith("gpt-test (medium)") for body in primary_comments[:-1])
+    # The planner's effort is untouched.
+    assert not any(
+        "--effort" in argv and "high" in argv
+        for argv, _cwd in runner.argv_commands if argv[:1] == ["claude"]
+    )
+
+
+def test_unsupported_sweep_effort_for_the_primary_backend_fails_before_any_turn(tmp_path):
+    """`sweep-effort-turn`: `max` is a Claude effort, not a Codex one."""
+    claude, codex = _m1505_three_blocking_rounds()
+    runner, _messages = _m1505_run(
+        tmp_path, claude=claude, codex=codex, plan_sweep_reasoning_effort="max",
+    )
+    assert _m1103_agent_calls(runner) == []
+
+
+def test_sweep_effort_is_ignored_with_a_log_line_for_a_backend_without_effort(tmp_path):
+    """`sweep-effort-turn`: a Gemini primary runs unchanged."""
+    fresh, base = _m1103_fresh_base()
+    review = structured_plan_review(
+        state="blocking", summary="Gap 1.", blocking_plan_issues=["Close gap 1."],
+        reviewer="Google Gemini",
+    )
+    runner = _FakeRunner(claude_outputs=[fresh], gemini_outputs=[review])
+    config = _staged_plan_config(
+        tmp_path, max_rounds=1, primary_plan_reviewer="gemini",
+        plan_sweep_reasoning_effort="high",
+    )
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    assert any(
+        "--plan-sweep-reasoning-effort high is ignored: the primary plan reviewer's "
+        "gemini backend has no effort control" in m
+        for m in messages
+    )
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+def test_sweep_turn_inputs_override_bare_and_seat_efforts(tmp_path, backend):
+    """`sweep-effort-turn`: bare agents get a turn config, seats a turn-local copy."""
+    from coding_review_agent_loop.agents.registry import agent_signature
+    from coding_review_agent_loop.config import resolve_invocation
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    config = make_config(tmp_path, claude_model="claude-test", codex_model="gpt-test")
+    agent, turn_config = plan_first_loop_module._plan_sweep_turn_inputs(backend, config, "high")
+    assert agent == backend
+    assert resolve_invocation(turn_config, provider=backend, role="reviewer").resolved_effort == "high"
+    assert resolve_invocation(config, provider=backend, role="reviewer").resolved_effort == "medium"
+    assert plan_first_loop_module._plan_sweep_turn_inputs(backend, config, None) == (backend, config)
+
+    seat = SeatAgent(ReviewerSeat("primary-seat", backend, ("model-x",), "low"), tmp_path)
+    turn_seat, seat_config = plan_first_loop_module._plan_sweep_turn_inputs(seat, config, "high")
+    assert seat_config is config
+    assert isinstance(turn_seat, SeatAgent) and turn_seat == seat
+    assert turn_seat.effort == "high" and seat.effort == "low"
+    assert turn_seat.backend == backend and turn_seat.workdir == tmp_path
+    assert agent_signature(turn_seat).endswith("model-x (high))")
+    assert resolve_invocation(config, provider=turn_seat, role="reviewer").resolved_effort == "high"
+
+
+def _m1505_effort_arg(argv):
+    """The effort a recorded claude or codex invocation ran at."""
+    if argv[0] == "claude":
+        return argv[argv.index("--effort") + 1]
+    value = next(arg for arg in argv if arg.startswith("model_reasoning_effort="))
+    return value.split("=", 1)[1].strip('"')
+
+
+@pytest.mark.parametrize("primary_kind", ["claude", "codex-seat", "claude-seat"])
+def test_sweep_effort_workflow_for_claude_and_seat_primaries(tmp_path, primary_kind):
+    """`sweep-effort-turn`: bare Claude and named-seat primaries through the plan loop."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    primary_backend = "codex" if primary_kind == "codex-seat" else "claude"
+    planner_backend = "claude" if primary_backend == "codex" else "codex"
+    planner_signature = "Anthropic Claude" if planner_backend == "claude" else "OpenAI Codex"
+    claude_plan, _reviews = _m1505_three_blocking_rounds()
+    planner = [text.replace("-- Anthropic Claude", f"-- {planner_signature}") for text in claude_plan]
+    overrides: dict = {"coder": planner_backend, "plan_sweep_reasoning_effort": "high"}
+    if primary_kind == "claude":
+        signature = "Anthropic Claude"
+        overrides.update(
+            reviewer=("claude", "gemini"), primary_plan_reviewer="claude",
+            claude_model="claude-test",
+        )
+        base_effort = "medium"
+    else:
+        seat_dir, panel_dir = tmp_path / "primary-seat", tmp_path / "panel-seat"
+        seat_dir.mkdir()
+        panel_dir.mkdir()
+        seat = SeatAgent(
+            ReviewerSeat("primary-seat", primary_backend, ("seat-model",), "low"), seat_dir
+        )
+        panel = SeatAgent(ReviewerSeat("panel-seat", "gemini", ("gemini-model",)), panel_dir)
+        backend_name = "OpenAI Codex" if primary_backend == "codex" else "Anthropic Claude"
+        signature = f"primary-seat ({backend_name}: seat-model (low))"
+        overrides.update(
+            reviewer=(seat, panel), reviewer_seats=(seat, panel), primary_plan_reviewer=seat,
+        )
+        base_effort = "low"
+    reviews = [
+        structured_plan_review(
+            state="blocking", summary=f"Gap {n} remains.",
+            blocking_plan_issues=[f"Close gap {n}."],
+            prior_plan_item_dispositions=(
+                [{"item_id": f"item-{n - 1}", "disposition": "resolved"}] if n > 1 else None
+            ),
+            reviewer=signature,
+        )
+        for n in (1, 2, 3)
+    ]
+    outputs = {
+        f"{planner_backend}_outputs": planner,
+        f"{primary_backend}_outputs": reviews,
+    }
+    runner = _FakeRunner(**outputs)
+    config = _staged_plan_config(tmp_path, max_rounds=3, **overrides)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+
+    primary_argv = [argv for argv, _cwd in runner.argv_commands if argv[:1] == [primary_backend]]
+    planner_argv = [argv for argv, _cwd in runner.argv_commands if argv[:1] == [planner_backend]]
+    assert len(primary_argv) == 3
+    assert [_m1505_effort_arg(argv) for argv in primary_argv] == [base_effort, base_effort, "high"]
+    # The planner's effort never changes; no gemini panel turn runs.
+    planner_efforts = {_m1505_effort_arg(argv) for argv in planner_argv}
+    assert planner_efforts == {"medium"}
+    assert not any(argv[:1] == ["gemini"] for argv, _cwd in runner.argv_commands)
+    # The sweep turn starts a fresh provider session.
+    assert "--resume" not in primary_argv[2] and "resume" not in primary_argv[2]
+    assert any("sweep turn at effort high in a fresh session" in m for m in messages)
+    sweep_prompt = _m1251_prompts(runner, primary_backend)[2]
+    assert _SWEEP_HEADING in sweep_prompt
+    # Published signatures report the effort that ran.
+    primary_bodies = [
+        comment["body"].rstrip() for comment in runner.issue_comments
+        if "AGENT_PLAN_STATE" in comment["body"]
+        and comment["body"].rstrip().splitlines()[-1].startswith(
+            "-- primary-seat" if primary_kind != "claude" else "-- Anthropic Claude"
+        )
+    ]
+    if primary_kind == "claude":
+        # The planner is Codex here, so every Claude-signed plan comment is a review.
+        assert [body.endswith("(high)") for body in primary_bodies] == [False, False, True]
+        assert all(body.endswith("claude-test (medium)") for body in primary_bodies[:2])
+    else:
+        assert [body.endswith("seat-model (high))") for body in primary_bodies] == [
+            False, False, True,
+        ]
+        assert all(body.endswith("seat-model (low))") for body in primary_bodies[:2])
+    records = _m1505_primary_records_for(runner, "primary-seat" if primary_kind != "claude" else "Claude")
+    assert [record.plan_sweep for record in records] == [False, False, True]
+
+
+def _m1505_primary_records_for(runner, agent):
+    return [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == agent
+    ]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch, mixed):
+    """`repeat-reemission` (repaired path): the acknowledgement repair returns blocking."""
+    requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
+    dispositions = [{
+        "requirement_id": requirement.requirement_id,
+        "disposition": "addressed",
+        "evidence": "The plan preserves the public API.",
+    }]
+    base1 = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(plan_output), round_number=1
+    )
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1 remains.", blocking_plan_issues=["Close gap 1."],
+        human_requirement_dispositions=dispositions,
+    )
+    patch1, _base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    patch1 = patch1.replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n### Human requirements\n"
+        f"- {requirement.requirement_id}: the plan preserves the public API.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    # Round 2 approves without the acknowledgement; its repair blocks and
+    # re-emits the carried item-1 text as a "new" finding.
+    # Repair may only recover findings grounded in the reviewer's own source
+    # text, so the approval lists them as future follow-ups.
+    round2 = structured_plan_review(
+        state="approved", summary="Gap 1 closed.",
+        future_followups=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        human_requirement_dispositions=dispositions,
+    )
+    repaired = structured_plan_review(
+        state="blocking", summary="Gap 1 closed.",
+        blocking_plan_issues=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        human_requirements_resolved=True,
+        human_requirement_dispositions=dispositions,
+    )
+    runner = _FakeRunner(claude_outputs=[plan_output, patch1], codex_outputs=[round1, round2])
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+        with patch.object(
+            plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+        ) as logged:
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(
+                    runner, issue_number=56, config=_staged_plan_config(tmp_path, max_rounds=2),
+                    plan_first=True,
+                )
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    assert any("repair returned blocking for Codex" in m for m in messages)
+    assert any(
+        "Codex repaired blocking outcome new mandatory finding provenance: "
+        f"pre_existing=0 revision_introduced=0 untagged={int(mixed)} repeats=1" in m
+        for m in messages
+    )
+    from coding_review_agent_loop.history_export import _plan_provenance_counts
+    from coding_review_agent_loop.review_step_back import derive_plan_sweep_state
+
+    # Everything below is derived from the posted durable records only.
+    records = [
+        PostedRoundRecord(index=index, metadata=metadata, body="")
+        for index, metadata in enumerate(_plan_round_records(runner))
+    ]
+    round_two = [
+        record.metadata for record in records
+        if record.metadata.role == "reviewer" and record.metadata.agent == "Codex"
+        and record.metadata.round_number == 2
+    ]
+    # The repaired blocking outcome supersedes the approval posted before it.
+    assert [metadata.state for metadata in round_two] == ["approved", "blocking"]
+    repaired_items = [item for item in round_two[-1].new_items if item.status == "blocking"]
+    assert len(repaired_items) == (2 if mixed else 1)
+    duplicate = next(item for item in repaired_items if item.text == "Close gap 1.")
+    assert duplicate.repeat_of == "item-1"
+    if mixed:
+        fresh_item = next(item for item in repaired_items if item.text == "Close gap 2b.")
+        assert fresh_item.repeat_of is None
+    # The repeat-only repair ends the streak; the mixed one extends it.
+    state = derive_plan_sweep_state(records, primary="Codex")
+    assert [review.classification for review in state.reviews][-1] == (
+        "new-finding" if mixed else "repeat-only"
+    )
+    assert state.streak_before(3) == (2 if mixed else 0)
+    # The export counts the genuinely new item and never the duplicate.
+    counts = _plan_provenance_counts(records)
+    assert counts.resolvable
+    assert (counts.pre_existing, counts.revision_introduced, counts.untagged) == (0, 0, int(mixed))

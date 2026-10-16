@@ -200,6 +200,7 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
                 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
                 DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
                 DEFAULT_PLAN_STEP_BACK_ROUNDS,
+                DEFAULT_PLAN_SWEEP_ROUNDS,
             )
 
             values: dict[str, object] = {
@@ -233,6 +234,8 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
                 "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
                 "plan_step_back_rounds": DEFAULT_PLAN_STEP_BACK_ROUNDS,
                 "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
+                "plan_sweep_rounds": DEFAULT_PLAN_SWEEP_ROUNDS,
+                "plan_sweep_reasoning_effort": "",
             }
             if backend == "claude":
                 values["claude_model"] = model

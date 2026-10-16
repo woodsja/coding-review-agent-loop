@@ -711,6 +711,17 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "fields or canonical evidence rows."
         ),
     ),
+    "_plan_review_finding_provenances": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "A plan review finding's advisory provenance tag (#1505) degrades to untagged, "
+            "dropping only the tag; record construction reaches marker neutralization. "
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
     "_degradable_sub_items": ShapeCheckClassification(
         "mixed",
         frozenset({"authentication-or-forgery"}),
@@ -1628,9 +1639,15 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
     ),
     "parse_structured_plan_review": ShapeCheckClassification(
         "mixed",
-        frozenset({"kind-or-version-mismatch", "no-conservative-reading", "unparseable-envelope"}),
+        frozenset({
+            "authentication-or-forgery", "kind-or-version-mismatch", "no-conservative-reading",
+            "unparseable-envelope",
+        }),
         (
-            "Mixed: degrades through _degradable_response_impact. Fatal sites: "
+            "Mixed: degrades through _degradable_response_impact and "
+            "_plan_review_finding_provenances. Fatal sites: authentication-or-forgery: "
+            "marker neutralization through sanitize_historical_text when a provenance "
+            "degradation record is built; "
             "kind-or-version-mismatch: a kind, schema_version or contract version this "
             "parser does not read; no-conservative-reading: removing the element would "
             "weaken an obligation, finding, disposition, approved topology or discussion "

@@ -20,6 +20,7 @@ a resumed run agree at exactly K and M.  A malformed entry marks the history
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -33,6 +34,7 @@ from .plan_growth import (
     plan_growth_gate_enforced,
     plan_strategy,
 )
+from .protocol import PROVENANCE_PRE_EXISTING, PROVENANCE_REVISION_INTRODUCED
 
 if TYPE_CHECKING:
     from .round_state import PostedRoundMetadata, PostedRoundRecord
@@ -192,24 +194,42 @@ class StepBackState:
         return count
 
 
-def derive_plan_step_back_state(
+@dataclass(frozen=True)
+class _PrimaryWalk:
+    """The primary's counted reviews and retirement facts from plan records.
+
+    Shared by the plan step-back and the plan sweep (#1505) so their retirement
+    rules cannot drift; only the per-review classifier differs.
+    """
+
+    ordered: tuple["PostedRoundRecord", ...]
+    degraded: bool
+    boundary_index: int
+    retired_through: int
+    reset_indices: tuple[int, ...]
+    all_checkpoints: tuple[tuple[int, str | None], ...]
+    deferrals: tuple[tuple[int, int, str | None], ...]
+    reviews: tuple[PrimaryReview, ...]
+
+
+def _walk_primary_reviews(
     records: Sequence["PostedRoundRecord"],
     *,
     primary: str,
-    panel_opening_index: int | None = None,
-    current_issue_digest: str | None = None,
-) -> StepBackState:
-    """Derive the primary's streak inputs and active episode from plan records.
+    panel_opening_index: int | None,
+    current_issue_digest: str | None,
+    classify: Callable[[Sequence["PostedRoundRecord"], "PostedRoundRecord"], str],
+) -> _PrimaryWalk:
+    """Walk the primary's latest-per-round reviews under the shared retirement rules.
 
     Retirement mirrors the primary stall streak: a review whose latest preceding
     same-round checkpoint recorded a different issue digest retires itself and
     everything before it, and the operator reset marker retires the rounds
-    *before* the checkpoint's round.
-    A panel opening, an invalid scheduler record or a phase-advance record ends
-    the primary phase, so nothing at or before it counts.  An approval by the
-    primary closes the episode.
+    *before* the checkpoint's round.  A panel opening, an invalid scheduler
+    record or a phase-advance record ends the primary phase, so nothing at or
+    before it counts.  ``classify(ordered, record)`` names each counted review.
     """
-    ordered = sorted(records, key=lambda item: item.index)
+    ordered = tuple(sorted(records, key=lambda item: item.index))
     degraded = any(record.metadata.step_back_status == "invalid" for record in ordered)
     boundary_index = max(
         (
@@ -296,12 +316,50 @@ def derive_plan_step_back_state(
             PrimaryReview(
                 round_number=number,
                 index=record.index,
-                classification=classify_review(
-                    record.metadata, new_items=effective_new_items(ordered, record)
-                ),
+                classification=classify(ordered, record),
             )
         )
-    reviews = tuple(counted)
+    return _PrimaryWalk(
+        ordered=ordered,
+        degraded=degraded,
+        boundary_index=boundary_index,
+        retired_through=retired_through,
+        reset_indices=tuple(reset_indices),
+        all_checkpoints=tuple(all_checkpoints),
+        deferrals=tuple(deferrals),
+        reviews=tuple(counted),
+    )
+
+
+def derive_plan_step_back_state(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    primary: str,
+    panel_opening_index: int | None = None,
+    current_issue_digest: str | None = None,
+) -> StepBackState:
+    """Derive the primary's streak inputs and active episode from plan records.
+
+    Retirement follows :func:`_walk_primary_reviews`.  An approval by the
+    primary closes the episode.
+    """
+    walk = _walk_primary_reviews(
+        records,
+        primary=primary,
+        panel_opening_index=panel_opening_index,
+        current_issue_digest=current_issue_digest,
+        classify=lambda ordered, record: classify_review(
+            record.metadata, new_items=effective_new_items(ordered, record)
+        ),
+    )
+    ordered = walk.ordered
+    degraded = walk.degraded
+    boundary_index = walk.boundary_index
+    retired_through = walk.retired_through
+    reset_indices = walk.reset_indices
+    all_checkpoints = walk.all_checkpoints
+    deferrals = list(walk.deferrals)
+    reviews = walk.reviews
 
     episode: StepBackEntry | None = None
     for record in ordered:
@@ -384,6 +442,342 @@ def derive_plan_step_back_state(
         escalation_count=escalation_count,
         deferral_rounds=deferral_rounds,
     )
+
+
+# ---------------------------------------------------------------------------
+# Plan sweep trigger and finding provenance (#1505)
+#
+# Independent of the plan-growth gate: once the primary has blocked K
+# consecutive primary-phase rounds with new mandatory findings, its next review
+# is asked for one exhaustive pass.  The counted-review walk and its retirement
+# rules are the step-back's (:func:`_walk_primary_reviews`); only the counting
+# predicate differs.  It never stops a run and has no episode.
+# ---------------------------------------------------------------------------
+
+
+def eligible_new_mandatory_items(new_items: object, *, reviewer: str) -> tuple:
+    """The reviewer-owned mandatory new items that are not repeats (#1505).
+
+    The single eligibility filter shared by the sweep trigger and the history
+    export.  ``future`` items and items marked ``repeat_of`` at minting never
+    count.
+    """
+    mandatory = _MANDATORY_STATUSES[PHASE_PLAN]
+    return tuple(
+        item
+        for item in (new_items or ())
+        if item.reviewer == reviewer
+        and item.status in mandatory
+        and getattr(item, "repeat_of", None) is None
+    )
+
+
+def count_sweep_items(new_items: object, *, reviewer: str, first_review: bool) -> int:
+    """Trigger-only count of a review's new mandatory findings.
+
+    On a later review, findings the reviewer tagged ``revision_introduced`` are
+    excluded; untagged findings count, so omitting the tag cannot suppress the
+    trigger.  On the reviewer's first plan review every eligible finding counts,
+    whatever its tag.
+    """
+    eligible = eligible_new_mandatory_items(new_items, reviewer=reviewer)
+    if first_review:
+        return len(eligible)
+    return sum(
+        1 for item in eligible
+        if getattr(item, "provenance", None) != PROVENANCE_REVISION_INTRODUCED
+    )
+
+
+def classify_sweep_review(
+    metadata: "PostedRoundMetadata", new_items: object, *, first_review: bool
+) -> str:
+    """Classify one primary review for the sweep streak.
+
+    ``new-finding`` needs at least one counted item; any other block is
+    ``repeat-only``.  ``new_items`` of ``None`` (an unresolvable publication
+    record) is ``blocking-unresolved``.
+    """
+    if metadata.state == "approved":
+        return CLASS_APPROVED
+    if metadata.state != "blocking":
+        return CLASS_OTHER
+    if new_items is None:
+        return CLASS_BLOCKING_UNRESOLVED
+    if count_sweep_items(new_items, reviewer=metadata.agent, first_review=first_review) > 0:
+        return CLASS_NEW_FINDING
+    return CLASS_REPEAT_ONLY
+
+
+def first_plan_review_round(
+    records: Sequence["PostedRoundRecord"], *, reviewer: str
+) -> int | None:
+    """The lowest round of any plan reviewer record by ``reviewer``, if any."""
+    rounds = [
+        record.metadata.round_number
+        for record in records
+        if record.metadata.role == "reviewer" and record.metadata.agent == reviewer
+    ]
+    return min(rounds) if rounds else None
+
+
+@dataclass(frozen=True)
+class PlanSweepState:
+    """History-derived sweep streak of the primary plan reviewer (#1505)."""
+
+    degraded: bool
+    reviews: tuple[PrimaryReview, ...]
+
+    def _streak(self, round_number: int) -> list[PrimaryReview]:
+        streak: list[PrimaryReview] = []
+        for review in reversed(self.reviews):
+            if review.round_number >= round_number:
+                continue
+            # The streak must reach back from the round immediately before
+            # ``round_number``: an uncounted round anywhere, the newest one
+            # included, ends it.
+            expected = (streak[-1].round_number if streak else round_number) - 1
+            if review.classification != CLASS_NEW_FINDING or review.round_number != expected:
+                break
+            streak.append(review)
+        return streak
+
+    def streak_before(self, round_number: int) -> int:
+        """Consecutive newest-first ``new-finding`` reviews in rounds before ``round_number``.
+
+        A repeat-only, approved, unresolvable or other review ends it, and so
+        does a round with no counted review.
+        """
+        return len(self._streak(round_number))
+
+    def streak_first_round(self, round_number: int) -> int | None:
+        """The earliest round of the streak counted by :meth:`streak_before`."""
+        streak = self._streak(round_number)
+        return streak[-1].round_number if streak else None
+
+
+def derive_plan_sweep_state(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    primary: str,
+    panel_opening_index: int | None = None,
+    current_issue_digest: str | None = None,
+) -> PlanSweepState:
+    """Derive the primary's sweep streak with the step-back's retirement rules."""
+    first_round = first_plan_review_round(records, reviewer=primary)
+    walk = _walk_primary_reviews(
+        records,
+        primary=primary,
+        panel_opening_index=panel_opening_index,
+        current_issue_digest=current_issue_digest,
+        classify=lambda ordered, record: classify_sweep_review(
+            record.metadata,
+            effective_new_items(ordered, record),
+            first_review=record.metadata.round_number == first_round,
+        ),
+    )
+    return PlanSweepState(degraded=walk.degraded, reviews=walk.reviews)
+
+
+def plan_sweep_due(
+    state: PlanSweepState | None,
+    *,
+    round_number: int,
+    sweep_rounds: int,
+) -> bool:
+    """Whether round ``round_number``'s primary review gets the sweep request."""
+    if sweep_rounds <= 0 or state is None or state.degraded:
+        return False
+    return state.streak_before(round_number) >= sweep_rounds
+
+
+PLAN_SWEEP_CLASS_LIMIT = 12
+
+
+def plan_sweep_finding_classes(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    primary: str,
+    first_round: int,
+    limit: int = PLAN_SWEEP_CLASS_LIMIT,
+) -> tuple[str, ...]:
+    """The primary's mandatory finding classes since ``first_round``, repeats skipped.
+
+    The newest ``limit`` entries are kept; an ``and N more`` line names the rest.
+    """
+    lines = _mandatory_plan_finding_lines(
+        records, primary=primary, first_round=first_round, skip_repeats=True
+    )
+    if len(lines) <= limit:
+        return tuple(lines)
+    hidden = len(lines) - limit
+    return (*lines[-limit:], f"and {hidden} more earlier finding(s) not shown")
+
+
+def render_plan_sweep_guidance(classes: Sequence[str]) -> str:
+    """The primary's sweep request, shared by the full and compact review prompts."""
+    listed = "\n".join(f"- {line}" for line in classes) or "- (none recorded)"
+    return (
+        "PRIMARY SWEEP REQUEST (orchestrator guidance, not a reviewer finding; this "
+        "round only): your recent reviews of this plan each blocked on new mandatory "
+        "findings. Finding classes you have already raised:\n"
+        f"{listed}\n"
+        "Make one exhaustive pass over the whole current plan and report every "
+        "remaining in-scope defect in this review, rather than across later rounds. "
+        "Explicitly check the siblings of the listed classes: other entry points, call "
+        "sites, tests, docs and flows of the same kind. The blocking-scope rules, the "
+        "same-plan/future classification and the approval rules are unchanged: "
+        "out-of-scope findings stay future follow-ups or are omitted, and this sweep "
+        "is not a reason to block an otherwise acceptable plan. Give each new "
+        "mandatory finding its `provenance` against the previous-plan baseline below "
+        "when one is supplied.\n"
+    )
+
+
+BASELINE_STATUS_FIRST_REVIEW = "first-review"
+BASELINE_STATUS_AVAILABLE = "available"
+BASELINE_STATUS_UNAVAILABLE = "unavailable"
+PROVENANCE_BASELINE_DIFF_LIMIT = 12000
+
+
+@dataclass(frozen=True)
+class PlanBaseline:
+    """The plan a reviewer last reviewed, resolved from durable records (#1505)."""
+
+    status: str
+    round_number: int | None = None
+    subject: str | None = None
+    text: str | None = None
+    reason: str = ""
+
+
+def reviewer_previous_plan_baseline(
+    records: Sequence["PostedRoundRecord"], *, reviewer: str, before_round: int
+) -> PlanBaseline:
+    """Resolve ``reviewer``'s previous reviewed plan from plan records only.
+
+    The reviewer's latest plan reviewer record before ``before_round`` names
+    the plan subject it reviewed; the canonical text is the newest planner
+    record of that subject whose canonical plan hashes to it.  No earlier
+    review is a first review; an unmatched subject or hash is unavailable.
+    """
+    from .round_state import _plan_subject
+
+    previous = None
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if (
+            metadata.role == "reviewer"
+            and metadata.agent == reviewer
+            and metadata.round_number < before_round
+            and (previous is None or metadata.round_number >= previous.metadata.round_number)
+        ):
+            previous = record
+    if previous is None:
+        return PlanBaseline(status=BASELINE_STATUS_FIRST_REVIEW)
+    subject = previous.metadata.subject
+    round_number = previous.metadata.round_number
+    text = None
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if (
+            metadata.role == "coder"
+            and metadata.canonical_plan is not None
+            and subject
+            and metadata.subject == subject
+            and _plan_subject(metadata.canonical_plan) == subject
+        ):
+            text = metadata.canonical_plan
+    if text is None:
+        return PlanBaseline(
+            status=BASELINE_STATUS_UNAVAILABLE,
+            round_number=round_number,
+            subject=subject,
+            reason=f"the plan you reviewed in round {round_number} is not recoverable",
+        )
+    return PlanBaseline(
+        status=BASELINE_STATUS_AVAILABLE,
+        round_number=round_number,
+        subject=subject,
+        text=text,
+    )
+
+
+def render_provenance_baseline_block(baseline: PlanBaseline | None, current_plan: str) -> str:
+    """The volatile previous-plan baseline block of a plan review prompt."""
+    if baseline is None:
+        return ""
+    heading = "Finding provenance baseline (orchestrator, not a reviewer finding): "
+    if baseline.status == BASELINE_STATUS_FIRST_REVIEW:
+        return (
+            heading
+            + "this is your first plan review of this issue, so omit `provenance` "
+            "on every finding.\n"
+        )
+    unavailable = (
+        heading
+        + "the comparison baseline is unavailable ({reason}); omit `provenance` on "
+        "every finding, leaving it untagged, rather than guess.\n"
+    )
+    if baseline.status != BASELINE_STATUS_AVAILABLE or baseline.text is None:
+        return unavailable.format(reason=baseline.reason or "no previous plan was recorded")
+    if baseline.text.strip() == current_plan.strip():
+        return (
+            heading
+            + f"the current plan is identical to the plan you reviewed in round "
+            f"{baseline.round_number}, so any new mandatory finding is "
+            f"`{PROVENANCE_PRE_EXISTING}`.\n"
+        )
+    diff = "\n".join(
+        difflib.unified_diff(
+            baseline.text.strip().splitlines(),
+            current_plan.strip().splitlines(),
+            fromfile=f"plan reviewed in round {baseline.round_number}",
+            tofile="current plan",
+            lineterm="",
+            n=3,
+        )
+    )
+    if len(diff) > PROVENANCE_BASELINE_DIFF_LIMIT:
+        return unavailable.format(
+            reason=(
+                f"the diff from the plan you reviewed in round {baseline.round_number} "
+                f"exceeds {PROVENANCE_BASELINE_DIFF_LIMIT} characters"
+            )
+        )
+    return (
+        heading
+        + f"you last reviewed the plan of round {baseline.round_number}. Changes since "
+        "then, as a unified diff:\n"
+        "----- BEGIN BASELINE DIFF -----\n"
+        f"{diff}\n"
+        "----- END BASELINE DIFF -----\n"
+        f"Tag each new mandatory finding `{PROVENANCE_REVISION_INTRODUCED}` when a change "
+        f"shown in this diff introduced the defect, or `{PROVENANCE_PRE_EXISTING}` when "
+        f"it was already present in the plan you reviewed in round {baseline.round_number}.\n"
+    )
+
+
+def plan_round_provenance_counts(
+    new_items: object, *, reviewer: str
+) -> dict[str, int]:
+    """Per-provenance counts of a review's new mandatory items, for logging."""
+    mandatory = _MANDATORY_STATUSES[PHASE_PLAN]
+    owned = [
+        item for item in (new_items or ())
+        if item.reviewer == reviewer and item.status in mandatory
+    ]
+    eligible = [item for item in owned if getattr(item, "repeat_of", None) is None]
+    return {
+        PROVENANCE_PRE_EXISTING: sum(
+            1 for item in eligible if item.provenance == PROVENANCE_PRE_EXISTING
+        ),
+        PROVENANCE_REVISION_INTRODUCED: sum(
+            1 for item in eligible if item.provenance == PROVENANCE_REVISION_INTRODUCED
+        ),
+        "untagged": sum(1 for item in eligible if item.provenance is None),
+        "repeats": len(owned) - len(eligible),
+    }
 
 
 DISPOSITION_DEFER_PENDING = "defer-pending"
@@ -679,6 +1073,18 @@ def mandatory_plan_findings_since(
     records: Sequence["PostedRoundRecord"], *, primary: str, first_round: int, limit: int = 12
 ) -> tuple[str, ...]:
     """The primary's mandatory findings from ``first_round`` on, as ``id: first line``."""
+    return tuple(
+        _mandatory_plan_finding_lines(records, primary=primary, first_round=first_round)[-limit:]
+    )
+
+
+def _mandatory_plan_finding_lines(
+    records: Sequence["PostedRoundRecord"],
+    *,
+    primary: str,
+    first_round: int,
+    skip_repeats: bool = False,
+) -> list[str]:
     mandatory = _MANDATORY_STATUSES[PHASE_PLAN]
     ordered = sorted(records, key=lambda item: item.index)
     latest: dict[int, "PostedRoundRecord"] = {}
@@ -691,10 +1097,12 @@ def mandatory_plan_findings_since(
         if number < first_round or latest[number].metadata.state != "blocking":
             continue
         for item in effective_new_items(ordered, latest[number]) or ():
+            if skip_repeats and getattr(item, "repeat_of", None) is not None:
+                continue
             if item.status in mandatory and item.reviewer == primary:
                 first_line = next((line.strip() for line in item.text.splitlines() if line.strip()), "")
                 lines.append(f"[{item.item_id}] (round {number}) {first_line[:240]}")
-    return tuple(lines[-limit:])
+    return lines
 
 
 def _step_back_candidate_payload(

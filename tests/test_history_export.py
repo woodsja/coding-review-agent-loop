@@ -1128,3 +1128,109 @@ def test_pre_feature_proof_requires_a_known_edit_time_before_the_cutoff():
     assert derive_review(unknown_edit)["step_backs"] == UNAVAILABLE
     era_edit = comment(2, plan_review(CODEX, 1, "approved"), updated=after_cutoff(2))
     assert derive_review(era_edit)["step_backs"] == {"value": 0, "evidence": "verified"}
+
+
+# --- Plan finding provenance and sweep columns (#1505) ------------------------
+
+from coding_review_agent_loop.protocol import UnresolvedReviewItem  # noqa: E402
+
+_PROVENANCE_COLUMNS = (
+    "plan_findings_pre_existing", "plan_findings_revision_introduced",
+    "plan_findings_untagged", "plan_sweep_reviews",
+)
+
+
+def _finding(n: int, *, provenance=None, repeat_of=None, status="blocking", reviewer=CODEX):
+    return UnresolvedReviewItem(
+        item_id=f"item-{n}", reviewer=reviewer, source_round=1, text=f"Gap {n}.",
+        status=status, provenance=provenance, repeat_of=repeat_of,
+    )
+
+
+def _provenance_comments(*, round_two_phase="authoritative"):
+    round_two_items = (
+        _finding(3, provenance="pre_existing"),
+        _finding(4, provenance="revision_introduced"),
+        _finding(5),
+        _finding(6, provenance="pre_existing", repeat_of="item-1"),
+        _finding(7, provenance="pre_existing", status="future"),
+    )
+    return (
+        comment(1, plan_coder(1, plan="Plan v1.")),
+        # The first review's findings never count, whatever their tags.
+        comment(2, plan_review(CODEX, 1, "blocking", new_items=(
+            _finding(1, provenance="pre_existing"), _finding(2),
+        ))),
+        comment(3, plan_coder(2, plan="Plan v2.")),
+        comment(4, plan_review(
+            CODEX, 2, "blocking", plan_sweep=True, phase=round_two_phase,
+            new_items=() if round_two_phase == "publication" else round_two_items,
+        )),
+        *approved_plan_comments(start=5, round_number=3),
+    )
+
+
+def test_history_export_reports_provenance_buckets_and_sweep_reviews():
+    """`export-counts`: 1/1/1 with the repeat, future and first-review items excluded."""
+    row = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(
+            *_provenance_comments(),
+            # A foreign copy of a swept, tagged review never counts.
+            comment(20, plan_review(
+                CODEX, 3, "blocking", plan_sweep=True,
+                new_items=(_finding(9, provenance="pre_existing"),),
+            ), author=FOREIGN),
+        ),
+    )
+    assert row["plan_findings_pre_existing"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_findings_revision_introduced"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_findings_untagged"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_sweep_reviews"] == {"value": 1, "evidence": "verified"}
+    assert row["schema_version"] == 1
+    header = render_csv([row]).splitlines()[0].split(",")
+    for column in _PROVENANCE_COLUMNS:
+        assert column in header and f"{column}_evidence" in header
+
+
+def test_history_export_provenance_uses_the_shared_filter_without_the_trigger_rule():
+    """`export-counts`: a revision-introduced-only review breaks the trigger, yet exports."""
+    from coding_review_agent_loop.review_step_back import (
+        CLASS_REPEAT_ONLY,
+        classify_sweep_review,
+    )
+
+    items = (_finding(4, provenance="revision_introduced"),)
+    metadata = PostedRoundMetadata(
+        flow="plan", role="reviewer", agent=CODEX, round_number=2, subject="s",
+        state="blocking", new_items=items,
+    )
+    assert classify_sweep_review(metadata, items, first_review=False) == CLASS_REPEAT_ONLY
+    row = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(
+            comment(1, plan_coder(1, plan="Plan v1.")),
+            comment(2, plan_review(CODEX, 1, "blocking", new_items=(_finding(1),))),
+            comment(3, plan_coder(2, plan="Plan v2.")),
+            comment(4, plan_review(CODEX, 2, "blocking", new_items=items)),
+            *approved_plan_comments(start=5, round_number=3),
+        ),
+    )
+    assert row["plan_findings_revision_introduced"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_findings_pre_existing"]["value"] == 0
+    assert row["plan_findings_untagged"]["value"] == 0
+    assert row["plan_sweep_reviews"]["value"] == 0
+
+
+def test_history_export_provenance_is_unavailable_for_unbounded_or_unresolvable_history():
+    unbounded = derive(history(), issue_view(*_provenance_comments()[:4]))
+    for column in _PROVENANCE_COLUMNS:
+        assert unbounded[column] == {"value": None, "evidence": "unavailable"}
+    # A provisional publication record with no later reconciliation is unknowable.
+    unresolvable = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(*_provenance_comments(round_two_phase="publication")),
+    )
+    for column in _PROVENANCE_COLUMNS[:3]:
+        assert unresolvable[column] == {"value": None, "evidence": "unavailable"}
+    assert unresolvable["plan_sweep_reviews"] == {"value": 1, "evidence": "verified"}

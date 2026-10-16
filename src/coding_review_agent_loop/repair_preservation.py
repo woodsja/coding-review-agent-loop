@@ -12,6 +12,7 @@ from .protocol import (
     ParseDegradation,
     _extract_json_object_prefix,
     _flatten_plan_review_finding,
+    PLAN_REVIEW_PROVENANCE_VALUES,
     classify_architecture_status_near_miss,
     _normalize_requirement_label,
     normalize_response_file_structured_text,
@@ -1520,11 +1521,16 @@ def validate_repair_preservation(
         "plan_review": ("blocking_plan_issues", "same_plan_followups"),
     }.get(source["kind"], ())
     # Compare plan-review objects using the parser's canonical finding text.
-    available = [
-        _normalized(
-            _flatten_plan_review_finding(entry, item_context=field)
-            if source["kind"] == "plan_review"
-            else _pr_finding_text(entry)
+    # Each candidate keeps its valid plan provenance tag (#1505) beside the
+    # prose: the tag is never part of the canonical finding text.
+    available_pairs = [
+        (
+            _normalized(
+                _flatten_plan_review_finding(entry, item_context=field)
+                if source["kind"] == "plan_review"
+                else _pr_finding_text(entry)
+            ),
+            _valid_plan_provenance(entry) if source["kind"] == "plan_review" else None,
         )
         for field in finding_fields
         for entry in target.get(field, [])
@@ -1532,7 +1538,9 @@ def validate_repair_preservation(
         or (source["kind"] == "plan_review" and isinstance(entry, dict))
         or (source["kind"] == "pr_review" and isinstance(_pr_finding_text(entry), str))
     ]
-    available.sort(key=len)
+    available_pairs.sort(key=lambda pair: len(pair[0]))
+    available = [text for text, _tag in available_pairs]
+    available_tags = [tag for _text, tag in available_pairs]
     # A typed human-only evidence request (#1068) must survive repair.  When the
     # source listed the same text both as a request and as a finding, the
     # repair resolves that overlap by keeping the typed request: the finding
@@ -1563,7 +1571,8 @@ def validate_repair_preservation(
             continue
         for entry in entries:
             fragments = _fragments(
-                _pr_finding_view(entry) if source["kind"] == "pr_review" else entry
+                _pr_finding_view(entry) if source["kind"] == "pr_review"
+                else _plan_finding_prose_view(entry)
             )
             if not fragments:
                 continue
@@ -1572,12 +1581,32 @@ def validate_repair_preservation(
                 and _normalized_review_item_text(entry) in moved_to_evidence
             ):
                 continue
+            source_tag = (
+                _valid_plan_provenance(entry) if source["kind"] == "plan_review" else None
+            )
             match = next(
                 (i for i, candidate in enumerate(available)
-                 if _contains_fragments(candidate, fragments)), None,
+                 if _contains_fragments(candidate, fragments)
+                 and (source_tag is None or available_tags[i] == source_tag)), None,
             )
             require(match is not None, field)
             available.pop(match)
+            available_tags.pop(match)
+
+
+def _plan_finding_prose_view(entry: object) -> object:
+    """A plan finding without its advisory ``provenance`` tag (#1505)."""
+    if isinstance(entry, dict) and "provenance" in entry:
+        return {key: value for key, value in entry.items() if key != "provenance"}
+    return entry
+
+
+def _valid_plan_provenance(entry: object) -> str | None:
+    """A plan finding's valid provenance tag; a malformed tag may degrade freely."""
+    if not isinstance(entry, dict):
+        return None
+    tag = entry.get("provenance")
+    return tag if isinstance(tag, str) and tag in PLAN_REVIEW_PROVENANCE_VALUES else None
 
 
 def require_repair_architecture_impact_absent(repaired: str) -> None:

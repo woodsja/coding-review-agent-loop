@@ -129,6 +129,18 @@ class ApprovedFollowup:
     # admissible citation evidence for those rows (#1324).  Reviewer-declared;
     # only ``blocking_items`` accept it, and the orchestrator verifies it.
     evidence_row_ids: tuple[str, ...] = ()
+    # Optional reviewer self-report on a plan review finding (#1505): whether
+    # the defect was introduced by a change since the reviewer's previous plan
+    # review or was already present.  Advisory telemetry only; never part of
+    # the finding text and never an input to classification or approval.
+    provenance: str | None = None
+
+
+# Allowed values of the optional plan review finding ``provenance`` key (#1505).
+PROVENANCE_REVISION_INTRODUCED = "revision_introduced"
+PROVENANCE_PRE_EXISTING = "pre_existing"
+PLAN_REVIEW_PROVENANCE_VALUES = frozenset({PROVENANCE_REVISION_INTRODUCED, PROVENANCE_PRE_EXISTING})
+PLAN_REVIEW_FINDING_PROVENANCE_FIELD = "provenance"
 
 
 @dataclass(frozen=True)
@@ -254,6 +266,13 @@ class UnresolvedReviewItem:
     # and matrix identity they stand for.  Both or neither; evidence only.
     converted_row_id: str | None = None
     converted_matrix_identity: str | None = None
+    # Plan review findings only (#1505), both fixed when the orchestrator mints
+    # the item and never changed afterwards.  ``provenance`` is the reviewer's
+    # advisory ``revision_introduced``/``pre_existing`` tag; ``repeat_of`` is the
+    # orchestrator-computed ID of the carried item whose normalized text this
+    # new finding repeats.  Neither affects dispositions or approval.
+    provenance: str | None = None
+    repeat_of: str | None = None
 
     def __post_init__(self) -> None:
         if self.evidence_row_ids and (
@@ -415,6 +434,8 @@ class ParsedPlanReview:
     human_requirement_dispositions: tuple["HumanRequirementDisposition", ...] = ()
     architecture_impact: ArchitectureImpact | None = None
     architecture_impact_degradations: tuple[ParseDegradation, ...] = ()
+    # Finding provenance tags that degraded to untagged (#1505).
+    provenance_degradations: tuple[ParseDegradation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -5921,7 +5942,12 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
     raw = _normalize_plan_review_finding_key_aliases(raw, item_context=item_context)
     text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
     reference_fields = {name for name, _label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS}
-    accepted = text_fields | reference_fields | PLAN_REVIEW_FINDING_ID_FIELDS | {"sub_items"}
+    # ``provenance`` (#1505) is read separately by the parser and never folded
+    # into the finding text.
+    accepted = (
+        text_fields | reference_fields | PLAN_REVIEW_FINDING_ID_FIELDS
+        | {"sub_items", PLAN_REVIEW_FINDING_PROVENANCE_FIELD}
+    )
     folded_parts, folded_keys, unknown = _fold_unknown_finding_keys(  # shape-check: fatal:payload-bound
         raw,
         accepted=frozenset(accepted),
@@ -5993,6 +6019,37 @@ def _expect_plan_review_finding_list(
         _flatten_plan_review_finding(raw, item_context=f"{context} at index {index}")  # shape-check: fatal:no-conservative-reading
         for index, raw in enumerate(value)
     )
+
+
+def _plan_review_finding_provenances(
+    payload: dict[str, object], field_name: str, *, context: str
+) -> tuple[tuple[str | None, ...], tuple[ParseDegradation, ...]]:
+    """Read each finding's optional ``provenance`` tag, degrading a bad tag (#1505).
+
+    The tag is advisory telemetry: an unknown value or a wrong type drops only
+    the tag (the finding stays, untagged) and never rejects the review.
+    """
+    value = payload.get(field_name, [])
+    if not isinstance(value, list):
+        return (), ()
+    tags: list[str | None] = []
+    degradations: list[ParseDegradation] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, dict) or PLAN_REVIEW_FINDING_PROVENANCE_FIELD not in raw:
+            tags.append(None)
+            continue
+        tag = raw[PLAN_REVIEW_FINDING_PROVENANCE_FIELD]
+        if isinstance(tag, str) and tag in PLAN_REVIEW_PROVENANCE_VALUES:
+            tags.append(tag)
+            continue
+        tags.append(None)
+        degradations.append(ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+            element_path=f"{context}[{index}].provenance",
+            rule="provenance-not-an-allowed-value",
+            observed=tag,
+            outcome="tag-dropped",
+        ))
+    return tuple(tags), tuple(degradations)
 
 
 def _degradable_sub_items(
@@ -7302,8 +7359,20 @@ def _finalize_parsed_plan_review(
     )
 
 
-def _structured_followups(items: tuple[str, ...], *, reviewer: str) -> tuple[ApprovedFollowup, ...]:
-    return tuple(ApprovedFollowup(reviewer=reviewer, text=item) for item in items)
+def _structured_followups(
+    items: tuple[str, ...],
+    *,
+    reviewer: str,
+    provenances: Sequence[str | None] = (),
+) -> tuple[ApprovedFollowup, ...]:
+    return tuple(
+        ApprovedFollowup(
+            reviewer=reviewer,
+            text=item,
+            provenance=provenances[index] if index < len(provenances) else None,
+        )
+        for index, item in enumerate(items)
+    )
 
 
 def _normalized_review_item_text(text: str) -> str:
@@ -7562,14 +7631,37 @@ def parse_structured_plan_review(
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(  # shape-check: fatal:no-conservative-reading
         payload, mode=architecture_status_mode, context="plan_review.architecture_impact"
     )
+    provenances: dict[str, tuple[str | None, ...]] = {}
+    provenance_degradations: list[ParseDegradation] = []
+    for field_name in ("blocking_plan_issues", "same_plan_followups", "future_followups"):
+        tags, records = _plan_review_finding_provenances(  # shape-check: fatal:authentication-or-forgery
+            payload, field_name, context=f"plan_review.{field_name}"
+        )
+        provenances[field_name] = tags
+        provenance_degradations.extend(records)
+    for record in provenance_degradations:
+        _logger.warning(
+            "%s: dropped a malformed finding provenance tag (%s)",
+            record.element_path,
+            record.rule,
+        )
     items = _dedupe_plan_review_items(
         PlanReviewItems(
-            blocking=_structured_followups(blocking_items, reviewer=reviewer),
-            same_plan=_structured_followups(same_plan_followups, reviewer=reviewer),
-            future=_structured_followups(future_followups, reviewer=reviewer),
+            blocking=_structured_followups(
+                blocking_items, reviewer=reviewer,
+                provenances=provenances["blocking_plan_issues"],
+            ),
+            same_plan=_structured_followups(
+                same_plan_followups, reviewer=reviewer,
+                provenances=provenances["same_plan_followups"],
+            ),
+            future=_structured_followups(
+                future_followups, reviewer=reviewer,
+                provenances=provenances["future_followups"],
+            ),
         )
     )
-    return _finalize_parsed_plan_review(  # shape-check: fatal:no-conservative-reading
+    parsed = _finalize_parsed_plan_review(  # shape-check: fatal:no-conservative-reading
         state=state,
         summary=summary,
         items=items,
@@ -7578,6 +7670,11 @@ def parse_structured_plan_review(
         architecture_impact=architecture_impact,
         architecture_impact_degradations=architecture_impact_degradations,
     )
+    if provenance_degradations:
+        parsed = dataclasses.replace(
+            parsed, provenance_degradations=tuple(provenance_degradations)
+        )
+    return parsed
 
 
 def validate_structured_coder_followup(

@@ -53,7 +53,13 @@ from .review_rounds import (
     INCOMPLETE_PR_REVIEW_MISSING_HEADING,
     INCOMPLETE_PR_REVIEW_MISSING_LINE,
 )
-from .review_step_back import PLAN_STEP_BACK_HUMAN_DECISION_PREFIX
+from .protocol import PROVENANCE_PRE_EXISTING, PROVENANCE_REVISION_INTRODUCED
+from .review_step_back import (
+    PLAN_STEP_BACK_HUMAN_DECISION_PREFIX,
+    effective_new_items,
+    eligible_new_mandatory_items,
+    first_plan_review_round,
+)
 from .decomposition import find_decompositions_for_parent, find_phase_implementation_handoffs_for_parent
 from .followups import approved_plan_hashes_for_issue
 from .issue_pr_handoff import resolve_issue_pr_handoff_lineage
@@ -781,6 +787,55 @@ def _final_plan_size(records: Sequence[PostedRoundRecord]) -> int | None:
     return None
 
 
+@dataclass(frozen=True)
+class _PlanProvenanceCounts:
+    pre_existing: int
+    revision_introduced: int
+    untagged: int
+    resolvable: bool
+    sweep_reviews: int
+
+
+def _plan_provenance_counts(records: Sequence[PostedRoundRecord]) -> _PlanProvenanceCounts:
+    """Provenance buckets of new mandatory plan findings on non-first reviews (#1505).
+
+    Each reviewer's latest record per round counts; its first plan review is
+    excluded because nothing it raised can have been drip-fed.  Eligibility is
+    the sweep trigger's shared filter (reviewer-owned, mandatory, not a repeat),
+    but ``revision_introduced`` findings are bucketed, not dropped.  An
+    unresolvable publication record makes the counts unavailable.  Sweep
+    reviews are the latest per-round reviewer records carrying the sweep marker.
+    """
+    ordered = sorted(records, key=lambda record: record.index)
+    latest: dict[tuple[str, int], PostedRoundRecord] = {}
+    for record in ordered:
+        metadata = record.metadata
+        if metadata.role == "reviewer" and metadata.agent:
+            latest[(metadata.agent, metadata.round_number)] = record
+    buckets = {PROVENANCE_PRE_EXISTING: 0, PROVENANCE_REVISION_INTRODUCED: 0, None: 0}
+    resolvable = True
+    first_rounds: dict[str, int | None] = {}
+    for (agent, number), record in latest.items():
+        if agent not in first_rounds:
+            first_rounds[agent] = first_plan_review_round(ordered, reviewer=agent)
+        if number == first_rounds[agent]:
+            continue
+        new_items = effective_new_items(ordered, record)
+        if new_items is None:
+            resolvable = False
+            continue
+        for item in eligible_new_mandatory_items(new_items, reviewer=agent):
+            key = item.provenance if item.provenance in buckets else None
+            buckets[key] += 1
+    return _PlanProvenanceCounts(
+        pre_existing=buckets[PROVENANCE_PRE_EXISTING],
+        revision_introduced=buckets[PROVENANCE_REVISION_INTRODUCED],
+        untagged=buckets[None],
+        resolvable=resolvable,
+        sweep_reviews=sum(1 for record in latest.values() if record.metadata.plan_sweep),
+    )
+
+
 def derive_history_row(
     *,
     repo: str,
@@ -936,6 +991,9 @@ def derive_history_row(
         if diagnostic.kind == KIND_HUMAN_DECISION_STOP
     )
     plan_size = _final_plan_size(plan_records) if plan_records else 0
+    provenance = _plan_provenance_counts(plan_records)
+    sweep_reviews = provenance.sweep_reviews
+    plan_evidence = plan_terminal if plan_records else bounded
 
     # Outcome availability: every contributing source, including edits.
     available: list[datetime.datetime] = []
@@ -995,6 +1053,16 @@ def derive_history_row(
         "final_plan_size": _pair(
             plan_size, plan_size is not None and (plan_terminal if plan_records else bounded)
         ),
+        "plan_findings_pre_existing": _pair(
+            provenance.pre_existing, plan_evidence and provenance.resolvable
+        ),
+        "plan_findings_revision_introduced": _pair(
+            provenance.revision_introduced, plan_evidence and provenance.resolvable
+        ),
+        "plan_findings_untagged": _pair(
+            provenance.untagged, plan_evidence and provenance.resolvable
+        ),
+        "plan_sweep_reviews": _pair(sweep_reviews, plan_evidence),
         "pr_rounds": _pair(pr_round_count, pr_terminal),
         "merged": _pair(merged_any, merged_any or pr_terminal),
         "tool_commit": _pair(commits, bool(commits)),
@@ -1093,6 +1161,8 @@ def row_tool_commits(
 
 _PAIR_COLUMNS = (
     "plan_rounds", "step_backs", "human_decision_stops", "final_plan_size",
+    "plan_findings_pre_existing", "plan_findings_revision_introduced",
+    "plan_findings_untagged", "plan_sweep_reviews",
     "pr_rounds", "merged", "tool_commit",
 )
 

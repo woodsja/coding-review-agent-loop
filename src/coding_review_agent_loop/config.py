@@ -80,6 +80,8 @@ DEFAULT_MAX_ROUNDS = 10
 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
 DEFAULT_PLAN_STEP_BACK_ROUNDS = 2
 DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
+# Plan sweep trigger (#1505): K consecutive new-finding primary blocks; 0 disables.
+DEFAULT_PLAN_SWEEP_ROUNDS = 2
 # PR fix-loop step-back (#1251): K clustered new-finding blocks, and the line window.
 DEFAULT_PR_STEP_BACK_ROUNDS = 3
 DEFAULT_PR_EVIDENCE_STALL_ROUNDS = 2
@@ -261,6 +263,13 @@ class AgentLoopConfig:
     # step-back candidate itself counts as the first) stop for a human decision.
     plan_step_back_rounds: int = DEFAULT_PLAN_STEP_BACK_ROUNDS
     plan_step_back_escalation_rounds: int = DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
+    # Plan sweep (#1505): independent of the plan-growth gate, once the primary
+    # has blocked this many consecutive primary-phase rounds with new mandatory
+    # findings, its next review is asked for one exhaustive pass.  0 disables
+    # it.  ``plan_sweep_reasoning_effort`` (empty = off) raises the effort of
+    # that sweep turn only.
+    plan_sweep_rounds: int = DEFAULT_PLAN_SWEEP_ROUNDS
+    plan_sweep_reasoning_effort: str = ""
     pr_step_back_rounds: int = DEFAULT_PR_STEP_BACK_ROUNDS
     pr_evidence_stall_rounds: int = DEFAULT_PR_EVIDENCE_STALL_ROUNDS
     pr_evidence_capture_attempts: int = DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
@@ -828,7 +837,31 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "--plan-step-back-escalation-rounds must be a positive integer."
             )
+        sweep_rounds = self.plan_sweep_rounds
+        if (
+            isinstance(sweep_rounds, bool)
+            or not isinstance(sweep_rounds, int)
+            or sweep_rounds < 0
+        ):
+            raise AgentLoopError(
+                "--plan-sweep-rounds must be a non-negative integer (0 disables it)."
+            )
+        sweep_effort = self.plan_sweep_reasoning_effort
+        if not isinstance(sweep_effort, str):
+            raise AgentLoopError("--plan-sweep-reasoning-effort must be a string.")
+        if sweep_effort and sweep_effort not in CODEX_REASONING_EFFORTS | CLAUDE_EFFORTS:
+            raise AgentLoopError(
+                f"--plan-sweep-reasoning-effort value {sweep_effort!r} is unsupported; "
+                "choose one of: "
+                + ", ".join(sorted(CODEX_REASONING_EFFORTS | CLAUDE_EFFORTS))
+                + "."
+            )
+        if sweep_effort and self.plan_review_policy != "primary-then-panel":
+            raise AgentLoopError(
+                "--plan-sweep-reasoning-effort requires --plan-review-policy primary-then-panel."
+            )
         for flag, value, default in (
+            ("--plan-sweep-rounds", sweep_rounds, DEFAULT_PLAN_SWEEP_ROUNDS),
             ("--plan-step-back-rounds", step_back_rounds, DEFAULT_PLAN_STEP_BACK_ROUNDS),
             (
                 "--plan-step-back-escalation-rounds",
@@ -2474,6 +2507,8 @@ def config_from_args(
         plan_step_back_escalation_rounds=_arg_or_default(
             args, "plan_step_back_escalation_rounds", DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
         ),
+        plan_sweep_rounds=_arg_or_default(args, "plan_sweep_rounds", DEFAULT_PLAN_SWEEP_ROUNDS),
+        plan_sweep_reasoning_effort=getattr(args, "plan_sweep_reasoning_effort", None) or "",
         pr_step_back_rounds=_arg_or_default(
             args, "pr_step_back_rounds", DEFAULT_PR_STEP_BACK_ROUNDS
         ),

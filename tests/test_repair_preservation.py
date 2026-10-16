@@ -2738,3 +2738,48 @@ def test_1388_note_outside_required_and_optional_ids_may_be_dropped():
         unresolved_item_ids=("item-1",),
         optional_item_ids=("item-2",),
     )
+
+
+# --- Plan finding provenance through repair (#1505) ---------------------------
+
+
+def test_repair_preserves_a_tagged_plan_finding_object_exactly():
+    tagged = {"finding": "Step 2 skips resume.", "provenance": "pre_existing"}
+    source = _plan_review(blocking_plan_issues=[tagged])
+    check(source, _plan_review(blocking_plan_issues=[dict(tagged)]))
+    # The tag moves with the finding when it changes bucket.
+    check(source, _plan_review(same_plan_followups=[dict(tagged)]))
+
+
+@pytest.mark.parametrize(
+    "repaired",
+    [
+        ["Step 2 skips resume."],
+        [{"finding": "Step 2 skips resume.", "provenance": "revision_introduced"}],
+        [{"finding": "Step 2 skips resume.", "provenance": "bogus"}],
+    ],
+)
+def test_repair_cannot_drop_or_change_a_valid_provenance_tag(repaired):
+    source = _plan_review(blocking_plan_issues=[
+        {"finding": "Step 2 skips resume.", "provenance": "pre_existing"}
+    ])
+    rejects(source, _plan_review(blocking_plan_issues=repaired), match="blocking_plan_issues")
+
+
+@pytest.mark.parametrize("bad", ["bogus", 3, None])
+def test_a_malformed_source_provenance_tag_may_degrade_through_repair(bad):
+    source = _plan_review(blocking_plan_issues=[
+        {"finding": "Step 2 skips resume.", "provenance": bad}
+    ])
+    check(source, _plan_review(blocking_plan_issues=["Step 2 skips resume."]))
+
+
+def test_full_repair_validation_accepts_a_tagged_plan_review():
+    source = _plan_review(
+        blocking_plan_issues=[{"finding": "Step 2 skips resume.", "provenance": "pre_existing"}],
+        same_plan_followups=[{"text": "Name the flag.", "provenance": "revision_introduced"}],
+    )
+    validate_repair_preservation(
+        json.dumps(source),
+        json.dumps(source) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex",
+    )

@@ -1633,3 +1633,79 @@ def test_resume_adopts_an_admitted_conversion_record_and_drops_a_foreign_one():
     assert resumed_foreign is None or not any(
         item.converted_row_id for item in resumed_foreign.prior_items
     )
+
+
+# --- Plan finding provenance, repeat marker and sweep marker (#1505) -----------
+
+
+def _plan_reviewer_metadata(**overrides):
+    from coding_review_agent_loop.round_state import PostedRoundMetadata
+
+    values = dict(
+        flow="plan", role="reviewer", agent="Codex", round_number=2,
+        subject="plan", state="blocking",
+    )
+    values.update(overrides)
+    return PostedRoundMetadata(**values)
+
+
+def test_provenance_repeat_and_sweep_marker_round_trip_and_legacy_stays_byte_stable():
+    """`persistence-roundtrip`: set values round-trip, unset values are omitted."""
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+
+    plain = UnresolvedReviewItem(item_id="item-1", reviewer="Codex", source_round=2, text="t", status="blocking")
+    tagged = dataclasses.replace(
+        plain, item_id="item-2", provenance="revision_introduced", repeat_of="item-1"
+    )
+    legacy = _plan_reviewer_metadata(new_items=(plain,))
+    encoded_legacy = _encode_round_metadata(legacy)
+    stored_legacy = decode_mapping(encoded_legacy)
+    assert "plan_sweep" not in stored_legacy
+    assert {"provenance", "repeat_of"}.isdisjoint(stored_legacy["new_items"][0])
+    assert _encode_round_metadata(_decode_round_metadata(encoded_legacy)) == encoded_legacy
+
+    swept = _plan_reviewer_metadata(new_items=(plain, tagged), plan_sweep=True)
+    encoded = _encode_round_metadata(swept)
+    assert decode_mapping(encoded)["plan_sweep"] is True
+    decoded = _decode_round_metadata(encoded)
+    assert decoded.plan_sweep is True
+    assert [(item.provenance, item.repeat_of) for item in decoded.new_items] == [
+        (None, None), ("revision_introduced", "item-1"),
+    ]
+    assert _encode_round_metadata(decoded) == encoded
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("provenance", "unknown"), ("provenance", 3), ("provenance", ["pre_existing"]),
+        ("repeat_of", ""), ("repeat_of", 7), ("repeat_of", ["item-1"]),
+    ],
+)
+def test_malformed_stored_provenance_or_repeat_decodes_as_absent(key, bad, caplog):
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.round_state import _deserialize_unresolved_item, _serialize_unresolved_item
+
+    item = UnresolvedReviewItem(item_id="item-1", reviewer="Codex", source_round=1, text="t", status="blocking")
+    payload = _serialize_unresolved_item(item)
+    payload[key] = bad
+    with caplog.at_level("WARNING"):
+        restored = _deserialize_unresolved_item(payload)
+    assert getattr(restored, key) is None
+    assert restored.status == "blocking" and restored.text == "t"
+    assert any(key in message for message in caplog.messages)
+
+
+@pytest.mark.parametrize(
+    ("value", "overrides"),
+    [("yes", {}), (1, {}), (False, {}), (True, {"role": "coder"}), (True, {"flow": "pr"})],
+)
+def test_malformed_plan_sweep_marker_decodes_as_absent_without_degrading(value, overrides, caplog):
+    stored = decode_mapping(_encode_round_metadata(_plan_reviewer_metadata(**overrides)))
+    stored["plan_sweep"] = value
+    with caplog.at_level("WARNING"):
+        decoded = _decode_round_metadata(encode_mapping(stored))
+    assert decoded.plan_sweep is False
+    # A malformed sweep marker never degrades the step-back or stall history.
+    assert decoded.step_back_status == "absent"
+    assert any("plan_sweep" in message for message in caplog.messages)

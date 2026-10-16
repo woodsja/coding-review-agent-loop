@@ -143,6 +143,8 @@ def _next_unresolved_item(
     obligation_identity: str | None = None,
     sub_items: Sequence[str] = (),
     evidence_row_ids: Sequence[str] = (),
+    provenance: str | None = None,
+    repeat_of: str | None = None,
 ) -> UnresolvedReviewItem:
     if obligation_kind is not None and authority is None:
         authority = MACHINE_AUTHORITY
@@ -183,7 +185,32 @@ def _next_unresolved_item(
             if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}
             else ()
         ),
+        # Plan review findings only (#1505); machine obligations carry neither.
+        provenance=(
+            provenance if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} else None
+        ),
+        repeat_of=(
+            repeat_of if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} else None
+        ),
     )
+
+
+def carried_item_repeated_by(
+    text: str, carried_items: Sequence[UnresolvedReviewItem]
+) -> str | None:
+    """ID of the first carried item whose normalized text equals ``text`` (#1505).
+
+    Orchestrator-computed at minting, never read from agent output: a new
+    finding that re-emits a carried item is a repeat for sweep and export
+    counting only, and stays an ordinary finding for the planner.
+    """
+    normalized = _normalized_review_item_text(text)
+    if not normalized:
+        return None
+    for item in carried_items:
+        if _normalized_review_item_text(item.text) == normalized:
+            return item.item_id
+    return None
 
 
 def _is_machine_obligation(item: UnresolvedReviewItem) -> bool:

@@ -6585,3 +6585,103 @@ def test_root_only_under_limit_full_prompt_equals_pre_change_output(tmp_path, mo
     config = make_config(tmp_path, architecture_context=snapshot)
     prompt = _SET_BUILDERS[builder](config).replace(str(tmp_path), "<TMP>")
     assert _host_neutral(prompt) == _host_neutral(golden[builder])
+
+
+# --- Plan sweep request and provenance baseline (#1505) ---------------------
+
+from coding_review_agent_loop.review_step_back import (  # noqa: E402
+    BASELINE_STATUS_AVAILABLE,
+    BASELINE_STATUS_FIRST_REVIEW,
+    PlanBaseline,
+)
+
+_SWEEP_HEADING = "PRIMARY SWEEP REQUEST"
+_PROVENANCE_RULE = "Finding provenance: when this prompt supplies a previous-plan baseline"
+
+
+def _sweep_config(tmp_path, **overrides):
+    values = dict(
+        reviewer=("codex", "gemini"),
+        plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+def test_sweep_and_baseline_blocks_render_only_in_the_volatile_part(tmp_path):
+    """`prompt-placement`: full and compact branches, primary and non-primary."""
+    config = _sweep_config(tmp_path)
+    later = PlanBaseline(
+        status=BASELINE_STATUS_AVAILABLE, round_number=1, text="Plan v1.\nStep A."
+    )
+    first = PlanBaseline(status=BASELINE_STATUS_FIRST_REVIEW)
+    for compact in (False, True):
+        kwargs = dict(
+            compact_context=compact,
+            compact_tail=CompactPlanTailContext(subject="s", action="Review."),
+        )
+        primary = build_plan_review_prompt(
+            1505, 3, "Plan v2.\nStep A.\nStep B.", config, reviewer="codex",
+            plan_sweep_classes=("[item-1] (round 1) Gap 1",),
+            provenance_baseline=later, **kwargs,
+        )
+        panel = build_plan_review_prompt(
+            1505, 3, "Plan v2.\nStep A.\nStep B.", config, reviewer="gemini",
+            provenance_baseline=first, **kwargs,
+        )
+        plain = build_plan_review_prompt(
+            1505, 3, "Plan v2.\nStep A.\nStep B.", config, reviewer="codex", **kwargs,
+        )
+        assert _SWEEP_HEADING in primary, compact
+        assert "- [item-1] (round 1) Gap 1" in primary
+        assert "+Step B." in primary
+        assert "you last reviewed the plan of round 1" in primary
+        assert _SWEEP_HEADING not in panel and _SWEEP_HEADING not in plain
+        assert "this is your first plan review of this issue" in panel
+        assert "Finding provenance baseline" not in plain
+        # The static provenance rule is present in both schema paths.
+        for prompt in (primary, panel, plain):
+            assert _PROVENANCE_RULE in prompt
+        if compact:
+            prefixes = set()
+            for prompt in (primary, plain):
+                prefix, tail = prompt.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+                prefixes.add(prefix)
+                assert _SWEEP_HEADING not in prefix
+                assert "Finding provenance baseline" not in prefix
+                assert _PROVENANCE_RULE in prefix
+            assert _SWEEP_HEADING in primary.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)[1]
+            # The cacheable prefix never varies with the round's sweep or baseline.
+            assert len(prefixes) == 1
+
+
+def test_compact_stable_prefix_is_identical_across_rounds_with_sweep_and_baseline(tmp_path):
+    config = _sweep_config(tmp_path)
+    tail = CompactPlanTailContext(subject="s", action="Review.")
+    round_two = build_plan_review_prompt(
+        1505, 2, "Plan v1.", config, reviewer="codex", compact_context=True, compact_tail=tail,
+        provenance_baseline=PlanBaseline(status=BASELINE_STATUS_FIRST_REVIEW),
+    )
+    round_three = build_plan_review_prompt(
+        1505, 3, "Plan v2.", config, reviewer="codex", compact_context=True, compact_tail=tail,
+        plan_sweep_classes=("[item-1] (round 1) Gap 1",),
+        provenance_baseline=PlanBaseline(
+            status=BASELINE_STATUS_AVAILABLE, round_number=2, text="Plan v1."
+        ),
+    )
+    assert (
+        round_two.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)[0].encode()
+        == round_three.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)[0].encode()
+    )
+
+
+def test_full_board_plan_review_prompts_carry_no_provenance_rule(tmp_path):
+    """`disabled-and-policy`: the all-reviewers policy keeps today's prompt text."""
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    for compact in (False, True):
+        prompt = build_plan_review_prompt(
+            1505, 3, "Plan.", config, reviewer="codex", compact_context=compact,
+        )
+        assert _PROVENANCE_RULE not in prompt
+        assert _SWEEP_HEADING not in prompt
