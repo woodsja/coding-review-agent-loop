@@ -533,10 +533,11 @@ class PlanSweepState:
         for review in reversed(self.reviews):
             if review.round_number >= round_number:
                 continue
-            expected = streak[-1].round_number - 1 if streak else None
-            if review.classification != CLASS_NEW_FINDING or (
-                expected is not None and review.round_number != expected
-            ):
+            # The streak must reach back from the round immediately before
+            # ``round_number``: an uncounted round anywhere, the newest one
+            # included, ends it.
+            expected = (streak[-1].round_number if streak else round_number) - 1
+            if review.classification != CLASS_NEW_FINDING or review.round_number != expected:
                 break
             streak.append(review)
         return streak

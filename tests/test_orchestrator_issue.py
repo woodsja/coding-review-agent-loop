@@ -21037,3 +21037,201 @@ def test_sweep_turn_inputs_override_bare_and_seat_efforts(tmp_path, backend):
     assert turn_seat.backend == backend and turn_seat.workdir == tmp_path
     assert agent_signature(turn_seat).endswith("model-x (high))")
     assert resolve_invocation(config, provider=turn_seat, role="reviewer").resolved_effort == "high"
+
+
+def _m1505_effort_arg(argv):
+    """The effort a recorded claude or codex invocation ran at."""
+    if argv[0] == "claude":
+        return argv[argv.index("--effort") + 1]
+    value = next(arg for arg in argv if arg.startswith("model_reasoning_effort="))
+    return value.split("=", 1)[1].strip('"')
+
+
+@pytest.mark.parametrize("primary_kind", ["claude", "codex-seat", "claude-seat"])
+def test_sweep_effort_workflow_for_claude_and_seat_primaries(tmp_path, primary_kind):
+    """`sweep-effort-turn`: bare Claude and named-seat primaries through the plan loop."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    primary_backend = "codex" if primary_kind == "codex-seat" else "claude"
+    planner_backend = "claude" if primary_backend == "codex" else "codex"
+    planner_signature = "Anthropic Claude" if planner_backend == "claude" else "OpenAI Codex"
+    claude_plan, _reviews = _m1505_three_blocking_rounds()
+    planner = [text.replace("-- Anthropic Claude", f"-- {planner_signature}") for text in claude_plan]
+    overrides: dict = {"coder": planner_backend, "plan_sweep_reasoning_effort": "high"}
+    if primary_kind == "claude":
+        signature = "Anthropic Claude"
+        overrides.update(
+            reviewer=("claude", "gemini"), primary_plan_reviewer="claude",
+            claude_model="claude-test",
+        )
+        base_effort = "medium"
+    else:
+        seat_dir, panel_dir = tmp_path / "primary-seat", tmp_path / "panel-seat"
+        seat_dir.mkdir()
+        panel_dir.mkdir()
+        seat = SeatAgent(
+            ReviewerSeat("primary-seat", primary_backend, ("seat-model",), "low"), seat_dir
+        )
+        panel = SeatAgent(ReviewerSeat("panel-seat", "gemini", ("gemini-model",)), panel_dir)
+        backend_name = "OpenAI Codex" if primary_backend == "codex" else "Anthropic Claude"
+        signature = f"primary-seat ({backend_name}: seat-model (low))"
+        overrides.update(
+            reviewer=(seat, panel), reviewer_seats=(seat, panel), primary_plan_reviewer=seat,
+        )
+        base_effort = "low"
+    reviews = [
+        structured_plan_review(
+            state="blocking", summary=f"Gap {n} remains.",
+            blocking_plan_issues=[f"Close gap {n}."],
+            prior_plan_item_dispositions=(
+                [{"item_id": f"item-{n - 1}", "disposition": "resolved"}] if n > 1 else None
+            ),
+            reviewer=signature,
+        )
+        for n in (1, 2, 3)
+    ]
+    outputs = {
+        f"{planner_backend}_outputs": planner,
+        f"{primary_backend}_outputs": reviews,
+    }
+    runner = _FakeRunner(**outputs)
+    config = _staged_plan_config(tmp_path, max_rounds=3, **overrides)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+
+    primary_argv = [argv for argv, _cwd in runner.argv_commands if argv[:1] == [primary_backend]]
+    planner_argv = [argv for argv, _cwd in runner.argv_commands if argv[:1] == [planner_backend]]
+    assert len(primary_argv) == 3
+    assert [_m1505_effort_arg(argv) for argv in primary_argv] == [base_effort, base_effort, "high"]
+    # The planner's effort never changes; no gemini panel turn runs.
+    planner_efforts = {_m1505_effort_arg(argv) for argv in planner_argv}
+    assert planner_efforts == {"medium"}
+    assert not any(argv[:1] == ["gemini"] for argv, _cwd in runner.argv_commands)
+    # The sweep turn starts a fresh provider session.
+    assert "--resume" not in primary_argv[2] and "resume" not in primary_argv[2]
+    assert any("sweep turn at effort high in a fresh session" in m for m in messages)
+    sweep_prompt = _m1251_prompts(runner, primary_backend)[2]
+    assert _SWEEP_HEADING in sweep_prompt
+    # Published signatures report the effort that ran.
+    primary_bodies = [
+        comment["body"].rstrip() for comment in runner.issue_comments
+        if "AGENT_PLAN_STATE" in comment["body"]
+        and comment["body"].rstrip().splitlines()[-1].startswith(
+            "-- primary-seat" if primary_kind != "claude" else "-- Anthropic Claude"
+        )
+    ]
+    if primary_kind == "claude":
+        # The planner is Codex here, so every Claude-signed plan comment is a review.
+        assert [body.endswith("(high)") for body in primary_bodies] == [False, False, True]
+        assert all(body.endswith("claude-test (medium)") for body in primary_bodies[:2])
+    else:
+        assert [body.endswith("seat-model (high))") for body in primary_bodies] == [
+            False, False, True,
+        ]
+        assert all(body.endswith("seat-model (low))") for body in primary_bodies[:2])
+    records = _m1505_primary_records_for(runner, "primary-seat" if primary_kind != "claude" else "Claude")
+    assert [record.plan_sweep for record in records] == [False, False, True]
+
+
+def _m1505_primary_records_for(runner, agent):
+    return [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == agent
+    ]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch, mixed):
+    """`repeat-reemission` (repaired path): the acknowledgement repair returns blocking."""
+    requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
+    dispositions = [{
+        "requirement_id": requirement.requirement_id,
+        "disposition": "addressed",
+        "evidence": "The plan preserves the public API.",
+    }]
+    base1 = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(plan_output), round_number=1
+    )
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1 remains.", blocking_plan_issues=["Close gap 1."],
+        human_requirement_dispositions=dispositions,
+    )
+    patch1, _base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    patch1 = patch1.replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n### Human requirements\n"
+        f"- {requirement.requirement_id}: the plan preserves the public API.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    # Round 2 approves without the acknowledgement; its repair blocks and
+    # re-emits the carried item-1 text as a "new" finding.
+    # Repair may only recover findings grounded in the reviewer's own source
+    # text, so the approval lists them as future follow-ups.
+    round2 = structured_plan_review(
+        state="approved", summary="Gap 1 closed.",
+        future_followups=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        human_requirement_dispositions=dispositions,
+    )
+    repaired = structured_plan_review(
+        state="blocking", summary="Gap 1 closed.",
+        blocking_plan_issues=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        human_requirements_resolved=True,
+        human_requirement_dispositions=dispositions,
+    )
+    runner = _FakeRunner(claude_outputs=[plan_output, patch1], codex_outputs=[round1, round2])
+    real_get_issue_context = orchestrator_module.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    # Instrument minting: the repaired path's items are not re-posted on a
+    # reviewer record before this run stops.
+    minted_items = []
+    real_mint = plan_first_loop_module._next_unresolved_item
+
+    def _recording_mint(**kwargs):
+        item = real_mint(**kwargs)
+        minted_items.append(item)
+        return item
+
+    monkeypatch.setattr(plan_first_loop_module, "_next_unresolved_item", _recording_mint)
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+        with patch.object(
+            plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+        ) as logged:
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(
+                    runner, issue_number=56, config=_staged_plan_config(tmp_path, max_rounds=2),
+                    plan_first=True,
+                )
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    assert any("repair returned blocking for Codex" in m for m in messages)
+    from coding_review_agent_loop.review_step_back import (
+        count_sweep_items,
+        eligible_new_mandatory_items,
+    )
+
+    # The repaired blocking findings are minted as ordinary round-2 blockers.
+    repaired_items = [
+        item for item in minted_items
+        if item.source_round == 2 and item.status == "blocking" and item.reviewer == "Codex"
+    ]
+    assert len(repaired_items) == (2 if mixed else 1)
+    duplicate = next(item for item in repaired_items if item.text == "Close gap 1.")
+    assert duplicate.repeat_of == "item-1"
+    if mixed:
+        fresh_item = next(item for item in repaired_items if item.text == "Close gap 2b.")
+        assert fresh_item.repeat_of is None
+    # Excluded from the trigger and export filter; the mixed review still counts.
+    eligible = eligible_new_mandatory_items(repaired_items, reviewer="Codex")
+    assert [item.text for item in eligible] == (["Close gap 2b."] if mixed else [])
+    assert count_sweep_items(repaired_items, reviewer="Codex", first_review=False) == int(mixed)

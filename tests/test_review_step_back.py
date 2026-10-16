@@ -2553,6 +2553,23 @@ def test_a_round_without_a_counted_primary_review_ends_the_sweep_streak():
     assert _sweep(records).streak_before(4) == 1
 
 
+@pytest.mark.parametrize("trailing_checkpoint", [False, True])
+def test_a_trailing_uncounted_round_ends_the_sweep_streak(trailing_checkpoint):
+    """The streak must reach the round immediately before the queried one."""
+    records = _sweep_chain(
+        [(1, {"items": [_tagged(1)]}), (2, {"items": [_tagged(2, provenance=PRE)]})]
+    )
+    if trailing_checkpoint:
+        # Round 3 was checkpointed but recorded no primary review.
+        records.append(_checkpoint(10, 3, digest=DIGEST))
+    state = _sweep(records)
+    assert state.streak_before(3) == 2
+    assert state.streak_before(4) == 0
+    assert state.streak_first_round(4) is None
+    assert not plan_sweep_due(state, round_number=4, sweep_rounds=2)
+    assert not plan_sweep_due(state, round_number=4, sweep_rounds=1)
+
+
 def test_first_review_revision_tags_are_ignored_for_the_sweep_count():
     """`first-review-normalization`: round 1 counts despite its revision tags."""
     records = _sweep_chain(
@@ -2584,7 +2601,9 @@ def test_sweep_retirement_matches_the_step_back_rules():
     assert _sweep(reset).streak_before(3) == 0
     # Nothing at or after a panel opening counts (the loop also never sweeps
     # once the panel is open).
-    assert _sweep(base, panel_opening_index=2).streak_before(3) == 1
+    opened = _sweep(base, panel_opening_index=2)
+    assert [review.round_number for review in opened.reviews] == [1]
+    assert opened.streak_before(3) == 0
     assert _sweep(base, panel_opening_index=0).streak_before(3) == 0
     # A phase-advance record is a history boundary.
     advance = PostedRoundRecord(
@@ -2603,7 +2622,6 @@ def test_sweep_retirement_matches_the_step_back_rules():
         (base, {}),
         (base, {"current_issue_digest": "fedcba9876543210"}),
         (reset, {}),
-        (base, {"panel_opening_index": 2}),
         ([*base, advance], {}),
         (unqualified, {}),
     ):
