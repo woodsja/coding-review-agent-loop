@@ -19,3 +19,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - `agent-loop issue --triage` is one advisory validated turn armed at the fresh-dispatch point; it never reads or changes a routing argument and every failure is ignored (#1434).
 - `agent-loop triage backtest` is offline and report-only over local history-export files, so it makes no GitHub call and never changes routing (#1435).
 - The workflow transaction model landed as stage A of #827: model only, with no writer emitting its records and no orchestration call site consuming them yet (#827).
+- Semantic follow-up dedupe defaults to the Antigravity backend; an unresolvable helper CLI skips semantic matching with one log line instead of failing the run or adding the helper to the required agent-command preflight, and the per-call timeout is resolved at use time from the backend (#1472).

@@ -1077,6 +1077,18 @@ def test_unsupported_selection_is_rejected(tmp_path, overrides, fragment):
     assert fragment in str(info.value)
 
 
+def test_sandboxed_mode_rejects_the_default_semantic_backend(tmp_path):
+    """`sandboxed-default-rejected` (#1472): the antigravity default still needs an override."""
+    from coding_review_agent_loop.config import DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
+
+    assert DEFAULT_SEMANTIC_FOLLOWUP_BACKEND == "antigravity"
+    with pytest.raises(AgentLoopError, match="supports only Claude and Codex") as info:
+        sandboxed_config(tmp_path, semantic_followup_backend=DEFAULT_SEMANTIC_FOLLOWUP_BACKEND)
+    message = str(info.value)
+    assert "semantic_followup_backend selects 'antigravity'" in message
+    assert "--semantic-followup-backend claude|codex or --no-semantic-followup-dedupe" in message
+
+
 def test_antigravity_reviewer_refusal_explains_the_gap_and_the_trade(tmp_path):
     # #1079: the refusal must say why agy has no grant and that the board
     # shrinks, so the operator trades review depth for containment knowingly.

@@ -345,8 +345,8 @@ agent-loop issue 123 --repo OWNER/REPO --plan-first \
 Instead of `--semantic-followup-backend claude` you may pass
 `--no-semantic-followup-dedupe`. Both helper backends must be overridden
 because their defaults are rejected in this mode: the default repair backend
-(`antigravity`) and the default semantic-followup backend (`gemini`) have no
-role grant. Codex or Claude repair needs an explicit `--repair-model`.
+(`antigravity`) and the default semantic-followup backend (`antigravity`) have
+no role grant. Codex or Claude repair needs an explicit `--repair-model`.
 
 What each role gets:
 
@@ -1267,6 +1267,16 @@ and its bounds are configurable with `--semantic-followup-backend`,
 `--semantic-followup-max-calls`, `--semantic-followup-max-candidates`, and
 `--semantic-followup-prompt-char-limit`. Only high-confidence matches suppress
 or merge work; uncertain matches are filed with a possible-duplicate note.
+
+The default backend is `antigravity`, using the first `--antigravity-models`
+entry (a cheap Flash model) unless `--semantic-followup-model` is set. Its
+per-call timeout defaults to 120 seconds (30 seconds for the other backends);
+an explicit `--semantic-followup-timeout-seconds` always wins. The Antigravity
+classification turn runs in an isolated empty temporary directory with no tools
+and returns its JSON on stdout only. When the selected backend's CLI is not on
+`PATH`, semantic matching is skipped with one log line (`Approved follow-up
+semantic dedupe skipped: <backend> CLI '<cmd>' is not configured ...`) and
+deterministic matching continues; the run does not fail.
 
 ## Discuss Mode
 

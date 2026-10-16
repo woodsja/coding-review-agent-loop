@@ -976,6 +976,38 @@ _REPAIR_SETTINGS_INJECTION = {
     "permissions": {"allow": []},
 }
 
+_SEMANTIC_DEDUPE_ROLE = "semantic-dedupe"
+# Roles that run in an isolated temporary directory with no tools: the GEMINI
+# lock sits beside the temp dir, no checkout snapshot is taken, and the strict
+# empty-allowlist settings are injected for the turn (#1472).
+_ISOLATED_NO_TOOL_ROLES = frozenset({"repair", _SEMANTIC_DEDUPE_ROLE})
+
+_SEMANTIC_DEDUPE_GEMINI_MD = """# Agent Loop Classification
+
+This is a single-shot classification task in an isolated temporary directory.
+Do not use any tools: do not read or write files, run shell commands or tests,
+start background tasks, or invoke subagents. Use only the data in the prompt.
+Answer immediately.
+
+"""
+
+
+def _with_classification_output_instruction(prompt: str) -> str:
+    """Stdout-only answer contract for a no-tools classification turn."""
+    return f"""{prompt}
+
+IMPORTANT FOR ANTIGRAVITY (agy) OUTPUT FILTERING:
+
+Do not use any tools and do not write any files. When you are ready to answer,
+print this exact line:
+
+{PUBLIC_RESPONSE_MARKER}
+
+then print only the bare JSON object requested above, and end your turn
+immediately with no further output.
+"""
+
+
 _REPAIR_GEMINI_MD = """# Agent Loop Format Repair
 
 This is a single-shot formatting-only repair task in an isolated temporary directory.
@@ -1152,10 +1184,14 @@ class AntigravityBackend:
         model = config.antigravity_models[0]
         response_path = public_response_path(config, "antigravity")
         response_path.unlink(missing_ok=True)
-        prompt_text = _with_public_response_marker_instruction(
-            with_public_response_file_instruction(prompt, response_path),
-            role=role,
-        )
+        isolated_role = role in _ISOLATED_NO_TOOL_ROLES
+        if role == _SEMANTIC_DEDUPE_ROLE:
+            prompt_text = _with_classification_output_instruction(prompt)
+        else:
+            prompt_text = _with_public_response_marker_instruction(
+                with_public_response_file_instruction(prompt, response_path),
+                role=role,
+            )
         oversized_prompt = len(prompt_text.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
         args = [
             config.antigravity_cmd,
@@ -1165,7 +1201,7 @@ class AntigravityBackend:
             f"{config.antigravity_print_timeout_seconds}s",
             *config.antigravity_args,
         ]
-        if role in {"reviewer", "repair"}:
+        if role == "reviewer" or isolated_role:
             args = [a for a in args if a != "--dangerously-skip-permissions"]
         # agy resumes by conversation id (not gemini's --resume). agy --print does
         # not surface a conversation id in plain output, so in practice session_id
@@ -1190,7 +1226,7 @@ class AntigravityBackend:
         try:
             gemini_lock_path = (
                 config.antigravity_dir.parent / f".{config.antigravity_dir.name}.GEMINI.md.lock"
-                if role == "repair"
+                if isolated_role
                 else _git_lock_path(config.antigravity_dir)
             )
         except OSError as exc:
@@ -1199,6 +1235,8 @@ class AntigravityBackend:
             ) from exc
         if role == "repair":
             single_shot_instruction = _REPAIR_GEMINI_MD
+        elif role == _SEMANTIC_DEDUPE_ROLE:
+            single_shot_instruction = _SEMANTIC_DEDUPE_GEMINI_MD
         else:
             single_shot_instruction = single_shot_session_instruction(config.base)
         injected_gemini_prefix = single_shot_instruction
@@ -1226,7 +1264,7 @@ class AntigravityBackend:
             except (SafeGeminiAccessError, OSError) as exc:
                 log(config, f"Not touching GEMINI.md after the turn: {exc}")
 
-        settings_was_injected = role in {"reviewer", "repair"}
+        settings_was_injected = role == "reviewer" or isolated_role
         original_settings_text: str | None = None
         settings_restore_required = False
         seat_label = config.active_reviewer_seat_id or "Antigravity"
@@ -1272,7 +1310,7 @@ class AntigravityBackend:
                     original_settings_text = None
                 injection = (
                     _REPAIR_SETTINGS_INJECTION
-                    if role == "repair"
+                    if isolated_role
                     else _REVIEWER_SETTINGS_INJECTION
                 )
                 injected = {**existing_settings, **injection}
@@ -1282,7 +1320,7 @@ class AntigravityBackend:
                 settings_path.write_text(json.dumps(injected, indent=2), encoding="utf-8")
 
             # Hold both locks across the complete normal-run lifecycle. Repair
-            # uses an isolated temporary directory and intentionally performs no
+            # and semantic dedupe use an isolated temporary directory and intentionally performs no
             # checkout probes or replacement classification.
             try:
                 gemini_lock_file = gemini_lock_path.open("a+")
@@ -1297,7 +1335,7 @@ class AntigravityBackend:
                     raise CheckoutVerificationError(
                         f"cannot take the GEMINI lock {gemini_lock_path}: {exc}"
                     ) from exc
-                if role != "repair":
+                if not isolated_role:
                     before_snapshot = capture_workdir_snapshot(
                         runner,
                         config.antigravity_dir,
@@ -1353,7 +1391,7 @@ class AntigravityBackend:
                     # before the subprocess is spawned.
                     strip_injected_prefix()
                 # Parse only after cleanup, while both locks are still held.
-                if role != "repair" and result is not None:
+                if not isolated_role and result is not None:
                     response_file_text = read_public_response_file(response_path)
                     candidate = classify_antigravity_executable_replacement_interruption(
                         result,
@@ -1379,14 +1417,14 @@ class AntigravityBackend:
                 release_problem = _release_gemini_lock(gemini_lock_file)
                 if release_problem is not None:
                     log(config, f"GEMINI lock release problem: {release_problem}")
-                    if role != "repair":
+                    if not isolated_role:
                         from ..checkout_verification import poison_checkout
 
                         poison_checkout(
                             config.antigravity_dir,
                             f"GEMINI lock release failed ({release_problem})",
                         )
-                if role == "repair":
+                if isolated_role:
                     gemini_lock_path.unlink(missing_ok=True)
         finally:
             if settings_restore_required:
@@ -1408,6 +1446,11 @@ class AntigravityBackend:
         if role == "repair":
             response_file_text = read_public_response_file(response_path)
         assert result is not None
+        # A classification turn answers on stdout only; a response file left
+        # by another turn is never mistaken for its answer.
+        if role == _SEMANTIC_DEDUPE_ROLE:
+            response_path.unlink(missing_ok=True)
+            response_file_text = None
         if response_file_text is not None:
             message_text, text_source = response_file_text, "response_file"
         else:

@@ -1832,3 +1832,157 @@ def test_settings_lock_owner_cleanup_tolerates_an_oversized_integer_bound(tmp_pa
     assert result.text == "ok"
     assert harness.mod.read_settings_lock_holder(harness.holder_path).turn_bound_seconds is None
     assert harness.holder_path.exists()  # foreign token: left alone
+
+
+def _semantic_dedupe_setup(tmp_path, monkeypatch):
+    import json as _json
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+
+    workdir = tmp_path / "isolated"
+    workdir.mkdir()
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(_json.dumps({"existingKey": "existingValue"}), encoding="utf-8")
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+    config = make_config(
+        tmp_path,
+        antigravity_dir=workdir,
+        antigravity_models=("Gemini Flash",),
+        antigravity_args=("--dangerously-skip-permissions",),
+    )
+    return workdir, settings_file, config
+
+
+def test_antigravity_semantic_dedupe_runs_isolated_classification_turn(tmp_path, monkeypatch):
+    """`agy-dedupe-success` (#1472): classification wrapper, strict settings, stdout JSON."""
+    import json as _json
+    from coding_review_agent_loop.agents.antigravity import (
+        AntigravityBackend,
+        _REPAIR_SETTINGS_INJECTION,
+        _SEMANTIC_DEDUPE_GEMINI_MD,
+    )
+    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+    from coding_review_agent_loop.semantic_dedupe import parse_semantic_match
+
+    workdir, settings_file, config = _semantic_dedupe_setup(tmp_path, monkeypatch)
+    original_settings = settings_file.read_text(encoding="utf-8")
+    seen: dict[str, object] = {}
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            seen["settings"] = _json.loads(settings_file.read_text(encoding="utf-8"))
+            seen["gemini_md"] = (cwd / "GEMINI.md").read_text(encoding="utf-8")
+            seen["timeout"] = kwargs.get("timeout_seconds")
+            seen["sibling_lock"] = (cwd.parent / f".{cwd.name}.GEMINI.md.lock").exists()
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    answer = '{"duplicate_of": 7, "confidence": "high", "reason": "same work"}'
+    runner = CapturingRunner(
+        antigravity_outputs=[(f"thinking...\n{PUBLIC_RESPONSE_MARKER}\n{answer}\n", 0)]
+    )
+    result = AntigravityBackend().run(
+        runner, config, "Classify. Return strict JSON only.",
+        role="semantic-dedupe", label="semantic-followup-dedupe", timeout_seconds=120.0,
+    )
+
+    cmd = runner.commands[-1][0]
+    prompt = cmd[cmd.index("--print") + 1]
+    assert "--dangerously-skip-permissions" not in cmd
+    assert PUBLIC_RESPONSE_MARKER in prompt
+    assert "PUBLIC RESPONSE FILE" not in prompt
+    assert "AGENT_STATE" not in prompt
+    assert "AGENT_PR" not in prompt
+    assert "footer" not in prompt.lower()
+    assert "signature" not in prompt.lower()
+    assert "Run any verification steps" not in prompt
+    assert seen["settings"]["toolPermission"] == "strict"
+    assert seen["settings"]["permissions"] == _REPAIR_SETTINGS_INJECTION["permissions"]
+    assert seen["settings"]["existingKey"] == "existingValue"
+    assert _SEMANTIC_DEDUPE_GEMINI_MD in seen["gemini_md"]
+    assert "Agent Loop Single-Shot Session" not in seen["gemini_md"]
+    assert seen["timeout"] == 120.0
+    assert seen["sibling_lock"] is True
+    # Settings restored, sibling lock removed, no git metadata or probes.
+    assert settings_file.read_text(encoding="utf-8") == original_settings
+    assert not (workdir.parent / f".{workdir.name}.GEMINI.md.lock").exists()
+    assert not (workdir / ".git").exists()
+    assert not (workdir / "GEMINI.md").exists()
+    assert runner.git_probe_calls == []
+    assert result.text_source == "stdout_marker"
+    match = parse_semantic_match(result.text.strip(), allowed_ids={7, 8})
+    assert match.duplicate_of == 7
+
+
+def test_antigravity_semantic_dedupe_ignores_response_files(tmp_path, monkeypatch):
+    """`agy-dedupe-stale-response-file` (#1472): only stdout is the answer."""
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+    from coding_review_agent_loop.agents.base import public_response_path
+    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+
+    _workdir, _settings_file, config = _semantic_dedupe_setup(tmp_path, monkeypatch)
+    stale_path = public_response_path(config, "antigravity")
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.write_text("stale review response", encoding="utf-8")
+    answer = '{"duplicate_of": null, "confidence": "low", "reason": "distinct"}'
+    runner = FakeRunner(
+        antigravity_outputs=[(f"{PUBLIC_RESPONSE_MARKER}\n{answer}", 0)],
+        public_response_outputs=["a file written during the turn"],
+    )
+
+    result = AntigravityBackend().run(runner, config, "Classify.", role="semantic-dedupe")
+
+    assert result.text == answer
+    assert result.text_source == "stdout_marker"
+    assert result.response_file_text is None
+    assert "stale" not in result.text and "file written" not in result.text
+
+
+def test_antigravity_repair_and_reviewer_paths_keep_their_behaviour(tmp_path, monkeypatch):
+    """`agy-other-roles-unchanged` (#1472): only semantic-dedupe gets the classification path."""
+    import json as _json
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.agents.antigravity import (
+        AntigravityBackend,
+        _REPAIR_GEMINI_MD,
+        _REVIEWER_SETTINGS_INJECTION,
+        _SEMANTIC_DEDUPE_GEMINI_MD,
+    )
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: settings_file)
+    seen: list[tuple[str, dict | None]] = []
+
+    class CapturingRunner(FakeRunner):
+        def run_with_log(self, args, *, cwd, **kwargs):
+            settings = (
+                _json.loads(settings_file.read_text(encoding="utf-8"))
+                if settings_file.exists()
+                else None
+            )
+            seen.append(((cwd / "GEMINI.md").read_text(encoding="utf-8"), settings))
+            return super().run_with_log(args, cwd=cwd, **kwargs)
+
+    agy_dir = tmp_path / "agy"
+    agy_dir.mkdir()
+    config = make_config(tmp_path, antigravity_dir=agy_dir)
+    runner = CapturingRunner(antigravity_outputs=[("ok", 0), ("ok", 0), ("ok", 0)])
+    AntigravityBackend().run(runner, config, "Review PR.", role="reviewer")
+    reviewer_prompt = runner.commands[-1][0][-1]
+    AntigravityBackend().run(runner, config, "Implement.", role="coder")
+    coder_prompt = runner.commands[-1][0][-1]
+    AntigravityBackend().run_repair(runner, config, "Repair this.", model="ModelA")
+    repair_prompt = runner.commands[-1][0][-1]
+
+    (reviewer_md, reviewer_settings), (coder_md, coder_settings), (repair_md, repair_settings) = seen
+    assert "Agent Loop Single-Shot Session" in reviewer_md
+    assert reviewer_settings["permissions"] == _REVIEWER_SETTINGS_INJECTION["permissions"]
+    assert "Agent Loop Single-Shot Session" in coder_md
+    assert coder_settings is None
+    assert _REPAIR_GEMINI_MD in repair_md
+    assert repair_settings["permissions"] == {"allow": []}
+    for md in (reviewer_md, coder_md, repair_md):
+        assert _SEMANTIC_DEDUPE_GEMINI_MD not in md
+    for prompt in (reviewer_prompt, coder_prompt, repair_prompt):
+        assert "PUBLIC RESPONSE FILE" in prompt
+    assert "Run any verification steps" in coder_prompt
+    # Reviewer and coder still take the git-metadata lock and snapshots.
+    assert runner.git_probe_calls

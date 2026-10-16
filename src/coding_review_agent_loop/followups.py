@@ -783,6 +783,9 @@ def _semantic_batch_matcher(
         proposed: ApprovedFollowup,
         groups: tuple[GroupedApprovedFollowup, ...],
     ) -> SemanticMatch | None:
+        # Preflight already logged the unresolvable backend CLI once.
+        if not getattr(matcher, "available", True):
+            return None
         # Shared source context is included in the prompt, but the matcher is
         # still bounded to the configured group count and cannot create an
         # identity outside this batch.
@@ -1158,7 +1161,8 @@ def _find_existing_for_group(
             log(config, f"Suppressed approved follow-up as deterministic duplicate of existing issue #{number}")
             return "reused", number, "Deterministic equivalence with this existing tracker."
 
-    if matcher is None:
+    # An unavailable matcher was reported once by preflight; stay deterministic.
+    if matcher is None or not getattr(matcher, "available", True):
         return "new", None, None
     narrowed = _narrow_existing_candidates(
         followup,

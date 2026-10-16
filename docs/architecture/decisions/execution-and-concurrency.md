@@ -9,3 +9,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - SSH transport honours a non-executing subset of `~/.ssh/config` for the literal URL host, refusing rather than escaping any unsafe value, and never runs `ssh -G` (#1380).
 - Same-UID live races against `~/.ssh` are left out of scope for the SSH transport (#1371).
 - Antigravity tracks quota exhaustion per quota group for the logical run, so a verified exhaustion skips the whole group with no retry instead of retrying each model (#1236).
+- The Antigravity `semantic-dedupe` turn reuses the isolated `repair` path (sibling GEMINI lock, no checkout snapshot, strict empty allowlist) with a stdout-only classification contract, so a classifier never creates git metadata in its temporary directory or reads a stale response file (#1472).

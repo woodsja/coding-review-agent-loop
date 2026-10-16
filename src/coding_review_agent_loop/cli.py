@@ -40,7 +40,6 @@ from .config import (
     DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS,
     DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES,
     DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT,
-    DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS,
     AgentLoopConfig,
     config_from_args,
     ensure_agent_workdirs,
@@ -852,7 +851,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--semantic-followup-backend",
             choices=("claude", "codex", "gemini", "antigravity"),
             default=DEFAULT_SEMANTIC_FOLLOWUP_BACKEND,
-            help="Cheap isolated provider used for semantic follow-up matching.",
+            help=(
+                "Cheap isolated provider used for semantic follow-up matching "
+                "(default: antigravity, using the first --antigravity-models entry "
+                "unless --semantic-followup-model is set). When the selected CLI is "
+                "not on PATH, semantic matching is skipped with one log line."
+            ),
         )
         subparser.add_argument(
             "--semantic-followup-model",
@@ -862,8 +866,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--semantic-followup-timeout-seconds",
             type=int,
-            default=DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS,
-            help="Per-call semantic follow-up provider timeout (default: 30).",
+            default=None,
+            help=(
+                "Per-call semantic follow-up provider timeout "
+                "(default: 30; 120 for antigravity)."
+            ),
         )
         subparser.add_argument(
             "--semantic-followup-max-calls",

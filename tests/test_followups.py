@@ -1663,3 +1663,278 @@ def test_plan_publication_without_sources_skips_preflight(tmp_path, monkeypatch)
     assert runner.issues == []
     assert runner.comments
     assert runner.comments[-1].startswith("Planning complete for issue #884.")
+
+
+# --- #1472: antigravity default, backend-aware timeout, not-configured skip ---
+
+from coding_review_agent_loop.cli import build_parser as _build_parser  # noqa: E402
+from coding_review_agent_loop.config import (  # noqa: E402
+    DEFAULT_SEMANTIC_FOLLOWUP_BACKEND,
+    effective_semantic_followup_timeout_seconds,
+)
+from coding_review_agent_loop.semantic_dedupe import (  # noqa: E402
+    SemanticBackendUnavailable,
+    _strip_antigravity_json_fence,
+)
+
+_SKIP_LINE = "Approved follow-up semantic dedupe skipped: antigravity CLI 'agy' is not configured"
+_NULL_MATCH = json.dumps({"duplicate_of": None, "confidence": "low", "reason": "distinct"})
+
+
+def _parsed_args(tmp_path, *extra):
+    return _build_parser().parse_args(
+        [
+            "pr", "123", "--repo", "OWNER/REPO",
+            "--coder", "claude", "--reviewer", "codex",
+            *extra,
+        ]
+    )
+
+
+def test_cli_default_semantic_backend_and_backend_aware_timeout(tmp_path):
+    """`default-backend-and-timeout` (#1472): CLI parse defaults and explicit values."""
+    assert DEFAULT_SEMANTIC_FOLLOWUP_BACKEND == "antigravity"
+    args = _parsed_args(tmp_path)
+    assert args.semantic_followup_backend == "antigravity"
+    assert args.semantic_followup_timeout_seconds is None
+
+    default_config = make_config(
+        tmp_path,
+        semantic_followup_backend=args.semantic_followup_backend,
+        semantic_followup_timeout_seconds=args.semantic_followup_timeout_seconds,
+    )
+    assert effective_semantic_followup_timeout_seconds(default_config) == 120
+
+    claude_args = _parsed_args(tmp_path, "--semantic-followup-backend", "claude")
+    claude_config = make_config(
+        tmp_path,
+        semantic_followup_backend=claude_args.semantic_followup_backend,
+        semantic_followup_timeout_seconds=claude_args.semantic_followup_timeout_seconds,
+    )
+    assert effective_semantic_followup_timeout_seconds(claude_config) == 30
+
+    explicit = _parsed_args(tmp_path, "--semantic-followup-timeout-seconds", "30")
+    assert explicit.semantic_followup_timeout_seconds == 30
+    explicit_config = make_config(
+        tmp_path,
+        semantic_followup_backend=explicit.semantic_followup_backend,
+        semantic_followup_timeout_seconds=explicit.semantic_followup_timeout_seconds,
+    )
+    assert effective_semantic_followup_timeout_seconds(explicit_config) == 30
+
+    gemini = _parsed_args(tmp_path, "--semantic-followup-backend", "gemini")
+    assert gemini.semantic_followup_backend == "gemini"
+
+
+@pytest.mark.parametrize(
+    ("extra", "backend", "stored", "effective"),
+    (
+        ((), "antigravity", None, 120),
+        (("--semantic-followup-backend", "claude"), "claude", None, 30),
+        (("--semantic-followup-timeout-seconds", "30"), "antigravity", 30, 30),
+    ),
+    ids=("default", "claude", "explicit-30"),
+)
+def test_config_from_args_resolves_semantic_timeout(tmp_path, extra, backend, stored, effective):
+    from coding_review_agent_loop.config import config_from_args
+
+    args = _build_parser().parse_args([
+        "pr", "123", "--repo", "OWNER/REPO",
+        "--coder", "antigravity", "--reviewer", "codex",
+        "--codex-dir", str(tmp_path / "codex"),
+        "--dangerous-agent-permissions",
+        *extra,
+    ])
+    config = config_from_args(args, FakeRunner())
+    assert config.semantic_followup_backend == backend
+    assert config.semantic_followup_timeout_seconds == stored
+    assert effective_semantic_followup_timeout_seconds(config) == effective
+
+
+def test_direct_config_construction_resolves_backend_aware_timeout(tmp_path):
+    """`default-backend-and-timeout` (#1472): direct construction and validation."""
+    from dataclasses import replace
+
+    default = make_config(tmp_path)
+    assert default.semantic_followup_backend == "antigravity"
+    assert default.semantic_followup_timeout_seconds is None
+    assert effective_semantic_followup_timeout_seconds(default) == 120
+    claude = make_config(tmp_path, semantic_followup_backend="claude")
+    assert effective_semantic_followup_timeout_seconds(claude) == 30
+    explicit = make_config(tmp_path, semantic_followup_timeout_seconds=30)
+    assert effective_semantic_followup_timeout_seconds(explicit) == 30
+    assert effective_semantic_followup_timeout_seconds(
+        replace(default, semantic_followup_backend="codex")
+    ) == 30
+    assert make_config(tmp_path, semantic_followup_backend="gemini").semantic_followup_backend == "gemini"
+    for invalid in (0, -1, True):
+        with pytest.raises(AgentLoopError, match="--semantic-followup-timeout-seconds"):
+            make_config(tmp_path, semantic_followup_timeout_seconds=invalid)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (({}, 120.0), ({"semantic_followup_timeout_seconds": 30}, 30.0)),
+    ids=("default-antigravity", "explicit-30"),
+)
+def test_matcher_passes_resolved_timeout_to_transport(tmp_path, overrides, expected):
+    timeouts: list[float] = []
+
+    def transport(_prompt, _runner, _config, timeout):
+        timeouts.append(timeout)
+        return _NULL_MATCH
+
+    matcher = SemanticDedupeMatcher(
+        runner=FakeRunner(), config=make_config(tmp_path, **overrides), transport=transport
+    )
+    matcher.match(
+        proposed="Track the deferred recovery work.",
+        candidates=(SemanticCandidate(identity=484, title="Existing", body="Recovery"),),
+        source_context=_source(parent=473).render(),
+    )
+    assert timeouts == [expected]
+
+
+def _agy_unresolvable(monkeypatch):
+    import shutil as _shutil
+
+    real_which = _shutil.which
+    monkeypatch.setattr(
+        _shutil,
+        "which",
+        lambda command, *a, **k: None if command == "agy" else real_which(command, *a, **k),
+    )
+
+
+def test_unresolvable_backend_skips_semantic_matching_with_one_log_line(
+    tmp_path, monkeypatch, capsys
+):
+    """`backend-not-configured` (#1472): one log line, no provider call, deterministic results."""
+    _agy_unresolvable(monkeypatch)
+    provider_calls: list[object] = []
+    monkeypatch.setattr(
+        _semantic_dedupe_module,
+        "run_agent_result",
+        lambda *a, **k: provider_calls.append((a, k)),
+    )
+    runner = FakeRunner(
+        search_issues_payload=[
+            {
+                "number": 484,
+                "title": "Follow up future plan-review note: Improve salvage recovery coverage",
+                "url": "https://github.com/OWNER/REPO/issues/484",
+                "body": "Capture untracked-only salvage work when the HEAD diff is empty.",
+            }
+        ]
+    )
+    config = make_config(tmp_path, approved_followups="issue", quiet=False)
+    assert config.semantic_followup_backend == "antigravity"
+
+    published = _publish_approved_followups(
+        runner,
+        config=config,
+        pr_number=488,
+        head_sha="head-488",
+        pr_comments=[],
+        followups=[
+            ApprovedFollowup(
+                reviewer="Claude",
+                text="Ensure salvage captures worktree-only files when the HEAD diff is empty.",
+            ),
+            ApprovedFollowup(
+                reviewer="Codex",
+                text="Make salvage keep files that exist only in the worktree for recovery.",
+            ),
+        ],
+        source_context=_source(parent=473),
+    )
+
+    err = capsys.readouterr().err
+    assert published is True
+    assert provider_calls == []
+    assert not any(command[0][0] == "agy" for command in runner.commands)
+    assert err.count(_SKIP_LINE) == 1
+    assert "provider/environment failure" not in err
+    assert "budget exhausted" not in err
+    assert runner.issues  # deterministic publication still creates trackers
+
+
+def test_unavailable_matcher_never_invokes_transport(tmp_path, monkeypatch, capsys):
+    _agy_unresolvable(monkeypatch)
+    matcher = SemanticDedupeMatcher(runner=FakeRunner(), config=make_config(tmp_path, quiet=False))
+    assert matcher.transport is default_semantic_transport
+
+    assert matcher.preflight() is False
+    assert matcher.available is False
+    for _ in range(3):
+        with pytest.raises(SemanticBackendUnavailable):
+            matcher.match(
+                proposed="Track the deferred recovery work.",
+                candidates=(SemanticCandidate(identity=484, title="Existing", body="Recovery"),),
+                source_context=_source(parent=473).render(),
+            )
+    batch = _semantic_batch_matcher(matcher, source_context=_source(parent=473))
+    assert batch(ApprovedFollowup(reviewer="Claude", text="x"), _two_batch_groups()) is None
+    assert matcher.calls == 0
+    err = capsys.readouterr().err
+    assert err.count(_SKIP_LINE) == 1
+    assert "pass --antigravity-cmd" in err
+
+
+def test_resolvable_backend_preflight_is_unchanged(tmp_path):
+    matcher = SemanticDedupeMatcher(runner=FakeRunner(), config=make_config(tmp_path))
+    assert matcher.preflight() is True
+    assert matcher.available is True
+
+
+def test_injected_transport_bypasses_path_check(tmp_path, monkeypatch):
+    """`custom-transport-bypass` (#1472)."""
+    _agy_unresolvable(monkeypatch)
+    calls: list[str] = []
+
+    def transport(prompt, _runner, _config, _timeout):
+        calls.append(prompt)
+        return _NULL_MATCH
+
+    matcher = SemanticDedupeMatcher(runner=FakeRunner(), config=make_config(tmp_path), transport=transport)
+    assert matcher.preflight() is True
+    match = matcher.match(
+        proposed="Track the deferred recovery work.",
+        candidates=(SemanticCandidate(identity=484, title="Existing", body="Recovery"),),
+        source_context=_source(parent=473).render(),
+    )
+    assert match.duplicate_of is None
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        f"  {_NULL_MATCH}\n\n",
+        f"```json\n{_NULL_MATCH}\n```",
+        f"\n```\n{_NULL_MATCH}\n```\n",
+    ),
+    ids=("whitespace", "json-fence", "bare-fence"),
+)
+def test_antigravity_transport_strips_fence_before_parsing(tmp_path, monkeypatch, raw):
+    captured: dict[str, object] = {}
+
+    def fake_run_agent_result(_runner, *, agent, role, timeout_seconds, **_kwargs):
+        captured.update(agent=agent, role=role, timeout=timeout_seconds)
+        return SimpleNamespace(text=raw)
+
+    monkeypatch.setattr(_semantic_dedupe_module, "run_agent_result", fake_run_agent_result)
+    response = default_semantic_transport(_NULL_MATCH, FakeRunner(), make_config(tmp_path), 120.0)
+    assert captured == {"agent": "antigravity", "role": "semantic-dedupe", "timeout": 120.0}
+    assert response.text == _NULL_MATCH
+    assert parse_semantic_match(response.text, allowed_ids={484}).duplicate_of is None
+    assert _strip_antigravity_json_fence("```json\n{}\n```") == "{}"
+
+
+def test_non_antigravity_transport_text_is_untouched(tmp_path, monkeypatch):
+    fenced = f"```json\n{_NULL_MATCH}\n```"
+    monkeypatch.setattr(
+        _semantic_dedupe_module, "run_agent_result", lambda *_a, **_k: SimpleNamespace(text=fenced)
+    )
+    config = make_config(tmp_path, semantic_followup_backend="claude")
+    assert default_semantic_transport("p", FakeRunner(), config, 30.0).text == fenced
