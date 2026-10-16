@@ -8458,6 +8458,37 @@ success audit record. Configure the classifier with
 `--semantic-followup-prompt-char-limit`; use
 `--no-semantic-followup-dedupe` for deterministic-only operation.
 
+The default classifier backend is `antigravity`. It uses
+`--semantic-followup-model` when set, otherwise the first
+`--antigravity-models` entry, a cheap Flash model. `gemini`, `claude` and
+`codex` remain selectable. When `--semantic-followup-timeout-seconds` is not
+given, the per-call timeout is 120 seconds for `antigravity` (agy startup alone
+can approach the generic bound) and 30 seconds for the other backends; an
+explicit value always wins, whichever backend is selected.
+
+The Antigravity classification turn (`semantic-dedupe` role) runs in an
+isolated empty temporary directory, like format repair. It gets a minimal
+no-tools `GEMINI.md`, the strict empty-allowlist settings injection for the
+turn, a GEMINI lock beside the temporary directory, and no checkout snapshot.
+Its prompt carries no response-file, protocol-marker or footer contract: agy
+prints the output marker and then the bare JSON object, and only stdout after
+that marker is the answer. A response file is never read for this role. One
+surrounding `` ```json `` fence and surrounding whitespace are stripped before
+strict JSON validation.
+
+Before any publication write, the matcher checks that the selected backend's
+CLI (`--claude-cmd`, `--codex-cmd`, `--gemini-cmd` or `--antigravity-cmd`)
+resolves on `PATH`. When it does not, semantic matching is skipped for that
+publication with exactly one log line:
+
+```text
+Approved follow-up semantic dedupe skipped: antigravity CLI 'agy' is not configured (not found on PATH; pass --antigravity-cmd, choose --semantic-followup-backend, or use --no-semantic-followup-dedupe); using deterministic matching
+```
+
+No provider is invoked, no semantic budget is consumed, deterministic matching
+continues, and the run does not fail. The helper backend is deliberately not
+part of the required agent-command preflight.
+
 Publication summaries distinguish created issues, reused trackers, uncertain
 matches, and cap-skipped work. The three-new-issue cap is applied after all
 groups have been checked for reuse, so reusing an existing tracker does not

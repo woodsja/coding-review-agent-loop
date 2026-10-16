@@ -104,8 +104,10 @@ ANTIGRAVITY_TRANSIENT_MODEL_ACCESS_SIGNATURES: tuple[str, ...] = (
     "model-access validation error",
 )
 DEFAULT_REASONING_EFFORT = "medium"
-DEFAULT_SEMANTIC_FOLLOWUP_BACKEND: AgentName = "gemini"
+DEFAULT_SEMANTIC_FOLLOWUP_BACKEND: AgentName = "antigravity"
 DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS = 30
+# agy startup alone can approach the generic 30 s bound (#1472).
+DEFAULT_ANTIGRAVITY_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS = 120
 DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS = 5
 DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES = 50
 DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT = 12_000
@@ -228,7 +230,9 @@ class AgentLoopConfig:
     semantic_followup_dedupe: bool = True
     semantic_followup_backend: AgentName = DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
     semantic_followup_model: str = ""
-    semantic_followup_timeout_seconds: int = DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS
+    # None means the operator set no timeout; see
+    # effective_semantic_followup_timeout_seconds for the backend default.
+    semantic_followup_timeout_seconds: int | None = None
     semantic_followup_max_calls: int = DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS
     semantic_followup_max_candidates: int = DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES
     semantic_followup_prompt_char_limit: int = DEFAULT_SEMANTIC_FOLLOWUP_PROMPT_CHAR_LIMIT
@@ -633,8 +637,13 @@ class AgentLoopConfig:
             seen_group_models.add(override[0])
         if self.semantic_followup_backend not in {"claude", "codex", "gemini", "antigravity"}:
             raise AgentLoopError("--semantic-followup-backend must name a supported agent.")
+        semantic_limits: list[tuple[str, object]] = []
+        if self.semantic_followup_timeout_seconds is not None:
+            semantic_limits.append(
+                ("--semantic-followup-timeout-seconds", self.semantic_followup_timeout_seconds)
+            )
         for option_name, value in (
-            ("--semantic-followup-timeout-seconds", self.semantic_followup_timeout_seconds),
+            *semantic_limits,
             ("--semantic-followup-max-calls", self.semantic_followup_max_calls),
             ("--semantic-followup-max-candidates", self.semantic_followup_max_candidates),
             ("--semantic-followup-prompt-char-limit", self.semantic_followup_prompt_char_limit),
@@ -966,6 +975,15 @@ class AgentLoopConfig:
         from .containment import policy_from_values
 
         return policy_from_values(self.__dict__)
+
+
+def effective_semantic_followup_timeout_seconds(config: AgentLoopConfig) -> int:
+    """Per-call semantic follow-up timeout: explicit value, else the backend default."""
+    if config.semantic_followup_timeout_seconds is not None:
+        return config.semantic_followup_timeout_seconds
+    if config.semantic_followup_backend == "antigravity":
+        return DEFAULT_ANTIGRAVITY_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS
+    return DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS
 
 
 def reviewers(config: AgentLoopConfig) -> tuple[AgentName, ...]:
@@ -2451,7 +2469,7 @@ def config_from_args(
         ),
         semantic_followup_model=getattr(args, "semantic_followup_model", ""),
         semantic_followup_timeout_seconds=getattr(
-            args, "semantic_followup_timeout_seconds", DEFAULT_SEMANTIC_FOLLOWUP_TIMEOUT_SECONDS
+            args, "semantic_followup_timeout_seconds", None
         ),
         semantic_followup_max_calls=getattr(
             args, "semantic_followup_max_calls", DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS

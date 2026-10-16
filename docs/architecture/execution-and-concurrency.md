@@ -141,7 +141,11 @@ real test gate, and refreshed only afterwards; a gate adopts only new
 artifacts. Each completed turn refreshes it, and a post-turn capture that
 fails, or exceeds the 100,000-path cap, poisons the entry so a later
 clean-but-wrong checkout is refused rather than adopted. `semantic-dedupe` and
-`repair` (tool-owned temporary directories) and dry-run are exempt. Explicit
+`repair` (tool-owned temporary directories) and dry-run are exempt. The
+Antigravity backend treats `semantic-dedupe` like `repair`: a GEMINI lock
+beside the temporary directory instead of in git metadata, no checkout
+snapshot or replacement classification, and the strict empty-allowlist
+settings injection for the turn. Explicit
 agent directories must be existing git checkouts. Foreign writes *during* a
 turn are absorbed into the refreshed baseline; excluding them is the claim's
 responsibility.

@@ -10,6 +10,8 @@ second publishing authority.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Callable, Literal, TYPE_CHECKING
 
 from .agents.base import AgentName
 from .agents.registry import run_agent_result
+from .config import effective_semantic_followup_timeout_seconds
 from .errors import AgentLoopError, QuotaResetExceededError
 from .logging import log
 from .protocol_markers import sanitize_historical_text
@@ -259,6 +262,24 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
         raise
 
 
+_JSON_FENCE_RE = re.compile(r"\A```(?:json)?[ \t]*\n(?P<body>.*?)\n?```\Z", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_antigravity_json_fence(text: str) -> str:
+    """Trim whitespace and one surrounding ```json fence from an agy answer."""
+    stripped = text.strip()
+    fenced = _JSON_FENCE_RE.match(stripped)
+    return fenced.group("body").strip() if fenced else stripped
+
+
+def _backend_command(config: "AgentLoopConfig", backend: str) -> str:
+    return str(getattr(config, f"{backend}_cmd", "") or "")
+
+
+def _cli_resolvable(command: str) -> bool:
+    return bool(command) and shutil.which(command) is not None
+
+
 def default_semantic_transport(
     prompt: str,
     runner: "Runner",
@@ -279,7 +300,10 @@ def default_semantic_transport(
             label="semantic-followup-dedupe",
             timeout_seconds=timeout_seconds,
         )
-        return SemanticProviderResult(text=result.text, result=result)
+        text = result.text
+        if backend == "antigravity":
+            text = _strip_antigravity_json_fence(text)
+        return SemanticProviderResult(text=text, result=result)
     finally:
         # The directory is outside the repository and contains no durable
         # orchestration state.  Best-effort cleanup is deliberately omitted
@@ -306,6 +330,9 @@ class SemanticDedupeMatcher:
         self.transport = transport or default_semantic_transport
         self.usage_context = usage_context
         self.calls = 0
+        # False once preflight finds the selected backend CLI unresolvable;
+        # callers then keep deterministic matching without a provider call.
+        self.available = True
 
     def preflight(self) -> bool:
         """Build and discard the isolated provider config before any GitHub write.
@@ -318,6 +345,18 @@ class SemanticDedupeMatcher:
         """
         if self.transport is not default_semantic_transport:
             return True
+        backend = self.config.semantic_followup_backend
+        command = _backend_command(self.config, backend)
+        if not _cli_resolvable(command):
+            self.available = False
+            log(
+                self.config,
+                f"Approved follow-up semantic dedupe skipped: {backend} CLI '{command}' is not "
+                f"configured (not found on PATH; pass --{backend}-cmd, choose "
+                "--semantic-followup-backend, or use --no-semantic-followup-dedupe); "
+                "using deterministic matching",
+            )
+            return False
         isolated_dir: Path | None = None
         try:
             _isolated_config, isolated_dir = _isolated_provider_config(
@@ -336,8 +375,6 @@ class SemanticDedupeMatcher:
             return False
         finally:
             if isolated_dir is not None:
-                import shutil
-
                 shutil.rmtree(isolated_dir, ignore_errors=True)
         return True
 
@@ -348,6 +385,8 @@ class SemanticDedupeMatcher:
         candidates: tuple[SemanticCandidate, ...],
         source_context: str,
     ) -> SemanticMatch:
+        if not self.available:
+            raise SemanticBackendUnavailable("semantic follow-up backend CLI is not configured")
         if self.calls >= self.config.semantic_followup_max_calls:
             raise BudgetExhausted("semantic call budget exhausted")
         if len(candidates) > self.config.semantic_followup_max_candidates:
@@ -365,7 +404,7 @@ class SemanticDedupeMatcher:
             prompt,
             self.runner,
             self.config,
-            float(self.config.semantic_followup_timeout_seconds),
+            float(effective_semantic_followup_timeout_seconds(self.config)),
         )
         if isinstance(response, str):
             raw = response
@@ -416,6 +455,10 @@ class BudgetExhausted(AgentLoopError):
     """Local semantic budget exhaustion; callers retain deterministic behavior."""
 
 
+class SemanticBackendUnavailable(BudgetExhausted):
+    """The selected backend CLI is not resolvable; preflight already logged it once."""
+
+
 class SemanticDedupeConfigurationError(AgentLoopError):
     """A deterministic defect in deriving the isolated semantic-dedupe provider config.
 
@@ -427,6 +470,7 @@ class SemanticDedupeConfigurationError(AgentLoopError):
 
 __all__ = [
     "BudgetExhausted",
+    "SemanticBackendUnavailable",
     "SemanticCandidate",
     "SemanticConfidence",
     "SemanticDedupeConfigurationError",
