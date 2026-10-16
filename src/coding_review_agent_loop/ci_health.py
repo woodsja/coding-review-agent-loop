@@ -421,3 +421,131 @@ def is_canonical_stall_only_text(text: str, *, stalls: Sequence[StalledCheck]) -
         return False
 
     return True
+
+
+# --- Post-approval plumbing classification (#1477) --------------------------
+
+WatchFailureClass = Literal[
+    "test-failure",
+    "plumbing-only",
+    "plumbing-awaiting-tests",
+    "stuck-infrastructure",
+    "not-classifiable",
+]
+
+_PASSED_STATUSES = frozenset({"success", "neutral"})
+
+
+def check_name_matches(name: str, names: frozenset[str] | set[str] | Sequence[str]) -> bool:
+    """Exact whole-name or exact final `` / ``-segment equality, never substring.
+
+    GitHub names a reusable-workflow job ``caller / job``; only that final
+    segment, compared exactly, may stand in for the catalogued job name.
+    """
+    candidates = {candidate for candidate in names if candidate}
+    if not name or not candidates:
+        return False
+    if name in candidates:
+        return True
+    segment = name.rsplit(" / ", 1)[-1] if " / " in name else None
+    return segment is not None and segment in candidates
+
+
+def board_tests_passed(
+    board: PullRequestChecks, plumbing_names: frozenset[str] | set[str] | Sequence[str]
+) -> bool:
+    """True when every non-plumbing check in the board's passing bucket passed.
+
+    The passing bucket also holds ``skipped`` checks; a skipped test did not
+    pass, so it never supports a plumbing-only decision on either route.
+    """
+    return all(
+        (check.status or "").strip().lower() in _PASSED_STATUSES
+        for check in board.passing
+        if not check_name_matches(check.name, plumbing_names)
+    )
+
+
+def classify_watch_failure(
+    board: PullRequestChecks,
+    plumbing_names: frozenset[str] | set[str] | Sequence[str],
+    stuck_contexts: Sequence[PullRequestCheck] = (),
+    *,
+    stuck_without_failed_jobs: Sequence[str] = (),
+    stuck_with_test_failures: Sequence[str] = (),
+) -> WatchFailureClass:
+    """Classify a post-approval CI failure before any coder routing.
+
+    ``stuck_contexts`` are confirmed stuck-pending required statuses; they are
+    plumbing by cause whatever their name.  ``stuck_without_failed_jobs``
+    names stuck contexts whose completed producing run has no failed job, so
+    a ``--failed`` rerun would be ineffective; ``stuck_with_test_failures``
+    names stuck contexts whose producing run has a failed non-plumbing job.
+    """
+    stuck_keys = {(check.kind, check.name) for check in stuck_contexts}
+    # (a) Test precedence: any failing non-plumbing check, or a stuck status
+    # whose producing run failed a test job, reaches the coder.
+    if any(not check_name_matches(check.name, plumbing_names) for check in board.failing):
+        return "test-failure"
+    if any(name in stuck_with_test_failures for _kind, name in stuck_keys):
+        return "test-failure"
+    # (b) Only an authoritative, complete board can be classified plumbing.
+    if not (
+        board.check_query_status == "ok"
+        and board.listing_complete
+        and board.branch_protection_status in {"configured", "not_found"}
+        and not board.missing_required
+    ):
+        return "not-classifiable"
+    if not board.failing and not stuck_keys:
+        return "not-classifiable"
+    if stuck_keys and any(name in stuck_without_failed_jobs for _kind, name in stuck_keys):
+        return "stuck-infrastructure"
+    unsettled = [
+        check for check in board.pending if (check.kind, check.name) not in stuck_keys
+    ]
+    tests = [check for check in board.passing if not check_name_matches(check.name, plumbing_names)]
+    if not board_tests_passed(board, plumbing_names):
+        # A test skipped as a dependent of a failed plumbing job did not pass.
+        return "not-classifiable"
+    if unsettled:
+        # (c2) Hold while tests (or plumbing) are still running.
+        return "plumbing-awaiting-tests"
+    if not tests:
+        return "not-classifiable"
+    return "plumbing-only"
+
+
+RunJobsClass = Literal["plumbing-only", "test-failure", "no-failed-jobs", "not-classifiable"]
+
+FAILED_JOB_CONCLUSIONS = frozenset(
+    {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+)
+
+
+def classify_run_jobs(
+    jobs: Sequence[tuple[str, str, str]] | None,
+    plumbing_names: frozenset[str] | set[str] | Sequence[str],
+    *,
+    require_passing_tests: bool = False,
+) -> RunJobsClass:
+    """Classify one workflow run from its complete latest-attempt job listing.
+
+    Shared by every rerun decision (#1477): a failed non-plumbing job is a
+    test failure; a run with no failed job has nothing for a rerun to retry;
+    an unreadable listing is never plumbing-only.  ``require_passing_tests``
+    also demands that every non-plumbing job succeeded (the managed route,
+    where the run's jobs are the only test evidence).
+    """
+    if jobs is None:
+        return "not-classifiable"
+    failed = [job for job in jobs if job[1] in FAILED_JOB_CONCLUSIONS]
+    if any(not check_name_matches(name, plumbing_names) for name, _c, _u in failed):
+        return "test-failure"
+    if not failed:
+        return "no-failed-jobs"
+    if require_passing_tests:
+        tests = [job for job in jobs if not check_name_matches(job[0], plumbing_names)]
+        if not tests or any(conclusion != "success" for _n, conclusion, _u in tests):
+            return "not-classifiable"
+    return "plumbing-only"

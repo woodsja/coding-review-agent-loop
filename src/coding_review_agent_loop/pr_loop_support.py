@@ -45,6 +45,7 @@ from .github import (
     _classify_check_status,
     IssueContext,
     PullRequestMetadata,
+    PullRequestCheck,
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
@@ -108,6 +109,8 @@ from .workdir_guard import (
     partition_reported_tests_by_workdir,
 )
 from .checks import (
+    _ci_plumbing_stop_message,
+    final_context_state_line,
     _pending_ci_stop_message,
     _pr_check_details,
     _unreadable_protection_stop_message,
@@ -775,6 +778,53 @@ def _stop_on_terminal_without_status(
     return 0
 
 
+def _stop_on_ci_plumbing_failure(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    reason: str,
+    run_urls: Sequence[str],
+    plumbing: Sequence[str],
+    final_line: str | None,
+    recovery: str | None = None,
+    watch_hint: bool = False,
+) -> int:
+    """Stop on a plumbing-only CI failure without a coder obligation (#1477).
+
+    Exit semantics match the infrastructure-stall stop: a clean, resumable
+    stop with no coder round and no merge.
+    """
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_ci_plumbing_stop_message(
+            pr_number,
+            reason=reason,
+            run_urls=run_urls,
+            plumbing=plumbing,
+            final_line=final_line,
+            recovery=recovery,
+            watch_hint=watch_hint,
+        ),
+    )
+    log(
+        config,
+        f"Round {round_number}: PR #{pr_number} CI failed only in plumbing jobs ({reason}); "
+        "stopping on infrastructure without a coder round or merge",
+    )
+    print(
+        f"PR #{pr_number} CI stopped on infrastructure: {reason} "
+        f"Run: {', '.join(run_urls) or 'unavailable'}."
+        + (f" {final_line}." if final_line else "")
+        + " No coder round was started and no merge was attempted."
+        + (f" {recovery}" if recovery else "")
+    )
+    return 0
+
+
 def _pr_followup_source_context(
     *,
     config: AgentLoopConfig,
@@ -816,8 +866,19 @@ def _stop_after_ci_watch_timeout(
     reason: Literal["budget_exhausted", "timeout", "non_authoritative", "protection_unreadable"],
     source_context: FollowupSourceContext,
     usage_context: RunUsageContext | None = None,
+    checks_board: PullRequestChecks | None = None,
+    stuck_checks: Sequence[PullRequestCheck] = (),
 ) -> int:
-    """Publish resumable guidance for a watch that cannot continue or finish."""
+    """Publish resumable guidance for a watch that cannot continue or finish.
+
+    Every watch-ending stop names the observed final-ci/exact-head state here
+    (#1477), so no caller can drop known final-state evidence.
+    """
+    final_line = final_context_state_line(checks_board, stuck=stuck_checks)
+    if final_line and final_line not in details:
+        details = [*details, final_line]
+    # Printed and raised reports carry the same state as the comment.
+    final_suffix = f" {final_line}." if final_line else ""
     _publish_approved_followups(
         runner,
         config=config,
@@ -852,13 +913,14 @@ def _stop_after_ci_watch_timeout(
         )
         print(
             f"PR #{pr_number} CI watch budget was exhausted by earlier rounds; "
-            f"no fresh poll was performed and no merge was attempted. "
+            f"no fresh poll was performed and no merge was attempted.{final_suffix} "
             f"Rerun: {rerun}{note}"
         )
         if config.auto_merge:
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch budget was exhausted before "
                 "a fresh poll; no merge attempted."
+                + final_suffix
             )
     elif reason == "timeout":
         print(
@@ -869,6 +931,7 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch did not pass within "
                 f"{config.ci_timeout_seconds}s; no merge attempted."
+                + final_suffix
             )
     elif reason == "protection_unreadable":
         log(
@@ -887,6 +950,7 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} branch protection is unreadable and GitHub's merge state "
                 "is not CLEAN; no merge attempted."
+                + final_suffix
             )
     else:
         log(
@@ -902,6 +966,7 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch returned a non-authoritative "
                 "passing-looking result; no merge attempted."
+                + final_suffix
             )
     return 0
 

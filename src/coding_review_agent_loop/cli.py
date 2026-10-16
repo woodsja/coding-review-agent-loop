@@ -670,9 +670,27 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=(
                 "For ordinary CI without --auto-merge, foreground-poll the full GitHub check "
-                "board after approval and resume the coder if CI fails. Ordinary --auto-merge "
-                "always uses this full-board gate; --no-watch-pending-ci is retained only as a "
-                "compatibility warning. Managed exact-head qualification remains its own gate."
+                "board after approval, bounded by --ci-timeout-seconds (off by default; a run "
+                "that stops on pending checks prints a hint naming this flag). A test failure "
+                "resumes the coder; a plumbing-only failure on a complete board (see "
+                "--ci-plumbing-check) re-runs the failed jobs once, then stops on infrastructure "
+                "if plumbing fails again. Ordinary --auto-merge always uses this full-board gate; "
+                "--no-watch-pending-ci is retained only as a compatibility warning. Managed CI "
+                "(--managed-ci) always waits for final-ci/exact-head after approval, with or "
+                "without --auto-merge."
+            ),
+        )
+        subparser.add_argument(
+            "--ci-plumbing-check",
+            action="append",
+            dest="ci_plumbing_check",
+            default=None,
+            metavar="NAME",
+            help=(
+                "Repeatable. An exact check or status name to treat as CI plumbing (status "
+                "publishing, routing, attestation) in addition to the managed catalog, for "
+                "example a caller job named route. Matches the whole name or the final "
+                "' / '-separated segment exactly, never a substring."
             ),
         )
         subparser.add_argument(

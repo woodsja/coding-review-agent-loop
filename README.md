@@ -1808,9 +1808,18 @@ agent-loop pr 456 --repo OWNER/REPO --auto-merge
 
 For ordinary CI, auto-merge waits for a reliable, non-empty check board on the
 current head. Without auto-merge, `--watch-pending-ci` can wait and report that
-an approved PR is merge-ready without merging. Set the total watcher budget
+an approved PR is merge-ready without merging. It is off by default; a run that
+stops on pending checks prints a hint naming it. Set the total watcher budget
 with `--ci-timeout-seconds` (default 1200) and its polling interval with
-`--ci-poll-interval-seconds` (default 30). GitHub runner stalls are bounded by
+`--ci-poll-interval-seconds` (default 30). After approval, a test failure
+resumes the coder. A failure in plumbing jobs only (status publishing,
+routing, attestation), with every test check passed on a complete board, is
+re-run once and watched again. If plumbing fails again, the loop stops with
+an infrastructure message and the run URL instead of resuming the coder. A
+required status left pending after its run completed counts as such a
+plumbing failure. Add caller-defined plumbing job names with the repeatable
+`--ci-plumbing-check NAME`; see
+[Plumbing failures and the rerun-once rule](docs/local_agent_loop.md#plumbing-failures-and-the-rerun-once-rule). GitHub runner stalls are bounded by
 `--ci-queued-grace-seconds`; see
 [External CI infrastructure stalls](docs/local_agent_loop.md#external-ci-infrastructure-stalls).
 
@@ -1855,7 +1864,10 @@ never grant fresh authority.
 
 Qualification and merge remain bound to the live head. The final merge uses
 `--match-head-commit` and merges only that qualified SHA. `--watch-pending-ci`
-and `--no-watch-pending-ci` do not alter managed exact-head qualification.
+and `--no-watch-pending-ci` do not alter managed exact-head qualification: a
+managed run always waits for `final-ci/exact-head` after approval, with or
+without `--auto-merge`, and applies the same plumbing rerun-once rule with a
+full, contract-verified rerun.
 
 ## Claude Code Skill Mode
 
