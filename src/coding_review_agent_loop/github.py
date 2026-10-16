@@ -5068,7 +5068,7 @@ class PlumbingRerunState:
 
 @dataclass(frozen=True)
 class OrdinaryRerunResult:
-    status: Literal["rerun_started", "unresolvable", "head_mismatch", "command_failed", "dry_run"]
+    status: Literal["rerun_started", "unresolvable", "head_mismatch", "command_failed", "dry_run", "expired"]
     run_id: int | None = None
     run_url: str | None = None
     prior_attempt: int | None = None
@@ -5139,6 +5139,7 @@ def rerun_ordinary_failed_jobs(
     observations: Sequence[PullRequestCheck],
     expected_head_sha: str | None,
     plumbing_names: frozenset[str] = frozenset(),
+    deadline: float | None = None,
 ) -> OrdinaryRerunResult:
     """Re-run the failed jobs of the one ordinary run behind ``observations``.
 
@@ -5203,6 +5204,12 @@ def rerun_ordinary_failed_jobs(
         }[jobs_class]
         return OrdinaryRerunResult(
             status="unresolvable", run_id=run_id, run_url=run_url, prior_attempt=attempt, reason=reason,
+        )
+    if deadline is not None and time.monotonic() >= deadline:
+        # The resolver and job reads consumed the shared watch budget.
+        return OrdinaryRerunResult(
+            status="expired", run_id=run_id, run_url=run_url, prior_attempt=attempt,
+            reason="the shared CI watch deadline passed before the rerun could be issued",
         )
     result = runner.run(
         [config.gh_cmd, "run", "rerun", str(run_id), "--failed", "--repo", config.repo],

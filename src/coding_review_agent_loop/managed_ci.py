@@ -9801,9 +9801,12 @@ def wait_for_final_qualification(
                 final = _v2_correlated_status(
                     runner, config=config, expected_head=expected_head, contract=contract
                 )
+                if final is not None:
+                    # Any correlated observation from the reread is the
+                    # freshest final state, terminal or not.
+                    last_status = final.status.lower()
                 if final is not None and final.status.lower() in _TERMINAL_CI_STATUSES:
                     status = final.status.lower()
-                    last_status = status
                     if status == "success" and complete_board:
                         _patch_intent(runner, config=config, contract=contract, state="completed")
                         return ManagedCiOutcome(
@@ -10071,7 +10074,7 @@ def classify_managed_board(
 
 @dataclass(frozen=True)
 class ManagedRerunResult:
-    status: Literal["rerun_started", "refused", "command_failed"]
+    status: Literal["rerun_started", "refused", "command_failed", "expired"]
     run_id: int | None = None
     run_url: str | None = None
     prior_attempt: int | None = None
@@ -10088,6 +10091,7 @@ def rerun_managed_attempt(
     config: AgentLoopConfig,
     contract: ManagedCiContract,
     expected_head_sha: str | None,
+    deadline: float | None = None,
 ) -> ManagedRerunResult:
     """Fully re-run the attached managed v2 run once, from terminal-without-status only.
 
@@ -10179,6 +10183,13 @@ def rerun_managed_attempt(
         or actor_id != contract.trusted_actor_id
     ):
         return refuse("the authenticated actor is not the managed trusted actor", attempt)
+    if deadline is not None and time.monotonic() >= deadline:
+        # The verification reads consumed the shared watch budget: never
+        # start CI that nothing will observe.
+        return ManagedRerunResult(
+            status="expired", run_id=run_id, run_url=run_url, prior_attempt=attempt,
+            reason="the shared CI watch deadline passed before the rerun could be issued",
+        )
     result = runner.run(
         [config.gh_cmd, "run", "rerun", str(run_id), "--repo", config.repo],
         cwd=active_workdir(config),

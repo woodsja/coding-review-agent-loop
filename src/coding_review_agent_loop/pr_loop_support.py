@@ -877,6 +877,8 @@ def _stop_after_ci_watch_timeout(
     final_line = final_context_state_line(checks_board, stuck=stuck_checks)
     if final_line and final_line not in details:
         details = [*details, final_line]
+    # Printed and raised reports carry the same state as the comment.
+    final_suffix = f" {final_line}." if final_line else ""
     _publish_approved_followups(
         runner,
         config=config,
@@ -911,13 +913,14 @@ def _stop_after_ci_watch_timeout(
         )
         print(
             f"PR #{pr_number} CI watch budget was exhausted by earlier rounds; "
-            f"no fresh poll was performed and no merge was attempted. "
+            f"no fresh poll was performed and no merge was attempted.{final_suffix} "
             f"Rerun: {rerun}{note}"
         )
         if config.auto_merge:
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch budget was exhausted before "
                 "a fresh poll; no merge attempted."
+                + final_suffix
             )
     elif reason == "timeout":
         print(
@@ -928,6 +931,7 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch did not pass within "
                 f"{config.ci_timeout_seconds}s; no merge attempted."
+                + final_suffix
             )
     elif reason == "protection_unreadable":
         log(
@@ -946,6 +950,7 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} branch protection is unreadable and GitHub's merge state "
                 "is not CLEAN; no merge attempted."
+                + final_suffix
             )
     else:
         log(
@@ -961,6 +966,7 @@ def _stop_after_ci_watch_timeout(
             raise AgentLoopError(
                 f"PR #{pr_number} full-board CI watch returned a non-authoritative "
                 "passing-looking result; no merge attempted."
+                + final_suffix
             )
     return 0
 

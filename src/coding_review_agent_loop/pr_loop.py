@@ -6799,6 +6799,15 @@ def run_pr_loop(
                                     stuck=pending_stuck,
                                 )
                                 break
+                            rerun = None
+                            if decision == "rerun":
+                                rerun = rerun_ordinary_failed_jobs(
+                                    runner, config, pending_rerun, pr_metadata.head_sha,
+                                    plumbing_names=plumbing_check_names(config),
+                                    deadline=watch_deadline,
+                                )
+                                if rerun.status == "expired":
+                                    decision = "budget_exhausted"
                             if decision == "budget_exhausted":
                                 # Never issue a rerun nothing will observe.
                                 exhausted_details = [
@@ -6825,10 +6834,7 @@ def run_pr_loop(
                                 )
                                 break
                             if decision == "rerun":
-                                rerun = rerun_ordinary_failed_jobs(
-                                    runner, config, pending_rerun, pr_metadata.head_sha,
-                                    plumbing_names=plumbing_check_names(config),
-                                )
+                                assert rerun is not None
                                 rerun_state = rerun.state(head_key)
                                 if rerun_state is None:
                                     plumbing_stop = stop_on_ordinary_plumbing(
@@ -7795,6 +7801,7 @@ def run_pr_loop(
                                         managed_attempts_left > 0
                                         and time.monotonic() < managed_deadline
                                     ),
+                                    deadline=managed_deadline,
                                 )
                                 if managed_plumbing_stop == "coder":
                                     # A classified test failure resumes the coder through
@@ -9520,6 +9527,7 @@ def _route_managed_plumbing_outcome(
     contract,
     reruns_used: set[str],
     budget_left: bool,
+    deadline: float | None = None,
 ):
     """Apply the plumbing rerun-once rule to one managed qualification outcome.
 
@@ -9579,7 +9587,12 @@ def _route_managed_plumbing_outcome(
     reruns_used.add(head_sha)
     rerun = rerun_managed_attempt(
         runner, config=config, contract=contract, expected_head_sha=head_sha,
+        deadline=deadline,
     )
+    if rerun.status == "expired":
+        # Verification reads used up the shared deadline: no write; the
+        # existing terminal handling applies with no coder or merge.
+        return None
     if rerun.status != "rerun_started" or rerun.prior_attempt is None:
         return stop(
             f"The single automatic managed rerun could not be performed: {rerun.reason}.",

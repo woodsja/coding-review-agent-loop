@@ -16029,11 +16029,12 @@ def _waiter_runner(**kwargs):
     )
 
 
-def test_waiter_timeout_reports_the_final_state_seen_by_the_terminal_reread(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reread_state", ["success", "pending"])
+def test_waiter_timeout_reports_the_final_state_seen_by_the_terminal_reread(tmp_path, monkeypatch, reread_state):
     config = make_config(tmp_path, managed_ci=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     contract = _no_status_contract(terminal_run_id=None, terminal_run_attempt=None,
                                    terminal_attempts=(), terminal_outcome=None)
-    reads = iter([None, PullRequestCheck(name=FINAL_CONTEXT, kind="status_context", status="success")])
+    reads = iter([None, PullRequestCheck(name=FINAL_CONTEXT, kind="status_context", status=reread_state)])
     monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *a, **k: next(reads, None))
 
     outcome = wait_for_final_qualification(
@@ -16042,10 +16043,10 @@ def test_waiter_timeout_reports_the_final_state_seen_by_the_terminal_reread(tmp_
         contract=contract,
     )
 
-    # The reread saw success on the final poll while another check was still
-    # pending, so the timeout reports success rather than absent.
+    # The reread observed a correlated status on the final poll (terminal or
+    # not) while another check was still pending, so the timeout reports it.
     assert outcome.status == "timeout"
-    assert outcome.final_status == "success"
+    assert outcome.final_status == reread_state
 
 
 def test_waiter_stops_at_the_shared_deadline_while_polls_remain(tmp_path, monkeypatch):
@@ -16065,3 +16066,43 @@ def test_waiter_stops_at_the_shared_deadline_while_polls_remain(tmp_path, monkey
     assert outcome.status == "timeout"
     assert outcome.attempts_used == 1
     assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
+
+
+
+def test_managed_rerun_rechecks_the_deadline_after_its_verification_reads(tmp_path, monkeypatch):
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = _rerun_runner()
+    elapsed = {"expired": False}
+    real_monotonic = managed_ci.time.monotonic
+    real_read = managed_ci.read_actions_run
+
+    def read_run(*args, **kwargs):
+        # The real verification read uses up the shared deadline.
+        elapsed["expired"] = True
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(managed_ci, "read_actions_run", read_run)
+    monkeypatch.setattr(
+        managed_ci.time, "monotonic",
+        lambda: real_monotonic() + (10_000_000.0 if elapsed["expired"] else 0.0),
+    )
+    deadline = real_monotonic() + 600
+
+    result = rerun_managed_attempt(
+        runner, config=config, contract=_no_status_contract(), expected_head_sha=V2_HEAD,
+        deadline=deadline,
+    )
+    assert result.status == "expired"
+    assert runner.reruns == []
+
+    # Through the routing helper the expiry keeps the existing terminal
+    # handling: no rerun, no plumbing stop, no coder or merge path.
+    elapsed["expired"] = False
+    code = pr_loop_module._route_managed_plumbing_outcome(
+        runner, config=config, pr_number=7, round_number=1, head_sha=V2_HEAD,
+        outcome=_terminal(head_sha=V2_HEAD), contract=_no_status_contract(),
+        reruns_used=set(), budget_left=True, deadline=deadline,
+    )
+    assert code is None
+    assert runner.reruns == []
+    assert not any("CI failed only in plumbing jobs" in comment for comment in runner.comments)

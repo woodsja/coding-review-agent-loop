@@ -7027,7 +7027,9 @@ in the approval snapshot:
   rerun would retry nothing, or something that is not plumbing, and the loop
   stops on infrastructure instead. The rerun is never issued in dry-run, and
   never once the shared watch budget (attempts or deadline) is spent: a
-  rerun nothing would observe is a timeout, not a write. Approval-snapshot
+  rerun nothing would observe is a timeout, not a write. Both rerun helpers
+  recheck the deadline after their verification reads, immediately before the
+  write. Approval-snapshot
   and watcher failures share one rerun budget per head; evidence from before
   that rerun keeps watching, fresh evidence stops on infrastructure.
 - **Plumbing awaiting tests.** If plumbing failed while test checks are still

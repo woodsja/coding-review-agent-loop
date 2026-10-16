@@ -1191,27 +1191,37 @@ from coding_review_agent_loop.pr_loop_support import _stop_after_ci_watch_timeou
 from coding_review_agent_loop.pr_loop_support import _pr_followup_source_context  # noqa: E402
 
 
+@pytest.mark.parametrize("auto_merge", [False, True])
 @pytest.mark.parametrize(
     "reason", ["budget_exhausted", "timeout", "non_authoritative", "protection_unreadable"],
 )
-def test_every_watch_timeout_stop_names_the_final_context_state(tmp_path, capsys, reason):
+def test_every_watch_timeout_stop_names_the_final_context_state(tmp_path, capsys, reason, auto_merge):
     runner = _LoopRunner()
-    config = make_config(tmp_path, watch_pending_ci=True)
+    config = make_config(tmp_path, watch_pending_ci=True, auto_merge=auto_merge)
     board = _board(_tests("in_progress"), _final_status("pending"), required=("tests", "final-ci/exact-head"))
     stuck = _final_status("pending")
 
-    _stop_after_ci_watch_timeout(
-        runner, config=config, pr_number=77, round_number=1, head_sha=HEAD, pr_comments=[],
-        followups=[], details=["detail"], reason=reason,
-        source_context=_pr_followup_source_context(
-            config=config, pr_number=77, pr_metadata=_metadata(), issue_context=None,
-        ),
-        checks_board=board, stuck_checks=(stuck,) if reason == "timeout" else (),
-    )
+    def stop():
+        return _stop_after_ci_watch_timeout(
+            runner, config=config, pr_number=77, round_number=1, head_sha=HEAD, pr_comments=[],
+            followups=[], details=["detail"], reason=reason,
+            source_context=_pr_followup_source_context(
+                config=config, pr_number=77, pr_metadata=_metadata(), issue_context=None,
+            ),
+            checks_board=board, stuck_checks=(stuck,) if reason == "timeout" else (),
+        )
 
     expected = "final-ci/exact-head: stuck-pending" if reason == "timeout" else "final-ci/exact-head: pending"
+    if auto_merge:
+        # The raised report carries the same state as the comment.
+        with pytest.raises(AgentLoopError, match=re.escape(expected)):
+            stop()
+    else:
+        stop()
+    # Comment and printed report both name the state.
     assert any(expected in comment for comment in runner.comments)
     assert sum(comment.count("final-ci/exact-head:") for comment in runner.comments) == 1
+    assert expected in capsys.readouterr().out
 
 
 def test_loop_budget_exhausted_by_earlier_rounds_names_the_final_context_state(tmp_path, monkeypatch, capsys):
@@ -1246,4 +1256,40 @@ def test_loop_budget_exhausted_by_earlier_rounds_names_the_final_context_state(t
     assert len(runner.claude_calls()) == 1
     stop = runner.comments[-1]
     assert "final-ci/exact-head: pending" in stop
-    assert "no fresh poll was performed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "no fresh poll was performed" in out
+    assert "final-ci/exact-head: pending" in out
+
+
+
+# -- Round-3: the deadline is rechecked immediately before the rerun write ----
+
+
+def test_loop_ordinary_rerun_refused_when_resolver_reads_consume_the_deadline(tmp_path, monkeypatch, capsys):
+    runner = _approved_runner()
+    _install_boards(
+        monkeypatch, snapshot=_board(_tests("in_progress")), watcher=[_board(_tests(), _publisher())],
+    )
+    elapsed = {"expired": False}
+    real_monotonic = github_module.time.monotonic
+    real_read_jobs = github_module.read_run_jobs
+
+    def read_jobs(*args, **kwargs):
+        # The verification read itself uses up the shared watch budget.
+        elapsed["expired"] = True
+        return real_read_jobs(*args, **kwargs)
+
+    monkeypatch.setattr(github_module, "read_run_jobs", read_jobs)
+    monkeypatch.setattr(
+        github_module.time, "monotonic",
+        lambda: real_monotonic() + (10_000_000.0 if elapsed["expired"] else 0.0),
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path)) == 0
+
+    assert elapsed["expired"]
+    assert runner.reruns == []
+    assert runner.claude_calls() == []
+    assert runner.merges() == []
+    out = capsys.readouterr().out
+    assert "CI watch timed out" in out and "no rerun was issued" in out
