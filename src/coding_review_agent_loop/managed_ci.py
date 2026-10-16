@@ -4600,6 +4600,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--primary-reviewer",
     "--plan-review-policy", "--primary-plan-reviewer", "--plan-primary-stall-rounds",
     "--plan-step-back-rounds", "--plan-step-back-escalation-rounds",
+    "--plan-sweep-rounds", "--plan-sweep-reasoning-effort",
     "--pr-step-back-rounds", "--pr-step-back-line-window", "--pr-evidence-stall-rounds",
     "--pr-evidence-capture-attempts", "--pr-convert-evidence-rows",
     "--pr-non-convergence-rounds",
