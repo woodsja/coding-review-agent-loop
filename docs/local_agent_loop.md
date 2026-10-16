@@ -7022,7 +7022,14 @@ in the approval snapshot:
   resolved from the check run's `check_suite_id`, or from a status context's
   Actions target URL. All observations must resolve to one completed run whose
   `head_sha` is the approved PR head and whose event is not
-  `workflow_dispatch`. The rerun is never issued in dry-run.
+  `workflow_dispatch`. That run's complete latest-attempt job listing must
+  show at least one failed job, every one of them plumbing; otherwise the
+  rerun would retry nothing, or something that is not plumbing, and the loop
+  stops on infrastructure instead. The rerun is never issued in dry-run, and
+  never once the shared watch budget (attempts or deadline) is spent: a
+  rerun nothing would observe is a timeout, not a write. Approval-snapshot
+  and watcher failures share one rerun budget per head; evidence from before
+  that rerun keeps watching, fresh evidence stops on infrastructure.
 - **Plumbing awaiting tests.** If plumbing failed while test checks are still
   running, the watcher holds and keeps polling. It reruns once if the tests
   then pass, and resumes the coder if a test fails. If the budget expires, it
@@ -7053,18 +7060,25 @@ its producing workflow run completed is a plumbing failure by cause, not
 "still running", whatever its name. For a pending status whose target URL
 names an Actions run, the watcher reads the run. When the same (context, run,
 attempt) reads `completed` on two consecutive polls, the status is
-`stuck-pending`. A status whose run is still in progress, whose run is
-unreadable, or that has no Actions run URL stays ordinary pending. A stuck
-status feeds the classification above. The loop re-runs once when the run has
-failed jobs, and otherwise stops on infrastructure, because a `--failed`
-rerun of a run with no failed job would do nothing.
+`stuck-pending`. A status whose run is still in progress, whose run or job
+listing is unreadable, or that has no Actions run URL stays ordinary pending.
+A stuck status feeds the classification above, decided from the run's job
+listing, never its aggregate conclusion. A failed non-plumbing job keeps test
+precedence and resumes the coder. The loop re-runs once when the run's failed
+jobs are all plumbing, and stops on infrastructure when the run has no failed
+job, because a `--failed` rerun would do nothing.
 
 #### Managed route
 
 A managed run that completes without publishing its correlated
 `final-ci/exact-head` status (terminal without status) gains the same
 rerun-once rule. The run's complete job listing must show only plumbing jobs
-failing and every test job successful. The loop re-reads the authenticated
+failing and every test job successful, and the counted PR-head board must be
+authoritative and complete (nothing pending or missing except
+`final-ci/exact-head` itself). A failing test, on the board or in the run's
+jobs, takes precedence: the loop records the managed CI obligation and
+resumes the coder, also when the run ended without publishing a status (for
+example a fresh test failure in the rerun attempt). The loop re-reads the authenticated
 audit record and requires the completed `no-status` transition for the run's
 current attempt N, which the dispatch validator accepts for attempt N+1. It
 then verifies the attached run against the contract (workflow revision, run

@@ -22,8 +22,15 @@ required check) before it reports plumbing-only. Plumbing that failed while
 tests still run is held, not routed. `github.watch_pr_checks` also confirms
 stuck-pending required statuses: their target-URL Actions run reads
 `completed` on two consecutive polls. Such statuses are plumbing by cause. It
-polls through evidence from before a rerun. The ordinary route re-runs the
-one resolved PR-head run's failed jobs once (`rerun_ordinary_failed_jobs`). The
+polls through evidence from before a rerun. Every rerun decision reads the
+producing run's complete job listing (`github.read_run_jobs`,
+`ci_health.classify_run_jobs`), never its aggregate conclusion, and one budget
+decision gates watcher and approval-snapshot reruns alike, before the shared
+watch budget is spent. The ordinary route re-runs the one resolved PR-head
+run's failed jobs once (`rerun_ordinary_failed_jobs`). The managed route also
+requires an authoritative complete PR-head board
+(`managed_ci.classify_managed_board`), and a board or job test failure routes
+to the coder even when no status was published. The
 managed route re-runs the attached v2 run fully (`rerun_managed_attempt`),
 only after re-reading the authenticated audit record's completed `no-status`
 transition for the current attempt, because the split publisher rejects

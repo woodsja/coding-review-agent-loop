@@ -1,5 +1,6 @@
 import datetime
 import json
+import re
 import pytest
 
 from coding_review_agent_loop.ci_health import (
@@ -1120,15 +1121,25 @@ def test_classifier_stuck_status_is_plumbing_by_cause_even_outside_the_catalog()
 class _RunsRunner(Runner):
     """Answers ``actions/runs/<id>`` reads from a scripted sequence per run."""
 
-    def __init__(self, runs):
+    def __init__(self, runs, jobs=None):
         super().__init__(dry_run=False)
         self.runs = {key: list(value) for key, value in runs.items()}
+        self.jobs = dict(jobs or {})
         self.commands = []
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         args = list(args)
         self.commands.append(args)
-        endpoint = args[2] if len(args) > 2 else ""
+        endpoint = next((arg for arg in args if isinstance(arg, str) and arg.startswith("repos/")), "")
+        jobs = re.search(r"/actions/runs/(\d+)/jobs\?", endpoint)
+        if jobs:
+            listing = self.jobs.get(jobs.group(1))
+            if listing is None:
+                return CommandResult(args, cwd, "", "HTTP 404", 1)
+            payload = {"total_count": len(listing), "jobs": [
+                {"name": name, "conclusion": conclusion} for name, conclusion in listing
+            ]}
+            return CommandResult(args, cwd, json.dumps(payload), "", 0)
         if "/actions/runs/" in endpoint:
             run_id = endpoint.rsplit("/", 1)[-1]
             sequence = self.runs.get(run_id)
@@ -1162,26 +1173,54 @@ def test_pending_status_with_running_or_unidentifiable_run_stays_pending(tmp_pat
                             required=("final-ci/exact-head",))
     tracker = {}
     for _poll in range(3):
-        stuck, _no_jobs, _attempts = github_module._confirm_stuck_statuses(
+        stuck, _no_jobs, _test_jobs, _attempts = github_module._confirm_stuck_statuses(
             runner, config, board, PLUMBING, tracker
         )
         assert stuck == ()
     assert classify_watch_failure(board, PLUMBING, stuck) == "not-classifiable"
 
 
-def test_pending_status_confirmed_stuck_only_after_one_confirmation_poll(tmp_path):
+@pytest.mark.parametrize(
+    ("conclusion", "jobs", "expected"),
+    [
+        # The job listing, never the aggregate conclusion, decides (#1477).
+        ("failure", [("tests", "success"), ("Publish final exact-head status", "failure")], "plumbing"),
+        ("cancelled", [], "no-failed-jobs"),
+        ("success", [("tests", "success")], "no-failed-jobs"),
+        ("failure", [("tests", "failure"), ("Publish final exact-head status", "failure")], "test-failure"),
+        ("failure", None, "unconfirmed"),
+    ],
+)
+def test_pending_status_confirmed_stuck_from_its_run_job_listing(tmp_path, conclusion, jobs, expected):
     config = make_config(tmp_path)
-    runner = _RunsRunner({"7": [{"status": "completed", "conclusion": "failure", "run_attempt": 1}]})
+    runner = _RunsRunner(
+        {"7": [{"status": "completed", "conclusion": conclusion, "run_attempt": 1}]},
+        jobs={} if jobs is None else {"7": jobs},
+    )
     board = _plumbing_board(
         passing=(_TEST_PASSED,),
         pending=(_pending_status("https://github.com/OWNER/REPO/actions/runs/7"),),
         required=("final-ci/exact-head",),
     )
     tracker = {}
-    first, _, _ = github_module._confirm_stuck_statuses(runner, config, board, PLUMBING, tracker)
-    second, no_jobs, attempts = github_module._confirm_stuck_statuses(
+    first, _, _, _ = github_module._confirm_stuck_statuses(runner, config, board, PLUMBING, tracker)
+    second, no_jobs, test_jobs, attempts = github_module._confirm_stuck_statuses(
         runner, config, board, PLUMBING, tracker
     )
     assert first == ()
+    if expected == "unconfirmed":
+        # An unreadable job listing fails closed to ordinary pending.
+        assert second == ()
+        return
     assert [check.name for check in second] == ["final-ci/exact-head"]
-    assert no_jobs == set() and attempts == {"final-ci/exact-head": 1}
+    assert attempts == {"final-ci/exact-head": 1}
+    assert (no_jobs == {"final-ci/exact-head"}) is (expected == "no-failed-jobs")
+    assert (test_jobs == {"final-ci/exact-head"}) is (expected == "test-failure")
+    verdict = classify_watch_failure(
+        board, PLUMBING, second,
+        stuck_without_failed_jobs=tuple(no_jobs), stuck_with_test_failures=tuple(test_jobs),
+    )
+    assert verdict == {
+        "plumbing": "plumbing-only", "no-failed-jobs": "stuck-infrastructure",
+        "test-failure": "test-failure",
+    }[expected]

@@ -396,10 +396,12 @@ def _ordinary_run(run_id=4242, *, attempt=1, head=HEAD, event="pull_request", st
 class _LoopRunner(FakeRunner):
     """FakeRunner that serves Actions run reads and records ``gh run rerun``."""
 
-    def __init__(self, *, runs=None, suites=None, rerun_returncode=0, **kwargs):
+    def __init__(self, *, runs=None, suites=None, rerun_returncode=0, jobs=None, **kwargs):
         super().__init__(**kwargs)
         self.runs = {str(key): value for key, value in (runs or {}).items()}
         self.suites = dict(suites or {})
+        # Per-run job listings; by default a failed run failed only its publisher.
+        self.jobs = {str(key): value for key, value in (jobs or {}).items()}
         self.rerun_returncode = rerun_returncode
         self.reruns = []
 
@@ -413,6 +415,23 @@ class _LoopRunner(FakeRunner):
                 run["run_attempt"] = run["run_attempt"] + 1
                 run["status"] = "in_progress"
             return CommandResult(cmd, cwd_path, "", "denied" if self.rerun_returncode else "", self.rerun_returncode)
+        endpoint = next((part for part in cmd if part.startswith("repos/")), "")
+        jobs = re.search(r"/actions/runs/(\d+)/jobs\?", endpoint)
+        if cmd[:2] == ["gh", "api"] and jobs:
+            cmd, cwd_path = self._record_command(args, cwd)
+            run = self.runs.get(jobs.group(1))
+            listing = self.jobs.get(jobs.group(1))
+            if listing is None and run is not None:
+                listing = [("tests", "success")] + (
+                    [("Publish final exact-head status", "failure")]
+                    if run.get("conclusion") == "failure" else []
+                )
+            if listing is None:
+                return CommandResult(cmd, cwd_path, "", "HTTP 404", 1)
+            payload = {"total_count": len(listing), "jobs": [
+                {"name": name, "conclusion": conclusion} for name, conclusion in listing
+            ]}
+            return CommandResult(cmd, cwd_path, json.dumps(payload), "", 0)
         if cmd[:2] == ["gh", "api"] and len(cmd) > 2:
             suite = re.search(r"/actions/runs\?check_suite_id=(\d+)$", cmd[2])
             single = re.search(r"/actions/runs/(\d+)$", cmd[2])
@@ -590,7 +609,7 @@ def test_watch_dry_run_issues_no_rerun_subprocess(tmp_path):
 )
 def test_ordinary_rerun_resolves_one_verified_run_before_the_write(tmp_path, run, suites, observations, status):
     runner = _LoopRunner(runs={run["id"]: run}, suites=suites)
-    result = rerun_ordinary_failed_jobs(runner, make_config(tmp_path), observations, HEAD)
+    result = rerun_ordinary_failed_jobs(runner, make_config(tmp_path), observations, HEAD, PLUMBING)
     assert result.status == status
     expected = [["gh", "run", "rerun", str(run["id"]), "--failed", "--repo", "OWNER/REPO"]]
     assert runner.reruns == (expected if status == "rerun_started" else [])
@@ -601,7 +620,7 @@ def test_ordinary_rerun_resolves_one_verified_run_before_the_write(tmp_path, run
 
 def test_ordinary_rerun_command_failure_is_reported(tmp_path):
     runner = _LoopRunner(runs={4242: _ordinary_run()}, suites={900: 4242}, rerun_returncode=1)
-    result = rerun_ordinary_failed_jobs(runner, make_config(tmp_path), (_publisher(),), HEAD)
+    result = rerun_ordinary_failed_jobs(runner, make_config(tmp_path), (_publisher(),), HEAD, PLUMBING)
     assert result.status == "command_failed"
     assert result.state(HEAD) is None
 
@@ -972,3 +991,194 @@ def test_loop_dry_run_preview_never_reruns(tmp_path, monkeypatch, capsys):
 
     assert runner.reruns == []
     assert runner.claude_calls() == []
+
+
+# -- Round-1 review fixes: job-listing verification, shared rerun budget, reporting --
+
+from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck  # noqa: E402
+from coding_review_agent_loop.github import CiWatchOutcome  # noqa: E402
+import coding_review_agent_loop.orchestrator as orchestrator  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("jobs", "reason"),
+    [
+        # A cancelled run with no jobs: --failed would retry nothing.
+        ([], "has no failed job for a rerun to retry"),
+        ([("tests", "success")], "has no failed job for a rerun to retry"),
+        ([("tests", "failure"), ("Publish final exact-head status", "failure")], "failed non-plumbing job"),
+        (None, "no readable complete job listing"),
+    ],
+)
+def test_ordinary_rerun_requires_failed_plumbing_jobs_in_the_run_listing(tmp_path, jobs, reason):
+    run = _ordinary_run()
+    runner = _LoopRunner(runs={4242: run}, suites={900: 4242}, jobs={} if jobs is None else {4242: jobs})
+    if jobs is None:
+        runner.runs["4242"]["conclusion"] = "cancelled"  # default listing would otherwise exist
+        runner.jobs = {}
+
+        def unreadable(self, args, *, cwd, check, input_text=None, _orig=runner._run_locked):
+            if any("/jobs?" in str(part) for part in args):
+                cmd, cwd_path = self._record_command(args, cwd)
+                return CommandResult(cmd, cwd_path, "", "HTTP 502", 1)
+            return _orig(args, cwd=cwd, check=check, input_text=input_text)
+
+        runner._run_locked = unreadable.__get__(runner)
+    result = rerun_ordinary_failed_jobs(runner, make_config(tmp_path), (_publisher(),), HEAD, PLUMBING)
+    assert result.status == "unresolvable"
+    assert reason in result.reason
+    assert runner.reruns == []
+
+
+@pytest.mark.parametrize(
+    ("jobs", "expect"),
+    [
+        ([], "infra"),                                                   # cancelled, zero jobs
+        ([("tests", "failure"), ("Publish final exact-head status", "failure")], "coder"),
+    ],
+)
+def test_loop_stuck_status_decided_by_run_jobs_not_conclusion(tmp_path, monkeypatch, jobs, expect):
+    runner = _approved_runner(
+        runs={4343: _ordinary_run(4343, conclusion="cancelled" if not jobs else "failure")},
+        suites={}, jobs={4343: jobs},
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved."),
+            structured_pr_review(
+                state="approved", summary="Approved again.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(state="blocking", summary="Fixed.", addressed_items=["item-1"]),
+        ],
+    )
+    _install_boards(
+        monkeypatch,
+        snapshot=_board(_tests("in_progress")),
+        watcher=[
+            _stuck_board(), _stuck_board(),
+            _board(_tests(check_id=20), _final_status("success", created_at="2026-10-14T19:05:00Z"),
+                   required=("tests", "final-ci/exact-head")),
+        ],
+    )
+
+    assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path)) == 0
+
+    assert runner.reruns == []
+    if expect == "infra":
+        assert runner.claude_calls() == []
+        stop = _comments_with(runner, "CI failed only in plumbing jobs")
+        assert stop and "no failed job to re-run" in stop[0]
+    else:
+        assert len(runner.claude_calls()) == 1
+
+
+_STATE = PlumbingRerunState(
+    head_sha=HEAD, run_id=4242, run_url=RUN_URL, prior_attempt=1,
+    stale_keys=frozenset({("check", 11)}),
+)
+
+
+@pytest.mark.parametrize(
+    ("observations", "state", "filter_stale", "budget_left", "decision"),
+    [
+        # Unspent budget: rerun only while the watch can still observe it.
+        ((_publisher(),), None, True, True, "rerun"),
+        ((_publisher(),), None, False, True, "rerun"),
+        ((_publisher(),), None, True, False, "budget_exhausted"),
+        ((_publisher(),), None, False, False, "budget_exhausted"),
+        # Spent budget, approval snapshot: prior-attempt evidence keeps watching,
+        # fresh evidence stops on infrastructure; never a second rerun.
+        ((_publisher(),), _STATE, True, True, "watch"),
+        ((_publisher(check_id=12),), _STATE, True, True, "infra_stop"),
+        ((_publisher(check_id=12),), _STATE, True, False, "infra_stop"),
+        # Spent budget, watcher outcome (already stale-filtered): infrastructure.
+        ((_publisher(),), _STATE, False, True, "infra_stop"),
+    ],
+)
+def test_every_plumbing_rerun_request_passes_one_budget_decision(
+    observations, state, filter_stale, budget_left, decision
+):
+    assert pr_loop_module._plumbing_rerun_decision(
+        observations, state, filter_stale=filter_stale, budget_left=budget_left,
+    ) == decision
+
+
+def test_loop_plumbing_failure_on_the_final_poll_issues_no_rerun(tmp_path, monkeypatch, capsys):
+    runner = _approved_runner()
+    _install_boards(
+        monkeypatch,
+        snapshot=_board(_tests("in_progress")),
+        watcher=[_board(_tests("in_progress")), _board(_tests(), _publisher())],
+    )
+
+    assert run_pr_loop(
+        runner, pr_number=77,
+        config=_loop_config(tmp_path, ci_timeout_seconds=60, ci_poll_interval_seconds=30),
+    ) == 0
+
+    assert runner.reruns == []
+    assert runner.claude_calls() == []
+    out = capsys.readouterr().out
+    assert "CI watch timed out" in out
+    assert "no rerun was issued" in out
+
+
+def test_loop_snapshot_plumbing_failure_past_the_deadline_issues_no_rerun(tmp_path, monkeypatch, capsys):
+    runner = _approved_runner()
+    _install_boards(
+        monkeypatch, snapshot=_board(_tests(), _publisher()), watcher=[_board(_tests(), _publisher())],
+    )
+    calls = []
+    real_monotonic = pr_loop_module.time.monotonic
+
+    def monotonic():
+        # Each reading jumps far past any deadline set from an earlier one,
+        # so the shared watch budget is spent before the rerun decision.
+        calls.append(None)
+        return real_monotonic() + 10_000.0 * len(calls)
+
+    monkeypatch.setattr(pr_loop_module.time, "monotonic", monotonic)
+
+    assert run_pr_loop(runner, pr_number=77, config=_loop_config(tmp_path)) == 0
+
+    assert runner.reruns == []
+    assert runner.claude_calls() == []
+    assert "no rerun was issued" in capsys.readouterr().out
+
+
+_FINAL_PENDING = _final_status("pending")
+
+
+@pytest.mark.parametrize("variant", ["infrastructure_stall", "auto_merge_passed"])
+def test_ordinary_terminal_reports_name_the_final_context_state(tmp_path, monkeypatch, capsys, variant):
+    runner = _approved_runner()
+    if variant == "infrastructure_stall":
+        stalled = PullRequestCheck(name="tests", kind="check_run", status="queued")
+        board = _board(stalled, _FINAL_PENDING, required=("tests", "final-ci/exact-head"))
+        outcome = CiWatchOutcome(
+            status="infrastructure_stall", pr_checks=board, head_sha=HEAD, attempts_used=1,
+            stall=CiInfrastructureStall(checks=(StalledCheck(
+                name="tests", kind="check_run", reason="queued_too_long",
+                check_id=1, run_id="1", url=None, age_seconds=1800.0,
+            ),)),
+        )
+        expected = "final-ci/exact-head: pending"
+        config = _loop_config(tmp_path)
+    else:
+        board = _board(_tests(), _final_status("success"), required=("tests", "final-ci/exact-head"))
+        outcome = CiWatchOutcome(
+            status="passed", pr_checks=board, head_sha=HEAD, attempts_used=1,
+            mergeability=_mergeability(head_sha=HEAD),
+        )
+        expected = "final-ci/exact-head: success"
+        config = _loop_config(tmp_path, auto_merge=True)
+        monkeypatch.setattr(pr_loop_module, "_merge_with_exact_head_proof", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop_module, "get_pr_checks", lambda *_a, **_k: _board(_tests("in_progress")))
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: outcome)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert expected in capsys.readouterr().out
+    if variant == "infrastructure_stall":
+        assert any(expected in comment for comment in runner.comments)

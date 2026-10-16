@@ -21,11 +21,12 @@ from urllib.parse import quote, urlparse
 
 from .ci_health import (
     CiInfrastructureStall,
+    FAILED_JOB_CONCLUSIONS,
     check_name_matches,
+    classify_run_jobs,
     PullRequestCheck,
     PullRequestChecks,
     V2_RUN_NAME_PREFIX,
-    decode_concatenated_json_objects,
     is_wholly_infrastructure_blocked,
 )
 from .config import AgentLoopConfig
@@ -33,6 +34,7 @@ from .errors import AgentLoopError
 from .github import (
     _fetch_protocol_comment_envelope,
     read_actions_run,
+    read_run_jobs,
     PullRequestMergeability,
     reconciled_pr_ready,
     resolve_authenticated_github_actor,
@@ -802,6 +804,8 @@ class ManagedCiOutcome:
     # url) per job; ``None`` when the listing was not read or was unreadable.
     jobs: tuple[tuple[str, str, str], ...] | None = None
     attempts_used: int = 0
+    # Last observed correlated final-ci/exact-head state, for terminal reports.
+    final_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -9694,6 +9698,7 @@ def wait_for_final_qualification(
     latest: PullRequestChecks | None = None
     terminal_confirmation: tuple[int, int | None] | None = None
     terminal_confirmation_seen = False
+    last_status: str | None = None
     for attempt in range(attempts):
         live_head = get_pr_head_sha(runner, config, pr_number)
         if live_head != expected_head:
@@ -9759,6 +9764,7 @@ def wait_for_final_qualification(
             final = None
             run_snapshot = None
         status = final.status.lower() if final is not None else "pending"
+        last_status = status if final is not None else "absent"
         log(config, f"Managed CI context '{FINAL_CONTEXT}' status: {status}")
         complete_board = (
             latest.check_query_status == "ok"
@@ -9827,7 +9833,7 @@ def wait_for_final_qualification(
                 details = _format_v2_failed_jobs(run_id, jobs)
             return ManagedCiOutcome(
                 status="failed", checks=latest, head_sha=live_head, failure_details=details,
-                run_id=run_id,
+                run_id=run_id, final_status=status,
                 run_attempt=contract.run_attempt if contract is not None else None,
                 jobs=jobs, attempts_used=attempt + 1,
             )
@@ -9840,11 +9846,13 @@ def wait_for_final_qualification(
                 head_sha=live_head,
                 stall=stall,
                 attempts_used=attempt + 1,
+                final_status=last_status,
             )
         if attempt < attempts - 1:
             runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
     return ManagedCiOutcome(
         status="timeout", checks=latest, head_sha=expected_head, attempts_used=attempts,
+        final_status=last_status,
     )
 
 
@@ -9981,47 +9989,11 @@ def _v2_attempt_is_correlatable(attempt: object) -> bool:
     return type(attempt) is int and attempt > 0
 
 
-_FAILED_JOB_CONCLUSIONS = frozenset(
-    {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
-)
-
-
 def _v2_jobs(
     runner: Runner, *, config: AgentLoopConfig, run_id: int | None
 ) -> tuple[tuple[str, str, str], ...] | None:
     """Return the run's latest-attempt jobs as (name, conclusion, url); ``None`` if unreadable."""
-    if run_id is None:
-        return None
-    result = runner.run(
-        [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100"],
-        cwd=active_workdir(config), check=False,
-    )
-    if result.returncode != 0:
-        return None
-    # Without --slurp, gh 2.45 concatenates object pages. Decode every object
-    # instead of accepting only the first page (or treating the stream as bad).
-    pages = decode_concatenated_json_objects(result.stdout or "")
-    if pages is None:
-        return None
-    jobs: list[tuple[str, str, str]] = []
-    total: int | None = None
-    for payload in pages:
-        page_jobs = payload.get("jobs")
-        if not isinstance(page_jobs, list):
-            return None
-        page_total = payload.get("total_count")
-        if isinstance(page_total, int) and not isinstance(page_total, bool):
-            total = page_total
-        for job in page_jobs:
-            if not isinstance(job, dict):
-                return None
-            name = job.get("name") if isinstance(job.get("name"), str) else "unnamed job"
-            conclusion = str(job.get("conclusion") or job.get("status") or "").lower()
-            url = job.get("html_url") if isinstance(job.get("html_url"), str) else ""
-            jobs.append((name, conclusion, url))
-    if total is not None and total != len(jobs):
-        return None
-    return tuple(jobs)
+    return read_run_jobs(runner, config, run_id)
 
 
 def _format_v2_failed_jobs(
@@ -10034,13 +10006,16 @@ def _format_v2_failed_jobs(
     details = [
         f"{name}: {conclusion}" + (f" ({url})" if url else "")
         for name, conclusion, url in jobs
-        if conclusion in _FAILED_JOB_CONCLUSIONS
+        if conclusion in FAILED_JOB_CONCLUSIONS
     ]
     return tuple(details) or (f"Managed CI run {run_id} failed; no failed job was exposed.",)
 
 
 def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | None) -> tuple[str, ...]:
     return _format_v2_failed_jobs(run_id, _v2_jobs(runner, config=config, run_id=run_id))
+
+
+format_failed_jobs = _format_v2_failed_jobs
 
 
 def classify_managed_jobs(
@@ -10052,15 +10027,34 @@ def classify_managed_jobs(
     plumbing, and every non-plumbing (test) job successful.  An unreadable
     listing, a skipped/pending test or no failed job is not classifiable.
     """
-    if not jobs:
-        return "not-classifiable"
-    failed = [job for job in jobs if job[1] in _FAILED_JOB_CONCLUSIONS]
-    if any(not check_name_matches(name, plumbing_names) for name, _c, _u in failed):
+    verdict = classify_run_jobs(jobs, plumbing_names, require_passing_tests=True)
+    return "not-classifiable" if verdict == "no-failed-jobs" else verdict
+
+
+def classify_managed_board(
+    checks: PullRequestChecks | None, plumbing_names: frozenset[str]
+) -> Literal["ok", "test-failure", "incomplete"]:
+    """Gate a managed plumbing decision on the counted PR-head board (#1477).
+
+    The managed run's own jobs are not on the PR-head board, so the board must
+    independently show no failing test (test precedence) and be authoritative
+    and complete: query ``ok``, complete listing, readable protection, and no
+    pending or missing check other than ``final-ci/exact-head`` itself, which
+    is legitimately unpublished on the terminal-without-status path.
+    """
+    if checks is None:
+        return "incomplete"
+    if any(not check_name_matches(check.name, plumbing_names) for check in checks.failing):
         return "test-failure"
-    tests = [job for job in jobs if not check_name_matches(job[0], plumbing_names)]
-    if not failed or not tests or any(conclusion != "success" for _n, conclusion, _u in tests):
-        return "not-classifiable"
-    return "plumbing-only"
+    if not (
+        checks.check_query_status == "ok"
+        and checks.listing_complete
+        and checks.branch_protection_status in {"configured", "not_found"}
+        and not any(name != FINAL_CONTEXT for name in checks.missing_required)
+        and not any(check.name != FINAL_CONTEXT for check in checks.pending)
+    ):
+        return "incomplete"
+    return "ok"
 
 
 @dataclass(frozen=True)

@@ -356,7 +356,9 @@ def _ci_infrastructure_details(stall: CiInfrastructureStall) -> list[str]:
     return [check.describe() for check in stall.checks]
 
 
-def _format_ci_infrastructure_comment(pr_number: int, stall: CiInfrastructureStall) -> str:
+def _format_ci_infrastructure_comment(
+    pr_number: int, stall: CiInfrastructureStall, *, final_line: str | None = None
+) -> str:
     lines = [
         CI_INFRASTRUCTURE_COMMENT_HEADLINE.format(pr_number=pr_number),
         "",
@@ -364,6 +366,8 @@ def _format_ci_infrastructure_comment(pr_number: int, stall: CiInfrastructureSta
         "",
     ]
     lines.extend(f"- {detail}" for detail in _ci_infrastructure_details(stall))
+    if final_line:
+        lines.append(f"- {final_line}")
     lines.extend(["", "-- coding-review-agent-loop"])
     return "\n".join(lines)
 
@@ -372,6 +376,8 @@ def _ci_infrastructure_stop_message(
     pr_number: int,
     stall: CiInfrastructureStall,
     carried_items: list[str],
+    *,
+    final_line: str | None = None,
 ) -> str:
     lines = [
         CI_INFRASTRUCTURE_STOP_HEADLINE.format(pr_number=pr_number),
@@ -381,6 +387,8 @@ def _ci_infrastructure_stop_message(
         "",
     ]
     lines.extend(f"- {detail}" for detail in _ci_infrastructure_details(stall))
+    if final_line:
+        lines.append(f"- {final_line}")
     if carried_items:
         lines.extend(["", "Reviewer items carried forward, still unresolved:"])
         lines.extend(f"- {item}" for item in carried_items)

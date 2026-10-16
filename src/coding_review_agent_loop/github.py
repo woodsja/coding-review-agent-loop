@@ -26,6 +26,7 @@ from .ci_health import (
     _extract_run_id,
     WatchFailureClass,
     check_name_matches,
+    classify_run_jobs,
     classify_watch_failure,
     decode_concatenated_json_objects,
     classify_ci_infrastructure_stall,
@@ -5137,6 +5138,7 @@ def rerun_ordinary_failed_jobs(
     config: AgentLoopConfig,
     observations: Sequence[PullRequestCheck],
     expected_head_sha: str | None,
+    plumbing_names: frozenset[str] = frozenset(),
 ) -> OrdinaryRerunResult:
     """Re-run the failed jobs of the one ordinary run behind ``observations``.
 
@@ -5189,6 +5191,18 @@ def rerun_ordinary_failed_jobs(
         return OrdinaryRerunResult(
             status="unresolvable", run_id=run_id, run_url=run_url,
             reason=f"run {run_id} is not a completed run with a readable attempt",
+        )
+    # The run's own job listing must show a failed job for --failed to retry,
+    # and every failed job must be plumbing; otherwise a rerun is unsafe.
+    jobs_class = classify_run_jobs(read_run_jobs(runner, config, run_id), plumbing_names)
+    if jobs_class != "plumbing-only":
+        reason = {
+            "no-failed-jobs": f"run {run_id} has no failed job for a rerun to retry",
+            "test-failure": f"run {run_id} has a failed non-plumbing job",
+            "not-classifiable": f"run {run_id} has no readable complete job listing",
+        }[jobs_class]
+        return OrdinaryRerunResult(
+            status="unresolvable", run_id=run_id, run_url=run_url, prior_attempt=attempt, reason=reason,
         )
     result = runner.run(
         [config.gh_cmd, "run", "rerun", str(run_id), "--failed", "--repo", config.repo],
@@ -5348,17 +5362,19 @@ def watch_pr_checks(
         # concrete failing check from the coder.
         hold_reason = None
         if plumbing_names is not None:
-            stuck, stuck_without_failed_jobs, stuck_attempts = _confirm_stuck_statuses(
+            (
+                stuck, stuck_without_failed_jobs, stuck_with_test_failures, stuck_attempts,
+            ) = _confirm_stuck_statuses(
                 runner, config, snapshot, plumbing_names, stuck_tracker
             )
             if snapshot.state == "failing" or stuck:
                 fresh_failing = tuple(
                     check for check in snapshot.failing
-                    if not _observation_is_stale(check, rerun_state, None)
+                    if not observation_is_stale(check, rerun_state, None)
                 )
                 fresh_stuck = tuple(
                     check for check in stuck
-                    if not _observation_is_stale(check, rerun_state, stuck_attempts.get(check.name))
+                    if not observation_is_stale(check, rerun_state, stuck_attempts.get(check.name))
                 )
                 if rerun_state is not None and not fresh_failing and not fresh_stuck:
                     # Prior-attempt evidence: wait for the rerun's own result.
@@ -5369,6 +5385,7 @@ def watch_pr_checks(
                         plumbing_names,
                         fresh_stuck,
                         stuck_without_failed_jobs=tuple(stuck_without_failed_jobs),
+                        stuck_with_test_failures=tuple(stuck_with_test_failures),
                     )
                     if classification == "test-failure" or (
                         classification == "not-classifiable" and fresh_failing
@@ -5446,26 +5463,27 @@ def watch_pr_checks(
     raise AssertionError("CI watch loop must return a terminal outcome")
 
 
-_RUN_CONCLUSIONS_WITHOUT_FAILED_JOBS = frozenset({"success", "neutral", "skipped"})
-
-
 def _confirm_stuck_statuses(
     runner: Runner,
     config: AgentLoopConfig,
     snapshot: PullRequestChecks,
     plumbing_names: frozenset[str],
     tracker: dict[str, tuple[int, int]],
-) -> tuple[tuple[PullRequestCheck, ...], set[str], dict[str, int]]:
+) -> tuple[tuple[PullRequestCheck, ...], set[str], set[str], dict[str, int]]:
     """Confirm required statuses left pending after their run completed.
 
     A candidate is a pending status context that is required (or a catalogued
     plumbing status) whose target URL names an Actions run.  The same
     (context, run, attempt) must read ``completed`` on two consecutive polls.
-    An unreadable run or a status without a run URL stays ordinary pending.
+    An unreadable run, an unreadable job listing, or a status without a run URL
+    stays ordinary pending.  The producing run's complete job listing (never
+    its aggregate conclusion) decides whether a rerun has a failed plumbing job
+    to retry, nothing to retry, or a failed test job that keeps precedence.
     """
     required = set(snapshot.required_checks)
     confirmed: list[PullRequestCheck] = []
     without_failed_jobs: set[str] = set()
+    with_test_failures: set[str] = set()
     attempts: dict[str, int] = {}
     seen: dict[str, tuple[int, int]] = {}
     for check in snapshot.pending:
@@ -5487,17 +5505,66 @@ def _confirm_stuck_statuses(
             continue
         key = (int(run_id), attempt)
         seen[check.name] = key
-        if tracker.get(check.name) == key:
-            confirmed.append(replace(check, run_id=run_id))
-            attempts[check.name] = attempt
-            if str(run.get("conclusion") or "").lower() in _RUN_CONCLUSIONS_WITHOUT_FAILED_JOBS:
-                without_failed_jobs.add(check.name)
+        if tracker.get(check.name) != key:
+            continue
+        jobs_class = classify_run_jobs(read_run_jobs(runner, config, run_id), plumbing_names)
+        if jobs_class == "not-classifiable":
+            continue
+        confirmed.append(replace(check, run_id=run_id))
+        attempts[check.name] = attempt
+        if jobs_class == "no-failed-jobs":
+            without_failed_jobs.add(check.name)
+        elif jobs_class == "test-failure":
+            with_test_failures.add(check.name)
     tracker.clear()
     tracker.update(seen)
-    return tuple(confirmed), without_failed_jobs, attempts
+    return tuple(confirmed), without_failed_jobs, with_test_failures, attempts
 
 
-def _observation_is_stale(
+def read_run_jobs(
+    runner: Runner, config: AgentLoopConfig, run_id: int | str | None
+) -> tuple[tuple[str, str, str], ...] | None:
+    """Return a run's latest-attempt jobs as (name, conclusion, url).
+
+    ``None`` when the listing is unreadable or incomplete (``total_count``
+    disagrees with the jobs read), so callers fail closed.
+    """
+    if run_id is None:
+        return None
+    result = run_gh_read(
+        runner,
+        [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100"],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    # Without --slurp, gh 2.45 concatenates object pages; decode every page.
+    pages = decode_concatenated_json_objects(result.stdout or "")
+    if pages is None:
+        return None
+    jobs: list[tuple[str, str, str]] = []
+    total: int | None = None
+    for payload in pages:
+        page_jobs = payload.get("jobs")
+        if not isinstance(page_jobs, list):
+            return None
+        page_total = payload.get("total_count")
+        if isinstance(page_total, int) and not isinstance(page_total, bool):
+            total = page_total
+        for job in page_jobs:
+            if not isinstance(job, dict):
+                return None
+            name = job.get("name") if isinstance(job.get("name"), str) else "unnamed job"
+            conclusion = str(job.get("conclusion") or job.get("status") or "").lower()
+            url = job.get("html_url") if isinstance(job.get("html_url"), str) else ""
+            jobs.append((name, conclusion, url))
+    if total is not None and total != len(jobs):
+        return None
+    return tuple(jobs)
+
+
+def observation_is_stale(
     check: PullRequestCheck,
     rerun_state: PlumbingRerunState | None,
     stuck_attempt: int | None,

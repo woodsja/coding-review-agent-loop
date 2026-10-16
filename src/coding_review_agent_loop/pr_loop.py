@@ -130,6 +130,7 @@ from .github import (
     validate_pr_expected_closing_issues,
     watch_pr_checks,
     PlumbingRerunState,
+    observation_is_stale,
     observation_run_urls,
     rerun_ordinary_failed_jobs,
 )
@@ -177,7 +178,9 @@ from .managed_ci import (
     recover_issue_created_handoff,
     render_managed_ci_resume_command,
     wait_for_final_qualification,
+    classify_managed_board,
     classify_managed_jobs,
+    format_failed_jobs,
     managed_run_url,
     plumbing_check_names,
     rerun_managed_attempt,
@@ -6502,6 +6505,7 @@ def run_pr_loop(
                     # runner was unavailable): stop cleanly and resumably instead
                     # of a synthetic blocking item, a coder round, or a merge.
                     stall = CiInfrastructureStall(checks=pr_checks.infrastructure_stalls)
+                    stall_final = final_context_state_line(pr_checks)
                     _publish_approved_followups(
                         runner,
                         config=config,
@@ -6516,14 +6520,14 @@ def run_pr_loop(
                         runner,
                         config=config,
                         pr_number=pr_number,
-                        body=_format_ci_infrastructure_comment(pr_number, stall),
+                        body=_format_ci_infrastructure_comment(pr_number, stall, final_line=stall_final),
                     )
                     post_pr_comment(
                         runner,
                         config=config,
                         pr_number=pr_number,
                         body=_append_evidence_barrier_note(
-                            _ci_infrastructure_stop_message(pr_number, stall, []),
+                            _ci_infrastructure_stop_message(pr_number, stall, [], final_line=stall_final),
                             unresolved_items,
                         ),
                     )
@@ -6539,6 +6543,7 @@ def run_pr_loop(
                         f"({'; '.join(_ci_infrastructure_details(stall))}). No code change is "
                         "required and no merge was attempted; rerun the same command once GitHub "
                         "Actions runners recover."
+                        + (f" {stall_final}." if stall_final else "")
                     )
                     return 0
                 if not must_fix_items and ordinary_recovery_selected and not managed_ci_active(pr_metadata):
@@ -6758,39 +6763,106 @@ def run_pr_loop(
                         if pr_checks is not None and snapshot_plumbing_class == "plumbing-only"
                         else ()
                     )
+                    # Snapshot evidence may predate an earlier rerun of this head;
+                    # watcher outcomes are already filtered for stale evidence.
+                    rerun_from_snapshot = bool(pending_rerun)
+                    rerun_board = pr_checks
                     plumbing_stop: int | None = None
                     while True:
                         if pending_rerun and not config.dry_run:
-                            rerun = rerun_ordinary_failed_jobs(
-                                runner, config, pending_rerun, pr_metadata.head_sha
+                            head_key = pr_metadata.head_sha or ""
+                            decision = _plumbing_rerun_decision(
+                                pending_rerun,
+                                plumbing_reruns.get(head_key),
+                                filter_stale=rerun_from_snapshot,
+                                budget_left=(
+                                    watch_attempts_remaining > 0
+                                    and time.monotonic() < watch_deadline
+                                ),
                             )
-                            rerun_state = rerun.state(pr_metadata.head_sha or "")
-                            if rerun_state is None:
+                            pending_failed = tuple(
+                                c for c in pending_rerun if c.kind == "check_run" or c.status != "pending"
+                            )
+                            pending_stuck = tuple(
+                                c for c in pending_rerun if c.kind == "status_context" and c.status == "pending"
+                            )
+                            prior = plumbing_reruns.get(head_key)
+                            if decision == "infra_stop":
                                 plumbing_stop = stop_on_ordinary_plumbing(
-                                    f"The single automatic rerun of the failed plumbing jobs could "
-                                    f"not be performed: {rerun.reason}.",
-                                    run_urls=(rerun.run_url,) if rerun.run_url else observation_run_urls(pending_rerun),
-                                    checks_board=pr_checks,
-                                    failed=tuple(c for c in pending_rerun if c.kind == "check_run" or c.status != "pending"),
-                                    stuck=tuple(c for c in pending_rerun if c.kind == "status_context" and c.status == "pending"),
+                                    "Plumbing failed again after the single automatic rerun"
+                                    + (f" of {prior.run_url}." if prior is not None and prior.run_url else "."),
+                                    run_urls=observation_run_urls(pending_rerun)
+                                    or ((prior.run_url,) if prior is not None and prior.run_url else ()),
+                                    checks_board=rerun_board,
+                                    failed=pending_failed,
+                                    stuck=pending_stuck,
                                 )
                                 break
-                            plumbing_reruns[rerun_state.head_sha] = rerun_state
-                            rerun_message = (
-                                f"PR #{pr_number}: plumbing-only CI failure in "
-                                f"{', '.join(check.name for check in pending_rerun)}; re-ran the "
-                                f"failed jobs of {rerun_state.run_url or f'run {rerun_state.run_id}'} "
-                                "once; no coder round. The watch continues under the same budget."
-                            )
-                            log(config, f"Round {round_number}: {rerun_message}")
-                            post_pr_comment(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
-                                body=rerun_message + "\n\n-- coding-review-agent-loop",
-                            )
+                            if decision == "budget_exhausted":
+                                # Never issue a rerun nothing will observe.
+                                exhausted_details = [
+                                    "Plumbing-only CI failure found, but the shared CI watch budget "
+                                    "was exhausted before the single automatic rerun could be issued "
+                                    "and observed; no rerun was issued and no coder round was started.",
+                                    *_plumbing_observation_lines(pending_failed, pending_stuck),
+                                    *(f"Run: {url}" for url in observation_run_urls(pending_rerun)),
+                                ]
+                                exhausted_final = final_context_state_line(rerun_board, stuck=pending_stuck)
+                                if exhausted_final:
+                                    exhausted_details.append(exhausted_final)
+                                plumbing_stop = _stop_after_ci_watch_timeout(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    round_number=round_number,
+                                    head_sha=pr_metadata.head_sha,
+                                    pr_comments=pr_comments,
+                                    followups=future_followups,
+                                    source_context=followup_source_context,
+                                    usage_context=usage_context,
+                                    details=exhausted_details,
+                                    reason="timeout",
+                                )
+                                break
+                            if decision == "rerun":
+                                rerun = rerun_ordinary_failed_jobs(
+                                    runner, config, pending_rerun, pr_metadata.head_sha,
+                                    plumbing_names=plumbing_check_names(config),
+                                )
+                                rerun_state = rerun.state(head_key)
+                                if rerun_state is None:
+                                    plumbing_stop = stop_on_ordinary_plumbing(
+                                        f"The single automatic rerun of the failed plumbing jobs could "
+                                        f"not be performed: {rerun.reason}.",
+                                        run_urls=(rerun.run_url,) if rerun.run_url else observation_run_urls(pending_rerun),
+                                        checks_board=rerun_board,
+                                        failed=pending_failed,
+                                        stuck=pending_stuck,
+                                    )
+                                    break
+                                plumbing_reruns[rerun_state.head_sha] = rerun_state
+                                rerun_message = (
+                                    f"PR #{pr_number}: plumbing-only CI failure in "
+                                    f"{', '.join(check.name for check in pending_rerun)}; re-ran the "
+                                    f"failed jobs of {rerun_state.run_url or f'run {rerun_state.run_id}'} "
+                                    "once; no coder round. The watch continues under the same budget."
+                                )
+                                log(config, f"Round {round_number}: {rerun_message}")
+                                post_pr_comment(
+                                    runner,
+                                    config=config,
+                                    pr_number=pr_number,
+                                    body=rerun_message + "\n\n-- coding-review-agent-loop",
+                                )
                         pending_rerun = ()
                         if watch_attempts_remaining <= 0:
+                            budget_details = [
+                                "The shared CI watch budget was exhausted before the "
+                                "plumbing rerun could be observed."
+                            ]
+                            budget_final = final_context_state_line(rerun_board)
+                            if budget_final:
+                                budget_details.append(budget_final)
                             plumbing_stop = _stop_after_ci_watch_timeout(
                                 runner,
                                 config=config,
@@ -6801,10 +6873,7 @@ def run_pr_loop(
                                 followups=future_followups,
                                 source_context=followup_source_context,
                                 usage_context=usage_context,
-                                details=[
-                                    "The shared CI watch budget was exhausted before the "
-                                    "plumbing rerun could be observed."
-                                ],
+                                details=budget_details,
                                 reason="budget_exhausted",
                             )
                             break
@@ -6827,6 +6896,8 @@ def run_pr_loop(
                         )
                         if route == "rerun_and_watch":
                             pending_rerun = (*watch_outcome.failed_checks, *watch_outcome.stuck_checks)
+                            rerun_from_snapshot = False
+                            rerun_board = watch_outcome.pr_checks
                             continue
                         prior = plumbing_reruns.get(pr_metadata.head_sha or "")
                         plumbing_stop = stop_on_ordinary_plumbing(
@@ -7011,8 +7082,10 @@ def run_pr_loop(
                                     source="full-board",
                                 ),
                             )
+                            merged_final = final_context_state_line(watch_outcome.pr_checks)
                             print(
                                 f"PR #{pr_number} merged after CI watch completed."
+                                + (f" {merged_final}." if merged_final else "")
                                 + announce_reduced_board_completion()
                             )
                             _record_staged_parent_completion_after_merge(
@@ -7058,12 +7131,13 @@ def run_pr_loop(
                             usage_context=usage_context,
                         )
                         assert watch_outcome.stall is not None
+                        watch_stall_final = final_context_state_line(watch_outcome.pr_checks)
                         post_pr_comment(
                             runner,
                             config=config,
                             pr_number=pr_number,
                             body=_format_ci_infrastructure_comment(
-                                pr_number, watch_outcome.stall
+                                pr_number, watch_outcome.stall, final_line=watch_stall_final
                             ),
                         )
                         post_pr_comment(
@@ -7072,12 +7146,15 @@ def run_pr_loop(
                             pr_number=pr_number,
                             body=_append_evidence_barrier_note(
                                 _ci_infrastructure_stop_message(
-                                    pr_number, watch_outcome.stall, []
+                                    pr_number, watch_outcome.stall, [], final_line=watch_stall_final
                                 ),
                                 unresolved_items,
                             ),
                         )
-                        print(f"PR #{pr_number} CI watch stopped: external CI infrastructure is stalled.")
+                        print(
+                            f"PR #{pr_number} CI watch stopped: external CI infrastructure is stalled."
+                            + (f" {watch_stall_final}." if watch_stall_final else "")
+                        )
                         return 0
                     if watch_outcome.status == "timeout":
                         details = (
@@ -7717,6 +7794,24 @@ def run_pr_loop(
                                     reruns_used=managed_plumbing_reruns,
                                     attempts_left=managed_attempts_left,
                                 )
+                                if managed_plumbing_stop == "coder":
+                                    # A classified test failure resumes the coder through
+                                    # the managed CI obligation, also when the run ended
+                                    # without publishing its status.
+                                    managed_plumbing_stop = None
+                                    if managed_outcome.status == "terminal_without_status":
+                                        managed_outcome = dataclasses_replace(
+                                            managed_outcome,
+                                            status="failed",
+                                            failure_details=(
+                                                *format_failed_jobs(managed_outcome.run_id, managed_outcome.jobs),
+                                                f"Managed run {managed_outcome.run_id} attempt "
+                                                f"{managed_outcome.run_attempt} completed without "
+                                                f"publishing a correlated `{FINAL_CONTEXT}` status.",
+                                            ),
+                                            final_status="absent",
+                                        )
+                                    break
                                 if isinstance(managed_plumbing_stop, int):
                                     break
                                 if managed_plumbing_stop is None:
@@ -7911,6 +8006,7 @@ def run_pr_loop(
                                     print(
                                         f"PR #{pr_number} approved by "
                                         f"{format_agent_list(configured_reviewers)}."
+                                        + f" {FINAL_CONTEXT}: success."
                                         + announce_reduced_board_completion()
                                     )
                                     _record_staged_parent_completion_after_merge(
@@ -7996,12 +8092,17 @@ def run_pr_loop(
                                 )
                             elif managed_outcome.status == "infrastructure_stall":
                                 assert managed_outcome.stall is not None
+                                managed_stall_final = final_context_state_line(
+                                    managed_outcome.checks,
+                                    managed_status=managed_outcome.final_status or "absent",
+                                )
                                 post_pr_comment(
                                     runner,
                                     config=config,
                                     pr_number=pr_number,
                                     body=_format_ci_infrastructure_comment(
-                                        pr_number, managed_outcome.stall
+                                        pr_number, managed_outcome.stall,
+                                        final_line=managed_stall_final,
                                     ),
                                 )
                                 post_pr_comment(
@@ -8010,7 +8111,8 @@ def run_pr_loop(
                                     pr_number=pr_number,
                                     body=_append_evidence_barrier_note(
                                         _ci_infrastructure_stop_message(
-                                            pr_number, managed_outcome.stall, []
+                                            pr_number, managed_outcome.stall, [],
+                                            final_line=managed_stall_final,
                                         ),
                                         unresolved_items,
                                     ),
@@ -8027,6 +8129,7 @@ def run_pr_loop(
                                     f"({'; '.join(_ci_infrastructure_details(managed_outcome.stall))}). "
                                     "No merge was attempted; rerun the same command once GitHub Actions "
                                     "runners recover."
+                                    + f" {managed_stall_final}."
                                 )
                                 return 0
                             elif managed_outcome.status == "terminal_without_status":
@@ -8045,7 +8148,7 @@ def run_pr_loop(
                                     if managed_outcome.checks
                                     else ["Managed exact-head CI failed."]
                                 )
-                                details.append(f"{FINAL_CONTEXT}: failure")
+                                details.append(f"{FINAL_CONTEXT}: {managed_outcome.final_status or 'failure'}")
                                 post_pr_comment(
                                     runner,
                                     config=config,
@@ -8075,7 +8178,12 @@ def run_pr_loop(
                             else:
                                 legacy_timeout_message = (
                                     f"Managed exact-head CI for PR #{pr_number} did not pass within "
-                                    f"{config.ci_timeout_seconds}s."
+                                    f"{config.ci_timeout_seconds}s. "
+                                    + final_context_state_line(
+                                        managed_outcome.checks,
+                                        managed_status=managed_outcome.final_status or "absent",
+                                    )
+                                    + "."
                                 )
                                 timeout_board = managed_outcome.checks
                                 if (
@@ -9349,6 +9457,26 @@ def _route_post_approval_ci_failure(
     return "coder"
 
 
+def _plumbing_rerun_decision(
+    observations, rerun_state, *, filter_stale: bool, budget_left: bool
+) -> str:
+    """Decide whether one plumbing-only failure may spend the head's single rerun.
+
+    Every rerun request, from the watcher or the approval snapshot, passes
+    through here (#1477).  A spent budget never issues another rerun: evidence
+    from before that rerun keeps watching, fresh evidence stops on
+    infrastructure.  An unspent budget reruns only while the shared watch
+    budget can still observe the result.
+    """
+    if rerun_state is not None:
+        fresh = [
+            check for check in observations
+            if not (filter_stale and observation_is_stale(check, rerun_state, None))
+        ]
+        return "watch" if not fresh else "infra_stop"
+    return "rerun" if budget_left else "budget_exhausted"
+
+
 def _plumbing_observation_lines(failed, stuck) -> list[str]:
     lines = [
         f"{check.name} ({check.status.lower()})"
@@ -9393,12 +9521,19 @@ def _route_managed_plumbing_outcome(
 ):
     """Apply the plumbing rerun-once rule to one managed qualification outcome.
 
-    Returns ``None`` to keep the existing outcome handling, an exit code for an
-    infrastructure stop, or ``_ManagedRerunContinue`` after a verified rerun.
+    Returns ``None`` to keep the existing outcome handling, ``"coder"`` for a
+    classified test failure (board or run jobs; test precedence), an exit code
+    for an infrastructure stop, or ``_ManagedRerunContinue`` after a verified
+    rerun.  Plumbing-only also requires an authoritative complete PR-head board.
     """
     if outcome.status not in {"terminal_without_status", "failed"} or not head_sha:
         return None
-    if classify_managed_jobs(outcome.jobs, plumbing_check_names(config)) != "plumbing-only":
+    names = plumbing_check_names(config)
+    board = classify_managed_board(outcome.checks, names)
+    jobs = classify_managed_jobs(outcome.jobs, names)
+    if board == "test-failure" or jobs == "test-failure":
+        return "coder"
+    if board != "ok" or jobs != "plumbing-only":
         return None
     failed_jobs = [
         f"{name}: {conclusion}" + (f" ({url})" if url else "")
