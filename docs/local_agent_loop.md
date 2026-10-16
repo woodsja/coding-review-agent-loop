@@ -1055,7 +1055,18 @@ Recommended layout:
 - **Detail docs (`docs/architecture/*.md`)**: one per component or group of
   related decisions, about 10–30k characters each. Each opens with a short
   summary and the source paths it covers, and ends with a "Decisions" section
-  recording what was chosen, why, and which issue.
+  that holds only a link to its decision log.
+- **Decision logs (`docs/architecture/decisions/<same-name>.md`)**: one per
+  detail doc, recording what was chosen, why, and which issue. Each entry is
+  `- **Title.** What was chosen; why; rejected alternatives. (#N, YYYY-MM-DD)`
+  and restates no current values (counts, timeouts, flag lists); it points to
+  the body section instead. Entries are append-only, migrated ones included: a
+  replaced entry gets `Superseded by #M: <clause>.` appended and is never
+  rewritten or deleted. Record decisions in the log, keep the detail doc's body
+  current, and read the log before changing a component's behaviour so a
+  rejected alternative is not proposed again. The logs are not architecture-set
+  members: the root names `docs/architecture/decisions/` only as inline code and
+  never links into it, so the logs are never injected into prompts.
 
 Size budget: `--architecture-read-size` (default 64 KiB) applies to the root
 and to each member. When the set has detail docs, the prompt carries the root

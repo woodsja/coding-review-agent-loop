@@ -1,0 +1,14 @@
+# Findings and convergence — decisions
+
+Decision log for [Findings and convergence](../findings-and-convergence.md). Entries are append-only: a
+replaced entry gets a `Superseded by #M: <clause>.` note appended and is
+never rewritten or deleted. The detail doc describes the current design.
+
+- Reviewer prompts limit blocking findings to stated or signed requirements, regressions in touched behaviour and introduced security or data-loss risk, and future follow-ups are accepted on blocking reviews but never become coder or planner work (#1389).
+- Human-only exact-head evidence is a separate channel from findings: an obligation owned by the requesting reviewer, answered through a freeze boundary at a clean head (#1068).
+- Risk-matrix rows whose evidence cannot be tool-captured convert into the same obligation kind, automatically after N capture-limited attempts or on operator request, with signed-evidence references minted only on owner clearance at the frozen head (#1325).
+- Conjunctive findings carry ordered sub-items whose status is reviewer-authoritative, while coder `addressed_sub_items` stay advisory claims (#958).
+- Malformed sub-items in a reviewer response degrade to a plain finding with a recorded degradation instead of rejecting the envelope (#924).
+- The PR fix loop reuses the plan step-back classification, clustering findings by mapped location across heads, so repeated new findings near one span trigger one generalizing coder turn and a reviewer sweep (#1251).
+- A separate non-convergence stop catches items that persist across K+1 reviews regardless of file, because the clustered trigger only counts new findings near one span (#1372).
+- The evidence-only stall stop ends a run whose only blocking items are tagged with unsatisfied risk-matrix rows for K rounds, derived from persisted evidence so a resume recomputes the same decision (#1324).

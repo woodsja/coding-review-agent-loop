@@ -87,3 +87,6 @@ document holds the full description.
 - [Testing and document maintenance](docs/architecture/testing-and-doc-maintenance.md)
 - [Plan context and presentation](docs/architecture/plan-context-and-presentation.md)
 - [Reviewer seats and boards](docs/architecture/reviewer-boards.md)
+
+Each detail doc's decision history lives in a paired append-only log under
+`docs/architecture/decisions/`. The logs are not architecture-set members.

@@ -137,18 +137,4 @@ alongside their owning modules rather than in one central model package.
 
 ## Decisions
 
-- Lifecycle modules were extracted from `orchestrator.py` by pure moves, leaving a docstring-and-imports re-export facade, so each layer imports alone in an acyclic chain while the historical import surface used by `cli.py` and tests keeps working (#1181).
-- A reviewer whose `architecture_impact.status` is the only defect is re-asked once through the shared re-ask slot, and repair may never introduce that status, because repair cannot supply the reviewer's decision (#1185).
-- Step-back bookkeeping in `review_step_back.py` is pure and history-derived for both the plan and the PR fix loops, with the git reads kept in `pr_loop_support.py` (#1251).
-- The step-back episode anchor takes its dissolved items and trade-offs from the step-back candidate record (#1278).
-- Finding history is advisory, bounded and in-memory per loop, seeded from round records the loop already extracted, so it informs prompts without persisting anything or inferring status from historical votes (#1273).
-- Coverage-map completeness is a pure, deterministic check in `risk_coverage_map.py`, run once by the approved-plan implementation seam with a single pre-review re-ask (#1290).
-- Evidence-only stall classification lives in the pure `evidence_stall.py`; the dispatch-path decision and stop message live in `pr_loop_support.py` (#1324).
-- Evidence conversion is pure in `evidence_conversion.py`, with I/O and the authenticated comment accessor in `pr_loop_support.py`, and `apply_signed_evidence_references` is the only producer of `operator-signed` rows, so provenance cannot come from agent text (#1325).
-- `coder_ci_guard.py` is a turn-scoped `gh` guard, so managed-CI coder and repair turns cannot dispatch CI before approval (#1366).
-- Operator-declared out-of-scope and non-goal sections are extracted by the pure `scope_declarations.py` into a binding-scope prompt block (#1389).
-- The shared write read-back verifier in `github.py` tolerates exactly one known host comment footer (#1043).
-- `agent-loop history export` is a read-only outcome export derived only from authenticated comment views; it posts nothing and makes no model call (#1433).
-- `agent-loop issue --triage` is one advisory validated turn armed at the fresh-dispatch point; it never reads or changes a routing argument and every failure is ignored (#1434).
-- `agent-loop triage backtest` is offline and report-only over local history-export files, so it makes no GitHub call and never changes routing (#1435).
-- The workflow transaction model landed as stage A of #827: model only, with no writer emitting its records and no orchestration call site consuming them yet (#827).
+[Decision log](decisions/components.md)

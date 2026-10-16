@@ -816,7 +816,14 @@ main source paths and detail doc, system-wide invariants, the main flows, and an
 index of the detail docs, with no issue history) plus detail docs of about
 10–30k characters each under `docs/architecture/`. Each detail doc opens with a
 short summary and the source paths it covers and ends with a "Decisions"
-section holding the decision history. When the set has detail docs, prompts
+section that holds only a link to its decision log at
+`docs/architecture/decisions/<same-name>.md`. Log entries take the shape
+`- **Title.** What was chosen; why; rejected alternatives. (#N, YYYY-MM-DD)`
+and restate no current values. They are append-only: a replaced entry gets
+`Superseded by #M: <clause>.` appended and is never rewritten or deleted.
+Record decisions in the log, keep the body current, and read the log before
+changing a component's behaviour. The root never links into
+`docs/architecture/decisions/`, so the logs stay outside the architecture set. When the set has detail docs, prompts
 carry the root overview followed by a short detail-doc index (path plus first
 heading). `--architecture-read-size` applies to the root and to each member.
 A root larger than the read size is not dropped: the prompt carries its
