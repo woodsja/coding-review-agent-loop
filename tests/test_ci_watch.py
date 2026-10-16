@@ -1182,3 +1182,68 @@ def test_ordinary_terminal_reports_name_the_final_context_state(tmp_path, monkey
     assert expected in capsys.readouterr().out
     if variant == "infrastructure_stall":
         assert any(expected in comment for comment in runner.comments)
+
+
+
+# -- Round-2: every watch-ending stop names the final-ci/exact-head state ----
+
+from coding_review_agent_loop.pr_loop_support import _stop_after_ci_watch_timeout  # noqa: E402
+from coding_review_agent_loop.pr_loop_support import _pr_followup_source_context  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "reason", ["budget_exhausted", "timeout", "non_authoritative", "protection_unreadable"],
+)
+def test_every_watch_timeout_stop_names_the_final_context_state(tmp_path, capsys, reason):
+    runner = _LoopRunner()
+    config = make_config(tmp_path, watch_pending_ci=True)
+    board = _board(_tests("in_progress"), _final_status("pending"), required=("tests", "final-ci/exact-head"))
+    stuck = _final_status("pending")
+
+    _stop_after_ci_watch_timeout(
+        runner, config=config, pr_number=77, round_number=1, head_sha=HEAD, pr_comments=[],
+        followups=[], details=["detail"], reason=reason,
+        source_context=_pr_followup_source_context(
+            config=config, pr_number=77, pr_metadata=_metadata(), issue_context=None,
+        ),
+        checks_board=board, stuck_checks=(stuck,) if reason == "timeout" else (),
+    )
+
+    expected = "final-ci/exact-head: stuck-pending" if reason == "timeout" else "final-ci/exact-head: pending"
+    assert any(expected in comment for comment in runner.comments)
+    assert sum(comment.count("final-ci/exact-head:") for comment in runner.comments) == 1
+
+
+def test_loop_budget_exhausted_by_earlier_rounds_names_the_final_context_state(tmp_path, monkeypatch, capsys):
+    runner = _approved_runner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved."),
+            structured_pr_review(
+                state="approved", summary="Approved again.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(state="blocking", summary="Fixed.", addressed_items=["item-1"]),
+        ],
+    )
+    snapshot = _board(_tests("in_progress"), _final_status("pending"), required=("tests", "final-ci/exact-head"))
+    monkeypatch.setattr(pr_loop_module, "get_pr_checks", lambda *_a, **_k: snapshot)
+    failing = _board(_tests("failure"), required=("tests",))
+    monkeypatch.setattr(
+        orchestrator, "watch_pr_checks",
+        lambda *a, **k: CiWatchOutcome(
+            status="failed", pr_checks=failing, failed_checks=failing.failing,
+            head_sha=HEAD, attempts_used=1,
+        ),
+    )
+
+    assert run_pr_loop(
+        runner, pr_number=77,
+        config=_loop_config(tmp_path, ci_timeout_seconds=30, ci_poll_interval_seconds=30),
+    ) == 0
+
+    assert len(runner.claude_calls()) == 1
+    stop = runner.comments[-1]
+    assert "final-ci/exact-head: pending" in stop
+    assert "no fresh poll was performed" in capsys.readouterr().out

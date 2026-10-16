@@ -45,6 +45,7 @@ from .github import (
     _classify_check_status,
     IssueContext,
     PullRequestMetadata,
+    PullRequestCheck,
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
@@ -109,6 +110,7 @@ from .workdir_guard import (
 )
 from .checks import (
     _ci_plumbing_stop_message,
+    final_context_state_line,
     _pending_ci_stop_message,
     _pr_check_details,
     _unreadable_protection_stop_message,
@@ -864,8 +866,17 @@ def _stop_after_ci_watch_timeout(
     reason: Literal["budget_exhausted", "timeout", "non_authoritative", "protection_unreadable"],
     source_context: FollowupSourceContext,
     usage_context: RunUsageContext | None = None,
+    checks_board: PullRequestChecks | None = None,
+    stuck_checks: Sequence[PullRequestCheck] = (),
 ) -> int:
-    """Publish resumable guidance for a watch that cannot continue or finish."""
+    """Publish resumable guidance for a watch that cannot continue or finish.
+
+    Every watch-ending stop names the observed final-ci/exact-head state here
+    (#1477), so no caller can drop known final-state evidence.
+    """
+    final_line = final_context_state_line(checks_board, stuck=stuck_checks)
+    if final_line and final_line not in details:
+        details = [*details, final_line]
     _publish_approved_followups(
         runner,
         config=config,

@@ -15710,13 +15710,15 @@ def _managed_loop(tmp_path, monkeypatch, outcomes, *, rerun_result=None, auto_me
     return runner, config, waits, reruns, merges
 
 
-def _managed_board(*, failing=(), pending=(), missing=(), query="ok", complete=True):
+def _managed_board(*, failing=(), pending=(), missing=(), query="ok", complete=True, skipped=()):
     tests = PullRequestCheck(name="tests", kind="check_run", status="success")
     final = PullRequestCheck(name=FINAL_CONTEXT, kind="status_context", status="pending")
     return PullRequestChecks(
         state="failing" if failing else "pending",
         required_checks=("tests", FINAL_CONTEXT),
-        passing=() if failing else (tests,),
+        passing=(() if failing else (tests,)) + tuple(
+            PullRequestCheck(name=name, kind="check_run", status="skipped") for name in skipped
+        ),
         pending=(final, *pending),
         failing=tuple(failing),
         missing_required=tuple(missing),
@@ -15861,7 +15863,7 @@ def test_same_head_rerun_after_published_failure_retains_the_failed_attachment(t
             status="failed", head_sha=V2_HEAD, run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
             checks=_managed_board(),
         ),
-        contract=contract, reruns_used=set(), attempts_left=5,
+        contract=contract, reruns_used=set(), budget_left=True,
     )
     assert code == 0
     assert runner.reruns == []
@@ -15959,3 +15961,107 @@ def test_managed_terminal_reports_name_the_final_context_state(tmp_path, monkeyp
         assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
         assert expected in capsys.readouterr().out
         assert any(expected in comment for comment in runner.comments)
+
+
+# -- Round-2 review fixes ---------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["terminal_without_status", "failed"])
+def test_managed_skipped_board_test_is_never_plumbing_only(tmp_path, monkeypatch, status):
+    board = _managed_board(skipped=("integration",))
+    outcome = (
+        _terminal(checks=board) if status == "terminal_without_status"
+        else ManagedCiOutcome(
+            status="failed", head_sha="abc123", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
+            checks=board, final_status="failure", attempts_used=1,
+            failure_details=("Publish final exact-head status: failure",),
+        )
+    )
+    runner, config, _waits, reruns, merges = _managed_loop(tmp_path, monkeypatch, [outcome])
+
+    if status == "failed":
+        # Not plumbing-only: the existing managed CI obligation resumes the coder.
+        with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    else:
+        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert any("without publishing a correlated" in comment for comment in runner.comments)
+    assert reruns == [] and merges == []
+    assert not any("CI failed only in plumbing jobs" in comment for comment in runner.comments)
+
+
+def test_managed_rerun_is_refused_once_the_shared_deadline_expires(tmp_path, monkeypatch):
+    runner, config, waits, reruns, merges = _managed_loop(tmp_path, monkeypatch, [_terminal()])
+    calls = []
+    real_monotonic = pr_loop_module.time.monotonic
+
+    def monotonic():
+        # Each reading jumps past any deadline taken from an earlier reading,
+        # while poll attempts remain.
+        calls.append(None)
+        return real_monotonic() + 10_000.0 * len(calls)
+
+    monkeypatch.setattr(pr_loop_module.time, "monotonic", monotonic)
+
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert waits[0]["deadline"] is not None
+    assert reruns == [] and merges == []
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert any("without publishing a correlated" in comment for comment in runner.comments)
+
+
+def _waiter_runner(**kwargs):
+    kwargs.setdefault("pr_check_runs_payload", {"check_runs": [
+        {"name": "tests", "status": "completed", "conclusion": "success"},
+        {"name": "lint", "status": "in_progress"},
+    ]})
+    return V2ManagedRunner(
+        base_sha=V2_REVISION,
+        workflow_runs=[valid_v2_run(run_id=100, attempt=1, status="completed", conclusion="success")],
+        intent_comments=[_no_status_comment(state="attached", terminal_outcome=None, terminal_run_id=None,
+                                            terminal_run_attempt=None, terminal_attempts=())],
+        pr_payload={"headRefOid": V2_HEAD, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_status_payload={"statuses": []},
+        pr_branch_protection_payload={"contexts": [], "checks": []},
+        **kwargs,
+    )
+
+
+def test_waiter_timeout_reports_the_final_state_seen_by_the_terminal_reread(tmp_path, monkeypatch):
+    config = make_config(tmp_path, managed_ci=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
+    contract = _no_status_contract(terminal_run_id=None, terminal_run_attempt=None,
+                                   terminal_attempts=(), terminal_outcome=None)
+    reads = iter([None, PullRequestCheck(name=FINAL_CONTEXT, kind="status_context", status="success")])
+    monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *a, **k: next(reads, None))
+
+    outcome = wait_for_final_qualification(
+        _waiter_runner(), config=config, pr_number=7,
+        metadata=PullRequestMetadata(7, "OWNER/REPO", "t", "h", "main", V2_HEAD, "u"),
+        contract=contract,
+    )
+
+    # The reread saw success on the final poll while another check was still
+    # pending, so the timeout reports success rather than absent.
+    assert outcome.status == "timeout"
+    assert outcome.final_status == "success"
+
+
+def test_waiter_stops_at_the_shared_deadline_while_polls_remain(tmp_path, monkeypatch):
+    config = make_config(tmp_path, managed_ci=True, ci_timeout_seconds=600, ci_poll_interval_seconds=30)
+    monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *a, **k: None)
+    runner = _waiter_runner()
+
+    outcome = wait_for_final_qualification(
+        runner, config=config, pr_number=7,
+        metadata=PullRequestMetadata(7, "OWNER/REPO", "t", "h", "main", V2_HEAD, "u"),
+        contract=_no_status_contract(terminal_run_id=None, terminal_run_attempt=None,
+                                     terminal_attempts=(), terminal_outcome=None,
+                                     attached_run_id=None, run_attempt=None),
+        attempts=10, deadline=0.0,
+    )
+
+    assert outcome.status == "timeout"
+    assert outcome.attempts_used == 1
+    assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)

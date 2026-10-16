@@ -451,6 +451,21 @@ def check_name_matches(name: str, names: frozenset[str] | set[str] | Sequence[st
     return segment is not None and segment in candidates
 
 
+def board_tests_passed(
+    board: PullRequestChecks, plumbing_names: frozenset[str] | set[str] | Sequence[str]
+) -> bool:
+    """True when every non-plumbing check in the board's passing bucket passed.
+
+    The passing bucket also holds ``skipped`` checks; a skipped test did not
+    pass, so it never supports a plumbing-only decision on either route.
+    """
+    return all(
+        (check.status or "").strip().lower() in _PASSED_STATUSES
+        for check in board.passing
+        if not check_name_matches(check.name, plumbing_names)
+    )
+
+
 def classify_watch_failure(
     board: PullRequestChecks,
     plumbing_names: frozenset[str] | set[str] | Sequence[str],
@@ -490,7 +505,7 @@ def classify_watch_failure(
         check for check in board.pending if (check.kind, check.name) not in stuck_keys
     ]
     tests = [check for check in board.passing if not check_name_matches(check.name, plumbing_names)]
-    if any((check.status or "").strip().lower() not in _PASSED_STATUSES for check in tests):
+    if not board_tests_passed(board, plumbing_names):
         # A test skipped as a dependent of a failed plumbing job did not pass.
         return "not-classifiable"
     if unsettled:

@@ -7075,8 +7075,11 @@ A managed run that completes without publishing its correlated
 rerun-once rule. The run's complete job listing must show only plumbing jobs
 failing and every test job successful, and the counted PR-head board must be
 authoritative and complete (nothing pending or missing except
-`final-ci/exact-head` itself). A failing test, on the board or in the run's
-jobs, takes precedence: the loop records the managed CI obligation and
+`final-ci/exact-head` itself), with every non-plumbing board check
+successful: a skipped test did not pass. The managed wait and the rerun
+decision share one monotonic deadline as well as the poll budget, so a rerun
+is never issued once `--ci-timeout-seconds` has elapsed. A failing test, on
+the board or in the run's jobs, takes precedence: the loop records the managed CI obligation and
 resumes the coder, also when the run ended without publishing a status (for
 example a fresh test failure in the rerun attempt). The loop re-reads the authenticated
 audit record and requires the completed `no-status` transition for the run's

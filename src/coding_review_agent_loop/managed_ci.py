@@ -22,6 +22,7 @@ from urllib.parse import quote, urlparse
 from .ci_health import (
     CiInfrastructureStall,
     FAILED_JOB_CONCLUSIONS,
+    board_tests_passed,
     check_name_matches,
     classify_run_jobs,
     PullRequestCheck,
@@ -9672,12 +9673,15 @@ def wait_for_final_qualification(
     contract: ManagedCiContract | None = None,
     attempts: int | None = None,
     min_run_attempt: int | None = None,
+    deadline: float | None = None,
 ) -> ManagedCiOutcome:
     """Wait for the correlated managed exact-head result.
 
     ``min_run_attempt`` (#1477) ignores correlated terminal statuses and the
     terminal-without-status confirmation until the attached run reaches that
     attempt, so a plumbing rerun is judged only on its own attempt.
+    ``deadline`` is the shared monotonic watch deadline; reaching it ends the
+    wait with ``timeout`` even while polls remain.
     """
     expected_head = metadata.head_sha
     if not expected_head:
@@ -9799,6 +9803,7 @@ def wait_for_final_qualification(
                 )
                 if final is not None and final.status.lower() in _TERMINAL_CI_STATUSES:
                     status = final.status.lower()
+                    last_status = status
                     if status == "success" and complete_board:
                         _patch_intent(runner, config=config, contract=contract, state="completed")
                         return ManagedCiOutcome(
@@ -9847,6 +9852,11 @@ def wait_for_final_qualification(
                 stall=stall,
                 attempts_used=attempt + 1,
                 final_status=last_status,
+            )
+        if deadline is not None and time.monotonic() >= deadline:
+            return ManagedCiOutcome(
+                status="timeout", checks=latest, head_sha=expected_head,
+                attempts_used=attempt + 1, final_status=last_status,
             )
         if attempt < attempts - 1:
             runner.run(["sleep", str(config.ci_poll_interval_seconds)], cwd=active_workdir(config))
@@ -10046,6 +10056,8 @@ def classify_managed_board(
         return "incomplete"
     if any(not check_name_matches(check.name, plumbing_names) for check in checks.failing):
         return "test-failure"
+    if not board_tests_passed(checks, plumbing_names):
+        return "incomplete"
     if not (
         checks.check_query_status == "ok"
         and checks.listing_complete

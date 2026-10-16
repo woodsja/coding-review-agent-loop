@@ -6740,6 +6740,7 @@ def run_pr_loop(
                             followups=future_followups,
                             source_context=followup_source_context,
                             usage_context=usage_context,
+                            checks_board=pr_checks,
                             details=[
                                 "The shared CI watch budget was exhausted by earlier watcher rounds; "
                                 "no fresh CI poll was performed."
@@ -6807,9 +6808,6 @@ def run_pr_loop(
                                     *_plumbing_observation_lines(pending_failed, pending_stuck),
                                     *(f"Run: {url}" for url in observation_run_urls(pending_rerun)),
                                 ]
-                                exhausted_final = final_context_state_line(rerun_board, stuck=pending_stuck)
-                                if exhausted_final:
-                                    exhausted_details.append(exhausted_final)
                                 plumbing_stop = _stop_after_ci_watch_timeout(
                                     runner,
                                     config=config,
@@ -6820,6 +6818,8 @@ def run_pr_loop(
                                     followups=future_followups,
                                     source_context=followup_source_context,
                                     usage_context=usage_context,
+                                    checks_board=rerun_board,
+                                    stuck_checks=pending_stuck,
                                     details=exhausted_details,
                                     reason="timeout",
                                 )
@@ -6860,9 +6860,6 @@ def run_pr_loop(
                                 "The shared CI watch budget was exhausted before the "
                                 "plumbing rerun could be observed."
                             ]
-                            budget_final = final_context_state_line(rerun_board)
-                            if budget_final:
-                                budget_details.append(budget_final)
                             plumbing_stop = _stop_after_ci_watch_timeout(
                                 runner,
                                 config=config,
@@ -6873,6 +6870,7 @@ def run_pr_loop(
                                 followups=future_followups,
                                 source_context=followup_source_context,
                                 usage_context=usage_context,
+                                checks_board=rerun_board,
                                 details=budget_details,
                                 reason="budget_exhausted",
                             )
@@ -7022,6 +7020,7 @@ def run_pr_loop(
                                 followups=future_followups,
                                 source_context=followup_source_context,
                                 usage_context=usage_context,
+                                checks_board=watch_outcome.pr_checks,
                                 details=details,
                                 reason="non_authoritative",
                             )
@@ -7178,11 +7177,6 @@ def run_pr_loop(
                             f"Stuck pending after its producing run completed (plumbing): {check.name}"
                             for check in watch_outcome.stuck_checks
                         )
-                        timeout_final = final_context_state_line(
-                            watch_outcome.pr_checks, stuck=watch_outcome.stuck_checks
-                        )
-                        if timeout_final:
-                            details.append(timeout_final)
                         return _stop_after_ci_watch_timeout(
                             runner,
                             config=config,
@@ -7193,6 +7187,8 @@ def run_pr_loop(
                             followups=future_followups,
                             source_context=followup_source_context,
                             usage_context=usage_context,
+                            checks_board=watch_outcome.pr_checks,
+                            stuck_checks=watch_outcome.stuck_checks,
                             details=details,
                             reason="timeout",
                         )
@@ -7221,6 +7217,7 @@ def run_pr_loop(
                             followups=future_followups,
                             source_context=followup_source_context,
                             usage_context=usage_context,
+                            checks_board=watch_outcome.pr_checks,
                             details=details,
                             reason="protection_unreadable",
                         )
@@ -7770,6 +7767,7 @@ def run_pr_loop(
                             managed_attempts_left = max(
                                 1, config.ci_timeout_seconds // config.ci_poll_interval_seconds
                             )
+                            managed_deadline = time.monotonic() + config.ci_timeout_seconds
                             managed_min_attempt: int | None = None
                             managed_plumbing_stop: int | None = None
                             while True:
@@ -7781,6 +7779,7 @@ def run_pr_loop(
                                     contract=managed_ci,
                                     attempts=managed_attempts_left,
                                     min_run_attempt=managed_min_attempt,
+                                    deadline=managed_deadline,
                                 )
                                 managed_attempts_left -= managed_outcome.attempts_used
                                 managed_plumbing_stop = _route_managed_plumbing_outcome(
@@ -7792,7 +7791,10 @@ def run_pr_loop(
                                     outcome=managed_outcome,
                                     contract=managed_ci,
                                     reruns_used=managed_plumbing_reruns,
-                                    attempts_left=managed_attempts_left,
+                                    budget_left=(
+                                        managed_attempts_left > 0
+                                        and time.monotonic() < managed_deadline
+                                    ),
                                 )
                                 if managed_plumbing_stop == "coder":
                                     # A classified test failure resumes the coder through
@@ -9517,7 +9519,7 @@ def _route_managed_plumbing_outcome(
     outcome,
     contract,
     reruns_used: set[str],
-    attempts_left: int,
+    budget_left: bool,
 ):
     """Apply the plumbing rerun-once rule to one managed qualification outcome.
 
@@ -9570,7 +9572,9 @@ def _route_managed_plumbing_outcome(
             "Plumbing failed again after the single automatic managed rerun.",
             "absent (run completed without a correlated status)",
         )
-    if attempts_left <= 0:
+    if not budget_left:
+        # The shared attempts or deadline are spent: never issue a rerun that
+        # nothing will observe; the existing terminal handling applies.
         return None
     reruns_used.add(head_sha)
     rerun = rerun_managed_attempt(
