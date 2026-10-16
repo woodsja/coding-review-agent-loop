@@ -8185,14 +8185,9 @@ def run_pr_loop(
                                     allowed_rounds += 1
                                     watch_failure_extension_used = True
                             else:
-                                legacy_timeout_message = (
+                                base_timeout_message = (
                                     f"Managed exact-head CI for PR #{pr_number} did not pass within "
-                                    f"{config.ci_timeout_seconds}s. "
-                                    + final_context_state_line(
-                                        managed_outcome.checks,
-                                        managed_status=managed_outcome.final_status or "absent",
-                                    )
-                                    + "."
+                                    f"{config.ci_timeout_seconds}s."
                                 )
                                 timeout_board = managed_outcome.checks
                                 if (
@@ -8202,7 +8197,18 @@ def run_pr_loop(
                                     or timeout_board.check_query_status != "ok"
                                     or timeout_board.check_query_errors
                                 ):
-                                    raise AgentLoopError(legacy_timeout_message)
+                                    # A non-authoritative observation (partial query or
+                                    # another head) is not final-state evidence for the
+                                    # approved head: keep the exact legacy refusal.
+                                    raise AgentLoopError(base_timeout_message)
+                                legacy_timeout_message = (
+                                    f"{base_timeout_message} "
+                                    + final_context_state_line(
+                                        managed_outcome.checks,
+                                        managed_status=managed_outcome.final_status or "absent",
+                                    )
+                                    + "."
+                                )
                                 stalled_names = {
                                     stalled.name for stalled in timeout_board.infrastructure_stalls
                                 }

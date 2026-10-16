@@ -6987,7 +6987,10 @@ Terminal watch reports name the observed `final-ci/exact-head` state whenever
 that context is on the board, required, or expected by the managed route. The
 state is one of `success`, `failure`, `pending`, `stuck-pending` or `absent`.
 These reports are the merge-ready message, failing-CI comments, timeout
-details, plumbing infrastructure stops and the managed manual-merge message.
+details, plumbing infrastructure stops and the managed manual-merge message. A
+managed timeout whose board is not authoritative for the approved head (a
+partial query or another head) keeps the plain timeout refusal, because
+that observation is not final-state evidence.
 
 #### Plumbing failures and the rerun-once rule
 
