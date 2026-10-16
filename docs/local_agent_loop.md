@@ -1025,13 +1025,16 @@ cannot fit. The default expands as needed for the bounded architecture block.
 #### Architecture set, layout and size budget
 
 `--architecture-path` names the root of the **architecture set**: the root
-document plus every repository-relative Markdown file under `docs/architecture/`
-that the root links to. Inline links count, as do full, collapsed and shortcut
-reference links; a reference definition counts only when a reference outside
-code uses its label. Links inside code, external URLs, non-`.md` targets,
-targets outside `docs/architecture/`, and escapes above the repository root are
-ignored. Links are followed one level only, so links inside detail docs and
-unlinked files under `docs/architecture/` are never members. Every member is
+document plus every repository-relative Markdown file under a detail directory
+(`--architecture-detail-dir`, default `docs/architecture/`) that the root links
+to, minus excluded history (`--architecture-exclude`). Inline links count, as
+do full, collapsed and shortcut reference links; a reference definition counts
+only when a reference outside code uses its label. Links inside code, external
+URLs, non-`.md` targets, targets outside every detail directory, targets inside
+an exclusion, and escapes above the repository root are ignored. Links are
+followed one level only, so links inside detail docs and unlinked files under a
+detail directory are never members; agents may still open them, and excluded
+history, on demand from the checkout. Every member is
 read from the same immutable revision as the root, in bounded batches.
 Links are read with a CommonMark parser (`markdown-it-py`, a runtime
 dependency), so membership follows rendered Markdown: fenced and indented
@@ -1066,16 +1069,60 @@ Recommended layout:
   current, and read the log before changing a component's behaviour so a
   rejected alternative is not proposed again. The logs are not architecture-set
   members: the root names `docs/architecture/decisions/` only as inline code and
-  never links into it, so the logs are never injected into prompts.
+  never links into it, so the logs are never injected into prompts. The
+  default `*/decisions/` exclusion keeps them out even if a link is added.
+
+This layout is the recommended default, not a requirement. Its layers are a
+short root index, detail docs that are set members, deeper docs linked on
+demand, and a decision log or ADRs kept out of the set. The root follows
+matklad's `ARCHITECTURE.md` (a short map of the codebase); history follows the
+ADR practice of recording decisions apart from the current design; and the
+summarized detail-doc index is the same idea as an `AGENTS.md` or `llms.txt`
+index, where each entry carries a one-line description so an agent can choose
+what to open.
+
+Pointing the tool at an existing convention:
+
+| Flag | Effect |
+| --- | --- |
+| `--architecture-path PATH` | Root document (default `ARCHITECTURE.md`). |
+| `--architecture-detail-dir DIR` | Repeatable. Directories whose root-linked `.md` files are members. Giving it replaces the default `docs/architecture/`; repeat that value to keep it. |
+| `--architecture-exclude DIR` | Repeatable. History directory that is never a member, even when linked. A leading `*/` matches it at any depth. Adds to the defaults `*/decisions/`, `doc/adr/` and `docs/adr/`. |
+| `--no-default-architecture-excludes` | Drop the default exclusions; only `--architecture-exclude` values apply. |
+
+Values must be normalized repository-relative POSIX directories (one optional
+trailing `/`); absolute paths, `.`/`..` components, URI schemes, backslashes,
+control characters and glob syntax other than the exclusion's leading `*/` are
+rejected with an error naming the flag. At most 16 detail directories and 32
+exclusions are accepted. An exclusion always wins over a detail directory, and
+a detail directory that an exclusion covers entirely is rejected before any
+agent runs, rather than silently producing an empty set. For example, a
+repository with component docs in `docs/design/` and adr-tools records in
+`doc/adr/` runs with `--architecture-detail-dir docs/design`; its root may link
+ADRs freely because `doc/adr/` is excluded by default.
+
+An explicit directory list was chosen over "any repository-relative `.md`
+linked from the root": the default set, and so its identity, stays exactly as
+before, and a stray root link to a README or changelog never becomes a member
+that invalidates approvals. Membership stays one level deep; a deeper walk
+would change the identity and is not supported. The policy itself is not part
+of the architecture identity, only the resulting member paths and blobs are, so
+a repository using the default layout keeps the same identity. A repository
+whose root already links into an excluded directory loses those members once,
+which changes its identity once.
 
 Size budget: `--architecture-read-size` (default 64 KiB) applies to the root
 and to each member. When the set has detail docs, the prompt carries the root
-overview followed by a detail-doc index (path plus first heading); the overview
+overview followed by a detail-doc index: path, first heading and the first
+sentence of the doc's first paragraph after that heading (link targets, images
+and raw HTML removed), bounded to 200 characters. Summaries are dropped first,
+before any entry, section index or overview text is lost; then the overview
 truncates before the index, and the index collapses to a member count under a
-tight budget. A root larger than the read size is still injected as identity,
+tight budget. Summaries are never part of any identity. A root larger than the read size is still injected as identity,
 size and a bounded heading index (never prose), with a diagnostic that the
 document is too large to inject and should be split into a short root overview
-plus `docs/architecture/*` detail docs. The root is scanned for headings and
+plus detail docs under the first configured detail directory (by default
+`docs/architecture/*`). The root is scanned for headings and
 links up to a 2 MiB ceiling; above it, or when the root is not valid UTF-8
 text, the prompt says set membership is unknown. A repository with only a root
 document under the read size gets exactly the same prompts and round-metadata

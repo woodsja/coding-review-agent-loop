@@ -88,6 +88,7 @@ def _freeze_prompt_architecture(
         repository=config.repo,
         path=config.architecture_path,
         read_size=config.architecture_read_size,
+        policy=config.architecture_membership_policy,
         # Keep the normalized live target ref in the identity.  The pair's
         # merge-base is the immutable commit used for document reads; a moving
         # target tip must not masquerade as a retarget when the ref and
@@ -640,6 +641,7 @@ def _architecture_document_paths_hook(
                         repository=config.repo,
                         path=config.architecture_path,
                         read_size=config.architecture_read_size,
+                        policy=config.architecture_membership_policy,
                     )
                 )
         except (AgentLoopError, OSError):

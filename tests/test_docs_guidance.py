@@ -195,6 +195,12 @@ def test_default_render_injects_the_whole_root_and_every_detail_doc(tmp_path):
     assert "Detail documents in the architecture set" in rendered
     for path in _architecture_set_paths()[1:]:
         assert f"- {path.relative_to(REPO_ROOT).as_posix()} — " in rendered
+    # Every detail doc opens with a summary, and the default budget still
+    # fits each one in the index (#1499).
+    assert len(snapshot.members) == len(_architecture_set_paths()) - 1
+    for member in snapshot.members:
+        assert member.summary
+        assert f"- {member.path} — {member.first_heading}: {member.summary}" in rendered
 
 
 def test_local_agent_loop_doc_has_decision_heading_and_table():
@@ -1475,6 +1481,18 @@ def test_docs_describe_the_architecture_set_layout_and_size_budget():
         assert "`--architecture-read-size`" in flat
         assert "canonical_document_path" in flat
         assert "only a detail doc" in flat or "changes only a detail doc" in flat
+        # Layered layout and the membership override flags (#1499).
+        for flag in (
+            "`--architecture-detail-dir", "`--architecture-exclude",
+            "`--no-default-architecture-excludes`",
+        ):
+            assert flag in flat, flag
+        for text_fragment in (
+            "recommended default, not a requirement", "`*/decisions/`", "`doc/adr/`",
+            "`docs/adr/`", "on demand", "`AGENTS.md`", "`llms.txt`", "matklad",
+            "first heading and the first sentence", "200 characters",
+        ):
+            assert text_fragment in flat, text_fragment
     assert "docs/architecture/" in " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
     import argparse
 
@@ -1483,5 +1501,7 @@ def test_docs_describe_the_architecture_set_layout_and_size_budget():
         action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     )
     help_text = " ".join(subparsers.choices["issue"].format_help().split())
-    assert "docs/architecture/*.md" in help_text
+    assert "--architecture-detail-dir" in help_text and "docs/architecture/" in help_text
+    assert "--architecture-exclude" in help_text
+    assert "--no-default-architecture-excludes" in help_text
     assert "split it" in help_text

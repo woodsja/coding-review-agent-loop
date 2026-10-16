@@ -25,8 +25,16 @@ DEFAULT_ARCHITECTURE_AGGREGATE_CHARS = 24_000
 DEFAULT_MANAGED_CONTEXT_CHARS = 80_000
 
 # The architecture set (#1454): the root document plus every Markdown file
-# under this directory that the root links to, one level only.
-ARCHITECTURE_DETAIL_DIR = "docs/architecture/"
+# under a configured detail directory that the root links to, one level only.
+# Detail directories are configurable (#1499); this is the default list.
+DEFAULT_ARCHITECTURE_DETAIL_DIRS = ("docs/architecture/",)
+# Kept for existing imports: the first default detail directory.
+ARCHITECTURE_DETAIL_DIR = DEFAULT_ARCHITECTURE_DETAIL_DIRS[0]
+# History (decision logs, ADRs) is never a set member, even when linked
+# (#1499).  A leading ``*/`` matches the directory at any depth.
+DEFAULT_ARCHITECTURE_EXCLUDES = ("*/decisions/", "doc/adr/", "docs/adr/")
+ARCHITECTURE_DETAIL_DIR_CAP = 16
+ARCHITECTURE_EXCLUDE_CAP = 32
 # An oversized root is still read up to this ceiling so its heading index and
 # links are known; above it the root is never read.
 DEFAULT_ARCHITECTURE_SCAN_CEILING = 2 * 1024 * 1024
@@ -35,6 +43,7 @@ DEFAULT_ARCHITECTURE_SCAN_CEILING = 2 * 1024 * 1024
 ARCHITECTURE_MEMBER_HEADING_CAP = 64
 ARCHITECTURE_LS_TREE_BATCH = 100
 _ARCHITECTURE_HEADING_CHARS = 200
+_ARCHITECTURE_SUMMARY_CHARS = 200
 _OVERSIZED_HEADING_INDEX_CAP = 500
 _ARCHITECTURE_CHANGED_MEMBER_RENDER_CAP = 20
 
@@ -43,10 +52,17 @@ _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MARKER_LIKE_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _MEMBERSHIP_UNKNOWN_LINE = "- Architecture set: membership unknown (root could not be scanned)"
-_SPLIT_RECOMMENDATION = (
-    "The document is too large to inject and should be split into a short root "
-    "overview plus docs/architecture/* detail docs."
-)
+_GLOB_CHARS_RE = re.compile(r"[*?\[\]]")
+
+
+def _split_recommendation(detail_dir: str) -> str:
+    return (
+        "The document is too large to inject and should be split into a short root "
+        f"overview plus {detail_dir}* detail docs."
+    )
+
+
+_SPLIT_RECOMMENDATION = _split_recommendation(ARCHITECTURE_DETAIL_DIR)
 _PARSER_UNAVAILABLE_NOTE = (
     "The CommonMark parser (markdown-it-py) is unavailable, so architecture-set "
     "membership is unknown."
@@ -62,22 +78,133 @@ def _sanitize_architecture_text(text: str) -> str:
     return _MARKER_LIKE_RE.sub("[repository comment omitted]", text)
 
 
+def _normalize_repo_path(path: object, option: str) -> str:
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise AgentLoopError(f"{option} must be a non-empty repository-relative POSIX path.")
+    if "\\" in path or _CONTROL_RE.search(path):
+        raise AgentLoopError(f"{option} must use printable POSIX path characters only.")
+    if path.startswith("/"):
+        raise AgentLoopError(f"{option} must be repository-relative, not absolute.")
+    parts = path.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise AgentLoopError(f"{option} must not contain empty, '.' or '..' components.")
+    normalized = str(PurePosixPath(*parts))
+    if normalized != path:
+        raise AgentLoopError(f"{option} must be a normalized POSIX path.")
+    return normalized
+
+
 def normalize_architecture_path(value: str | None) -> str:
     """Validate and normalize the configured repository-relative path."""
     path = DEFAULT_ARCHITECTURE_PATH if value is None else value
-    if not isinstance(path, str) or not path or "\x00" in path:
-        raise AgentLoopError("--architecture-path must be a non-empty repository-relative POSIX path.")
-    if "\\" in path or _CONTROL_RE.search(path):
-        raise AgentLoopError("--architecture-path must use printable POSIX path characters only.")
-    if path.startswith("/"):
-        raise AgentLoopError("--architecture-path must be repository-relative, not absolute.")
-    parts = path.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise AgentLoopError("--architecture-path must not contain empty, '.' or '..' components.")
-    normalized = str(PurePosixPath(*parts))
-    if normalized != path:
-        raise AgentLoopError("--architecture-path must be a normalized POSIX path.")
-    return normalized
+    return _normalize_repo_path(path, "--architecture-path")
+
+
+def _normalize_directory(value: object, option: str) -> str:
+    """A repository-relative directory in canonical ``prefix/`` form."""
+    if isinstance(value, str) and value.endswith("/"):
+        value = value[:-1]
+    if isinstance(value, str) and _URI_SCHEME_RE.match(value):
+        raise AgentLoopError(f"{option} must be a repository-relative path, not a URI.")
+    if isinstance(value, str) and _GLOB_CHARS_RE.search(value):
+        raise AgentLoopError(
+            f"{option} must not contain glob characters (only a leading '*/' is allowed "
+            "in --architecture-exclude)."
+        )
+    return _normalize_repo_path(value, option) + "/"
+
+
+def normalize_architecture_detail_dir(value: object) -> str:
+    """Validate one ``--architecture-detail-dir`` value; returns ``dir/``."""
+    return _normalize_directory(value, "--architecture-detail-dir")
+
+
+def normalize_architecture_exclude(value: object) -> str:
+    """Validate one ``--architecture-exclude`` value.
+
+    The value is a repository-relative directory, optionally prefixed by one
+    ``*/`` segment meaning "this directory at any depth, including the
+    repository root".  No other glob syntax is accepted.
+    """
+    option = "--architecture-exclude"
+    if isinstance(value, str) and value.startswith("*/"):
+        return "*/" + _normalize_directory(value[2:], option)
+    return _normalize_directory(value, option)
+
+
+def _bounded_unique(values: Iterable[object], normalize, cap: int, option: str) -> tuple[str, ...]:
+    result: list[str] = []
+    for value in values:
+        normalized = normalize(value)
+        if normalized not in result:
+            result.append(normalized)
+    if len(result) > cap:
+        raise AgentLoopError(f"{option} accepts at most {cap} distinct values.")
+    return tuple(result)
+
+
+def _exclusion_matches(exclusion: str, path: str) -> bool:
+    """Whether ``path`` lies inside the excluded directory (component-wise)."""
+    if exclusion.startswith("*/"):
+        return ("/" + path).find("/" + exclusion[2:]) >= 0
+    return path.startswith(exclusion)
+
+
+@dataclass(frozen=True)
+class ArchitectureMembershipPolicy:
+    """Which root-linked documents are architecture-set members (#1499).
+
+    A linked ``.md`` is a member when it lies under a detail directory and
+    under no exclusion; an exclusion always wins.  The policy is never part of
+    an identity: the resulting member paths and blobs already are, so a
+    policy that changes no membership changes no identity.
+    """
+
+    detail_dirs: tuple[str, ...] = DEFAULT_ARCHITECTURE_DETAIL_DIRS
+    excludes: tuple[str, ...] = DEFAULT_ARCHITECTURE_EXCLUDES
+
+    def __post_init__(self) -> None:
+        detail_dirs = _bounded_unique(
+            self.detail_dirs, normalize_architecture_detail_dir,
+            ARCHITECTURE_DETAIL_DIR_CAP, "--architecture-detail-dir",
+        )
+        if not detail_dirs:
+            raise AgentLoopError("--architecture-detail-dir must name at least one directory.")
+        excludes = _bounded_unique(
+            self.excludes, normalize_architecture_exclude,
+            ARCHITECTURE_EXCLUDE_CAP, "--architecture-exclude",
+        )
+        object.__setattr__(self, "detail_dirs", detail_dirs)
+        object.__setattr__(self, "excludes", excludes)
+        for detail_dir in detail_dirs:
+            covering = next(
+                (item for item in excludes if _exclusion_matches(item, detail_dir)), None
+            )
+            if covering is not None:
+                raise AgentLoopError(
+                    f"--architecture-detail-dir {detail_dir!r} is wholly excluded by "
+                    f"architecture exclusion {covering!r}; it could never contribute a member. "
+                    "Remove the exclusion (--no-default-architecture-excludes for a default) "
+                    "or choose another detail directory."
+                )
+
+    def is_excluded(self, path: str) -> bool:
+        return any(_exclusion_matches(item, path) for item in self.excludes)
+
+    def is_member(self, resolved: str, root_path: str) -> bool:
+        return (
+            resolved != root_path
+            and resolved.endswith(".md")
+            and any(resolved.startswith(item) for item in self.detail_dirs)
+            and not self.is_excluded(resolved)
+        )
+
+
+DEFAULT_ARCHITECTURE_MEMBERSHIP_POLICY = ArchitectureMembershipPolicy()
+
+
+def _policy_or_default(policy: ArchitectureMembershipPolicy | None) -> ArchitectureMembershipPolicy:
+    return DEFAULT_ARCHITECTURE_MEMBERSHIP_POLICY if policy is None else policy
 
 
 @dataclass(frozen=True)
@@ -101,6 +228,9 @@ class ArchitectureMember:
     availability: str
     size: int | None = None
     first_heading: str | None = None
+    # Bounded first summary sentence (#1499); rendering detail only, never
+    # part of the identity (like ``first_heading``).
+    summary: str | None = None
 
     def identity(self) -> dict[str, object]:
         return {
@@ -363,10 +493,50 @@ def _parsed_headings(text: str, tokens: list | None = None) -> tuple[str, ...] |
     return tuple(result)
 
 
+def _first_summary(tokens: list | None) -> str | None:
+    """The first sentence of a document's first top-level paragraph.
+
+    The paragraph after the first heading (or the document's first paragraph
+    when it has no heading) is reduced to its text content, so link targets,
+    images and raw HTML are not reproduced, then bounded.
+    """
+    if not tokens:
+        return None
+    start = next((index for index, token in enumerate(tokens) if token.type == "heading_open"), 0)
+    for index in range(start, len(tokens) - 1):
+        token = tokens[index]
+        if token.type != "paragraph_open" or token.level != 0:
+            continue
+        inline = tokens[index + 1]
+        if inline.type != "inline":
+            return None
+        parts: list[str] = []
+        for child in inline.children or ():
+            if child.type in {"text", "code_inline"}:
+                parts.append(child.content)
+            elif child.type in {"softbreak", "hardbreak"}:
+                parts.append(" ")
+        text = " ".join("".join(parts).split())
+        boundaries = [
+            position for position in (text.find(mark) for mark in (". ", "? ", "! "))
+            if position >= 0
+        ]
+        if boundaries:
+            text = text[: min(boundaries) + 1]
+        if len(text) > _ARCHITECTURE_SUMMARY_CHARS:
+            text = text[: _ARCHITECTURE_SUMMARY_CHARS - 3].rstrip() + "..."
+        return text or None
+    return None
+
+
 def _linked_detail_paths(
     root_text: str, root_path: str, tokens: list | None = None,
+    policy: ArchitectureMembershipPolicy | None = None,
 ) -> tuple[str, ...] | None:
-    """Repository paths of docs/architecture/*.md files linked from the root.
+    """Repository paths of member ``.md`` files linked from the root.
+
+    Membership follows ``policy`` (default: ``docs/architecture/`` minus the
+    default history exclusions).
 
     Every link the CommonMark parser produces counts: inline links and
     reference links whose definition exists.  Images (including any link
@@ -379,6 +549,7 @@ def _linked_detail_paths(
         tokens = _parse_markdown(root_text)
         if tokens is None:
             return None
+    policy = _policy_or_default(policy)
     base_dir_parts = root_path.split("/")[:-1]
     found: set[str] = set()
     pending = list(tokens)
@@ -394,12 +565,7 @@ def _linked_detail_paths(
         if not isinstance(href, str):
             continue
         resolved = _resolve_repo_relative(base_dir_parts, _link_destination_path(href))
-        if (
-            resolved is not None
-            and resolved != root_path
-            and resolved.startswith(ARCHITECTURE_DETAIL_DIR)
-            and resolved.endswith(".md")
-        ):
+        if resolved is not None and policy.is_member(resolved, root_path):
             found.add(resolved)
     return tuple(sorted(found))
 
@@ -520,18 +686,21 @@ def _acquire_members(
         if text is None:
             resolved.append(ArchitectureMember(member.path, member.blob_oid, "binary", size))
             continue
-        headings = _parsed_headings(text)
+        tokens = _parse_markdown(text)
+        headings = _parsed_headings(text, tokens) if tokens is not None else None
         first = _bounded_heading(headings[0]) if headings else None
-        resolved.append(ArchitectureMember(member.path, member.blob_oid, "available", size, first))
+        resolved.append(ArchitectureMember(
+            member.path, member.blob_oid, "available", size, first, _first_summary(tokens),
+        ))
     return tuple(resolved)
 
 
 def _members_for_root(
     runner: Runner, *, checkout, revision: str, root_text: str, root_path: str, max_bytes: int,
-    tokens: list | None = None,
+    tokens: list | None = None, policy: ArchitectureMembershipPolicy | None = None,
 ) -> tuple[ArchitectureMember, ...] | None:
     """Linked members, or None when the root's links cannot be parsed."""
-    paths = _linked_detail_paths(root_text, root_path, tokens)
+    paths = _linked_detail_paths(root_text, root_path, tokens, policy)
     if paths is None:
         return None
     if not paths:
@@ -550,9 +719,11 @@ def acquire_architecture_snapshot(
     path: str = DEFAULT_ARCHITECTURE_PATH,
     max_bytes: int = DEFAULT_ARCHITECTURE_READ_SIZE,
     scan_ceiling: int | None = None,
+    policy: ArchitectureMembershipPolicy | None = None,
 ) -> ArchitectureSnapshot:
     """Read the architecture set's root (and its linked members) from one immutable revision."""
     locator = ArchitectureLocator(repository, path)
+    policy = _policy_or_default(policy)
     if scan_ceiling is None:
         scan_ceiling = DEFAULT_ARCHITECTURE_SCAN_CEILING
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
@@ -589,7 +760,7 @@ def acquire_architecture_snapshot(
     except (TypeError, ValueError):
         return _snapshot_unavailable(locator, revision, "Git returned an invalid blob size.")
     if size > max_bytes:
-        diagnostic = f"Architecture blob is {size} bytes; limit is {max_bytes}. {_SPLIT_RECOMMENDATION}"
+        diagnostic = f"Architecture blob is {size} bytes; limit is {max_bytes}. {_split_recommendation(policy.detail_dirs[0])}"
         oversized = ArchitectureSnapshot(
             repository=locator.repository, path=locator.path, revision=revision,
             blob_oid=oid.decode("ascii"), sha256=None, availability="oversized", size=size,
@@ -612,7 +783,7 @@ def acquire_architecture_snapshot(
         tokens = _parse_markdown(text)
         members = _members_for_root(
             runner, checkout=checkout, revision=revision, root_text=text,
-            root_path=locator.path, max_bytes=max_bytes, tokens=tokens,
+            root_path=locator.path, max_bytes=max_bytes, tokens=tokens, policy=policy,
         )
         parsed_headings = _parsed_headings(text, tokens) if tokens is not None else ()
         headings = tuple(_bounded_heading(item) for item in parsed_headings[:_OVERSIZED_HEADING_INDEX_CAP])
@@ -641,7 +812,7 @@ def acquire_architecture_snapshot(
         )
     members = _members_for_root(
         runner, checkout=checkout, revision=revision, root_text=text,
-        root_path=locator.path, max_bytes=max_bytes,
+        root_path=locator.path, max_bytes=max_bytes, policy=policy,
     )
     return ArchitectureSnapshot(
         repository=locator.repository, path=locator.path, revision=revision,
@@ -661,6 +832,7 @@ def acquire_architecture_pair(
     candidate_revision: str,
     path: str = DEFAULT_ARCHITECTURE_PATH,
     max_bytes: int = DEFAULT_ARCHITECTURE_READ_SIZE,
+    policy: ArchitectureMembershipPolicy | None = None,
 ) -> ArchitecturePair:
     """Capture base/candidate architecture from one immutable PR acquisition."""
     locator = ArchitectureLocator(repository, path)
@@ -688,7 +860,7 @@ def acquire_architecture_pair(
         base = _snapshot_unavailable(locator, None, "No valid merge base was established.")
         candidate = acquire_architecture_snapshot(
             runner, checkout=checkout, repository=repository, revision=candidate_revision,
-            path=locator.path, max_bytes=max_bytes,
+            path=locator.path, max_bytes=max_bytes, policy=policy,
         )
         return ArchitecturePair(
             repository=repository, path=locator.path, target_revision=target_revision,
@@ -698,11 +870,11 @@ def acquire_architecture_pair(
     base_revision = merge_base
     base = acquire_architecture_snapshot(
         runner, checkout=checkout, repository=repository, revision=base_revision,
-        path=locator.path, max_bytes=max_bytes,
+        path=locator.path, max_bytes=max_bytes, policy=policy,
     )
     candidate = acquire_architecture_snapshot(
         runner, checkout=checkout, repository=repository, revision=candidate_revision,
-        path=locator.path, max_bytes=max_bytes,
+        path=locator.path, max_bytes=max_bytes, policy=policy,
     )
     if base.availability == "unavailable" or candidate.availability == "unavailable":
         change = "unavailable"
@@ -765,23 +937,48 @@ def _fit_listing(header: str, lines: Sequence[str], budget: int, more_template: 
     return ""
 
 
-def _member_index(members: Sequence[ArchitectureMember], budget: int) -> str:
-    """The detail-document index: path plus first heading, bounded by ``budget``."""
-    if not members or budget <= 0:
-        return ""
+_MEMBER_INDEX_HEADER = (
+    "\n\nDetail documents in the architecture set (open the file in the assigned checkout):\n"
+)
+
+
+def _member_index_lines(members: Sequence[ArchitectureMember], summaries: bool) -> list[str]:
     lines: list[str] = []
     for member in sorted(members, key=lambda item: item.path):
         path = sanitize_historical_text(member.path)
         if member.availability != "available":
             lines.append(f"- {path} — ({member.availability})")
-        elif member.first_heading:
-            lines.append(f"- {path} — {_sanitize_architecture_text(member.first_heading)}")
+            continue
+        heading = _sanitize_architecture_text(member.first_heading) if member.first_heading else ""
+        summary = _sanitize_architecture_text(member.summary) if summaries and member.summary else ""
+        if heading and summary:
+            lines.append(f"- {path} — {heading}: {summary}")
+        elif heading or summary:
+            lines.append(f"- {path} — {heading or summary}")
         else:
             lines.append(f"- {path}")
-    text = _fit_listing(
-        "\n\nDetail documents in the architecture set (open the file in the assigned checkout):\n",
-        lines, budget, "[{n} more members]",
-    )
+    return lines
+
+
+def _full_member_index(members: Sequence[ArchitectureMember], summaries: bool) -> str:
+    """The unbounded index, used to detect whether a bounded render degraded."""
+    if not members:
+        return ""
+    return _MEMBER_INDEX_HEADER + "\n".join(_member_index_lines(members, summaries))
+
+
+def _has_summaries(snapshot: ArchitectureSnapshot) -> bool:
+    return any(member.summary for member in snapshot.members)
+
+
+def _member_index(
+    members: Sequence[ArchitectureMember], budget: int, *, summaries: bool = False,
+) -> str:
+    """The detail-document index: path, first heading and optional summary, bounded by ``budget``."""
+    if not members or budget <= 0:
+        return ""
+    lines = _member_index_lines(members, summaries)
+    text = _fit_listing(_MEMBER_INDEX_HEADER, lines, budget, "[{n} more members]")
     if text:
         return text
     notice = (
@@ -792,17 +989,31 @@ def _member_index(members: Sequence[ArchitectureMember], budget: int) -> str:
 
 
 def _render_oversized_snapshot(snapshot: ArchitectureSnapshot, metadata: str, max_chars: int) -> str:
-    """Identity, size and split diagnostic always; then bounded indexes, never prose."""
-    detail = _member_index(snapshot.members, max_chars - len(metadata) - 1)
+    """Identity, size and split diagnostic always; then bounded indexes, never prose.
+
+    Member summaries (#1499) are the first optional material dropped: when
+    they would cost any member entry or section-index line, the render is
+    repeated without them.
+    """
+    if _has_summaries(snapshot):
+        rendered, degraded = _render_oversized_once(snapshot, metadata, max_chars, summaries=True)
+        if not degraded:
+            return rendered
+    return _render_oversized_once(snapshot, metadata, max_chars, summaries=False)[0]
+
+
+def _render_oversized_once(
+    snapshot: ArchitectureSnapshot, metadata: str, max_chars: int, *, summaries: bool,
+) -> tuple[str, bool]:
+    detail = _member_index(snapshot.members, max_chars - len(metadata) - 1, summaries=summaries)
+    degraded = detail != _full_member_index(snapshot.members, summaries)
     budget = max_chars - len(metadata) - len(detail) - 1
     index = ""
     if snapshot.heading_index:
-        index = _fit_listing(
-            "\n\nSections available for targeted checkout inspection:\n",
-            [f"- {sanitize_historical_text(heading)}" for heading in snapshot.heading_index],
-            budget,
-            "[{n} more headings omitted for prompt budget]",
-        )
+        lines = [f"- {sanitize_historical_text(heading)}" for heading in snapshot.heading_index]
+        header = "\n\nSections available for targeted checkout inspection:\n"
+        index = _fit_listing(header, lines, budget, "[{n} more headings omitted for prompt budget]")
+        degraded = degraded or index != header + "\n".join(lines)
         notice = "\n\nSection index omitted for prompt budget; inspect headings in the assigned checkout."
     else:
         notice = "\n\nNo section index is available; inspect the document in the assigned checkout directly."
@@ -811,7 +1022,7 @@ def _render_oversized_snapshot(snapshot: ArchitectureSnapshot, metadata: str, ma
     result = metadata + index + detail
     # The trailing newline is optional: at the identity-only boundary it must
     # not push the render past its allocation.
-    return result + "\n" if len(result) < max_chars else result
+    return (result + "\n" if len(result) < max_chars else result), degraded
 
 
 def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: int = DEFAULT_ARCHITECTURE_SNAPSHOT_CHARS, label: str = "Architecture context") -> str:
@@ -826,9 +1037,25 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
         return metadata[:max_chars]
     if snapshot.availability == "oversized":
         return _render_oversized_snapshot(snapshot, metadata, max_chars)
+    # Budget order (#1454, #1499): identity, member entries, overview prose,
+    # then member summaries.  Summaries are tried first and dropped whenever
+    # they would cost any other material.
+    if _has_summaries(snapshot):
+        rendered, degraded = _render_available_snapshot(snapshot, metadata, max_chars, summaries=True)
+        if not degraded:
+            return rendered
+    return _render_available_snapshot(snapshot, metadata, max_chars, summaries=False)[0]
+
+
+def _render_available_snapshot(
+    snapshot: ArchitectureSnapshot, metadata: str, max_chars: int, *, summaries: bool,
+) -> tuple[str, bool]:
+    """One render attempt; also reports whether any optional material degraded."""
     # The detail-document index is budgeted after the mandatory identity and
     # before the overview prose, so the overview truncates first (#1454).
-    detail = _member_index(snapshot.members, max_chars - len(metadata) - 1)
+    full_detail = _full_member_index(snapshot.members, summaries)
+    detail = _member_index(snapshot.members, max_chars - len(metadata) - 1, summaries=summaries)
+    degraded = detail != full_detail
     index = ""
     if snapshot.heading_index:
         index = "\n\nSections available for targeted checkout inspection:\n" + "\n".join(
@@ -846,23 +1073,27 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
     reserve = len(omission) + (len(truncation_status) if detail and snapshot.content else 0)
     remaining = max_chars - len(metadata) - len(index) - len(detail) - len(overview_prefix) - 1
     if remaining < reserve:
+        degraded = True
         index = "\n\nSection index omitted for prompt budget; inspect headings in the assigned checkout."
         remaining = max_chars - len(metadata) - len(index) - len(detail) - len(overview_prefix) - 1
     if remaining < reserve and detail:
+        degraded = True
         detail = _member_index(
             snapshot.members,
             max_chars - len(metadata) - len(index) - len(overview_prefix) - reserve - 1,
+            summaries=summaries,
         )
         remaining = max_chars - len(metadata) - len(index) - len(detail) - len(overview_prefix) - 1
     if remaining < len(omission):
         # Returning identity-only text is deterministic and still bounded.
-        return metadata
+        return metadata, True
     if snapshot.content is not None and snapshot.is_available and remaining > 0:
         sanitized = _sanitize_architecture_text(snapshot.content)
         if detail and len(sanitized) > remaining and remaining - len(truncation_status) >= len(omission):
             remaining -= len(truncation_status)
         text, truncated = _bounded_text(sanitized, remaining)
         if truncated:
+            degraded = True
             metadata += truncation_status
         result = metadata + index + overview_prefix + text + detail + "\n"
     else:
@@ -871,8 +1102,8 @@ def render_architecture_snapshot(snapshot: ArchitectureSnapshot, *, max_chars: i
         # This can only happen when adding the truncation status consumed part
         # of the reserved space. Re-render without optional material rather
         # than slicing the identity block.
-        return metadata
-    return result
+        return metadata, True
+    return result, degraded
 
 
 def _comparison_prefix(pair: ArchitecturePair) -> str:
@@ -909,7 +1140,8 @@ def _comparison_prefix(pair: ArchitecturePair) -> str:
 def render_architecture_pair(pair: ArchitecturePair, *, max_chars: int = DEFAULT_ARCHITECTURE_AGGREGATE_CHARS) -> str:
     if max_chars <= 0:
         raise AgentLoopError("Architecture aggregate render size must be positive.")
-    # Members are named, never quoted: only the root snapshots carry text.
+    # Members are named with at most a bounded first-sentence summary; only
+    # the root snapshots carry document text.
     comparison_prefix = _comparison_prefix(pair)
     if len(comparison_prefix) + 2 > max_chars:
         raise AgentLoopError("Architecture aggregate budget is too small for comparison identity.")
@@ -1004,6 +1236,7 @@ def freeze_architecture_context(
     read_size: int = DEFAULT_ARCHITECTURE_READ_SIZE,
     target_revision: str | None = None,
     candidate_revision: str | None = None,
+    policy: ArchitectureMembershipPolicy | None = None,
 ) -> ArchitectureSnapshot | ArchitecturePair | None:
     """Acquire one frozen prompt identity for an issue or PR turn."""
     if candidate_revision is None:
@@ -1014,10 +1247,10 @@ def freeze_architecture_context(
     if target_revision is None:
         return acquire_architecture_snapshot(
             runner, checkout=checkout, repository=repository, revision=candidate_revision,
-            path=path, max_bytes=read_size,
+            path=path, max_bytes=read_size, policy=policy,
         )
     return acquire_architecture_pair(
         runner, checkout=checkout, repository=repository,
         target_revision=target_revision, candidate_revision=candidate_revision,
-        path=path, max_bytes=read_size,
+        path=path, max_bytes=read_size, policy=policy,
     )

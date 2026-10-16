@@ -921,9 +921,42 @@ def build_parser() -> argparse.ArgumentParser:
             default="ARCHITECTURE.md",
             help=(
                 "Repository-relative POSIX path of the root architecture document. "
-                "The architecture set is this root plus the docs/architecture/*.md "
-                "files it links to (one level only)."
+                "The architecture set is this root plus the .md files it links to "
+                "under the --architecture-detail-dir directories (one level only), "
+                "minus history excluded by --architecture-exclude."
             ),
+        )
+        subparser.add_argument(
+            "--architecture-detail-dir",
+            dest="architecture_detail_dirs",
+            action="append",
+            default=None,
+            metavar="DIR",
+            help=(
+                "Repository-relative directory whose root-linked .md files are "
+                "architecture-set members. Repeatable; giving it replaces the default "
+                "docs/architecture/, so list that again to keep it."
+            ),
+        )
+        subparser.add_argument(
+            "--architecture-exclude",
+            dest="architecture_excludes",
+            action="append",
+            default=None,
+            metavar="DIR",
+            help=(
+                "Repository-relative history directory (decision logs, ADRs) that is "
+                "never an architecture-set member, even when linked. A leading '*/' "
+                "matches the directory at any depth. Repeatable; adds to the defaults "
+                "*/decisions/, doc/adr/ and docs/adr/."
+            ),
+        )
+        subparser.add_argument(
+            "--no-default-architecture-excludes",
+            dest="architecture_default_excludes",
+            action="store_false",
+            default=True,
+            help="Drop the default history exclusions; only --architecture-exclude values apply.",
         )
         subparser.add_argument(
             "--architecture-read-size",
