@@ -4967,3 +4967,62 @@ def test_run_pr_loop_refuses_a_foreign_managed_branch_handoff_before_any_write(t
         if cmd[:3] in (["gh", "pr", "comment"], ["gh", "pr", "edit"], ["gh", "workflow", "run"])
         or (cmd[:2] == ["gh", "api"] and any(arg in ("POST", "PATCH", "DELETE") for arg in cmd))
     ]
+
+
+def test_approved_all_reviewers_plan_resumed_with_a_baseline_budget_is_not_reopened(
+    tmp_path, monkeypatch
+):
+    """#1516 row flag-validation-inheritance (workflow): a primary-then-panel invocation
+    with a non-default --plan-provenance-baseline-max-chars resumes a completely
+    approved all-reviewers plan.  The shortcut completes without a config validation
+    error or a planning turn, and implementation gets the invocation's budget back."""
+    from coding_review_agent_loop import plan_first_loop
+    from coding_review_agent_loop.review_step_back import DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
+
+    full_board = _plan_cfg(tmp_path, ("codex", "gemini"))
+    runner = _plan_runner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    assert run_issue_loop(runner, issue_number=56, config=full_board, plan_first=True) == 0
+    start = len(runner.commands)
+
+    approving_configs, restored_configs = [], []
+    real_approving = plan_first_loop._approving_plan_board_config
+    real_restore = plan_first_loop._restore_invocation_board
+
+    def spy_approving(config, approving):
+        result = real_approving(config, approving)
+        approving_configs.append(result)
+        return result
+
+    def spy_restore(config, invocation):
+        result = real_restore(config, invocation)
+        restored_configs.append(result)
+        return result
+
+    monkeypatch.setattr(plan_first_loop, "_approving_plan_board_config", spy_approving)
+    monkeypatch.setattr(plan_first_loop, "_restore_invocation_board", spy_restore)
+    staged = _plan_cfg(
+        tmp_path, ("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex", plan_provenance_baseline_max_chars=50000,
+        plan_execution_mode="implement-one-shot",
+    )
+    # The implementation coder's turn is not scripted, so the run stops there.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            runner, issue_number=56, config=staged, plan_first=True,
+            implement_after_approval=True,
+        )
+    turns = [cmd for cmd, _cwd in runner.commands[start:] if cmd[0] in _PLAN_AGENTS]
+    # Exactly one turn, the implementation coder: no planner, no plan reviewer.
+    assert [cmd[0] for cmd in turns] == ["claude"]
+    assert turns[0][-1].startswith("Implement the approved plan for GitHub issue #56")
+    (approving,) = approving_configs
+    assert approving.plan_review_policy == "all-reviewers"
+    assert approving.plan_provenance_baseline_max_chars == DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
+    (restored,) = restored_configs
+    assert restored.plan_review_policy == "primary-then-panel"
+    assert restored.plan_provenance_baseline_max_chars == 50000
+    assert _plan_links(runner) == []

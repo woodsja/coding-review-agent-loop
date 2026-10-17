@@ -23,7 +23,7 @@ import io
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,6 +55,10 @@ from .review_rounds import (
 )
 from .protocol import PROVENANCE_PRE_EXISTING, PROVENANCE_REVISION_INTRODUCED
 from .review_step_back import (
+    BASELINE_FORM_COMPACT_DIFF,
+    BASELINE_FORM_DIFF,
+    BASELINE_FORM_FULL,
+    BASELINE_FORM_UNAVAILABLE,
     PLAN_STEP_BACK_HUMAN_DECISION_PREFIX,
     effective_new_items,
     eligible_new_mandatory_items,
@@ -787,6 +791,14 @@ def _final_plan_size(records: Sequence[PostedRoundRecord]) -> int | None:
     return None
 
 
+_BASELINE_EXPORT_FORMS = (
+    BASELINE_FORM_DIFF,
+    BASELINE_FORM_COMPACT_DIFF,
+    BASELINE_FORM_FULL,
+    BASELINE_FORM_UNAVAILABLE,
+)
+
+
 @dataclass(frozen=True)
 class _PlanProvenanceCounts:
     pre_existing: int
@@ -794,6 +806,8 @@ class _PlanProvenanceCounts:
     untagged: int
     resolvable: bool
     sweep_reviews: int
+    # Baseline forms (#1516) of non-first latest reviewer records that carry one.
+    baseline_forms: Mapping[str, int] = dataclass_field(default_factory=dict)
 
 
 def _plan_provenance_counts(records: Sequence[PostedRoundRecord]) -> _PlanProvenanceCounts:
@@ -805,6 +819,8 @@ def _plan_provenance_counts(records: Sequence[PostedRoundRecord]) -> _PlanProven
     but ``revision_introduced`` findings are bucketed, not dropped.  An
     unresolvable publication record makes the counts unavailable.  Sweep
     reviews are the latest per-round reviewer records carrying the sweep marker.
+    Baseline forms (#1516) count the same non-first records by their recorded
+    comparison form; records without the field count in no form.
     """
     ordered = sorted(records, key=lambda record: record.index)
     latest: dict[tuple[str, int], PostedRoundRecord] = {}
@@ -813,6 +829,7 @@ def _plan_provenance_counts(records: Sequence[PostedRoundRecord]) -> _PlanProven
         if metadata.role == "reviewer" and metadata.agent:
             latest[(metadata.agent, metadata.round_number)] = record
     buckets = {PROVENANCE_PRE_EXISTING: 0, PROVENANCE_REVISION_INTRODUCED: 0, None: 0}
+    forms = dict.fromkeys(_BASELINE_EXPORT_FORMS, 0)
     resolvable = True
     first_rounds: dict[str, int | None] = {}
     for (agent, number), record in latest.items():
@@ -820,6 +837,8 @@ def _plan_provenance_counts(records: Sequence[PostedRoundRecord]) -> _PlanProven
             first_rounds[agent] = first_plan_review_round(ordered, reviewer=agent)
         if number == first_rounds[agent]:
             continue
+        if record.metadata.provenance_baseline_form in forms:
+            forms[record.metadata.provenance_baseline_form] += 1
         new_items = effective_new_items(ordered, record)
         if new_items is None:
             resolvable = False
@@ -833,6 +852,7 @@ def _plan_provenance_counts(records: Sequence[PostedRoundRecord]) -> _PlanProven
         untagged=buckets[None],
         resolvable=resolvable,
         sweep_reviews=sum(1 for record in latest.values() if record.metadata.plan_sweep),
+        baseline_forms=forms,
     )
 
 
@@ -1063,6 +1083,18 @@ def derive_history_row(
             provenance.untagged, plan_evidence and provenance.resolvable
         ),
         "plan_sweep_reviews": _pair(sweep_reviews, plan_evidence),
+        "plan_baselines_diff": _pair(
+            provenance.baseline_forms.get(BASELINE_FORM_DIFF, 0), plan_evidence
+        ),
+        "plan_baselines_compact_diff": _pair(
+            provenance.baseline_forms.get(BASELINE_FORM_COMPACT_DIFF, 0), plan_evidence
+        ),
+        "plan_baselines_full": _pair(
+            provenance.baseline_forms.get(BASELINE_FORM_FULL, 0), plan_evidence
+        ),
+        "plan_baselines_unavailable": _pair(
+            provenance.baseline_forms.get(BASELINE_FORM_UNAVAILABLE, 0), plan_evidence
+        ),
         "pr_rounds": _pair(pr_round_count, pr_terminal),
         "merged": _pair(merged_any, merged_any or pr_terminal),
         "tool_commit": _pair(commits, bool(commits)),
@@ -1163,6 +1195,8 @@ _PAIR_COLUMNS = (
     "plan_rounds", "step_backs", "human_decision_stops", "final_plan_size",
     "plan_findings_pre_existing", "plan_findings_revision_introduced",
     "plan_findings_untagged", "plan_sweep_reviews",
+    "plan_baselines_diff", "plan_baselines_compact_diff", "plan_baselines_full",
+    "plan_baselines_unavailable",
     "pr_rounds", "merged", "tool_commit",
 )
 

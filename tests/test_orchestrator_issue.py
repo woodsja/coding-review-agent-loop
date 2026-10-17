@@ -21241,3 +21241,118 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
     counts = _plan_provenance_counts(records)
     assert counts.resolvable
     assert (counts.pre_existing, counts.revision_introduced, counts.untagged) == (0, 0, int(mixed))
+
+
+# --- Tiered finding-provenance baseline (#1516) -------------------------------
+
+
+def _m1516_long_plan_outputs():
+    """A fresh #1590-sized plan, then a one-word-edit patch of its long steps."""
+    from agent_loop_helpers import long_plan_revision_pair
+
+    previous, current = long_plan_revision_pair()
+    fresh_payload = json.loads(structured_v1_plan_state().split("\n<!--", 1)[0])
+    fresh_payload["plan_steps"] = previous.splitlines()
+    fresh = (
+        json.dumps(fresh_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    patch_payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Close gap 1.",
+        "prior_plan_item_dispositions": [{"item_id": "item-1", "disposition": "resolved"}],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "plan_steps", "value": current.splitlines()}
+        ],
+    }
+    revision = (
+        json.dumps(patch_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    reviews = [
+        structured_plan_review(
+            state="blocking", summary=f"Gap {n} remains.",
+            blocking_plan_issues=[f"Close gap {n}."],
+            prior_plan_item_dispositions=(
+                [{"item_id": "item-1", "disposition": "resolved"}] if n > 1 else None
+            ),
+        )
+        for n in (1, 2)
+    ]
+    return [fresh, revision], reviews
+
+
+def _m1516_baseline_lines(messages):
+    return [m for m in messages if "Codex provenance baseline:" in m]
+
+
+def _m1516_primary_records(runner):
+    """The primary's plan reviewer records, hydrating large-plan sidecars."""
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments],
+        flow="plan",
+    )
+    return [
+        record.metadata for record in records
+        if record.metadata.role == "reviewer" and record.metadata.agent == "Codex"
+    ]
+
+
+def test_resumed_round_renders_and_records_the_same_baseline_form(tmp_path):
+    """`resume-same-form`: prompt, log line and record agree, fresh or resumed."""
+    claude, codex = _m1516_long_plan_outputs()
+    live, live_messages = _m1505_run(
+        tmp_path / "live", claude=claude, codex=codex, max_rounds=2
+    )
+    live_reviews = _m1251_prompts(live, "codex")
+    assert len(live_reviews) == 2
+    assert "this is your first plan review of this issue" in live_reviews[0]
+    assert "+++ current plan (compact: changed sentences only)" in live_reviews[1]
+    assert "the comparison baseline is unavailable" not in live_reviews[1]
+    live_records = _m1516_primary_records(live)
+    assert [record.provenance_baseline_form for record in live_records] == [
+        "first-review", "compact-diff",
+    ]
+    compact_chars = live_records[1].provenance_baseline_chars
+    assert compact_chars > 0
+    live_lines = _m1516_baseline_lines(live_messages)
+    assert len(live_lines) == 2
+    assert "form=first-review chars=0" in live_lines[0]
+    assert f"form=compact-diff chars={compact_chars} " in live_lines[1]
+    assert "from_round=1" in live_lines[1]
+
+    # The first process dies after the planner revision, before round 2's review.
+    first, _messages = _m1505_run(
+        tmp_path / "resumed", claude=claude, codex=codex[:1], max_rounds=2
+    )
+    assert len(_m1516_primary_records(first)) == 1
+    rerun = _FakeRunner(issue_comments=list(first.issue_comments), codex_outputs=codex[1:])
+    config = _staged_plan_config(tmp_path / "resumed", max_rounds=2)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    rerun_messages = [str(call.args[-1]) for call in logged.call_args_list]
+    resumed_reviews = _m1251_prompts(rerun, "codex")
+    assert len(resumed_reviews) == 1
+    baseline_block = live_reviews[1].split("Finding provenance baseline", 1)[1].split(
+        "----- END BASELINE DIFF -----", 1
+    )[0]
+    assert "REVISED" in baseline_block
+    assert baseline_block in resumed_reviews[0]
+    resumed_record = _m1516_primary_records(rerun)[-1]
+    assert (resumed_record.provenance_baseline_form, resumed_record.provenance_baseline_chars) == (
+        "compact-diff", compact_chars,
+    )
+    resumed_lines = _m1516_baseline_lines(rerun_messages)
+    assert resumed_lines == [live_lines[1]]

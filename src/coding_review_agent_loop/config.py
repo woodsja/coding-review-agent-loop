@@ -37,6 +37,7 @@ from .scratch import make_private_dirs, scratch_root
 from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
 from .plan_review_scheduling import PLAN_REVIEW_POLICIES
+from .review_step_back import DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
 from .review_scheduling import (
     DEFAULT_BROAD_RULES,
     PR_REVIEW_POLICIES,
@@ -274,6 +275,10 @@ class AgentLoopConfig:
     # that sweep turn only.
     plan_sweep_rounds: int = DEFAULT_PLAN_SWEEP_ROUNDS
     plan_sweep_reasoning_effort: str = ""
+    # Finding-provenance baseline hard budget (#1516): the largest previous-plan
+    # baseline payload (diff, compact diff or full previous plan) a later plan
+    # review prompt may carry.  0 disables the baseline.
+    plan_provenance_baseline_max_chars: int = DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
     pr_step_back_rounds: int = DEFAULT_PR_STEP_BACK_ROUNDS
     pr_evidence_stall_rounds: int = DEFAULT_PR_EVIDENCE_STALL_ROUNDS
     pr_evidence_capture_attempts: int = DEFAULT_PR_EVIDENCE_CAPTURE_ATTEMPTS
@@ -855,6 +860,16 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "--plan-sweep-rounds must be a non-negative integer (0 disables it)."
             )
+        baseline_max_chars = self.plan_provenance_baseline_max_chars
+        if (
+            isinstance(baseline_max_chars, bool)
+            or not isinstance(baseline_max_chars, int)
+            or baseline_max_chars < 0
+        ):
+            raise AgentLoopError(
+                "--plan-provenance-baseline-max-chars must be a non-negative integer "
+                "(0 disables the baseline)."
+            )
         sweep_effort = self.plan_sweep_reasoning_effort
         if not isinstance(sweep_effort, str):
             raise AgentLoopError("--plan-sweep-reasoning-effort must be a string.")
@@ -871,6 +886,11 @@ class AgentLoopConfig:
             )
         for flag, value, default in (
             ("--plan-sweep-rounds", sweep_rounds, DEFAULT_PLAN_SWEEP_ROUNDS),
+            (
+                "--plan-provenance-baseline-max-chars",
+                baseline_max_chars,
+                DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
+            ),
             ("--plan-step-back-rounds", step_back_rounds, DEFAULT_PLAN_STEP_BACK_ROUNDS),
             (
                 "--plan-step-back-escalation-rounds",
@@ -2527,6 +2547,9 @@ def config_from_args(
         ),
         plan_sweep_rounds=_arg_or_default(args, "plan_sweep_rounds", DEFAULT_PLAN_SWEEP_ROUNDS),
         plan_sweep_reasoning_effort=getattr(args, "plan_sweep_reasoning_effort", None) or "",
+        plan_provenance_baseline_max_chars=_arg_or_default(
+            args, "plan_provenance_baseline_max_chars", DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
+        ),
         pr_step_back_rounds=_arg_or_default(
             args, "pr_step_back_rounds", DEFAULT_PR_STEP_BACK_ROUNDS
         ),

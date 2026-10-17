@@ -4053,7 +4053,9 @@ primary-then-panel` two more flags address that pattern. Neither stops a run.
   ignores it with a log line.
 
 Both flags require `--plan-review-policy primary-then-panel` when set to a
-non-default value, and child-planning cycles inherit them.
+non-default value, and child-planning cycles inherit them. The same applies to
+`--plan-provenance-baseline-max-chars`, described under finding provenance
+below.
 
 A review counts toward K when the primary blocked and at least one of its new
 `blocking`/`same-plan` items counts. Future follow-ups never count, and neither
@@ -4072,16 +4074,53 @@ derived from durable round records, so a resumed run asks for the same sweep.
 The orchestrator records `plan_sweep: true` on the swept primary review record.
 
 **Finding provenance.** Under `primary-then-panel`, each plan review prompt
-after the reviewer's first carries a previous-plan baseline: a unified diff
-(3 context lines, at most 12000 characters) from the plan that reviewer last
-reviewed, resolved from the durable planner record by plan subject and hash,
-to the current plan. It is rebuilt from GitHub records, so compact prompts,
-fresh sessions and resumed runs get the same baseline. Reviewers tag each new
+after the reviewer's first carries a previous-plan baseline against the plan
+that reviewer last reviewed, resolved from the durable planner record by plan
+subject and hash. It is rebuilt from GitHub records by a deterministic
+selector, so compact prompts, fresh sessions and resumed runs get the same
+baseline, and it always sits in the volatile per-round part of the prompt,
+never in the cacheable stable prefix. The selector tries four forms in order
+(#1516):
+
+1. `diff`: the unified line diff (3 context lines), when it fits the diff
+   budget.
+2. `compact-diff`: a sentence-level diff. Lines are matched first. A replaced
+   line shows only its changed sentences or table cells (split after `.`, `!`,
+   `?` or `;` and on ` | `), with one unchanged unit of context. A changed unit
+   longer than 600 characters shows only its changed words, with 12 words of
+   context. Wholly added or removed lines are shown in full. Long canonical
+   plan lines (a single step or table row can reach 18k characters) make the
+   unified diff larger than the plan itself after a one-word edit; the compact
+   diff shows only the edit. It must also fit the diff budget.
+3. `full-baseline`: the full text of the previous reviewed plan, fenced and
+   labelled as baseline data, not instructions, for the reviewer to compare
+   with the current plan. It must fit the hard budget.
+4. `unavailable`: the reviewer is told to omit `provenance` rather than guess.
+   This is kept only for an unrecoverable previous plan, a disabled budget, or
+   a previous plan over the hard budget.
+
+The diff budget is max(12000, half the current plan's characters), capped by
+the hard budget `--plan-provenance-baseline-max-chars N` (default 120000, `0`
+disables the baseline so every later review gets the unavailable notice). A
+diff over half the plan costs nearly as much as the full baseline and is
+harder to read. Below a 24k-character plan the 12000 floor keeps the #1505
+behaviour. Like the sweep flags, a non-default value requires
+`--plan-review-policy primary-then-panel`, and child-planning cycles inherit
+it. A first review and an identical plan keep their own notices. Each round
+logs one line per invoked reviewer,
+`Planning round R: <reviewer> provenance baseline: form=<form> chars=<n> plan_chars=<n> from_round=<k>`,
+where `chars` is the payload size (the diff or the previous plan, without
+framing). The orchestrator records the same form and size on that reviewer's
+round record as `provenance_baseline: {"form": ..., "chars": ...}`; the field
+is omitted when no baseline applies, and a malformed stored value decodes as
+absent.
+
+Reviewers tag each new
 `blocking_plan_issues` and `same_plan_followups` finding object with
-`"provenance": "revision_introduced"` (a change in the diff introduced it) or
-`"pre_existing"` (it was already in the plan they last reviewed). A first
-review, an unavailable or oversized baseline, and future follow-ups carry no
-tag. The tag is advisory telemetry: it never changes classification or
+`"provenance": "revision_introduced"` (a change shown by the baseline
+introduced it) or `"pre_existing"` (it was already in the plan they last
+reviewed). A first review, an unavailable baseline, and future follow-ups
+carry no tag. The tag is advisory telemetry: it never changes classification or
 approval, it is persisted on the minted item as `provenance`, and each plan
 round logs, per reviewer, its new mandatory findings by provenance with the
 repeat count, the first-review flag and the sweep flag. The
@@ -4940,6 +4979,13 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   reviews whose record carries `plan_sweep: true`. All four follow the
   `plan_rounds` evidence rule; the three finding counts are `unavailable` when a
   provisional publication record has no later reconciliation.
+- `plan_baselines_diff`, `plan_baselines_compact_diff`, `plan_baselines_full`
+  and `plan_baselines_unavailable` (#1516) count the same non-first latest
+  reviewer records by the provenance baseline form recorded on them (`diff`,
+  `compact-diff`, `full-baseline`, `unavailable`). First reviews, identical-plan
+  reviews and records without the field (written before #1516, or under the
+  all-reviewers policy) count in no column. They follow the `plan_rounds`
+  evidence rule.
 - `step_backs` classifies each counted round. A round is in the step-back era
   when one of its records carries step-back data or a field that postdates
   step-back recording. It is pre-feature when every record comment of the

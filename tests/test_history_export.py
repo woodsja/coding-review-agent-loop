@@ -1234,3 +1234,69 @@ def test_history_export_provenance_is_unavailable_for_unbounded_or_unresolvable_
     for column in _PROVENANCE_COLUMNS[:3]:
         assert unresolvable[column] == {"value": None, "evidence": "unavailable"}
     assert unresolvable["plan_sweep_reviews"] == {"value": 1, "evidence": "verified"}
+
+
+# --- Plan provenance baseline form columns (#1516) ----------------------------
+
+_BASELINE_COLUMNS = (
+    "plan_baselines_diff", "plan_baselines_compact_diff", "plan_baselines_full",
+    "plan_baselines_unavailable",
+)
+
+
+def _baseline(form: str, chars: int = 10) -> dict:
+    return {"provenance_baseline_form": form, "provenance_baseline_chars": chars}
+
+
+def _baseline_comments():
+    return (
+        comment(1, plan_coder(1, plan="Plan v1.")),
+        # First reviews never count, whatever form they record.
+        comment(2, plan_review(CODEX, 1, "blocking", **_baseline("first-review", 0))),
+        comment(3, plan_review(CLAUDE, 1, "blocking", **_baseline("unavailable", 0))),
+        comment(4, plan_coder(2, plan="Plan v2.")),
+        # Superseded by the later record of the same reviewer and round.
+        comment(5, plan_review(CODEX, 2, "blocking", **_baseline("unavailable", 0))),
+        comment(6, plan_review(CODEX, 2, "blocking", **_baseline("compact-diff", 900))),
+        # A pre-feature record without the field counts in no form.
+        comment(7, plan_review(CLAUDE, 2, "blocking")),
+        comment(8, plan_coder(3, plan="Plan v3.")),
+        comment(9, plan_review(CODEX, 3, "blocking", **_baseline("full-baseline", 5000))),
+        comment(10, plan_review(CLAUDE, 3, "blocking", **_baseline("unavailable", 0))),
+        comment(11, plan_coder(4, plan="Plan v4.")),
+        comment(12, plan_review(CODEX, 4, "approved", **_baseline("diff", 300))),
+        comment(13, plan_review(CLAUDE, 4, "approved", **_baseline("identical", 0))),
+        handoff(14),
+    )
+
+
+def test_history_export_counts_baseline_forms_of_non_first_reviews():
+    """`export-form-counts`: latest non-first records only, plan_evidence rule."""
+    row = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(
+            *_baseline_comments(),
+            comment(20, plan_review(CODEX, 5, "blocking", **_baseline("diff")), author=FOREIGN),
+        ),
+    )
+    assert row["plan_baselines_diff"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_baselines_compact_diff"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_baselines_full"] == {"value": 1, "evidence": "verified"}
+    assert row["plan_baselines_unavailable"] == {"value": 1, "evidence": "verified"}
+    assert row["schema_version"] == 1
+    header = render_csv([row]).splitlines()[0].split(",")
+    for column in _BASELINE_COLUMNS:
+        assert column in header and f"{column}_evidence" in header
+    assert header.index("plan_baselines_diff") > header.index("plan_sweep_reviews")
+
+
+def test_history_export_baseline_forms_follow_the_plan_evidence_rule():
+    unbounded = derive(history(), issue_view(*_baseline_comments()[:7]))
+    for column in _BASELINE_COLUMNS:
+        assert unbounded[column] == {"value": None, "evidence": "unavailable"}
+    legacy = derive(
+        history(state="CLOSED", closed=at(30, 11)),
+        issue_view(*_provenance_comments()),
+    )
+    for column in _BASELINE_COLUMNS:
+        assert legacy[column] == {"value": 0, "evidence": "verified"}

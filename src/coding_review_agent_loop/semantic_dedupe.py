@@ -204,6 +204,7 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
                 DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
                 DEFAULT_PLAN_STEP_BACK_ROUNDS,
                 DEFAULT_PLAN_SWEEP_ROUNDS,
+                DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
             )
 
             values: dict[str, object] = {
@@ -239,6 +240,7 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
                 "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
                 "plan_sweep_rounds": DEFAULT_PLAN_SWEEP_ROUNDS,
                 "plan_sweep_reasoning_effort": "",
+                "plan_provenance_baseline_max_chars": DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
             }
             if backend == "claude":
                 values["claude_model"] = model
