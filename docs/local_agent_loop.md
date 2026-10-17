@@ -1921,9 +1921,15 @@ Cleanup is `confirmed` only when both of these hold:
 - a host-wide census of `/proc`, reading both `stat` and `status` for every
   process, finds no live non-kernel process, of any uid,
   started at or after the supervisor's start, other than the supervisor itself
-  and the owned inventory.
+  and the owned inventory. An entry that has already exited and only awaits
+  reaping is not a live process and is skipped: both `stat` and the `status`
+  `State:` line must report the same zombie or dead state (`Z`, `X` or `x`)
+  and `status` must report `Threads: 1`.
 
-The census has no uid, scope or ancestry exemption, so work delegated to
+A zombie thread-group leader whose other threads are still running
+(`Threads:` above 1), an entry with a missing or unparsable `State:` or
+`Threads:` line, and an entry whose `stat` and `status` states disagree are
+still flagged. The census has no uid, scope or ancestry exemption, so work delegated to
 `systemd-run --user`, a session manager, cron, another agent-loop scope or a
 daemon of another uid is flagged. Flagged processes yield `cleanup=escaped` and
 are printed to stderr with their PIDs, uids, command names and cgroups. They

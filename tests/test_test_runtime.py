@@ -6308,9 +6308,18 @@ def _fx_fake_proc(root: Path, entries: dict[int, dict]) -> Path:
     for pid, info in entries.items():
         directory = root / str(pid)
         directory.mkdir(parents=True)
-        fields = ["S", str(info.get("ppid", 1))] + ["0"] * 4 + [str(info.get("flags", 0))] + ["0"] * 12 + [str(info["start"])]
+        state = info.get("state", "S")
+        fields = [state, str(info.get("ppid", 1))] + ["0"] * 4 + [str(info.get("flags", 0))] + ["0"] * 12 + [str(info["start"])]
         (directory / "stat").write_text(f"{pid} ({info.get('comm', 'proc')}) " + " ".join(fields) + "\n")
-        (directory / "status").write_text(f"Name:\tproc\nUid:\t{info.get('uid', 1000)}\t0\t0\t0\n")
+        status = f"Name:\tproc\n"
+        status_state = info.get("status_state", state)
+        if status_state is not None:
+            status += f"State:\t{status_state} (state)\n"
+        status += f"Uid:\t{info.get('uid', 1000)}\t0\t0\t0\n"
+        threads = info.get("threads", 1)
+        if threads is not None:
+            status += f"Threads:\t{threads}\n"
+        (directory / "status").write_text(status)
         (directory / "cgroup").write_text(info.get("cgroup", "0::/user.slice") + "\n")
     return root
 
@@ -6360,6 +6369,90 @@ def test_fixture_census_unreadable_entry_is_unconfirmed(tmp_path):
     assert fx_supervisor.census(
         window_start=100, owned=(), self_identity=(100, 100), proc_root=tmp_path / "missing",
     ).cleanup == "unconfirmed"
+
+
+def _fx_census(proc: Path):
+    return fx_supervisor.census(window_start=100, owned=(), self_identity=(100, 100), proc_root=proc)
+
+
+@pytest.mark.parametrize("state", ["Z", "X", "x"])
+def test_fixture_census_skips_single_thread_dead_entry(tmp_path, monkeypatch, state):
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(fx_supervisor.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        1: {"start": 1, "ppid": 0},
+        50: {"start": 50, "ppid": 1, "comm": "parent"},              # unrelated pre-window parent
+        100: {"start": 100},
+        200: {"start": 150, "ppid": 50, "state": state, "threads": 1},  # unreaped child
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "confirmed"
+    assert result.escaped == []
+    assert signals == []
+
+
+def test_fixture_census_flags_zombie_leader_with_live_threads(tmp_path):
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": "Z", "threads": 3},
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "escaped"
+    assert [item["pid"] for item in result.escaped] == [200]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"threads": None},                        # Threads line missing
+        {"threads": "many"},                      # Threads line unparsable
+        {"threads": ""},                          # Threads line without a value
+        {"status_state": None},                   # State line missing
+        {"status_state": ""},                     # State line without a value
+        {"status_state": "S"},                    # stat dead, status live
+        {"status_state": "X"},                    # stat and status name different dead states
+    ],
+)
+def test_fixture_census_flags_ambiguous_dead_entry(tmp_path, overrides):
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": "Z", **overrides},
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "escaped"
+    assert [item["pid"] for item in result.escaped] == [200]
+
+
+def test_fixture_census_flags_live_stat_with_dead_status(tmp_path):
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": "S", "status_state": "Z"},
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "escaped"
+    assert [item["pid"] for item in result.escaped] == [200]
+
+
+def test_fixture_census_zombie_with_unreadable_status_is_unconfirmed(tmp_path):
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": "Z"},
+    })
+    (proc / "200" / "status").unlink()
+    (proc / "200" / "status").mkdir()  # reading it fails while the entry exists
+    assert _fx_census(proc).cleanup == "unconfirmed"
+
+
+@pytest.mark.parametrize("state", ["R", "S", "D", "T", "t", "I"])
+def test_fixture_census_flags_every_live_state(tmp_path, state):
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": state},
+        201: {"start": 151, "state": "Z"},
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "escaped"
+    assert [item["pid"] for item in result.escaped] == [200]
 
 
 @_FX_HOST
