@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import datetime
 import hashlib
-import re
 import shlex
 import sys
 import time
@@ -65,6 +64,7 @@ from .pr_board_state import (
     check_lineage_floor,
     qualification_board_check,
     resolve_pr_board_state,
+    resolve_pr_owning_issue,
 )
 from .round_state import (
     canonical_deferred_history_items,
@@ -683,39 +683,38 @@ def _entry_plan_handoff_board(
 ) -> PlanHandoffBoard | None:
     """Read-only handoff board of the exact approved plan bound to this PR.
 
-    Runs before the first PR write, so it uses only authoritative scope: the
-    caller's issue, else an explicit managed-CI issue scope, else the PR-side
-    contract's primary issue.  The plan identity comes from the caller's
-    approved plan or the issue-side handoff that names this PR, and the board
+    Runs before the first PR write, so it uses only authoritative scope from
+    :func:`resolve_pr_owning_issue`, shared with the named legacy entry check:
+    the caller's issue, else an explicit managed-CI issue scope, else the
+    PR-side contract's primary issue, else the managed branch's issue during
+    managed-CI recovery, else the single linked issue.  The plan identity
+    comes from the caller's approved plan or the issue-side handoff that names
+    this PR, and the board
     is taken from the issue (child, else staged parent) holding exactly that
     plan, the same selection the handoff seam applies.  ``None`` means no
     plan is bound, so no plan authorization applies.
     """
-    fresh_scope_number = managed_ci_issue_number or config.managed_ci_issue_number
-    branch_match = re.fullmatch(
-        r"agent-loop/managed-([1-9]\d*)", pr_context.metadata.head_branch or "",
-    )
-    branch_number = int(branch_match.group(1)) if branch_match is not None else None
-    ordinary_managed_recovery = config.managed_ci_pr_mode or fresh_scope_number is not None
-    owning_number = issue_context.number if issue_context is not None else None
-    if owning_number is None:
-        owning_number = fresh_scope_number
-    if owning_number is None:
+    def recorded_primary_issue_number() -> int | None:
         recorded = find_latest_pr_contract(
             pr_context.comments, repository=config.repo, pr_number=pr_number,
         )
-        if recorded is not None:
-            owning_number = recorded.primary_issue_number
-    if owning_number is None and ordinary_managed_recovery:
-        # Ordinary managed-CI recovery binds the issue named by the managed
-        # branch, exactly as recover_issue_created_handoff does.
-        owning_number = branch_number
-    if owning_number is None:
-        # The same single-linked-issue fallback the provenance block applies;
-        # its handoff record must still name this PR to bind a plan.
-        linked = parse_linked_issue_numbers(pr_context.metadata.body, repo=config.repo)
-        if len(linked) == 1:
-            owning_number = linked[0]
+        return recorded.primary_issue_number if recorded is not None else None
+
+    # The same owning-issue resolution the named legacy entry check uses
+    # (#1418); ordinary managed-CI recovery binds the managed branch's issue
+    # exactly as recover_issue_created_handoff does.
+    resolved = resolve_pr_owning_issue(
+        config,
+        caller_issue_number=issue_context.number if issue_context is not None else None,
+        managed_ci_issue_number=managed_ci_issue_number,
+        head_branch=pr_context.metadata.head_branch,
+        recorded_primary_issue_number=recorded_primary_issue_number,
+        pr_body=pr_context.metadata.body,
+    )
+    fresh_scope_number = resolved.fresh_scope_number
+    branch_number = resolved.branch_issue_number
+    ordinary_managed_recovery = resolved.ordinary_managed_recovery
+    owning_number = resolved.owning_issue_number
     if owning_number is None:
         return None
     # Only the managed-CI recovery paths bind an issue's canonical plan when
@@ -890,6 +889,8 @@ def run_pr_loop(
                 issue_context.number if issue_context is not None else None
             ),
             pr_body=initial_pr_context.metadata.body,
+            managed_ci_issue_number=managed_ci_issue_number,
+            head_branch=initial_pr_context.metadata.head_branch,
         )
         # The first PR write (the retained-label release, managed-CI fresh
         # authorization, activation, or any post) follows this point.  Whenever

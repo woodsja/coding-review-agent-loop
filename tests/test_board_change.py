@@ -4791,3 +4791,179 @@ def test_named_legacy_entry_check_requires_actor_authored_records(tmp_path):
     foreign.pr_payload["comments"][0].update(_rest_author_id=999, author={"login": "intruder"})
     with pytest.raises(AgentLoopError, match="Human decision required: PR #77 has unanchored"):
         _entry_check(foreign, config, [body])
+
+
+# --- Shared owning-issue resolution for the named legacy entry (#1418) -----------------
+
+
+def _owning_handoff(*, issue_number=56, login="coding-review-agent-loop", author_id=_ACTOR_ID):
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+
+    return {
+        "author": {"login": login},
+        "createdAt": "2026-05-19T09:00:00Z",
+        "body": format_issue_pr_handoff_comment(
+            issue_number=issue_number, pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="abc123",
+            flow="issue-implementation", plan_hash=None,
+        ),
+        "_rest_author_id": author_id,
+    }
+
+
+def _managed_entry_runner(body, issue_comments_by_number, *, head_branch="agent-loop/managed-56"):
+    runner = _legacy_runner([body])
+    runner.pr_payload.update(body="Task PR.", headRefName=head_branch)
+    runner.serve_rest_issue_comments = True
+    runner.issue_comments_by_number = {
+        int(number): list(comments) for number, comments in issue_comments_by_number.items()
+    }
+    return runner
+
+
+def _owning_entry_check(runner, config, body, **kwargs):
+    from coding_review_agent_loop.pr_board_state import authenticate_named_legacy_pr_entry
+
+    authenticate_named_legacy_pr_entry(
+        runner, config=config, pr_number=77, comments=[SimpleNamespace(body=body)],
+        owning_issue_number=None, pr_body="Task PR.", **kwargs,
+    )
+
+
+def _issue_rest_reads(runner, number):
+    return [
+        cmd for cmd in _rest_reads(runner)
+        if cmd[2].startswith(f"repos/OWNER/REPO/issues/{number}/comments?")
+    ]
+
+
+def test_named_legacy_entry_check_refuses_a_foreign_handoff_on_the_managed_branch_issue(tmp_path):
+    """Row managed-branch-foreign-handoff: the branch-named issue is authenticated."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash, managed_ci_pr_mode=True)
+    body = _legacy("coder", "Claude", 1)
+    runner = _managed_entry_runner(
+        body, {56: [_owning_handoff(login="intruder", author_id=999)]},
+    )
+    with pytest.raises(AgentLoopError, match="handoff record on issue #56 is not the latest"):
+        _owning_entry_check(runner, config, body, head_branch="agent-loop/managed-56")
+    assert _issue_rest_reads(runner, 56)
+    assert len(runner.pr_payload["comments"]) == 1
+
+
+def test_named_legacy_entry_check_admits_an_actor_handoff_on_the_managed_branch_issue(tmp_path):
+    """Row managed-branch-authored-handoff: the same setup with an actor-authored handoff passes."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash, managed_ci_pr_mode=True)
+    body = _legacy("coder", "Claude", 1)
+    runner = _managed_entry_runner(body, {56: [_owning_handoff()]})
+    _owning_entry_check(runner, config, body, head_branch="agent-loop/managed-56")
+    assert _issue_rest_reads(runner, 56)
+
+
+@pytest.mark.parametrize("scope_source", ["argument", "config"])
+def test_named_legacy_entry_check_authenticates_the_explicit_managed_ci_scope(tmp_path, scope_source):
+    """Row explicit-scope-wins: the scope issue, not the branch issue, is authenticated."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    overrides = {"managed_ci_issue_number": 58} if scope_source == "config" else {}
+    config = _named(tmp_path, "codex", flash, **overrides)
+    body = _legacy("coder", "Claude", 1)
+    issues = {
+        56: [_owning_handoff()],
+        58: [_owning_handoff(issue_number=58, login="intruder", author_id=999)],
+    }
+    kwargs = {"managed_ci_issue_number": 58} if scope_source == "argument" else {}
+    runner = _managed_entry_runner(body, issues)
+    with pytest.raises(AgentLoopError, match="handoff record on issue #58 is not the latest"):
+        _owning_entry_check(runner, config, body, head_branch="agent-loop/managed-56", **kwargs)
+    assert _issue_rest_reads(runner, 58)
+    assert not _issue_rest_reads(runner, 56)
+
+    issues[58] = [_owning_handoff(issue_number=58)]
+    admitted = _managed_entry_runner(body, issues)
+    _owning_entry_check(admitted, config, body, head_branch="agent-loop/managed-56", **kwargs)
+    assert _issue_rest_reads(admitted, 58)
+    assert not _issue_rest_reads(admitted, 56)
+
+
+def test_named_legacy_entry_check_skips_the_managed_branch_outside_managed_ci(tmp_path):
+    """Row non-managed-branch-no-fallback: no new issue read or refusal."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash)
+    body = _legacy("coder", "Claude", 1)
+    runner = _managed_entry_runner(
+        body, {56: [_owning_handoff(login="intruder", author_id=999)]},
+    )
+    _owning_entry_check(runner, config, body, head_branch="agent-loop/managed-56")
+    assert not _issue_rest_reads(runner, 56)
+
+
+
+
+@pytest.mark.parametrize(
+    "caller, argument_scope, config_scope, contract, branch, managed_mode, body, expected",
+    [
+        # (owning, fresh_scope, branch_issue, ordinary_managed_recovery)
+        (41, 42, None, 43, "agent-loop/managed-44", True, "Fixes #45", (41, 42, 44, True)),
+        (None, 42, 49, 43, "agent-loop/managed-44", False, "Fixes #45", (42, 42, 44, True)),
+        (None, None, 49, 43, "agent-loop/managed-44", False, "Fixes #45", (49, 49, 44, True)),
+        (None, None, None, 43, "agent-loop/managed-44", True, "Fixes #45", (43, None, 44, True)),
+        (None, None, None, None, "agent-loop/managed-44", True, "Fixes #45", (44, None, 44, True)),
+        (None, None, None, None, "agent-loop/managed-44", False, "Fixes #45", (45, None, 44, False)),
+        (None, None, None, None, "agent-loop/managed-44", False, "Task PR.", (None, None, 44, False)),
+        (None, None, None, None, "agent-loop/managed-0", True, "Fixes #45", (45, None, None, True)),
+        (None, None, None, None, "feature/x", True, "Fixes #45", (45, None, None, True)),
+        (None, None, None, None, None, True, "Fixes #45 and fixes #46", (None, None, None, True)),
+        (None, None, None, None, "agent-loop/managed-44-x", True, "Task PR.", (None, None, None, True)),
+    ],
+)
+def test_resolve_pr_owning_issue_order_and_recovery_fields(
+    tmp_path, caller, argument_scope, config_scope, contract, branch, managed_mode, body, expected,
+):
+    """Row resolver-parity: the documented order and the recovery-scope fields."""
+    from coding_review_agent_loop.pr_board_state import resolve_pr_owning_issue
+
+    config = make_config(
+        tmp_path, managed_ci_pr_mode=managed_mode, managed_ci_issue_number=config_scope,
+    )
+    reads = []
+
+    def lazy_contract():
+        reads.append(1)
+        return contract
+
+    resolved = resolve_pr_owning_issue(
+        config, caller_issue_number=caller, managed_ci_issue_number=argument_scope,
+        head_branch=branch, recorded_primary_issue_number=lazy_contract, pr_body=body,
+    )
+    assert (
+        resolved.owning_issue_number, resolved.fresh_scope_number,
+        resolved.branch_issue_number, resolved.ordinary_managed_recovery,
+    ) == expected
+    # The contract is consulted only when the caller and the scope resolve nothing.
+    assert reads == ([] if caller is not None or resolved.fresh_scope_number else [1])
+    # A precomputed contract value resolves identically.
+    assert resolve_pr_owning_issue(
+        config, caller_issue_number=caller, managed_ci_issue_number=argument_scope,
+        head_branch=branch, recorded_primary_issue_number=contract, pr_body=body,
+    ) == resolved
+
+
+def test_run_pr_loop_refuses_a_foreign_managed_branch_handoff_before_any_write(tmp_path):
+    """Row managed-branch-foreign-handoff: run_pr_loop refuses with nothing written."""
+    flash = _seat(tmp_path, "flash", "antigravity", "Model F")
+    config = _named(tmp_path, "codex", flash, managed_ci_pr_mode=True)
+    body = _legacy("coder", "Claude", 1)
+    runner = _managed_entry_runner(
+        body, {56: [_owning_handoff(login="intruder", author_id=999)]},
+    )
+    with pytest.raises(AgentLoopError, match="handoff record on issue #56 is not the latest"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _issue_rest_reads(runner, 56)
+    assert len(runner.pr_payload["comments"]) == 1
+    assert _agents(runner) == []
+    assert not [
+        cmd for cmd, _cwd in runner.commands
+        if cmd[:3] in (["gh", "pr", "comment"], ["gh", "pr", "edit"], ["gh", "workflow", "run"])
+        or (cmd[:2] == ["gh", "api"] and any(arg in ("POST", "PATCH", "DELETE") for arg in cmd))
+    ]
