@@ -328,7 +328,12 @@ head advance is authorized instead by the tool-owned merge-conflict obligation:
 exactly one coder round metadata record for the new exact head and the
 immediately following round, authored by the bound actor, newer than the
 predecessor authorization, carrying the orchestrator-minted machine-authority
-merge-conflict obligation in its round items. That obligation is minted by the
+merge-conflict obligation in its round items. The obligation counts only with
+machine authority, an open `blocking` or `same-pr` status, and a
+`repair_required` (as minted) or `awaiting_current_head_review` (advanced for
+the pushed head) lifecycle; a resolved, deferred, cleared or qualification-stage
+item does not, and its raw fields are type-checked before comparison (#1057).
+That obligation is minted by the
 tool and sits outside the coder's classifiable item namespace, so an agent
 response cannot introduce it. The continuity comment binds that single record,
 and resume reauthenticates the same shape rather than a reviewer pair that never

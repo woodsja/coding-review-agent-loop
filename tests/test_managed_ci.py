@@ -1454,6 +1454,224 @@ def test_continuity_publication_rejects_a_lone_coder_record_without_the_obligati
         )
 
 
+# --- #1057: only an open, live machine-authority conflict obligation counts ---
+
+
+def _conflict_item(**changes):
+    item = UnresolvedReviewItem(
+        item_id="item-merge-conflict",
+        reviewer="agent-loop",
+        source_round=13,
+        text="PR has a merge conflict with main.",
+        status="blocking",
+        authority="machine",
+        obligation_kind="merge-conflict",
+        lifecycle="repair_required",
+    )
+    return replace(item, **changes) if changes else item
+
+
+def _conflict_item_round_comment(comment_id, item, *, subject="merged-head", round_number=13):
+    return {
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="agent-loop",
+                round_number=round_number, subject=subject,
+                prior_items=(item,),
+            ),
+        ),
+    }
+
+
+def _conflict_continuity(comment_id=61):
+    return ManagedCiIssueAuthorization(
+        kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha="merged-head", actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
+        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        round_comment_ids=(comment_id,),
+    )
+
+
+def _raw_conflict_item(**changes):
+    item = {
+        "authority": "machine",
+        "obligation_kind": "merge-conflict",
+        "status": "blocking",
+        "lifecycle": "repair_required",
+    }
+    for key, value in changes.items():
+        if value is _MISSING:
+            item.pop(key)
+        else:
+            item[key] = value
+    return item
+
+
+_MISSING = object()
+
+_ACCEPTED_RAW_CONFLICT_PAYLOADS = {
+    "minted": {"prior_items": [_raw_conflict_item()]},
+    "advanced-same-pr": {
+        "new_items": [
+            _raw_conflict_item(status="same-pr", lifecycle="awaiting_current_head_review")
+        ]
+    },
+    "after-a-malformed-item": {
+        "prior_items": ["not-a-mapping", _raw_conflict_item(status=["blocking"])],
+        "new_items": [_raw_conflict_item()],
+    },
+}
+
+_REJECTED_RAW_CONFLICT_PAYLOADS = {
+    "authority-missing": {"prior_items": [_raw_conflict_item(authority=_MISSING)]},
+    "authority-unknown": {"prior_items": [_raw_conflict_item(authority="unknown")]},
+    "authority-reviewer": {"prior_items": [_raw_conflict_item(authority="reviewer")]},
+    "authority-unhashable": {"prior_items": [_raw_conflict_item(authority=["machine"])]},
+    "status-resolved": {"prior_items": [_raw_conflict_item(status="resolved")]},
+    "status-future": {"prior_items": [_raw_conflict_item(status="future")]},
+    "status-missing": {"prior_items": [_raw_conflict_item(status=_MISSING)]},
+    "status-list": {"prior_items": [_raw_conflict_item(status=["blocking"])]},
+    "status-dict": {"prior_items": [_raw_conflict_item(status={"blocking": True})]},
+    "lifecycle-cleared": {"prior_items": [_raw_conflict_item(lifecycle="cleared")]},
+    "lifecycle-qualification-ready": {
+        "prior_items": [_raw_conflict_item(lifecycle="qualification_ready")]
+    },
+    "lifecycle-qualifying": {"prior_items": [_raw_conflict_item(lifecycle="qualifying")]},
+    "lifecycle-missing": {"prior_items": [_raw_conflict_item(lifecycle=_MISSING)]},
+    "lifecycle-list": {"prior_items": [_raw_conflict_item(lifecycle=["repair_required"])]},
+    "lifecycle-dict": {"prior_items": [_raw_conflict_item(lifecycle={"a": 1})]},
+    "kind-wrong": {"prior_items": [_raw_conflict_item(obligation_kind="managed-exact-head-ci")]},
+    "kind-unhashable": {"prior_items": [_raw_conflict_item(obligation_kind=["merge-conflict"])]},
+    "non-mapping-items": {"prior_items": ["merge-conflict", 7, None, ["merge-conflict"]]},
+    "items-not-a-list": {"prior_items": _raw_conflict_item(), "new_items": "merge-conflict"},
+    "no-items": {},
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ACCEPTED_RAW_CONFLICT_PAYLOADS))
+def test_m1057_conflict_predicate_accepts_open_live_machine_obligation(case):
+    payload = _ACCEPTED_RAW_CONFLICT_PAYLOADS[case]
+    assert managed_ci._records_merge_conflict_obligation(payload) is True
+
+
+@pytest.mark.parametrize("case", sorted(_REJECTED_RAW_CONFLICT_PAYLOADS))
+def test_m1057_conflict_predicate_rejects_stale_forged_or_malformed_items(case):
+    payload = _REJECTED_RAW_CONFLICT_PAYLOADS[case]
+    assert managed_ci._records_merge_conflict_obligation(payload) is False
+
+
+def test_m1057_malformed_conflict_record_does_not_abort_decoding_other_records():
+    import coding_review_agent_loop.round_transport as transport
+
+    bad = _conflict_item_round_comment(60, _conflict_item())
+    marker = transport.ROUND_RESUME_MARKER_RE.search(bad["body"])
+    payload = transport.decode_mapping(marker.group("payload"))
+    payload["prior_items"][0]["status"] = ["blocking"]
+    payload["prior_items"][0]["lifecycle"] = {"repair_required": True}
+    bad["body"] = (
+        bad["body"][: marker.start("payload")]
+        + transport.encode_mapping(payload)
+        + bad["body"][marker.end("payload"):]
+    )
+    good = _conflict_item_round_comment(61, _conflict_item())
+
+    records = managed_ci._continuity_round_records([bad, good])
+
+    assert records[0]["resolves_merge_conflict"] is False
+    assert records[1]["resolves_merge_conflict"] is True
+
+
+def _stale_conflict_items():
+    return {
+        "unknown-authority": _conflict_item(authority="unknown"),
+        "resolved-status": _conflict_item(status="resolved"),
+        "future-status": _conflict_item(status="future"),
+        "cleared": _conflict_item(lifecycle="cleared"),
+        "qualification-ready": _conflict_item(lifecycle="qualification_ready"),
+        "qualifying": _conflict_item(lifecycle="qualifying"),
+    }
+
+
+@pytest.mark.parametrize("case", sorted(_stale_conflict_items()))
+def test_m1057_stale_or_non_machine_conflict_item_denies_continuity(tmp_path, case):
+    comment = _conflict_item_round_comment(61, _stale_conflict_items()[case])
+    records = managed_ci._continuity_round_records([comment])
+    assert records[0]["resolves_merge_conflict"] is False
+    assert records[0]["ci_repair_transitions"] == frozenset()
+
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(comment)
+    with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+            actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+            after_comment_id=50,
+        )
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [comment], authorization=_conflict_continuity()
+    ) is False
+
+
+def test_m1057_resume_rejects_a_conflict_grant_whose_obligation_went_stale(tmp_path):
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    _publish_conflict_round_continuity(runner, config=config)
+
+    runner.intent_comments = [
+        _conflict_item_round_comment(61, _conflict_item(lifecycle="cleared"))
+        if comment.get("id") == 61 else comment
+        for comment in runner.intent_comments
+    ]
+    audit = _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head="merged-head",
+    )
+
+    assert audit is None
+
+
+@pytest.mark.parametrize("confirmed_head", ["abc123", None])
+def test_m1057_orchestrator_minted_conflict_shapes_still_grant_continuity(
+    tmp_path, confirmed_head
+):
+    """The real minted and post-push advanced shapes keep authorizing continuity."""
+    from coding_review_agent_loop.unresolved_items import (
+        _advance_machine_obligations_for_head,
+        _upsert_merge_conflict_item,
+    )
+
+    minted = _upsert_merge_conflict_item(
+        [], source_round=13, text="PR has a merge conflict with main.",
+        confirmed_head_sha=confirmed_head,
+    )
+    (item,) = _advance_machine_obligations_for_head(minted, current_head_sha="merged-head")
+    expected_lifecycle = (
+        "awaiting_current_head_review" if confirmed_head else "repair_required"
+    )
+    assert item.lifecycle == expected_lifecycle
+    comment = _conflict_item_round_comment(61, item)
+
+    assert managed_ci._continuity_round_records([comment])[0]["resolves_merge_conflict"] is True
+    runner = AuthorizationCommentRunner(issue_events=[label_event()])
+    runner.intent_comments.append(comment)
+    selected = managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
+        actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+        after_comment_id=50,
+    )
+    assert selected == (61,)
+    assert managed_ci._continuity_round_metadata_is_valid(
+        [comment], authorization=_conflict_continuity()
+    ) is True
+
+
 # --- #1024: an exact-head CI repair round authorizes continuity on its own ---
 
 
