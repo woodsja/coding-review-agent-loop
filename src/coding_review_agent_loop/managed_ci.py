@@ -2130,8 +2130,9 @@ def _continuity_round_records(
                 else None
             ),
             # A conflict-resolution round is orchestrator-routed and skips
-            # reviewers by construction (#829); the machine obligation on the
-            # coder record is the durable evidence of that routing.
+            # reviewers by construction (#829); the open, live machine-authority
+            # obligation on the coder record is the durable evidence of that
+            # routing (#1057).
             "resolves_merge_conflict": _records_merge_conflict_obligation(payload),
             # A CI repair round is routed by the orchestrator-minted CI
             # obligation (#1024); the (failed, candidate) head pairs it binds
@@ -2141,14 +2142,40 @@ def _continuity_round_records(
     return result
 
 
+_MERGE_CONFLICT_OPEN_STATUSES = frozenset({"blocking", "same-pr"})
+_MERGE_CONFLICT_LIVE_LIFECYCLES = frozenset({"repair_required", "awaiting_current_head_review"})
+
+
 def _records_merge_conflict_obligation(payload: Mapping[str, object]) -> bool:
-    """Whether this record carries the tool-owned merge-conflict obligation."""
+    """Whether this record carries the tool-owned merge-conflict obligation.
+
+    Only the shape the orchestrator writes for a conflict round counts: a
+    machine-authority merge-conflict obligation that is still open
+    (``blocking``/``same-pr``) and live (``repair_required`` as minted, or
+    ``awaiting_current_head_review`` once advanced for the pushed head).  A
+    resolved, deferred, cleared or qualification-stage item is not evidence of
+    a conflict round (#1057).
+    """
     for key in ("prior_items", "new_items"):
         items = payload.get(key)
         if not isinstance(items, list):
             continue
         for item in items:
-            if isinstance(item, Mapping) and item.get("obligation_kind") == "merge-conflict":
+            if not isinstance(item, Mapping):
+                continue
+            # Items are arbitrary JSON from any commenter and are decoded before
+            # author filtering, so raw fields are type-checked before they are
+            # hashed by a membership test (#1370).
+            status = item.get("status")
+            lifecycle = item.get("lifecycle")
+            if (
+                item.get("authority") == MACHINE_AUTHORITY
+                and item.get("obligation_kind") == "merge-conflict"
+                and isinstance(status, str)
+                and status in _MERGE_CONFLICT_OPEN_STATUSES
+                and isinstance(lifecycle, str)
+                and lifecycle in _MERGE_CONFLICT_LIVE_LIFECYCLES
+            ):
                 return True
     return False
 
