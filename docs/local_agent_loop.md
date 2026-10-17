@@ -642,6 +642,11 @@ role and advertised turn bound, or `unknown holder`) and waits that holder's
 advertised turn bound plus a 180s margin, falling back to its own turn bound
 (the larger of `--antigravity-print-timeout-seconds`, the repair timeout and the
 turn timeout) plus the margin for an unknown holder, and never less than 120s.
+A `semantic-dedupe` holder advertises its resolved per-call timeout
+(`--semantic-followup-timeout-seconds`, 120s by default for antigravity),
+because the runner enforces that timeout; every other role advertises the
+role-independent bound above, and a waiter's own fallback for an unknown holder
+stays that role-independent bound whatever its role.
 The window restarts for each new holder, under an overall cap of three times
 the largest allowance seen. An expired wait is a transient, seat-local failure:
 the validated turn retries the wait once in place (without spending
