@@ -160,8 +160,13 @@ resolves it read-only at PR entry, at startup and at the qualification gate.
   `run_pr_loop` entry. It is a top-level call after base resolution and before
   the floor/amendment block and the first PR write, with no other gate. It
   applies only when named seats are configured and the PR has unanchored coder,
-  reviewer or summary records and no link. It reads the PR, and the owning issue,
-  with `github.read_authenticated_protocol_comments`. Each such record, the PR
+  reviewer or summary records and no link. The owning issue comes from
+  `pr_board_state.resolve_pr_owning_issue`, the same resolver
+  `pr_loop._entry_plan_handoff_board` uses: the caller's issue, else the
+  explicit managed-CI issue scope, else the PR contract's primary issue, else
+  the `agent-loop/managed-N` branch issue during managed-CI recovery, else the
+  single linked issue. It reads the PR, and that owning issue, with
+  `github.read_authenticated_protocol_comments`. Each such record, the PR
   contract record, and the latest handoff record naming the PR (compared with
   the unfiltered `resolve_issue_pr_handoff_lineage` selection) must be authored
   by the authenticated actor; otherwise it refuses for a human decision.

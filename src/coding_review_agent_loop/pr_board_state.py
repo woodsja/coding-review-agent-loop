@@ -10,6 +10,7 @@ agent, so every caller can refuse before any write.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
@@ -336,6 +337,73 @@ def named_legacy_entry_required(config: object, comments: Sequence[object]) -> b
     return any(record.metadata.role in _LEGACY_ENTRY_ROLES for record in records)
 
 
+# Same pattern recover_issue_created_handoff applies to a managed branch.
+_MANAGED_BRANCH_RE = re.compile(r"agent-loop/managed-([1-9]\d*)")
+
+
+@dataclass(frozen=True)
+class PrOwningIssue:
+    """The issue that owns a PR's handoff for one invocation (#1418)."""
+
+    owning_issue_number: int | None
+    fresh_scope_number: int | None
+    branch_issue_number: int | None
+    ordinary_managed_recovery: bool
+
+
+def resolve_pr_owning_issue(
+    config: object,
+    *,
+    caller_issue_number: int | None,
+    managed_ci_issue_number: int | None,
+    head_branch: str | None,
+    recorded_primary_issue_number: int | None | Callable[[], int | None],
+    pr_body: str | None,
+) -> PrOwningIssue:
+    """Resolve the issue that owns a PR before its first write (#1418).
+
+    The order is: the caller's issue; else the explicit managed-CI issue
+    scope (the argument, else ``config.managed_ci_issue_number``); else the
+    recorded PR contract's primary issue; else, only during ordinary
+    managed-CI recovery (managed-CI PR mode or a fresh scope), the issue named
+    by an ``agent-loop/managed-N`` head branch; else the single issue the PR
+    body links.  ``recorded_primary_issue_number`` may be a callable so a
+    caller reads the contract only when the earlier lookups resolve nothing.
+    Performs no I/O.
+    """
+    from .github import parse_linked_issue_numbers
+
+    fresh_scope_number = managed_ci_issue_number or getattr(
+        config, "managed_ci_issue_number", None
+    )
+    branch_match = _MANAGED_BRANCH_RE.fullmatch(head_branch or "")
+    branch_number = int(branch_match.group(1)) if branch_match is not None else None
+    ordinary_managed_recovery = bool(
+        getattr(config, "managed_ci_pr_mode", False) or fresh_scope_number is not None
+    )
+    owning_number = caller_issue_number
+    if owning_number is None:
+        owning_number = fresh_scope_number
+    if owning_number is None:
+        owning_number = (
+            recorded_primary_issue_number()
+            if callable(recorded_primary_issue_number)
+            else recorded_primary_issue_number
+        )
+    if owning_number is None and ordinary_managed_recovery:
+        owning_number = branch_number
+    if owning_number is None:
+        linked = parse_linked_issue_numbers(pr_body, repo=getattr(config, "repo"))
+        if len(linked) == 1:
+            owning_number = linked[0]
+    return PrOwningIssue(
+        owning_issue_number=owning_number,
+        fresh_scope_number=fresh_scope_number,
+        branch_issue_number=branch_number,
+        ordinary_managed_recovery=ordinary_managed_recovery,
+    )
+
+
 def authenticate_named_legacy_pr_entry(
     runner: object,
     *,
@@ -344,18 +412,22 @@ def authenticate_named_legacy_pr_entry(
     comments: Sequence[object],
     owning_issue_number: int | None,
     pr_body: str | None = None,
+    managed_ci_issue_number: int | None = None,
+    head_branch: str | None = None,
 ) -> None:
     """Refuse unanchored named-board PR history not written by the actor (#1365).
 
     Before the PR loop adopts unanchored legacy round records under a named
     board, every coder, reviewer or summary record and the owning issue's
     canonical handoff record must be authored by the authenticated actor.
-    The owning issue is chosen as the PR loop chooses it: the caller's issue,
-    else the PR contract's primary issue, else the single issue the PR body
-    links.  Reads only; any failure raises before a PR write or agent
-    invocation.
+    The owning issue comes from :func:`resolve_pr_owning_issue`, the same
+    resolver ``pr_loop._entry_plan_handoff_board`` uses: the caller's issue,
+    else the explicit managed-CI issue scope, else the PR contract's primary
+    issue, else the ``agent-loop/managed-N`` branch issue during managed-CI
+    recovery, else the single issue the PR body links (#1418).  Reads only;
+    any failure raises before a PR write or agent invocation.
     """
-    from .github import parse_linked_issue_numbers, read_authenticated_protocol_comments
+    from .github import read_authenticated_protocol_comments
     from .issue_pr_handoff import resolve_issue_pr_handoff_lineage
     from .pr_contract import find_latest_pr_contract
     from .pr_loop_support import _cached_trusted_actor
@@ -392,12 +464,16 @@ def authenticate_named_legacy_pr_entry(
     recorded = find_latest_pr_contract(pr_full, repository=repo, pr_number=pr_number)
     if recorded != find_latest_pr_contract(pr_view.authored, repository=repo, pr_number=pr_number):
         raise refuse("its PR contract record was not written by the authenticated actor")
-    if owning_issue_number is None and recorded is not None:
-        owning_issue_number = recorded.primary_issue_number
-    if owning_issue_number is None:
-        linked = parse_linked_issue_numbers(pr_body, repo=repo)
-        if len(linked) == 1:
-            owning_issue_number = linked[0]
+    owning_issue_number = resolve_pr_owning_issue(
+        config,
+        caller_issue_number=owning_issue_number,
+        managed_ci_issue_number=managed_ci_issue_number,
+        head_branch=head_branch,
+        recorded_primary_issue_number=(
+            recorded.primary_issue_number if recorded is not None else None
+        ),
+        pr_body=pr_body,
+    ).owning_issue_number
     if owning_issue_number is None:
         # Task-origin PRs have no issue handoff record.
         return
