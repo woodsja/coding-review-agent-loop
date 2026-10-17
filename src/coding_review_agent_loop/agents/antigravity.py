@@ -111,6 +111,28 @@ def settings_lock_turn_bound_seconds(
     ))
 
 
+def settings_lock_advertised_turn_bound_seconds(
+    config: AgentLoopConfig, role: str | None, timeout_seconds: float | None = None
+) -> float:
+    """Turn bound this invocation publishes in its settings-lock holder record.
+
+    Only a ``semantic-dedupe`` turn narrows: it always runs under its resolved
+    per-call runner timeout, and that timeout (not agy's print timeout) is the
+    real bound on its hold (#1508). Every other role, and a dedupe call without
+    a positive finite timeout, advertises the role-independent bound. A
+    waiter's own allowance for an unknown holder stays role-independent.
+    """
+    if (
+        role == _SEMANTIC_DEDUPE_ROLE
+        and isinstance(timeout_seconds, (int, float))
+        and not isinstance(timeout_seconds, bool)
+        and math.isfinite(timeout_seconds)
+        and timeout_seconds > 0
+    ):
+        return float(timeout_seconds)
+    return settings_lock_turn_bound_seconds(config, timeout_seconds)
+
+
 def settings_lock_wait_budget_seconds(turn_bound_seconds: float) -> float:
     """Wait allowance for one holder whose turn is bounded by *turn_bound_seconds*."""
     return float(max(
@@ -1270,6 +1292,9 @@ class AntigravityBackend:
         seat_label = config.active_reviewer_seat_id or "Antigravity"
         holder_path = _settings_lock_holder_path(settings_lock_path)
         own_turn_bound = settings_lock_turn_bound_seconds(config, timeout_seconds)
+        advertised_turn_bound = settings_lock_advertised_turn_bound_seconds(
+            config, role, timeout_seconds
+        )
         holder_token = secrets.token_hex(16)
         # Set only after this invocation acquired the lock AND replaced the
         # holder record, so a timed-out waiter never removes another's record.
@@ -1290,7 +1315,7 @@ class AntigravityBackend:
                     run_id=run_id,
                     seat=config.active_reviewer_seat_id,
                     role=role,
-                    turn_bound_seconds=own_turn_bound,
+                    turn_bound_seconds=advertised_turn_bound,
                 ))
                 holder_token_published = True
             except OSError as exc:

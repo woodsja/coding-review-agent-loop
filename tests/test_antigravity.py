@@ -1986,3 +1986,155 @@ def test_antigravity_repair_and_reviewer_paths_keep_their_behaviour(tmp_path, mo
     assert "Run any verification steps" in coder_prompt
     # Reviewer and coder still take the git-metadata lock and snapshots.
     assert runner.git_probe_calls
+
+
+# --- Role-aware advertised settings-lock bound (#1508) ----------------------
+
+
+def test_settings_lock_advertised_turn_bound_narrows_only_semantic_dedupe(tmp_path):
+    """`dedupe-without-timeout` / `other-roles-unchanged` (#1508)."""
+    import importlib
+
+    agy_mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
+    advertised = agy_mod.settings_lock_advertised_turn_bound_seconds
+    config = make_config(tmp_path, antigravity_print_timeout_seconds=600, repair_timeout_seconds=120)
+    repair_heavy = make_config(tmp_path, antigravity_print_timeout_seconds=60, repair_timeout_seconds=900)
+
+    assert advertised(config, "semantic-dedupe", 120) == 120
+    assert advertised(config, "semantic-dedupe", 120.0) == 120
+    assert advertised(config, "semantic-dedupe", 900) == 900
+    assert advertised(config, "semantic-dedupe", 5) == 5
+    # Without a positive finite timeout the dedupe role never under-advertises.
+    for missing in (None, 0, -1):
+        assert advertised(config, "semantic-dedupe", missing) == 600
+    assert advertised(repair_heavy, "semantic-dedupe", None) == 900
+    # Every other role keeps exactly the role-independent bound.
+    for role in ("reviewer", "coder", "repair", None):
+        for timeout in (None, 120, 1500):
+            assert advertised(config, role, timeout) == agy_mod.settings_lock_turn_bound_seconds(
+                config, timeout
+            )
+            assert advertised(repair_heavy, role, timeout) == agy_mod.settings_lock_turn_bound_seconds(
+                repair_heavy, timeout
+            )
+    assert advertised(config, "reviewer", 120) == 600
+    assert advertised(config, "coder", 120) == 600
+    assert advertised(repair_heavy, "repair", None) == 900
+
+
+def _record_holder_publications(harness, monkeypatch):
+    import fcntl
+    import json
+
+    order: list[str] = []
+    published: list[dict] = []
+    real_flock = fcntl.flock
+
+    def ordered_flock(handle, operation):
+        if getattr(handle, "name", None) == str(harness.lock_path) and operation == fcntl.LOCK_UN:
+            order.append("unlock:" + ("record" if harness.holder_path.exists() else "no-record"))
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", ordered_flock)
+
+    class Runner(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            published.append(json.loads(harness.holder_path.read_text(encoding="utf-8")))
+            return super().run_with_log(args, **kwargs)
+
+    return Runner, published, order
+
+
+def test_semantic_dedupe_holder_publishes_its_runner_timeout(tmp_path, monkeypatch):
+    """`dedupe-holder-publishes-runner-timeout` (#1508)."""
+    from coding_review_agent_loop.protocol import PUBLIC_RESPONSE_MARKER
+
+    harness = _SettingsLockHarness(tmp_path, monkeypatch)
+    Runner, published, order = _record_holder_publications(harness, monkeypatch)
+    config = harness.config(
+        tmp_path, antigravity_print_timeout_seconds=600, active_reviewer_seat_id="flash"
+    )
+    answer = '{"duplicate_of": null, "confidence": "low", "reason": "distinct"}'
+    result = harness.mod.AntigravityBackend().run(
+        Runner(antigravity_outputs=[(f"{PUBLIC_RESPONSE_MARKER}\n{answer}", 0)]),
+        config, "Classify.", run_id="run-dedupe",
+        role="semantic-dedupe", label="semantic-followup-dedupe", timeout_seconds=120.0,
+    )
+
+    assert result.text == answer
+    assert len(published) == 1
+    assert published[0]["role"] == "semantic-dedupe"
+    assert published[0]["turn_bound_seconds"] == 120
+    assert published[0]["run_id"] == "run-dedupe"
+    assert set(published[0]) == {"token", "pid", "run_id", "seat", "role", "turn_bound_seconds"}
+    # Removed by its owner before unlock, exactly as for other roles.
+    assert order == ["unlock:no-record"]
+    assert not harness.holder_path.exists()
+    assert harness.settings.read_text(encoding="utf-8") == harness.original_settings
+
+
+@pytest.mark.parametrize(
+    ("role", "timeout_seconds", "expected"),
+    [("reviewer", None, 600), ("reviewer", 1500.0, 1500), ("coder", 120.0, 600),
+     ("coder", None, 600), ("repair", None, 900)],
+)
+def test_non_dedupe_holders_publish_the_role_independent_bound(
+    tmp_path, monkeypatch, role, timeout_seconds, expected
+):
+    """`other-roles-unchanged` (#1508): only semantic-dedupe narrows its bound."""
+    harness = _SettingsLockHarness(tmp_path, monkeypatch)
+    Runner, published, order = _record_holder_publications(harness, monkeypatch)
+    repair_timeout = 900 if role == "repair" else 120
+    config = harness.config(
+        tmp_path, antigravity_print_timeout_seconds=600, repair_timeout_seconds=repair_timeout
+    )
+    kwargs = {"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}
+    harness.mod.AntigravityBackend().run(
+        Runner(antigravity_outputs=[("ok", 0)]), config, "Work.", role=role, **kwargs
+    )
+    assert published[0]["role"] == role
+    assert published[0]["turn_bound_seconds"] == expected
+    assert published[0]["turn_bound_seconds"] == harness.mod.settings_lock_turn_bound_seconds(
+        config, timeout_seconds
+    )
+    assert order == ["unlock:no-record"]
+
+
+def test_settings_lock_waiter_behind_a_dedupe_holder_allows_300s(tmp_path, monkeypatch, capsys):
+    """`waiter-behind-dedupe-holder` (#1508): 120s bound + 180s margin, not 780s."""
+    from coding_review_agent_loop.errors import AgentSettingsLockWaitTimeout
+
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=5000)
+    harness.write_holder(role="semantic-dedupe", turn_bound_seconds=120)
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    with pytest.raises(AgentSettingsLockWaitTimeout) as caught:
+        harness.mod.AntigravityBackend().run(runner, config, "Review.", role="reviewer")
+    assert caught.value.waited_seconds == pytest.approx(300, abs=0.5)
+    assert caught.value.holder_role == "semantic-dedupe"
+    assert caught.value.holder_turn_bound_seconds == 120
+    assert "turn bound 120s; allowing 300s" in capsys.readouterr().err
+    assert _agy_commands(runner) == []
+    assert harness.settings.read_text(encoding="utf-8") == harness.original_settings
+
+
+@pytest.mark.parametrize("record", [None, "{not json", '{"token": "t", "role": "semantic-dedupe"}'])
+def test_semantic_dedupe_waiter_keeps_role_independent_unknown_holder_allowance(
+    tmp_path, monkeypatch, capsys, record
+):
+    """`dedupe-waiter-unknown-holder` (#1508): own fallback is not the dedupe timeout."""
+    from coding_review_agent_loop.errors import AgentSettingsLockWaitTimeout
+
+    harness = _SettingsLockHarness(tmp_path, monkeypatch, release_at=5000)
+    if record is not None:
+        harness.holder_path.write_text(record, encoding="utf-8")
+    runner = FakeRunner(antigravity_outputs=[("ok", 0)])
+    config = harness.config(tmp_path, antigravity_print_timeout_seconds=600)
+    with pytest.raises(AgentSettingsLockWaitTimeout) as caught:
+        harness.mod.AntigravityBackend().run(
+            runner, config, "Classify.", role="semantic-dedupe", timeout_seconds=120.0
+        )
+    assert caught.value.waited_seconds == pytest.approx(780, abs=0.5)
+    assert caught.value.holder_turn_bound_seconds is None
+    assert "allowing 780s" in capsys.readouterr().err
+    assert _agy_commands(runner) == []
