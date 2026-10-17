@@ -281,6 +281,34 @@ def _uid_from_status(text: str) -> int | None:
     return None
 
 
+# Exited processes awaiting reaping (zombie or dead), as in the stat state field.
+_DEAD_STATES = frozenset({"Z", "X", "x"})
+
+
+def _status_field(text: str, key: str) -> str | None:
+    for line in text.splitlines():
+        if line.startswith(key):
+            parts = line.split()
+            return parts[1] if len(parts) > 1 else None
+    return None
+
+
+def _is_reapable_dead(entry: ProcEntry, status_text: str) -> bool:
+    """True only for a single-thread entry that stat and status both call dead.
+
+    A thread-group leader that exited while other threads still run shows
+    as a zombie in stat, but status then reports more than one thread, so it
+    stays counted.  Any missing, unparsable or disagreeing field also keeps
+    the entry counted.
+    """
+    if entry.state not in _DEAD_STATES:
+        return False
+    if _status_field(status_text, "State:") != entry.state:
+        return False
+    threads = _status_field(status_text, "Threads:")
+    return threads is not None and threads.isdigit() and int(threads) == 1
+
+
 def _cgroup(pid: int, proc_root: Path) -> str:
     try:
         return (proc_root / str(pid) / "cgroup").read_text(encoding="utf-8", errors="replace").strip()[:256]
@@ -298,9 +326,12 @@ def census(
 ) -> CensusResult:
     """Flag every live non-kernel process of any uid started in the window.
 
-    The single exclusion is the census process's own exact (pid, start)
-    identity.  There is no uid, ancestry or scope exemption.  A recycled PID
-    with a different start time is still flagged.
+    The exclusions are the census process's own exact (pid, start) identity,
+    the owned inventory, and entries that have already exited and only await
+    reaping (a single-thread entry that both stat and status report as
+    zombie or dead), which are not live processes.  There is no uid, ancestry
+    or scope exemption.  A recycled PID with a different start time is still
+    flagged.
     """
     owned_set = set(owned)
     try:
@@ -342,6 +373,8 @@ def census(
                 continue
             return CensusResult("unconfirmed", reason=f"/proc entry {name} status is unreadable")
         if is_kernel_thread(entry):
+            continue
+        if _is_reapable_dead(entry, status_text):
             continue
         if entry.start < window_start:
             continue
