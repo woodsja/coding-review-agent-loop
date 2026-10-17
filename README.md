@@ -567,7 +567,7 @@ agent-loop task "Add a health-check endpoint" \
 | `agent-loop managed-pr` | Code is pushed but no PR exists, and the repository uses managed exact-head CI. |
 | `agent-loop managed-ci preflight` | You want a read-only readiness report for managed CI. |
 | `agent-loop issue --triage` | You want an advisory route recommendation (discuss-first, plan-first or direct) posted before the run's first agent turn; the run still takes the route you selected. See [advisory issue triage](docs/local_agent_loop.md#advisory-issue-triage). |
-| `agent-loop history export` | You want a read-only per-issue outcome table (route taken, plan/PR rounds, step-backs, human-decision stops, plan finding provenance and sweep reviews, merge state, infrastructure failures, run-start snapshot). See [outcome history export](docs/local_agent_loop.md#outcome-history-export). |
+| `agent-loop history export` | You want a read-only per-issue outcome table (route taken, plan/PR rounds, step-backs, human-decision stops, plan finding provenance, baseline forms and sweep reviews, merge state, infrastructure failures, run-start snapshot). See [outcome history export](docs/local_agent_loop.md#outcome-history-export). |
 | `agent-loop triage backtest` | You want an offline, report-only measurement of a triage provider command against outcome labels from `history export` files (per-route precision/recall, majority baseline, hybrid-routing threshold finding). See [offline triage backtest](docs/local_agent_loop.md#offline-triage-backtest). |
 
 Run `agent-loop <command> --help` for the complete options for one workflow.
@@ -1565,7 +1565,11 @@ findings it tagged `revision_introduced` do not count; it never stops a run.
 `--plan-sweep-reasoning-effort LEVEL` (off by default) runs only that sweep turn at a
 higher Codex or Claude effort. Plan reviewers tag new mandatory findings with an
 optional `provenance` (`revision_introduced` or `pre_existing`) against a previous-plan
-diff, and `history export` reports the counts; see
+baseline: the unified diff, a compact sentence-level diff, or the full previous reviewed
+plan as baseline data, in that order. The diff forms must fit max(12000, half the current
+plan), and every form must fit `--plan-provenance-baseline-max-chars N` (default 120000,
+`0` disables; otherwise the baseline is unavailable). `history export` reports the tag
+counts and the baseline forms; see
 [plan sweep trigger and finding provenance](docs/local_agent_loop.md#plan-sweep-trigger-and-finding-provenance).
 An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's
@@ -1575,7 +1579,7 @@ full-board. In the PR fix loop, `--pr-step-back-rounds K` (default 3, `0` disabl
 consecutive rounds with new findings clustered on one file span, the next coder turn must fix
 the whole class with one rule and a parametrized test, that reviewer sweeps the resulting head
 for every remaining instance, and a further clustered sibling stops for a human decision. `--pr-evidence-stall-rounds K` (default 2, `0` disables) stops for a human decision (exit 4) when K consecutive PR reviews have only evidence-only blockers (findings tagged with approved risk-matrix rows that stay unverified at the head), no failing check, and an unchanged set of unsatisfied rows. `--pr-evidence-capture-attempts N` (default 2, `0` disables) first converts a row whose evidence was only capture-limited (incomplete capture, unverified launch, unknown selectors; never an authoritative failure) for N consecutive coder attempts into an exact-head human evidence obligation answered at the final evidence freeze, and `agent-loop pr N --pr-convert-evidence-rows ROW[,ROW...]` converts named unsatisfied rows on demand before any agent runs. `--pr-non-convergence-rounds K` (default 3, `0` disables, independent of `--pr-step-back-rounds`) stops for a human decision (exit 4) before the next coder turn when the same tracked-reviewer items stayed blocking across K consecutive coder turns that each changed the head, wherever the findings are; the message lists each item with its attempts, the diff growth and the PR size, and the override options (`0` or a larger K, a signed decision, a pushed change, or re-filing unattainable evidence as an exact-head evidence request). A clustered-sibling escalation stops first, and this stop wins over a fresh step-back turn. Evidence no agent session or runner can produce belongs only in `exact_head_evidence_requests`. A child-planning cycle inherits `--plan-review-policy`,
-`--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`, `--plan-sweep-rounds`, and `--plan-sweep-reasoning-effort` but never the parent's `--plan-review-force-full`
+`--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, `--plan-step-back-escalation-rounds`, `--plan-sweep-rounds`, `--plan-sweep-reasoning-effort`, and `--plan-provenance-baseline-max-chars` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted

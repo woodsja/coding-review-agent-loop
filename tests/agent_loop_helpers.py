@@ -2286,3 +2286,39 @@ def pr_payload_for_state(pr_number, state):
     }
 
 
+
+
+def long_plan_revision_pair(*, seed: int = 1516, changed_lines: int = 60) -> tuple[str, str]:
+    """A #1590-shaped canonical plan pair (#1516): long lines, one-word edits.
+
+    About 170 lines and 70-80k characters: a short median line, every ninth
+    line about 800 characters, and four lines of 5k-18k characters.  The
+    revision replaces one word in ``changed_lines`` lines, every long line
+    included, so the unified line diff is over 100k characters.
+    """
+    import random
+
+    rng = random.Random(seed)
+    words = (
+        "the reviewer plan step test record round baseline diff form budget prompt "
+        "config resume history export selector"
+    ).split()
+    long_targets = {10: 18000, 50: 9000, 90: 6000, 130: 5000}
+    lines = []
+    for index in range(170):
+        target = long_targets.get(index, 800 if index % 9 == 0 else 90)
+        parts: list[str] = []
+        size = 0
+        while size < target:
+            sentence = " ".join(rng.choice(words) for _ in range(rng.randint(8, 20)))
+            parts.append(sentence.capitalize() + ".")
+            size += len(parts[-1]) + 1
+        lines.append(f"{index}. " + " ".join(parts))
+    revised = list(lines)
+    long_lines = [index for index, line in enumerate(lines) if len(line) > 500]
+    others = [index for index in range(len(lines)) if index not in long_lines]
+    for index in long_lines + rng.sample(others, changed_lines - len(long_lines)):
+        tokens = revised[index].split(" ")
+        tokens[rng.randrange(1, len(tokens))] = "REVISED"
+        revised[index] = " ".join(tokens)
+    return "\n".join(lines), "\n".join(revised)

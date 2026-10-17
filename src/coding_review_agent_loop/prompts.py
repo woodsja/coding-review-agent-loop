@@ -2582,11 +2582,12 @@ def _plan_review_provenance_guidance(config: AgentLoopConfig) -> str:
         return ""
     return (
         "Finding provenance: when this prompt supplies a previous-plan baseline (a "
-        "diff from the plan you last reviewed), give every new `blocking_plan_issues` "
+        "diff, compact diff, or the full text of the plan you last reviewed), give every "
+        "new `blocking_plan_issues` "
         "and `same_plan_followups` finding in object form with a `provenance` key, for "
         'example {"finding": "Step 4 skips the resumed path.", "provenance": '
-        '"pre_existing"}. Use `revision_introduced` when a change shown in the '
-        "baseline diff introduced the defect, or `pre_existing` when it was already "
+        '"pre_existing"}. Use `revision_introduced` when a change shown by the '
+        "baseline introduced the defect, or `pre_existing` when it was already "
         "present in the plan you last reviewed. Omit the key on your first plan review, "
         "when the baseline is unavailable, and on `future_followups`. Do not re-raise a "
         "carried unresolved item as a new finding; disposition it instead. The tag is "
@@ -2596,17 +2597,20 @@ def _plan_review_provenance_guidance(config: AgentLoopConfig) -> str:
 
 def _plan_review_volatile_blocks(
     plan: str,
+    config: AgentLoopConfig,
     *,
     plan_sweep_classes: Sequence[str] | None,
     provenance_baseline: PlanBaseline | None,
 ) -> str:
-    """Per-round sweep request and provenance baseline (#1505); never cacheable."""
+    """Per-round sweep request and provenance baseline (#1505, #1516); never cacheable."""
     sweep = (
         render_plan_sweep_guidance(plan_sweep_classes)
         if plan_sweep_classes is not None
         else ""
     )
-    return sweep + render_provenance_baseline_block(provenance_baseline, plan)
+    return sweep + render_provenance_baseline_block(
+        provenance_baseline, plan, max_chars=config.plan_provenance_baseline_max_chars
+    )
 
 
 def _plan_review_schema_and_rules() -> str:
@@ -3662,7 +3666,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
 Review the plan for correctness, architecture fit, missing edge cases within
 the issue's scope, test strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -3827,7 +3831,7 @@ Current implementation plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{render_plan_step_back_review_notice() if step_back_review_notice else ""}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}{_agent_unavailable_guidance(reviewer_signature)}
+{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{render_plan_step_back_review_notice() if step_back_review_notice else ""}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before

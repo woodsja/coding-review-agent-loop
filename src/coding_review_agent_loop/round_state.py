@@ -355,6 +355,13 @@ class PostedRoundMetadata:
     # taken from agent output.  Omitted when False, and a malformed stored value
     # decodes as False.
     plan_sweep: bool = False
+    # Orchestrator-written finding-provenance baseline form and payload size
+    # (#1516) on a plan reviewer record: the form the deterministic selector
+    # rendered into that reviewer's prompt.  Encoded as one optional
+    # ``provenance_baseline`` object only when set; a malformed stored value
+    # decodes as absent.
+    provenance_baseline_form: str | None = None
+    provenance_baseline_chars: int | None = None
     # Coder-recovery and head-review-recovery records (#1292).  All are
     # optional and omitted from the encoding when unset, so every historical
     # record re-encodes byte-identically.  A malformed scalar decodes as
@@ -2903,6 +2910,11 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["step_back_entries"] = [dict(entry) for entry in metadata.step_back_entries]
     if metadata.plan_sweep:
         payload["plan_sweep"] = True
+    if metadata.provenance_baseline_form is not None:
+        payload["provenance_baseline"] = {
+            "form": metadata.provenance_baseline_form,
+            "chars": metadata.provenance_baseline_chars or 0,
+        }
     if metadata.risk_test_matrix_evidence_full_round is not None:
         payload["risk_test_matrix_evidence_full_round"] = (
             metadata.risk_test_matrix_evidence_full_round
@@ -3202,6 +3214,32 @@ def _decode_plan_sweep(payload: Mapping[str, object]) -> bool:
         return True
     logger.warning("Ignoring a malformed plan_sweep marker on a persisted round record")
     return False
+
+
+def _decode_provenance_baseline(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode the optional provenance baseline record (#1516); malformed is absent."""
+    from .review_step_back import BASELINE_FORMS
+
+    if "provenance_baseline" not in payload:
+        return {}
+    value = payload["provenance_baseline"]
+    if (
+        isinstance(value, Mapping)
+        and set(value) == {"form", "chars"}
+        and isinstance(value.get("form"), str)
+        and value["form"] in BASELINE_FORMS
+        and isinstance(value.get("chars"), int)
+        and not isinstance(value["chars"], bool)
+        and value["chars"] >= 0
+        and payload.get("flow") == "plan"
+        and payload.get("role") == "reviewer"
+    ):
+        return {
+            "provenance_baseline_form": value["form"],
+            "provenance_baseline_chars": value["chars"],
+        }
+    logger.warning("Ignoring a malformed provenance_baseline field on a persisted round record")
+    return {}
 
 
 def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
@@ -3566,6 +3604,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             **_decode_recovery_fields(payload),
             **_decode_step_back_fields(payload),
             plan_sweep=_decode_plan_sweep(payload),
+            **_decode_provenance_baseline(payload),
             **_decode_evidence_fields(payload),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),

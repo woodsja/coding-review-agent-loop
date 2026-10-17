@@ -1709,3 +1709,56 @@ def test_malformed_plan_sweep_marker_decodes_as_absent_without_degrading(value, 
     # A malformed sweep marker never degrades the step-back or stall history.
     assert decoded.step_back_status == "absent"
     assert any("plan_sweep" in message for message in caplog.messages)
+
+
+def test_provenance_baseline_field_round_trips_and_is_omitted_when_unset():
+    """`record-field-roundtrip` (#1516)."""
+    unset = _encode_round_metadata(_plan_reviewer_metadata())
+    assert "provenance_baseline" not in decode_mapping(unset)
+    assert _decode_round_metadata(unset).provenance_baseline_form is None
+    for form, chars in (("compact-diff", 27812), ("full-baseline", 0), ("unavailable", 0)):
+        metadata = _plan_reviewer_metadata(
+            provenance_baseline_form=form, provenance_baseline_chars=chars, plan_sweep=True,
+        )
+        encoded = _encode_round_metadata(metadata)
+        assert decode_mapping(encoded)["provenance_baseline"] == {"form": form, "chars": chars}
+        decoded = _decode_round_metadata(encoded)
+        assert (decoded.provenance_baseline_form, decoded.provenance_baseline_chars) == (
+            form, chars,
+        )
+        assert decoded.plan_sweep is True
+        assert _encode_round_metadata(decoded) == encoded
+
+
+@pytest.mark.parametrize(
+    ("value", "overrides"),
+    [
+        ("diff", {}),
+        ({"form": "patch", "chars": 1}, {}),
+        ({"form": "diff", "chars": -1}, {}),
+        ({"form": "diff", "chars": "10"}, {}),
+        ({"form": "diff", "chars": True}, {}),
+        ({"form": "diff"}, {}),
+        ({"form": "diff", "chars": 1, "extra": 1}, {}),
+        ({"form": 3, "chars": 1}, {}),
+        ({"form": "diff", "chars": 1}, {"role": "coder"}),
+        ({"form": "diff", "chars": 1}, {"flow": "pr"}),
+    ],
+)
+def test_malformed_provenance_baseline_decodes_as_absent_without_degrading(
+    value, overrides, caplog
+):
+    stored = decode_mapping(
+        _encode_round_metadata(_plan_reviewer_metadata(plan_sweep=True, **overrides))
+        if not overrides
+        else _encode_round_metadata(_plan_reviewer_metadata(**overrides))
+    )
+    stored["provenance_baseline"] = value
+    with caplog.at_level("WARNING"):
+        decoded = _decode_round_metadata(encode_mapping(stored))
+    assert decoded.provenance_baseline_form is None
+    assert decoded.provenance_baseline_chars is None
+    # A malformed baseline field never degrades step-back, stall or sweep history.
+    assert decoded.step_back_status == "absent"
+    assert decoded.plan_sweep is (not overrides)
+    assert any("provenance_baseline" in message for message in caplog.messages)

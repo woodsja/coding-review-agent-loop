@@ -142,6 +142,7 @@ class PlanVerificationContext:
             DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
             DEFAULT_PLAN_STEP_BACK_ROUNDS,
             DEFAULT_PLAN_SWEEP_ROUNDS,
+            DEFAULT_PROVENANCE_BASELINE_MAX_CHARS,
         )
         from .reviewer_seats import SeatAgent
 
@@ -183,6 +184,10 @@ class PlanVerificationContext:
             ),
             plan_sweep_reasoning_effort=(
                 config.plan_sweep_reasoning_effort if staged else ""
+            ),
+            plan_provenance_baseline_max_chars=(
+                config.plan_provenance_baseline_max_chars
+                if staged else DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
             ),
             pr_review_policy="all-reviewers",
             primary_reviewer=None,

@@ -257,11 +257,22 @@ is validated against the primary's backend before any agent turn and ignored wit
 a log line for backends without effort control. Under the same policy, each
 reviewer's later prompts carry a previous-plan baseline
 (`reviewer_previous_plan_baseline`, resolved from the reviewer's latest earlier
-review subject and the hash-checked planner record of that subject) as a bounded
-diff, against which reviewers tag new mandatory findings with an advisory
+review subject and the hash-checked planner record of that subject), against
+which reviewers tag new mandatory findings with an advisory
 `provenance` (`revision_introduced` or `pre_existing`). Minting persists `provenance` and the orchestrator-computed
 `repeat_of` (a normalized-text match against the carried ledger) as optional
-item fields, omitted when unset.
+item fields, omitted when unset. The pure `select_provenance_baseline` chooses
+the baseline form (#1516): the unified line diff, then a deterministic
+sentence/cell/word-level compact diff (`compact_plan_diff`), each within the
+diff budget max(12000, half the current plan), then the full previous reviewed
+plan fenced as baseline data, then `unavailable`. Every form is bounded by
+`--plan-provenance-baseline-max-chars` (default 120000, `0` disables), which
+joins the primary-then-panel validation, child-planning inheritance and the
+approved-plan board copy boundary beside the sweep flags. The plan loop selects
+once per reviewer per round from pre-round durable records, so the volatile
+prompt block, the per-reviewer log line and the optional reviewer-record field
+`provenance_baseline` (`form`, `chars`; omitted when unset, malformed decodes
+as absent) always agree, and a resumed round recomputes the same form.
 
 Planning scheduler metadata is a flow-discriminated branch of the same durable
 round-metadata transport. A planning record carries the candidate key in place

@@ -1096,6 +1096,20 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-provenance-baseline-max-chars",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Under --plan-review-policy primary-then-panel, the hard budget in characters "
+                "for the previous-plan baseline a later plan review receives for finding "
+                "provenance (default: 120000; 0 disables it). The baseline is the unified "
+                "diff, then a compact sentence-level diff, each within max(12000, half the "
+                "current plan) and this budget, then the full previous reviewed plan; over "
+                "this budget the reviewer is told the baseline is unavailable."
+            ),
+        )
+        subparser.add_argument(
             "--plan-sweep-reasoning-effort",
             default=None,
             metavar="LEVEL",

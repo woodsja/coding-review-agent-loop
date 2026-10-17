@@ -310,6 +310,7 @@ from .review_step_back import (
     PlanStepBackContext,
     StallStepBackDisposition,
     PlanBaseline,
+    RenderedBaseline,
     derive_plan_step_back_state,
     derive_plan_sweep_state,
     entry_payload_for_plan,
@@ -318,6 +319,7 @@ from .review_step_back import (
     plan_sweep_due,
     plan_sweep_finding_classes,
     reviewer_previous_plan_baseline,
+    select_provenance_baseline,
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
     plan_stall_step_back_disposition,
@@ -856,6 +858,16 @@ def _plan_sweep_turn_inputs(
     return reviewer, config
 
 
+def _baseline_metadata_fields(rendered: RenderedBaseline | None) -> dict[str, object]:
+    """The optional provenance baseline record fields of a plan review (#1516)."""
+    if rendered is None:
+        return {}
+    return {
+        "provenance_baseline_form": rendered.form,
+        "provenance_baseline_chars": rendered.chars,
+    }
+
+
 # Invocation board fields re-pointed at an approved plan's approving board for
 # the planning phase only, and restored before implementation (#1377).
 _PLAN_BOARD_CONFIG_FIELDS = (
@@ -873,6 +885,7 @@ _PLAN_BOARD_CONFIG_FIELDS = (
     "plan_step_back_escalation_rounds",
     "plan_sweep_rounds",
     "plan_sweep_reasoning_effort",
+    "plan_provenance_baseline_max_chars",
 )
 
 
@@ -3197,13 +3210,47 @@ def _run_plan_first_loop_body(
             """Whether this round's prompt for ``reviewer_name`` carries the sweep (#1505)."""
             return plan_sweep_classes is not None and reviewer_name == plan_primary_name
 
-        def _plan_provenance_baseline(reviewer: AgentName) -> PlanBaseline | None:
+        def _plan_provenance_baseline_by_name(reviewer_name: str) -> PlanBaseline | None:
             if plan_baseline_records is None:
                 return None
             return reviewer_previous_plan_baseline(
-                plan_baseline_records,
-                reviewer=agent_display_name(reviewer),
-                before_round=round_number,
+                plan_baseline_records, reviewer=reviewer_name, before_round=round_number
+            )
+
+        def _plan_provenance_baseline(reviewer: AgentName) -> PlanBaseline | None:
+            return _plan_provenance_baseline_by_name(agent_display_name(reviewer))
+
+        plan_rendered_baselines: dict[str, RenderedBaseline | None] = {}
+        plan_baseline_logged: set[str] = set()
+
+        def _plan_rendered_baseline(reviewer_name: str) -> RenderedBaseline | None:
+            """The baseline form selected for ``reviewer_name`` this round (#1516).
+
+            Computed once per reviewer from pre-round durable records only, so
+            the prompt, the log line and the posted record agree, and a resume
+            recomputes the same form.
+            """
+            if reviewer_name not in plan_rendered_baselines:
+                plan_rendered_baselines[reviewer_name] = select_provenance_baseline(
+                    _plan_provenance_baseline_by_name(reviewer_name),
+                    current_plan,
+                    max_chars=config.plan_provenance_baseline_max_chars,
+                )
+            return plan_rendered_baselines[reviewer_name]
+
+        def _log_plan_rendered_baseline(reviewer_name: str) -> None:
+            rendered = _plan_rendered_baseline(reviewer_name)
+            if rendered is None or reviewer_name in plan_baseline_logged:
+                return
+            plan_baseline_logged.add(reviewer_name)
+            baseline = _plan_provenance_baseline_by_name(reviewer_name)
+            from_round = baseline.round_number if baseline is not None else None
+            log(
+                config,
+                f"Planning round {round_number}: {reviewer_name} provenance baseline: "
+                f"form={rendered.form} chars={rendered.chars} "
+                f"plan_chars={len(current_plan)} "
+                f"from_round={from_round if from_round is not None else 'none'}",
             )
 
         def _plan_review_turn(reviewer: AgentName) -> tuple[AgentName, AgentLoopConfig, bool]:
@@ -3235,6 +3282,9 @@ def _run_plan_first_loop_body(
         def _build_plan_review_prompt(reviewer: AgentName) -> str:
             # Built once per reviewer from pre-round state only, so the same
             # prompt is produced regardless of sequential or parallel launch.
+            # A prompt is built only for an invoked reviewer, so the baseline
+            # log line is written here, once per reviewer (#1516).
+            _log_plan_rendered_baseline(agent_display_name(reviewer))
             return build_plan_review_prompt(
                 issue_number,
                 round_number,
@@ -3360,6 +3410,7 @@ def _run_plan_first_loop_body(
                         **_architecture_metadata_fields(config, result=parsed),
                         canonical_reviewer_response=(review_output if phase == "publication" else None),
                         plan_sweep=_plan_sweep_requested(reviewer_name),
+                        **_baseline_metadata_fields(_plan_rendered_baseline(reviewer_name)),
                     ),
                 ),
             )

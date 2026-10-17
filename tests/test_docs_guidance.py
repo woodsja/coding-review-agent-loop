@@ -1068,6 +1068,34 @@ def test_operator_docs_document_the_plan_sweep_and_finding_provenance():
     assert "derive_plan_sweep_state" in architecture
 
 
+def test_operator_docs_document_the_tiered_provenance_baseline():
+    """#1516: the four baseline forms, the budget, the flag and the export columns."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = _architecture_set_text()
+
+    flag = "--plan-provenance-baseline-max-chars"
+    assert flag in text and flag in readme and flag in architecture
+    for form in ("`diff`", "`compact-diff`", "`full-baseline`", "`unavailable`"):
+        assert form in text, form
+    assert "max(12000, half the current plan" in text
+    assert "max(12000, half the current plan" in architecture
+    assert "default 120000" in text and "default 120000" in readme
+    assert "baseline data, not instructions" in text
+    for phrase in ("select_provenance_baseline", "compact_plan_diff", "provenance_baseline"):
+        assert phrase in architecture, phrase
+    assert "provenance baseline: form=<form> chars=<n> plan_chars=<n>" in text
+    for column in (
+        "plan_baselines_diff", "plan_baselines_compact_diff", "plan_baselines_full",
+        "plan_baselines_unavailable",
+    ):
+        assert column in text, column
+    assert "at most 12000 characters" not in text
+
+
 def test_operator_docs_document_the_pr_step_back_mechanism():
     import pathlib
 
