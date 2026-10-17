@@ -4110,7 +4110,11 @@ it. A first review and an identical plan keep their own notices. Each round
 logs one line per invoked reviewer,
 `Planning round R: <reviewer> provenance baseline: form=<form> chars=<n> plan_chars=<n> from_round=<k>`,
 where `chars` is the payload size (the diff or the previous plan, without
-framing). The orchestrator records the same form and size on that reviewer's
+framing). Payload text that resembles a `BEGIN`/`END` fence line (three or
+more hyphens before `BEGIN` or `END`) is escaped with a backslash before its
+hyphens, after the diff marker in the diff forms, so planner-authored text
+cannot appear to close the baseline data early; the block then says so, and
+`chars` counts the escaped payload. The orchestrator records the same form and size on that reviewer's
 round record as `provenance_baseline: {"form": ..., "chars": ...}`; the field
 is omitted when no baseline applies, and a malformed stored value decodes as
 absent.
