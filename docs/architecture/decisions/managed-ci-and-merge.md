@@ -16,3 +16,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - A rejected-coder recovery across a fresh grant is a third accepted continuity shape, walked through one shared chain authentication (#1367).
 - Coder and format-repair turns on a managed PR run under a `gh` guard that refuses CI dispatch before approval, plus a post-turn dispatch audit (#1366).
 - Post-approval CI watching stays opt-in without auto-merge (an end-of-run hint names `--watch-pending-ci`). Plumbing-only failures on a complete board are re-run once before any coder round, then stop on infrastructure (#1477).
+- A fresh process resumes a matching `qualifying` managed checkpoint as `qualification_ready` and dispatches a fresh attempt under its own generation, rather than adopting the prior generation's attempt or re-running reviewers (#1177).

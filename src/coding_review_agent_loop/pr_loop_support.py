@@ -1152,6 +1152,39 @@ def _qualification_digest(value: object) -> str:
     return hashlib.sha256(repr(value).encode("utf-8")).hexdigest()[:16]
 
 
+def _managed_checkpoint_needs_fresh_attempt(
+    checkpoint: QualificationCheckpoint | None,
+    contract: ManagedCiContract | None,
+    head_sha: str | None,
+) -> bool:
+    """True when a fresh process must re-dispatch a ``qualifying`` managed attempt (#1177).
+
+    Real activation mints a new intent generation that never adopts an
+    earlier generation's attempt, so a persisted ``qualifying`` managed
+    checkpoint cannot name an attempt this invocation owns.  Such a
+    checkpoint may resume as ``qualification_ready`` only when the contract
+    is a managed v2 contract that owns no attempt at all (no attachment,
+    nonce or issued dispatch) and is not bound to another head.  Every other
+    combination keeps the strict attempt-ID comparison authoritative.
+    """
+    return bool(
+        checkpoint is not None
+        and checkpoint.valid
+        and checkpoint.lifecycle == "qualifying"
+        and checkpoint.obligation_kind == "managed-exact-head-ci"
+        and head_sha
+        and checkpoint.candidate_head_sha == head_sha
+        and contract is not None
+        and contract.protocol_version == 2
+        and contract.activation_path == "managed"
+        and (contract.expected_head_sha is None or contract.expected_head_sha == head_sha)
+        and contract.attached_run_id is None
+        and contract.run_attempt is None
+        and contract.nonce is None
+        and not contract.dispatch_issued
+    )
+
+
 def _qualification_checkpoint_review_identity_matches(
     checkpoint: QualificationCheckpoint,
     *,

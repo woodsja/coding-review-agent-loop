@@ -64,6 +64,9 @@ plus the history read only when a candidate exists.
 Managed CI is a repository-integrated alternative: intermediate runs may be
 suppressed, then a reviewed candidate receives an authenticated final workflow
 dispatch. Version-2 intent records track generation, nonce, run, and attempt.
+A fresh process never adopts an earlier generation's attempt; a matching
+`qualifying` checkpoint resumes as `qualification_ready` and dispatches a fresh
+exact-head attempt instead of re-running reviewers.
 Qualification requires correlated exact-head evidence and the full counted
 check board, not a model's statement that CI passed. Head changes invalidate the
 proof. Automatic merge uses `--match-head-commit`; explicit managed CI can

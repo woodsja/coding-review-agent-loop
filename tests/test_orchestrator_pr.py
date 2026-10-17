@@ -5234,6 +5234,244 @@ def test_managed_qualification_resume_attaches_without_redispatch(
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
+def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **config_kwargs):
+    """A fresh-process resume after a stop while managed qualification was in flight (#1177)."""
+    config = make_config(
+        tmp_path, managed_ci=managed, auto_merge=True, max_rounds=1, **config_kwargs
+    )
+    invocation = orchestrator.resolve_invocation(config, provider="codex", role="reviewer")
+    acquisition_contract = {
+        "Codex": (invocation.configured_model, invocation.resolved_effort, "codex")
+    }
+    item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed on the previous head.", status="blocking",
+        source_status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
+        failed_head_sha="old-head", candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        base_branch="main",
+        requirements_digest=orchestrator._qualification_digest(tuple()),
+        acquisition_digest=orchestrator._qualification_digest(acquisition_contract),
+        approval_digest=orchestrator._qualification_digest(("Codex",)),
+        scheduler_digest=orchestrator._qualification_digest(
+            orchestrator._prior_item_ledger_signature((item,))
+        ),
+        qualification_attempt_id=attempt_id,
+        allowed_rounds=1,
+    )
+    reviewer_comment = _attach_round_metadata(
+        "Approved the repaired head.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+            prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
+            state="approved", architecture_contract_version=1,
+        ),
+    )
+    checkpoint_comment = _attach_round_metadata(
+        "Qualification was dispatched.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            prior_items=(item,), state="blocking", phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint, architecture_contract_version=1,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[],
+        pr_payload={
+            "comments": [
+                {"author": {"login": "coding-review-agent-loop"}, "body": reviewer_comment},
+                {"author": {"login": "coding-review-agent-loop"}, "body": checkpoint_comment},
+            ]
+        },
+    )
+    return config, runner
+
+
+def _posted_attempt_checkpoints(runner):
+    return [
+        line
+        for comment in runner.pr_payload["comments"]
+        for line in comment["body"].splitlines()
+        if "qualification checkpoint: attached attempt" in line
+    ]
+
+
+def test_managed_qualification_fresh_process_resume_dispatches_a_fresh_attempt(
+    tmp_path, monkeypatch, capsys
+):
+    """#1177: a fresh unattached contract resumes a qualifying checkpoint without reviewers."""
+    config, runner = _managed_qualifying_resume(tmp_path, quiet=False)
+    # What real activation returns: a fresh generation, no attachment, no head binding.
+    contract = ManagedCiContract(protocol_version=2, intent_generation="fresh-gen")
+    dispatches = []
+    merges = []
+    waited = []
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+
+    def dispatch(*a, **k):
+        c = k["contract"]
+        dispatches.append((k["expected_head_sha"], c.intent_generation))
+        c.attached_run_id, c.run_attempt, c.expected_head_sha = 999, 1, k["expected_head_sha"]
+
+    def wait(*a, **k):
+        c = k["contract"]
+        waited.append((c.attached_run_id, c.run_attempt, c.expected_head_sha))
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", dispatch)
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: merges.append(k))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert dispatches == [("abc123", "fresh-gen")]
+    assert waited == [(999, 1, "abc123")]
+    assert merges == [{"expected_head_sha": "abc123"}]
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    attempts = _posted_attempt_checkpoints(runner)
+    assert attempts == ["PR #77 qualification checkpoint: attached attempt 999/1."]
+    err = capsys.readouterr().err
+    assert "without its prior attempt 123/1" in err
+    assert "without redispatching completed reviewer work" in err
+    assert "force_full=True" not in err
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [
+        pytest.param(
+            ManagedCiContract(
+                protocol_version=2, attached_run_id=456, run_attempt=1,
+                expected_head_sha="abc123",
+            ),
+            id="mismatched-same-head-attachment",
+        ),
+        pytest.param(
+            ManagedCiContract(protocol_version=2, dispatch_issued=True),
+            id="dispatch-issued-without-attachment",
+        ),
+        pytest.param(
+            ManagedCiContract(protocol_version=2, nonce="owned-nonce"),
+            id="nonce-without-attachment",
+        ),
+        pytest.param(
+            ManagedCiContract(protocol_version=2, expected_head_sha="old-head"),
+            id="unattached-stale-head-contract",
+        ),
+        pytest.param(None, id="managed-contract-missing"),
+    ],
+)
+def test_managed_qualifying_checkpoint_without_fresh_attempt_path_forces_review(
+    tmp_path, monkeypatch, contract
+):
+    """#1177: only an unattached, unbound, unowned contract may skip the board."""
+    # The selective scheduler exposes the automatic full-board fallback.
+    config, runner = _managed_qualifying_resume(
+        tmp_path, managed=contract is not None,
+        reviewer=("codex",), pr_review_policy="selective-intermediate",
+    )
+    if contract is not None:
+        monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
+        monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    force_full_values = []
+    reviewer_calls = []
+    dispatches = []
+    downgrades = []
+    real_select = orchestrator.select_reviewers
+    real_run_validated_agent = orchestrator._run_validated_agent
+    import coding_review_agent_loop.pr_loop as pr_loop_module
+
+    real_helper = pr_loop_module._managed_checkpoint_needs_fresh_attempt
+
+    def capture_force_full(snapshot, *args, **kwargs):
+        force_full_values.append(snapshot.force_full)
+        return real_select(snapshot, *args, **kwargs)
+
+    def stop_at_reviewer(*args, **kwargs):
+        if kwargs.get("role") == "reviewer":
+            reviewer_calls.append(kwargs)
+            raise AgentLoopError("review board invoked before qualification")
+        return real_run_validated_agent(*args, **kwargs)
+
+    def helper(*args, **kwargs):
+        result = real_helper(*args, **kwargs)
+        downgrades.append(result)
+        return result
+
+    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", stop_at_reviewer)
+    monkeypatch.setattr(pr_loop_module, "_managed_checkpoint_needs_fresh_attempt", helper)
+    monkeypatch.setattr(
+        orchestrator, "dispatch_final_qualification", lambda *a, **k: dispatches.append(k)
+    )
+
+    with pytest.raises(AgentLoopError, match="review board invoked"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert downgrades and not any(downgrades)
+    assert reviewer_calls
+    assert force_full_values == [True]
+    assert dispatches == []
+    assert _posted_attempt_checkpoints(runner) == []
+
+
+def test_managed_checkpoint_needs_fresh_attempt_helper_covers_each_conjunct():
+    """#1177: the fresh-process downgrade predicate, one conjunct at a time."""
+    from coding_review_agent_loop.pr_loop_support import (
+        _managed_checkpoint_needs_fresh_attempt as needs_fresh,
+    )
+
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity="managed-exact-head-ci:item-1",
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        qualification_attempt_id="555/1",
+    )
+    fresh = ManagedCiContract(protocol_version=2, intent_generation="fresh-gen")
+
+    assert needs_fresh(checkpoint, fresh, "abc123")
+    assert needs_fresh(checkpoint, dataclasses.replace(fresh, expected_head_sha="abc123"), "abc123")
+    assert not needs_fresh(checkpoint, dataclasses.replace(fresh, expected_head_sha="old-head"), "abc123")
+    assert not needs_fresh(None, fresh, "abc123")
+    assert not needs_fresh(QualificationCheckpoint.invalid("stale"), fresh, "abc123")
+    assert not needs_fresh(
+        dataclasses.replace(checkpoint, lifecycle="qualification_ready"), fresh, "abc123"
+    )
+    assert not needs_fresh(
+        dataclasses.replace(
+            checkpoint, obligation_kind="github-pr-checks",
+            obligation_identity="github-pr-checks:item-1",
+        ),
+        fresh,
+        "abc123",
+    )
+    assert not needs_fresh(checkpoint, fresh, "other-head")
+    assert not needs_fresh(checkpoint, fresh, None)
+    assert not needs_fresh(checkpoint, fresh, "")
+    assert not needs_fresh(checkpoint, None, "abc123")
+    assert not needs_fresh(checkpoint, dataclasses.replace(fresh, protocol_version=1), "abc123")
+    assert not needs_fresh(
+        checkpoint, dataclasses.replace(fresh, activation_path="ordinary_fallback"), "abc123"
+    )
+    for owned in (
+        {"attached_run_id": 555},
+        {"run_attempt": 1},
+        {"nonce": "owned-nonce"},
+        {"dispatch_issued": True},
+    ):
+        assert not needs_fresh(checkpoint, dataclasses.replace(fresh, **owned), "abc123"), owned
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
