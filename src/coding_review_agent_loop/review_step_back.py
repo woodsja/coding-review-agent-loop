@@ -747,9 +747,15 @@ _BASELINE_HEADING = "Finding provenance baseline (orchestrator, not a reviewer f
 _UNIT_BOUNDARY = re.compile(r"[.!?;]\s+| \| ")
 _WORD_TOKEN = re.compile(r"\S+\s*|\s+")
 # A fence-like hyphen run inside baseline payload content (#1517): three or
-# more hyphens, optional blanks, then a whole-word BEGIN or END.  Three, not
-# five, because a unified-diff marker can add one adjacent hyphen.
+# more hyphens, optional blanks, then a whole-word BEGIN or END.  Such runs
+# are escaped everywhere in the payload.  A unified-diff ``-`` marker sits
+# directly against its content and extends a leading run by one hyphen, so a
+# two-hyphen content prefix after that marker is escaped as well (#1519).
+# Together these keep every rendered payload line from beginning with a
+# fence-like run of three or more hyphens.
 _FENCE_LIKE_RUN = re.compile(r"-{3,}(?=[ \t]*(?:BEGIN|END)\b)", re.IGNORECASE)
+# Exactly two leading hyphens before a whole-word BEGIN or END (#1519).
+_MARKER_ADJACENT_RUN = re.compile(r"--(?!-)(?=[ \t]*(?:BEGIN|END)\b)", re.IGNORECASE)
 _BASELINE_ESCAPE_NOTICE = (
     "Payload text that resembles a BEGIN/END fence is shown with a backslash before "
     "its hyphens (after the diff marker, in diff lines); only the unescaped fence "
@@ -900,13 +906,31 @@ def _neutralize_fence_content(text: str) -> str:
     return _FENCE_LIKE_RUN.sub(lambda match: "\\" + match.group(0), text)
 
 
+def _neutralize_marker_content(marker: str, content: str) -> str:
+    """``content`` neutralized for display after diff ``marker`` (#1517, #1519).
+
+    Every fence-like run in ``content`` is escaped.  When the marker ends in a
+    hyphen, a two-hyphen content prefix before BEGIN/END would render as a
+    three-hyphen run, so it gets one leading backslash too.  The general run
+    needs three hyphens and the prefix pattern exactly two, so no run is
+    escaped twice.
+    """
+    escaped = _neutralize_fence_content(content)
+    if marker.endswith("-") and _MARKER_ADJACENT_RUN.match(content):
+        return "\\" + escaped
+    return escaped
+
+
 def _neutralize_diff_payload(diff: str, *, marker_width: int) -> str:
     """Escape fence-like content in a baseline diff, keeping its markers (#1517).
 
     The first two lines are the renderer-owned file headers and ``@@`` lines
     are hunk headers; both stay verbatim.  Every other line keeps its first
     ``marker_width`` characters (the diff marker) in place and has only the
-    content after them neutralized.
+    content after them neutralized: every fence-like run of three or more
+    hyphens, plus a two-hyphen content prefix directly after a ``-`` marker
+    (#1519).  So no payload line after the file headers begins with a
+    fence-like run of three or more hyphens.
     """
     lines = diff.split("\n")
     out = lines[:2]
@@ -914,7 +938,8 @@ def _neutralize_diff_payload(diff: str, *, marker_width: int) -> str:
         if line.startswith("@@"):
             out.append(line)
         else:
-            out.append(line[:marker_width] + _neutralize_fence_content(line[marker_width:]))
+            marker = line[:marker_width]
+            out.append(marker + _neutralize_marker_content(marker, line[marker_width:]))
     return "\n".join(out)
 
 
