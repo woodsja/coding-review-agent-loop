@@ -4949,6 +4949,24 @@ def test_resolve_pr_owning_issue_order_and_recovery_fields(
     ) == resolved
 
 
+@pytest.mark.parametrize(
+    "branch", ["agent-loop/managed-1513", "agent-loop/managed-01", "feature/x", None],
+)
+def test_resolve_pr_owning_issue_uses_the_shared_managed_branch_parser(tmp_path, branch):
+    """#1513: the owning-issue branch number is the shared parser's result."""
+    from coding_review_agent_loop.managed_ci import managed_branch_issue_number
+    from coding_review_agent_loop.pr_board_state import resolve_pr_owning_issue
+
+    config = make_config(tmp_path, managed_ci_pr_mode=True)
+    resolved = resolve_pr_owning_issue(
+        config, caller_issue_number=None, managed_ci_issue_number=None,
+        head_branch=branch, recorded_primary_issue_number=None, pr_body="Task PR.",
+    )
+    assert resolved.branch_issue_number == managed_branch_issue_number(branch)
+    assert resolved.owning_issue_number == managed_branch_issue_number(branch)
+    assert (resolved.branch_issue_number is not None) == (branch == "agent-loop/managed-1513")
+
+
 def test_run_pr_loop_refuses_a_foreign_managed_branch_handoff_before_any_write(tmp_path):
     """Row managed-branch-foreign-handoff: run_pr_loop refuses with nothing written."""
     flash = _seat(tmp_path, "flash", "antigravity", "Model F")

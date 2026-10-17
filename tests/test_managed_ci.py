@@ -469,6 +469,39 @@ class ManualQualificationRunner(V2ManagedRunner):
         return super()._run_locked(args, cwd=cwd, check=check)
 
 
+@pytest.mark.parametrize(
+    "branch, expected",
+    [
+        ("agent-loop/managed-1", 1),
+        ("agent-loop/managed-1513", 1513),
+        (None, None),
+        ("", None),
+        ("agent-loop/managed-0", None),
+        ("agent-loop/managed-01", None),
+        ("agent-loop/managed-direct-123-abcd", None),
+        ("agent-loop/managed-12x", None),
+        ("refs/heads/agent-loop/managed-12", None),
+        ("xagent-loop/managed-12", None),
+        ("agent-loop/managed-", None),
+        (12, None),
+    ],
+)
+def test_managed_branch_issue_number_parses_only_canonical_issue_branches(branch, expected):
+    """#1513: one shared parser accepts only a whole canonical managed issue branch."""
+    assert managed_ci.managed_branch_issue_number(branch) == expected
+
+
+def test_managed_branch_issue_pattern_is_defined_once_in_source():
+    """#1513: the managed issue-branch grammar has exactly one definition."""
+    src = Path(managed_ci.__file__).parent
+    hits = [
+        path.name
+        for path in src.rglob("*.py")
+        for _ in range(path.read_text(encoding="utf-8").count("agent-loop/managed-([1-9]"))
+    ]
+    assert hits == ["managed_ci.py"]
+
+
 def test_protection_assessment_distinguishes_private_free_plan_limit(tmp_path):
     runner = FakeRunner(
         pr_branch_protection_returncode=1,
