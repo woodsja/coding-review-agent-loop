@@ -4233,6 +4233,22 @@ def revalidate_issue_created_handoff(
     )
 
 
+_MANAGED_ISSUE_BRANCH_RE = re.compile(r"agent-loop/managed-([1-9]\d*)")
+
+
+def managed_branch_issue_number(branch: str | None) -> int | None:
+    """Return the issue named by a whole ``agent-loop/managed-N`` branch (#1513).
+
+    ``N`` must be a positive integer without leading zeros, and any prefix or
+    suffix text rejects the branch.  The value is a parse result only and
+    grants no authority; callers still authenticate the PR it belongs to.
+    """
+    if not isinstance(branch, str):
+        return None
+    match = _MANAGED_ISSUE_BRANCH_RE.fullmatch(branch)
+    return int(match.group(1)) if match is not None else None
+
+
 @_surfaces_list_failures
 def recover_issue_created_handoff(
     runner: Runner,
@@ -4252,10 +4268,9 @@ def recover_issue_created_handoff(
         return None
     body = metadata.body or ""
     branch = metadata.head_branch or ""
-    match = re.fullmatch(r"agent-loop/managed-([1-9]\d*)", branch)
-    if match is None:
+    branch_issue_number = managed_branch_issue_number(branch)
+    if branch_issue_number is None:
         return None
-    branch_issue_number = int(match.group(1))
     if issue_number is not None and issue_number != branch_issue_number:
         command = render_managed_ci_resume_command(
             config,
@@ -4742,8 +4757,7 @@ def _issue_created_rendering_issue_number(
     handoff = managed_resume.issue_created_handoff if managed_resume is not None else None
     if handoff is not None and handoff.issue_number > 0:
         return handoff.issue_number
-    match = re.fullmatch(r"agent-loop/managed-([1-9]\d*)", head_ref or "")
-    return int(match.group(1)) if match is not None else None
+    return managed_branch_issue_number(head_ref)
 
 
 def _human_reviewer_trust_args(config: AgentLoopConfig) -> list[str]:

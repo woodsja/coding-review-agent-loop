@@ -10,7 +10,6 @@ agent, so every caller can refuse before any write.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dataclasses_replace
@@ -337,10 +336,6 @@ def named_legacy_entry_required(config: object, comments: Sequence[object]) -> b
     return any(record.metadata.role in _LEGACY_ENTRY_ROLES for record in records)
 
 
-# Same pattern recover_issue_created_handoff applies to a managed branch.
-_MANAGED_BRANCH_RE = re.compile(r"agent-loop/managed-([1-9]\d*)")
-
-
 @dataclass(frozen=True)
 class PrOwningIssue:
     """The issue that owns a PR's handoff for one invocation (#1418)."""
@@ -372,12 +367,12 @@ def resolve_pr_owning_issue(
     Performs no I/O.
     """
     from .github import parse_linked_issue_numbers
+    from .managed_ci import managed_branch_issue_number
 
     fresh_scope_number = managed_ci_issue_number or getattr(
         config, "managed_ci_issue_number", None
     )
-    branch_match = _MANAGED_BRANCH_RE.fullmatch(head_branch or "")
-    branch_number = int(branch_match.group(1)) if branch_match is not None else None
+    branch_number = managed_branch_issue_number(head_branch)
     ordinary_managed_recovery = bool(
         getattr(config, "managed_ci_pr_mode", False) or fresh_scope_number is not None
     )
