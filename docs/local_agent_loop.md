@@ -849,9 +849,15 @@ round metadata. It contains the obligation identity and lifecycle, failed and
 candidate heads, base and review/plan/requirement/scheduler identities,
 qualification attempt identity, and the independent one-shot allowances: one
 failure-repair extension and one head-change re-review extension. The effective
-ceiling is therefore at most `max_rounds + 2`. A restart attaches to a
-correlated in-flight attempt when possible; absent, malformed, stale, or
-contradictory checkpoints force safe reconstruction and full review.
+ceiling is therefore at most `max_rounds + 2`. An in-process round reuses its
+own correlated attachment for the candidate head. A fresh process never adopts
+a prior generation's attempt: a `qualifying` managed checkpoint whose review
+identities (approvals, plan, requirements, reviewer acquisition and ledger)
+still match, and whose freshly activated contract owns no attempt and names no
+other head, resumes as `qualification_ready` without redispatching reviewers and
+dispatches a fresh exact-head attempt under the new generation. Absent,
+malformed, stale, drifted, contradictory, or other-head checkpoints force safe
+reconstruction and full review.
 
 At the round limit, diagnostics identify the actual next action: a named
 reviewer-owned blocker, a CI obligation awaiting a repair head, a reviewed

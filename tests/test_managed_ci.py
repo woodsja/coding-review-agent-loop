@@ -16125,3 +16125,200 @@ def test_managed_rerun_rechecks_the_deadline_after_its_verification_reads(tmp_pa
     assert code is None
     assert runner.reruns == []
     assert not any("CI failed only in plumbing jobs" in comment for comment in runner.comments)
+
+
+def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
+    """#1177: the transcript a resumable managed qualification stop leaves behind.
+
+    Codex approved ``abc123``, the loop persisted a ``qualifying`` managed
+    checkpoint naming the prior attempt 555/1, and that attempt's
+    prior-generation intent comment is on the PR.  The rerun activates for
+    real, so its contract carries a fresh generation and no attempt.
+    """
+    import dataclasses
+    from coding_review_agent_loop.github import PullRequestMergeability
+    from coding_review_agent_loop.round_state import QualificationCheckpoint
+
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", reviewer=("codex",), auto_merge=True,
+        max_rounds=1, quiet=False,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
+        ),
+    )
+    invocation = orchestrator.resolve_invocation(config, provider="codex", role="reviewer")
+    item = UnresolvedReviewItem(
+        item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
+        text="Managed CI failed on the previous head.", status="blocking",
+        source_status="blocking", authority="machine",
+        obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
+        failed_head_sha="old-head", candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    approvers = ("Codex",) if drift != "approval-set" else ("Codex", "Claude")
+    checkpoint = QualificationCheckpoint(
+        obligation_kind="managed-exact-head-ci",
+        obligation_identity=item.obligation_identity,
+        lifecycle="qualifying",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        base_branch="main",
+        requirements_digest=orchestrator._qualification_digest(tuple()),
+        acquisition_digest=orchestrator._qualification_digest(
+            {"Codex": (invocation.configured_model, invocation.resolved_effort, "codex")}
+        ),
+        approval_digest=orchestrator._qualification_digest(approvers),
+        scheduler_digest=(
+            "stale-scheduler" if drift == "scheduler-digest"
+            else orchestrator._qualification_digest(
+                orchestrator._prior_item_ledger_signature((item,))
+            )
+        ),
+        qualification_attempt_id="555/1",
+        allowed_rounds=1,
+    )
+    approval = _attach_round_metadata(
+        "Approved the repaired head.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+            prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
+            state="approved", architecture_contract_version=1,
+        ),
+    )
+    summary = _attach_round_metadata(
+        "PR #7 qualification checkpoint: attached attempt 555/1.",
+        PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            prior_items=(item,), state="blocking", phase="qualification-checkpoint",
+            qualification_checkpoint=checkpoint, architecture_contract_version=1,
+        ),
+    )
+    prior_intent = str(_intent_body(
+        ManagedCiContract(
+            protocol_version=2, repository="OWNER/REPO", base_ref="main",
+            workflow_revision="workflow-sha", intent_generation="prior-gen",
+            nonce="prior-nonce", created_at=1, attached_run_id=555, run_attempt=1,
+        ),
+        pr_number=7, expected_head_sha="abc123", state="attached",
+    ))
+    runner = _qualified_ready_labeled_runner(
+        codex_outputs=[structured_pr_review(state="approved", summary="Re-reviewed.")],
+        intent_comments=[{"id": 30, "user": {"login": "agent-loop", "id": 1}, "body": prior_intent}],
+    )
+    runner.rest_pr["draft"] = True
+    runner.pr_payload["comments"] = [
+        {"author": {"login": "coding-review-agent-loop"}, "body": approval},
+        {"author": {"login": "coding-review-agent-loop"}, "body": summary},
+    ]
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    )
+    activations = []
+    real_activate = orchestrator.activate_managed_ci
+
+    def activate(*args, **kwargs):
+        contract = real_activate(*args, **kwargs)
+        activations.append(contract)
+        return contract
+
+    events = []
+
+    def dispatch(*_args, **kwargs):
+        contract = kwargs["contract"]
+        events.append((
+            "dispatch", kwargs["expected_head_sha"], contract.intent_generation,
+            contract.attached_run_id, contract.run_attempt,
+        ))
+        # The real dispatcher correlates and attaches the new run.
+        contract.attached_run_id, contract.run_attempt = 777, 1
+        contract.expected_head_sha = kwargs["expected_head_sha"]
+
+    def wait(*_args, **kwargs):
+        contract = kwargs["contract"]
+        events.append(("wait", contract.attached_run_id, contract.run_attempt))
+        return managed_ci.ManagedCiOutcome(
+            status="passed", head_sha="abc123",
+            checks=PullRequestChecks(
+                state="passing", required_checks=(FINAL_CONTEXT,),
+                passing=(PullRequestCheck(FINAL_CONTEXT, "check_run", "success"),),
+                pending=(), failing=(), missing_required=(),
+                branch_protection_status="configured", listing_complete=True,
+            ),
+        )
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", dispatch)
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(
+        orchestrator, "_mergeability_for_unreadable_protection",
+        lambda *a, **k: PullRequestMergeability(
+            state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="CLEAN",
+            head_sha="abc123", base_branch="main",
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: events.append("prepare"))
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof",
+        lambda *a, **k: events.append(("merge", k["proof"].head_sha)),
+    )
+    return config, runner, activations, events
+
+
+def _attempt_checkpoint_lines(runner):
+    return [
+        line
+        for comment in runner.pr_payload["comments"]
+        for line in comment["body"].splitlines()
+        if "qualification checkpoint: attached attempt" in line
+    ]
+
+
+def test_fresh_process_resume_of_qualifying_checkpoint_dispatches_fresh_attempt_with_real_activation(
+    tmp_path, monkeypatch, capsys,
+):
+    """#1177: real activation + posted approvals after a resumable qualification stop."""
+    config, runner, activations, events = _fresh_process_qualifying_resume(tmp_path, monkeypatch)
+
+    assert orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
+
+    (contract,) = activations
+    assert contract.protocol_version == 2 and contract.activation_path == "managed"
+    assert contract.intent_generation and contract.intent_generation != "prior-gen"
+    # No reviewer is redispatched and no scheduler fallback is requested.
+    assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
+    err = capsys.readouterr().err
+    assert "without its prior attempt 555/1" in err
+    assert "incomplete or stale" not in err
+    assert "force_full=True" not in err
+    # Exactly one fresh dispatch under the new generation; 555 is never attached.
+    dispatches = [event for event in events if event[0] == "dispatch"]
+    assert dispatches == [("dispatch", "abc123", contract.intent_generation, None, None)]
+    assert ("wait", 777, 1) in events and ("wait", 555, 1) not in events
+    assert events[-1] == ("merge", "abc123")
+    # The prior intent record is left as history; only the new attempt is checkpointed.
+    assert _attempt_checkpoint_lines(runner)[-1] == "PR #7 qualification checkpoint: attached attempt 777/1."
+    assert sum("attached attempt 555/1" in line for line in _attempt_checkpoint_lines(runner)) == 1
+
+
+@pytest.mark.parametrize("drift", ["approval-set", "scheduler-digest"])
+def test_fresh_process_resume_with_drifted_review_identity_forces_review_with_real_activation(
+    tmp_path, monkeypatch, capsys, drift,
+):
+    """#1177: a drifted qualifying checkpoint still forces review before any dispatch."""
+    config, runner, activations, events = _fresh_process_qualifying_resume(
+        tmp_path, monkeypatch, drift=drift,
+    )
+
+    def review_then_stop(*args, **kwargs):
+        events.append("review")
+        raise _ReviewReached
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", review_then_stop)
+
+    with pytest.raises(_ReviewReached):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    assert len(activations) == 1 and activations[0].attached_run_id is None
+    assert events == ["review"]
+    assert _attempt_checkpoint_lines(runner) == ["PR #7 qualification checkpoint: attached attempt 555/1."]

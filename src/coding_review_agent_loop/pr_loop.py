@@ -444,6 +444,7 @@ from .pr_loop_support import (
     _machine_obligation_checkpoint,
     _qualification_digest,
     _qualification_checkpoint_review_identity_matches,
+    _managed_checkpoint_needs_fresh_attempt,
     approved_pr_reopen_hint,
     _publish_sub_item_progress,
     _sub_item_progress_block,
@@ -3905,6 +3906,26 @@ def run_pr_loop(
                     checkpoint_expected_attempt_id = (
                         f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}"
                     )
+            if _managed_checkpoint_needs_fresh_attempt(
+                qualification_checkpoint, managed_ci, pr_metadata.head_sha
+            ):
+                # A fresh process never adopts a prior generation's attempt
+                # (#1177).  The review identities are still checked below; the
+                # managed final branch then dispatches a fresh exact-head
+                # attempt under this invocation's generation.
+                assert qualification_checkpoint is not None
+                log(
+                    config,
+                    f"Round {round_number}: resuming qualifying checkpoint for "
+                    f"{pr_metadata.head_sha} without its prior attempt "
+                    f"{qualification_checkpoint.qualification_attempt_id}; this "
+                    "invocation's fresh managed generation will dispatch a new attempt",
+                )
+                qualification_checkpoint = dataclasses_replace(
+                    qualification_checkpoint,
+                    lifecycle="qualification_ready",
+                    qualification_attempt_id=None,
+                )
             if (
                 qualification_checkpoint is not None
                 and qualification_checkpoint.valid
