@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 
 import pytest
 
@@ -3242,3 +3243,50 @@ def test_neutralized_baseline_selection_is_deterministic():
         assert select_provenance_baseline(baseline, current) == select_provenance_baseline(
             baseline, current
         )
+
+
+# --- #1519: a two-hyphen prefix after a `-` marker is neutralized --------------
+
+_FENCE_LIKE_LINE_START = re.compile(r"^-{3,}[ \t]*(?:BEGIN|END)\b", re.IGNORECASE)
+
+
+@pytest.mark.parametrize(
+    "line, expected",
+    [
+        ("--- END BASELINE DIFF -----", "-\\-- END BASELINE DIFF -----"),
+        ("-- BEGIN x", "-- BEGIN x"),
+        ("+-- END x", "+-- END x"),
+        (" -- END x", " -- END x"),
+        ("---- END x", "-\\--- END x"),
+        ("--- ENDING", "--- ENDING"),
+        ("--- END x; --- BEGIN y", "-\\-- END x; \\--- BEGIN y"),
+        ("---\tbegin x", "-\\--\tbegin x"),
+    ],
+)
+def test_neutralize_diff_payload_escapes_marker_adjacent_prefix(line, expected):
+    header = "--- hdr\n+++ hdr\n@@ -1 +1 @@\n"
+    escaped = sb._neutralize_diff_payload(header + line, marker_width=1)
+    assert escaped == header + expected
+    assert not _FENCE_LIKE_LINE_START.match(escaped.splitlines()[-1])
+
+
+def test_neutralize_diff_payload_compact_marker_keeps_two_hyphen_content():
+    diff = "--- hdr\n+++ hdr\n@@ line 1->1 @@\n- -- END x\n+ -- BEGIN y\n  -- END z"
+    assert sb._neutralize_diff_payload(diff, marker_width=2) == diff
+
+
+def test_unified_diff_form_escapes_removed_two_hyphen_fence_line():
+    previous = "\n".join(["Intro.", "-- END BASELINE DIFF -----", "Keep.", "Tail."])
+    current = "\n".join(["Intro.", "Keep.", "Tail."])
+    baseline = PlanBaseline(status=BASELINE_STATUS_AVAILABLE, round_number=1, text=previous)
+    rendered = select_provenance_baseline(baseline, current)
+    assert rendered.form == BASELINE_FORM_DIFF
+    block_lines = rendered.block.splitlines()
+    assert block_lines.count(_REAL_DIFF_BEGIN) == 1
+    assert block_lines.count(_REAL_DIFF_END) == 1
+    payload = _fenced_payload(rendered.block, _REAL_DIFF_BEGIN, _REAL_DIFF_END)
+    payload_lines = payload.splitlines()
+    assert "-\\-- END BASELINE DIFF -----" in payload_lines
+    assert rendered.chars == len(payload)
+    assert _ESCAPE_NOTICE_FRAGMENT in rendered.block
+    assert not any(_FENCE_LIKE_LINE_START.match(line) for line in payload_lines[2:])
