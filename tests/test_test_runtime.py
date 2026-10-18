@@ -6114,25 +6114,32 @@ def test_fixture_teardown_at_the_floor_keeps_a_positive_bound(tmp_path, monkeypa
     assert 3.0 <= row.fixture.teardown_duration_seconds < 5.0
 
 
-def _fx_venv_repo(tmp_path):
-    root, markers = _fx_repo(tmp_path)
-    venv_bin = root / ".venv" / "bin"
+def _fx_importable_python_shim(venv_bin: Path) -> Path:
+    """Give symlink-retarget tests a genuine pytest-capable synthetic virtualenv.
+
+    A bare symlink into the test runner's virtualenv loses its site-packages
+    because Python resolves the synthetic .venv, not the runner's environment.
+    Without this setup the bootstrap fails before testing launcher identity.
+    """
     venv_bin.mkdir(parents=True)
-    (venv_bin / "python").symlink_to(sys.executable)
-    # A bare symlink into the test runner's virtualenv is not itself an
-    # importable pytest environment: Python discovers the synthetic .venv,
-    # not the runner's site-packages. Keep this launcher functional until
-    # the test deliberately retargets it, including on isolated CI hosts.
+    shim = venv_bin / "python"
+    shim.symlink_to(sys.executable)
     (venv_bin.parent / "pyvenv.cfg").write_text(
         f"home = {Path(sys._base_executable).parent}\ninclude-system-site-packages = false\n"
     )
     packages = venv_bin.parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     packages.parent.mkdir(parents=True, exist_ok=True)
     packages.symlink_to(Path(pytest.__file__).parent.parent, target_is_directory=True)
+    return shim
+
+
+def _fx_venv_repo(tmp_path):
+    root, markers = _fx_repo(tmp_path)
+    shim = _fx_importable_python_shim(root / ".venv" / "bin")
     fake = tmp_path / "not-python"
     fake.write_text("#!/bin/sh\nexit 3\n")
     fake.chmod(0o755)
-    return root, markers, venv_bin / "python", fake
+    return root, markers, shim, fake
 
 
 @_FX_HOST
@@ -7068,10 +7075,7 @@ def _fx_proceed(deadline):
 
 @_FX_LINUX
 def test_fixture_launcher_retargeted_during_held_child_readiness_is_never_released(tmp_path, monkeypatch):
-    venv_bin = tmp_path / ".venv" / "bin"
-    venv_bin.mkdir(parents=True)
-    shim = venv_bin / "python"
-    shim.symlink_to(sys.executable)
+    shim = _fx_importable_python_shim(tmp_path / ".venv" / "bin")
     fake = tmp_path / "not-python"
     fake.write_text("#!/bin/sh\nexit 3\n")
     fake.chmod(0o755)
