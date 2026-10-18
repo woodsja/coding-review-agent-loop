@@ -385,6 +385,8 @@ def test_masked_settings_change_is_refused_before_credentialed_operator(case, pa
     target = root / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("synthetic settings change\n")
+    original_objects = sorted(str(p.relative_to(h.objects)) for p in h.objects.rglob("*") if p.is_file())
     with pytest.raises(HandoffError, match="operator-masked"):
         h.capture(allowed_new={path})
     assert h.tree is None
+    assert sorted(str(p.relative_to(h.objects)) for p in h.objects.rglob("*") if p.is_file()) == original_objects

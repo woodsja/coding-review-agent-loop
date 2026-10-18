@@ -4624,6 +4624,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--reviewer-codex-model", "--reviewer-codex-reasoning-effort",
     "--reviewer-claude-model", "--reviewer-claude-effort",
     "--gh-cmd", "--agent-permissions",
+    "--git-operator", "--git-operator-cli-sha256", "--git-operator-session-file",
     "--claude-arg", "--codex-arg", "--gemini-arg", "--antigravity-arg",
     "--test-command", "--test-python", "--coder-test-command-timeout-seconds", "--ci-timeout-seconds",
     "--ci-poll-interval-seconds", "--ci-startup-timeout-seconds",
@@ -4680,6 +4681,9 @@ _ONE_SHOT_OPERATOR_RECOVERY_OPTIONS = frozenset(
         "--plan-reset-stall-streak", "--plan-resume-keep-on-issue-edit", "--pr-convert-evidence-rows",
         # Advisory triage runs once, before a fresh run's first agent turn (#1434).
         "--triage", "--triage-model", "--triage-history",
+        # Do not leak private owner attestation/session paths into rerun commands.
+        # A split-mode operator must explicitly reauthorize every invocation.
+        "--git-operator", "--git-operator-cli-sha256", "--git-operator-session-file",
     }
 )
 _MANAGED_RECOVERY_OPTIONS = frozenset({

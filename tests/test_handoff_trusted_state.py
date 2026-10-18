@@ -1,8 +1,11 @@
 """Trusted handoff metadata must be unreachable and tamper-evident for the editor.
 
 The denial tests run commands under the REAL Codex workspace-write sandbox
-(`codex sandbox`, no model call, no credits) with the exact flags the editor
-role uses, so a regression that puts trusted state back under /tmp fails here
+(`codex sandbox`, no model call, no credits) with equivalent sandbox
+configuration overrides. The production `codex exec` role additionally uses
+`--ignore-user-config` and `--ignore-rules` (not accepted by the `sandbox`
+subcommand). The permission arguments are separately checked by the public
+role-grant tests, so a regression that puts trusted state back under /tmp fails here
 with a genuine operating-system result rather than a mocked one.
 """
 import os
@@ -159,3 +162,44 @@ def test_real_codex_sandbox_cannot_alter_operator_session_or_private_area(truste
         denied = sandboxed(checkout, f"echo tampered >> {target}")
         assert denied.returncode != 0 and "Read-only file system" in denied.stderr
     assert session.read_text() == "synthetic-not-a-secret"
+
+
+@pytest.mark.parametrize("config_source", ["user", "project"])
+def test_hostile_codex_settings_cannot_add_trusted_state_as_writable_root(
+        trusted_handoff, tmp_path, config_source):
+    checkout, h = trusted_handoff
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    # Exercise a would-be permission expansion via either Codex's user config
+    # or project-local settings. Our explicit overrides must take precedence.
+    config = (codex_home / "config.toml" if config_source == "user"
+              else checkout / ".codex" / "config.toml")
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[sandbox_workspace_write]\nwritable_roots = ["' +
+                      str(h.trusted.parent.resolve()) + '"]\n')
+    sentinel = h.trusted.parent / ("attempt-" + config_source)
+    candidate = Path(os.environ.get("AGENTLOOP_TEST_REAL_CODEX",
+                         str(Path.home() / ".local" / "bin" / "codex")))
+    if not candidate.is_file():
+        pytest.skip("Real Codex CLI unavailable; Ralph release gate required")
+    env = {**os.environ, "CODEX_HOME": str(codex_home)}
+    result = subprocess.run([str(candidate), "sandbox", *EDITOR_FLAGS,
+                             "--", "sh", "-c", f"echo forbidden > {sentinel}"],
+                            cwd=checkout, env=env, capture_output=True,
+                            text=True, timeout=60)
+    assert result.returncode != 0
+    assert not sentinel.exists()
+    assert "Read-only file system" in result.stderr or "Permission denied" in result.stderr
+
+
+def test_production_codex_exec_is_compatible_with_explicit_hardening_flags():
+    candidate = Path(os.environ.get("AGENTLOOP_TEST_REAL_CODEX",
+                         str(Path.home() / ".local" / "bin" / "codex")))
+    if not candidate.is_file():
+        pytest.skip("Real Codex CLI unavailable; Ralph release gate required")
+    result = subprocess.run([str(candidate), "exec", "--ignore-user-config",
+                             "--ignore-rules", "--sandbox", "workspace-write",
+                             "-c", "permissions={}",
+                             "-c", "sandbox_workspace_write.writable_roots=[]",
+                             "--help"], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr

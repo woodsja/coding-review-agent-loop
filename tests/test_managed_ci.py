@@ -16573,3 +16573,18 @@ def test_fresh_process_resume_with_drifted_review_identity_forces_review_with_re
     assert len(activations) == 1 and activations[0].attached_run_id is None
     assert events == ["review"]
     assert _attempt_checkpoint_lines(runner) == ["PR #7 qualification checkpoint: attached attempt 555/1."]
+
+
+def test_recovery_does_not_replay_git_operator_attestation_or_private_session(tmp_path):
+    config = make_config(tmp_path, invocation_argv=(
+        "agent-loop", "issue", "1", "--repo", "OWNER/REPO",
+        "--git-operator", "claude",
+        "--git-operator-cli-sha256", "a" * 64,
+        "--git-operator-session-file", "/private/.credentials.json",
+        "--coder", "codex", "--agent-permissions", "sandboxed",
+    ))
+    rendered = _render_recovery_command(config, target="pr", identifier=2, managed_ci=False)
+    assert "--git-operator" not in rendered
+    assert "/private/.credentials.json" not in rendered
+    assert "a" * 64 not in rendered
+    assert "--coder codex" in rendered

@@ -554,6 +554,14 @@ class Handoff:
             raise HandoffError("Candidate already frozen")
         self.allowed_new = frozenset(allowed_new)
         self.snapshot = self._snapshot(self.allowed_new)
+        # Refuse before writing even private Git blobs/index: the operator's
+        # namespace masks these paths and cannot commit them faithfully.
+        self.changed_paths = tuple(p for p, value in self.snapshot.items() if (
+            value is None or p not in self.base_entries or
+            (value[0], hashlib.sha1(b"blob " + str(len(value[1])).encode() + b"\0" + value[1]).hexdigest()) != self.base_entries[p]))
+        if any(name.split("/", 1)[0] in OPERATOR_MASKED_PATHS for name in self.changed_paths):
+            self.changed_paths = ()
+            raise HandoffError("Changes to operator-masked credential or settings paths are unsupported")
         self.git("read-tree", "--empty")
         entries = []
         for name, value in self.snapshot.items():
@@ -567,12 +575,6 @@ class Handoff:
         if self.tree == self.base_tree and not allow_no_change:
             self.tree = None
             raise HandoffError("No candidate changes")
-        self.changed_paths = tuple(p for p, value in self.snapshot.items() if (
-            value is None or p not in self.base_entries or
-            (value[0], hashlib.sha1(b"blob " + str(len(value[1])).encode() + b"\0" + value[1]).hexdigest()) != self.base_entries[p]))
-        if any(name.split("/", 1)[0] in OPERATOR_MASKED_PATHS for name in self.changed_paths):
-            self.tree = None
-            raise HandoffError("Changes to operator-masked credential or settings paths are unsupported")
         return self.tree
 
     def operator_context(self):

@@ -425,7 +425,10 @@ After validation the host freezes tracked and declared new files, calls the
 dedicated source-read-only `ClaudeGitOperator`, independently verifies its raw
 SHA, and publishes under an absent-branch lease. Ordinary PR binding supplies
 the complete expected-closing issue set without managed-CI waiver semantics.
-The authenticated PR tuple must match that SHA, branch and base. Under the
+The authenticated PR tuple must match that SHA, branch and base. A rendered GitHub
+recovery/rerun command deliberately removes the operator flag, executable
+SHA and session path; restarting the split role requires explicit operator
+reauthorization, so no private authentication path is exposed in issue/PR text. Under the
 shared-store lock the host imports only verified raw objects and advances the
 owned checkout's HEAD/index without rewriting candidate files. The existing
 checkout baseline, closing-contract and issue-to-PR handoff writers then feed
@@ -442,11 +445,16 @@ if it lies inside `/tmp`, `/var/tmp`, `/dev/shm`, `$TMPDIR` or the checkout,
 because those are the roots a Codex workspace-write editor can modify, and it
 is refused beneath a group- or world-writable ancestor. Metadata is created
 before the editor runs, so the editor sandbox sees it only as a read-only
-filesystem. `tests/test_handoff_trusted_state.py` proves this with the real
-`codex sandbox` (the editor's exact workspace-write flags): writes to `/tmp`
-and the checkout succeed, while writes to the trusted config, HEAD, hooks,
+filesystem. `tests/test_handoff_trusted_state.py` proves this using the real
+`codex sandbox` with equivalent effective workspace-write overrides: writes
+to `/tmp` and the checkout succeed, while writes to the trusted config, HEAD, hooks,
 attributes, alternates, journal and operator area all fail with the operating
-system's read-only error. As defence in depth the host also seals the
+system's read-only error. In production `codex exec` additionally uses
+`--ignore-user-config` and `--ignore-rules` (unsupported by the stand-alone
+`sandbox` subcommand), with `permissions={}` and an explicit empty
+`writable_roots` list. Tests also plant user/project config entries that attempt
+to expand the protected writable roots and verify an OS denial. As defence in
+depth the host also seals the
 administration directory (config, HEAD, base index, every non-object entry)
 before the editor runs and refuses to capture, verify or publish if any entry
 differs, so planted configuration, hooks, filters or alternates cannot be

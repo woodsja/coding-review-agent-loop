@@ -22,6 +22,7 @@ from .errors import (
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
 from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_command
+from .git_handoff import _path
 
 _logger = logging.getLogger(__name__)
 
@@ -7700,7 +7701,6 @@ def _editor_declaration(payload):
                 or any(not isinstance(p, str) or not p for p in paths)
                 or len(set(paths)) != len(paths)):
             raise AgentLoopError("Editor new_paths must be an explicit unique path list")  # shape-check: fatal:payload-bound
-        from .git_handoff import _path
         for path in paths:
             _path(path)  # shape-check: fatal:authentication-or-forgery
         editor_paths = tuple(paths)

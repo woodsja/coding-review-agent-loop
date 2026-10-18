@@ -122,7 +122,7 @@ def test_editor_grant_is_narrow_and_reversible(split_config, monkeypatch, tmp_pa
     assert ap.permission_class_for_role("editor", config=split_config, provider="codex") == "editor"
     grant = ap.role_permission_args(split_config, "codex", "editor")
     assert grant == ("--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write",
-                     "-c", 'approval_policy="never"',
+                     "-c", "permissions={}", "-c", 'approval_policy="never"',
                      "-c", "sandbox_workspace_write.network_access=false",
                      "-c", "sandbox_workspace_write.writable_roots=[]")
     assert not any(".git" in arg or "gh" in arg or "add-dir" in arg for arg in grant)
@@ -140,9 +140,10 @@ def test_editor_grant_is_narrow_and_reversible(split_config, monkeypatch, tmp_pa
 def test_editor_env_cannot_promote_permissions(split_config):
     env = ap.role_permission_env(split_config, "codex", "editor")
     assert env["GIT_CONFIG_COUNT"] == "0"
+    legacy = ap.role_permission_env(split_config, "codex", None)
     for secret in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"):
         assert env[secret] == ""
-    assert secret not in ap.role_permission_env(split_config, "codex", None)
+        assert secret not in legacy
     assert all(env[key] == "0" for key in ap.GIT_TRACE_VARIABLES)
 
 

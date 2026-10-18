@@ -2348,7 +2348,11 @@ def test_cli_worker_budget_busy_records_nothing(tmp_path, monkeypatch):
 
 def test_cli_inherited_budget_is_only_lowered(tmp_path, monkeypatch, capsys):
     from coding_review_agent_loop import cli as cli_module
+    from coding_review_agent_loop import containment
 
+    # Test precedence, not the memory capacity of the machine running pytest.
+    # Low-memory CI hosts otherwise cap the inherited worker count below two.
+    monkeypatch.setattr(containment, "probe_host_memory_bytes", lambda: 64 * 1024**3)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("AGENT_LOOP_TEST_WORKERS", "4")
     monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_ENFORCEMENT", "clamp")

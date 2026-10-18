@@ -1140,7 +1140,7 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
         # User/project exec policies must never add writable roots (notably
         # ~/.local/state, which holds the host's trusted commit evidence).
         return ("--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write",
-                "-c", 'approval_policy="never"',
+                "-c", "permissions={}", "-c", 'approval_policy="never"',
                 "-c", "sandbox_workspace_write.network_access=false",
                 "-c", "sandbox_workspace_write.writable_roots=[]")
     if provider == "claude":
