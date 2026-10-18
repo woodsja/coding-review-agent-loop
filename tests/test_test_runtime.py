@@ -6119,6 +6119,16 @@ def _fx_venv_repo(tmp_path):
     venv_bin = root / ".venv" / "bin"
     venv_bin.mkdir(parents=True)
     (venv_bin / "python").symlink_to(sys.executable)
+    # A bare symlink into the test runner's virtualenv is not itself an
+    # importable pytest environment: Python discovers the synthetic .venv,
+    # not the runner's site-packages. Keep this launcher functional until
+    # the test deliberately retargets it, including on isolated CI hosts.
+    (venv_bin.parent / "pyvenv.cfg").write_text(
+        f"home = {Path(sys._base_executable).parent}\ninclude-system-site-packages = false\n"
+    )
+    packages = venv_bin.parent / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    packages.parent.mkdir(parents=True, exist_ok=True)
+    packages.symlink_to(Path(pytest.__file__).parent.parent, target_is_directory=True)
     fake = tmp_path / "not-python"
     fake.write_text("#!/bin/sh\nexit 3\n")
     fake.chmod(0o755)
