@@ -153,13 +153,44 @@ namespaces skip the OS probes and provide no source-immutability claim.
 **Claude operator and host publication modules (fork #1, checkpoint 4B).**
 `ClaudeGitOperator(executable).run(handoff, auth=...)` in
 `claude_git_operator.py` is the live model entry point, separate from both
-lifecycle loops. `prepare` exposes its launch for inspection. It requires a
-root-owned executable under `/usr`, Linux bubblewrap, and exactly one explicit
-in-memory `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. It does not discover,
-copy or log credential files. Missing auth/confinement fails closed. A fresh
+lifecycle loops. `prepare` exposes its launch for inspection and is a context
+manager: callers must close it to release pinned descriptors. Linux bubblewrap
+and trusted system Git/Python remain mandatory. The default executable policy
+requires a root-owned executable under `/usr`. An explicit
+`local_executable_sha256` constructor argument also permits a native local
+Claude installation, such as the canonical file under
+`~/.local/share/claude/versions/`. The host supplies the expected SHA-256;
+launcher scripts, symlinks (including ancestor links), group/other-writable
+files and executables inside handoff storage are refused. The host opens the
+file through directory descriptors, pins its inode, mode, ownership, timestamps
+and digest, and binds that descriptor read-only at `/opt/reviewloop/claude`.
+The installation's directory and host home are not mounted. Pins are checked
+before and after invocation, and descriptors close on failure as well as success.
+A fixed isolated Python bootstrap closes all non-stdio descriptors before
+executing Claude, so host bind-source descriptors cannot bypass the read-only
+namespace mounts. The bootstrap grants no shell or additional model tools.
+Source mount layouts overlapping the isolated executable or runtime paths are
+refused before role setup, so a later mount cannot hide an attested file.
+
+Authentication requires exactly one explicit in-memory `ANTHROPIC_API_KEY` or
+`CLAUDE_CODE_OAUTH_TOKEN`, or an explicit `session_file` constructor argument
+pointing to an existing `.credentials.json`. Session files must be private,
+owned by the invoking user, regular, single-link files outside handoff storage.
+The host opens only an `O_PATH` descriptor and never reads, copies, extracts or
+logs the contents. The exact inode is mounted read-only at
+`/tmp/operator-home/.claude/.credentials.json`; the rest of that disposable
+`CLAUDE_CONFIG_DIR` is writable ephemeral scratch. No host Claude settings,
+parent directory or other login files are mounted. Token and session-file
+authentication cannot be combined. File replacement or modification blocks
+the run. A login that requires credential refresh/writes or other host files
+must fail closed; this implementation has no fallback or token extraction.
+Existing subscription login compatibility still requires the owner-run smoke
+test; the synthetic tests do not establish actual CLI authentication.
+
+Missing auth/confinement fails closed. A fresh
 mount root exposes system runtime files, the canonical read-only source, trusted
-read-only administration and shared **objects only**; shared config/refs and the
-host home are unavailable. Only private index/objects and ephemeral runtime
+read-only administration and read-only shared Git administration; the host home
+is unavailable. Only private index/objects and ephemeral runtime
 scratch are writable. The model retains network access for Anthropic. Project
 credential/settings directories are masked; symlinked environment masks are
 currently refused. Persistent Claude settings, SSH sockets, GitHub credentials
@@ -198,8 +229,10 @@ foreign or duplicate PRs. An uncertain POST is reconciled by listing again;
 retrying the same recorded identity does not blindly create another PR. PR
 binding currently supports `owner/repository` identities only.
 
-These modules are **not wired into issue_loop.py or pr_loop.py**. The next
-checkpoint must add the explicit editor/operator option and role validation,
+These modules are **not wired into issue_loop.py or pr_loop.py**. Checkpoint
+4C is partial: local executable/session attestation and its internal synthetic
+publication slice are implemented. Remaining work must add the explicit
+editor/operator option and role validation,
 retain claims across the seam, write EDITED/COMMITTED/PUSHED/PR_BOUND into existing
 round state, persist authenticated provenance/closing-contract records, and
 schedule a separate reviewer on the published head. The caller must preflight

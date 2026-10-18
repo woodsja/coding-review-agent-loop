@@ -1,20 +1,123 @@
 """Disposable Linux Claude role. No publication and no implicit auth discovery.
 
 The caller holds the worktree claim from Handoff.begin through verification.
-Supply only model authentication in memory; persistent user homes are never
-mounted. prepare() builds an inspectable launch; run() is the live entry point.
+Model authentication is explicit: an in-memory model token OR a read-only
+session-file mount. Persistent user homes/settings are never mounted.
+prepare() returns a context manager owning pinned file descriptors; run() is
+the live entry point. No implicit executable or credential discovery occurs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
 import json
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 
 from .git_handoff import Handoff, HandoffError
 from .secure_git import _trusted_executable
+
+
+def _file_identity(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _open_canonical(path: Path, *, metadata_only: bool) -> int:
+    """Open each component without following symlinks, including ancestors.
+
+    The returned descriptor, rather than a re-resolved host path, is the bind
+    source. O_PATH for sessions means host Python never reads their contents.
+    """
+    if not path.is_absolute() or '..' in path.parts:
+        raise OSError('Noncanonical path')
+    parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        flags = os.O_PATH if metadata_only else os.O_RDONLY | os.O_NONBLOCK
+        return os.open(path.name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def _digest(fd: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        block = os.pread(fd, 1024 * 1024, offset)
+        if not block:
+            return digest.hexdigest()
+        offset += len(block)
+        if offset > 512 * 1024 * 1024:
+            raise HandoffError('Local Claude executable exceeds attestation bound')
+        digest.update(block)
+
+
+@dataclass
+class _PinnedFile:
+    path: Path = field(repr=False)
+    fd: int
+    identity: tuple
+    digest: str | None = field(repr=False)
+    closed: bool = False
+
+    @classmethod
+    def open(cls, path: Path, *, digest: str | None = None):
+        label = 'session file' if digest is None else 'executable attestation'
+        fd = None
+        try:
+            fd = _open_canonical(path, metadata_only=digest is None)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid not in (0, os.getuid())
+                    or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID)):
+                raise ValueError('Unsafe file')
+            if digest is None:
+                if info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 1024 * 1024:
+                    raise ValueError('Unsafe session')
+            elif (not re.fullmatch(r'[0-9a-f]{64}', digest)
+                  or not info.st_mode & 0o111 or os.pread(fd, 4, 0) != b'\x7fELF'
+                  or _digest(fd) != digest):
+                raise ValueError('Unattested executable')
+            pin = cls(path, fd, _file_identity(info), digest)
+            pin.verify()
+            return pin
+        except (OSError, ValueError):
+            if fd is not None:
+                os.close(fd)
+            raise HandoffError(f'Unsafe Claude {label}') from None
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            raise
+
+    def verify(self):
+        try:
+            current = _open_canonical(self.path, metadata_only=True)
+            try:
+                valid = (_file_identity(os.fstat(current)) == self.identity
+                         and _file_identity(os.fstat(self.fd)) == self.identity)
+                if self.digest is not None:
+                    valid = valid and _digest(self.fd) == self.digest
+                valid = valid and _file_identity(os.fstat(self.fd)) == self.identity
+            finally:
+                os.close(current)
+            if self.closed or not valid:
+                raise ValueError('Changed pin')
+        except (OSError, ValueError):
+            raise HandoffError('Pinned Claude executable or session file changed') from None
+
+    def close(self):
+        if not self.closed:
+            os.close(self.fd)
+            self.closed = True
 
 
 @dataclass(frozen=True)
@@ -23,6 +126,33 @@ class OperatorLaunch:
     env: dict[str, str] = field(repr=False)
     wrapper: Path
     settings: Path
+    pins: tuple[_PinnedFile, ...] = field(default=(), repr=False)
+
+    @property
+    def pass_fds(self):
+        return tuple(pin.fd for pin in self.pins)
+
+    def verify_pins(self):
+        for pin in self.pins:
+            pin.verify()
+
+    def close(self):
+        for pin in self.pins:
+            pin.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+# Bind-source descriptors refer to the host mounts, not the read-only
+# namespace mounts. Never let the model inherit them (including O_PATH fds).
+# This fixed trusted bootstrap uses no shell and closes every non-stdio fd
+# before exec, independently of bubblewrap's own descriptor handling.
+_EXEC = ('import os, sys; os.closerange(3, os.sysconf("SC_OPEN_MAX")); '
+         'os.execv(sys.argv[1], sys.argv[1:])')
 
 
 # This program is generated in host-owned metadata, mounted read-only. Every
@@ -99,25 +229,67 @@ def _limits():
 
 
 class ClaudeGitOperator:
-    def __init__(self, executable: str):
+    def __init__(self, executable: str, *, local_executable_sha256: str | None = None,
+                 session_file: Path | None = None):
+        # Explicit host attestation only, never model-supplied values. Select
+        # the canonical native versions/... file rather than a launcher link.
         self.executable = executable
+        self.local_executable_sha256 = local_executable_sha256
+        self.session_file = session_file
 
-    def prepare(self, handoff: Handoff, *, auth: dict[str, str]) -> OperatorLaunch:
+    def prepare(self, handoff: Handoff, *, auth: dict[str, str] | None = None) -> OperatorLaunch:
         if sys.platform != 'linux':
             raise HandoffError('Claude Git operator requires Linux confinement')
+        pins = []
+        try:
+            return self._prepare(handoff, auth=auth or {}, pins=pins)
+        except BaseException:
+            for pin in pins:
+                pin.close()
+            raise
+
+    def _prepare(self, handoff, *, auth, pins):
         allowed_auth = {'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'}
-        if (len(auth) != 1 or not set(auth) <= allowed_auth
+        if self.session_file is not None:
+            if auth:
+                raise HandoffError('Choose one explicit Claude authentication source')
+        elif (len(auth) != 1 or not set(auth) <= allowed_auth
                 or not all(isinstance(v, str) and v.strip() and '\x00' not in v for v in auth.values())):
             raise HandoffError('Explicit Claude model authentication is required')
+        # Later source mounts must not hide the attested executable/session
+        # or expose host files in the isolated settings/runtime directory.
+        runtime = (Path('/opt/reviewloop'), Path('/tmp/operator-home'))
+        if any(root.is_relative_to(reserved) or reserved.is_relative_to(root)
+               for root in (handoff.checkout, handoff.common, handoff.trusted)
+               for reserved in runtime):
+            raise HandoffError('Handoff source mounts overlap the isolated Claude runtime')
         handoff._unchanged()
-        ctx = handoff.operator_context()
-        claude = _trusted_executable(self.executable)
+        private = handoff.trusted.parent / (handoff.trusted.name + '-operator')
+        forbidden = (handoff.checkout, handoff.common, handoff.trusted, private)
+        executable_pin = None
+        if self.local_executable_sha256 is not None:
+            if any(Path(self.executable).is_relative_to(p) for p in forbidden):
+                raise HandoffError('Attested Claude executable must be outside handoff storage')
+            executable_pin = _PinnedFile.open(Path(self.executable), digest=self.local_executable_sha256)
+            pins.append(executable_pin)
+            claude = '/opt/reviewloop/claude'
+        else:
+            claude = _trusted_executable(self.executable)
+            if not Path(claude).is_relative_to('/usr'):
+                raise HandoffError('Claude operator requires a trusted /usr executable or explicit local attestation')
+        session_pin = None
+        if self.session_file is not None:
+            session = Path(self.session_file)
+            if session.name != '.credentials.json' or any(session.is_relative_to(p) for p in forbidden):
+                raise HandoffError('Claude session file must be outside handoff storage')
+            session_pin = _PinnedFile.open(session)
+            pins.append(session_pin)
         python = _trusted_executable('/usr/bin/python3')
         git = _trusted_executable('/usr/bin/git')
         bwrap = _trusted_executable('/usr/bin/bwrap')
-        # No per-user installation, launcher scripts or inherited PATH.
-        if not all(Path(p).is_relative_to('/usr') for p in (claude, python, git)):
+        if not all(Path(p).is_relative_to('/usr') for p in (python, git, bwrap)):
             raise HandoffError('Claude operator requires a trusted /usr installation')
+        ctx = handoff.operator_context()
         role = handoff.trusted / 'claude-role'
         role.mkdir(mode=0o700)
         wrapper = role / 'git-operator'
@@ -153,15 +325,24 @@ class ClaudeGitOperator:
             if Path(path).exists():
                 mounts += ['--ro-bind', path, path]
         mounts += ['--dev', '/dev', '--proc', '/proc', '--size', str(256 * 1024 * 1024),
-                   '--tmpfs', '/tmp', '--dir', '/tmp/operator-home']
+                   '--tmpfs', '/tmp', '--dir', '/tmp/operator-home',
+                   '--dir', '/tmp/operator-home/.claude']
         for path in ('/etc/ssl/certs', '/etc/resolv.conf', '/etc/hosts', '/etc/nsswitch.conf'):
             if Path(path).exists():
                 mounts += ['--ro-bind', path, path]
+        # Descriptor bind sources pin exact inodes across path replacement.
+        # Neither the local-install parent nor the real Claude config/home is
+        # mounted. Session contents are never read by the host or put in argv.
+        if executable_pin is not None:
+            mounts += ['--ro-bind', f'/proc/self/fd/{executable_pin.fd}', claude]
+        if session_pin is not None:
+            mounts += ['--ro-bind', f'/proc/self/fd/{session_pin.fd}',
+                       '/tmp/operator-home/.claude/.credentials.json']
         for path in (handoff.checkout, handoff.common, handoff.trusted):
             mounts += ['--ro-bind', str(path), str(path)]
         # Mask project settings, credential sources and registered environment
-        # links; their targets are never mounted. Shared config/refs aren't
-        # exposed at all, and the checkout's .git pointer stays read-only.
+        # links; their targets are never mounted. Shared config/refs and the
+        # checkout's .git pointer stay read-only.
         masks = {'.aws', '.ssh', '.claude', '.claude.json', '.codex', '.agents',
                  '.config', '.netrc', '.gitconfig', '.git-credentials'}
         masks.update(str(p) for p in handoff.links)
@@ -192,18 +373,24 @@ class ClaudeGitOperator:
         env = {'PATH': '/usr/bin:/bin', 'HOME': '/tmp/operator-home',
                'CLAUDE_CONFIG_DIR': '/tmp/operator-home/.claude', 'TMPDIR': '/tmp',
                'LC_ALL': 'C', **auth}
-        return OperatorLaunch(tuple(mounts + args), env, wrapper, settings)
+        launch = OperatorLaunch(tuple(mounts + [python, '-I', '-S', '-c', _EXEC] + args),
+                                env, wrapper, settings, tuple(pins))
+        launch.verify_pins()
+        return launch
 
-    def run(self, handoff: Handoff, *, auth: dict[str, str], timeout: int = 300) -> str:
-        launch = self.prepare(handoff, auth=auth)
-        try:
-            result = subprocess.run(launch.argv, env=launch.env, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    timeout=timeout, preexec_fn=_limits)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise HandoffError('Claude confined Git operator unavailable') from exc
-        if result.returncode:
-            raise HandoffError('Claude confined Git operator failed; no fallback')
+    def run(self, handoff: Handoff, *, auth: dict[str, str] | None = None, timeout: int = 300) -> str:
+        with self.prepare(handoff, auth=auth) as launch:
+            launch.verify_pins()
+            try:
+                result = subprocess.run(launch.argv, env=launch.env, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        timeout=timeout, preexec_fn=_limits, pass_fds=launch.pass_fds)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise HandoffError('Claude confined Git operator unavailable') from exc
+            finally:
+                launch.verify_pins()
+            if result.returncode:
+                raise HandoffError('Claude confined Git operator failed; no fallback')
         from .git_handoff import _read
         value = _read(handoff.operator_context().private, 'result')
         if value is None or len(value[1]) != 41:
