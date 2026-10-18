@@ -355,3 +355,25 @@ def test_checkout_alias_is_canonicalized_for_private_git(case, tmp_path):
     h.capture(allowed_new=set())
     shutil.copytree(h.objects, h.operator_context().objects, dirs_exist_ok=True)
     assert h.verify(operator_commit(h))
+
+
+def test_operator_context_starts_with_base_git_index(case):
+    """Before an agent inspects status, the private index must reflect HEAD.
+
+    An absent index looks like a staged deletion, despite unchanged source.
+    """
+    import os
+    import subprocess
+    _, root, handoff = case
+    (root / 'old').write_text('changed by editor')
+    handoff.capture(allowed_new=set())
+    ctx = handoff.operator_context()
+    assert (ctx.private / 'index').is_file()
+    env = dict(os.environ, GIT_DIR=str(ctx.admin), GIT_WORK_TREE=str(root),
+               GIT_INDEX_FILE=str(ctx.private / 'index'),
+               GIT_OBJECT_DIRECTORY=str(ctx.objects),
+               GIT_ALTERNATE_OBJECT_DIRECTORIES=str(ctx.shared),
+               GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+    p = subprocess.run(['git', 'status', '--short', '--untracked-files=no'], cwd=root,
+                       env=env, capture_output=True, text=True, check=True)
+    assert p.stdout.startswith(' M old'), p.stdout

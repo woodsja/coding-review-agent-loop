@@ -339,6 +339,12 @@ class Handoff:
             private.mkdir(mode=0o700)
             objects = private / "objects"
             objects.mkdir()
+            # A missing private index makes `git status` falsely report the
+            # tracked checkout as staged deletions. Initialize from the pinned
+            # base before giving the operator any inspection tools. Only the
+            # disposable index is written; base objects are read via alternates.
+            _run(self.admin, self.checkout, ["read-tree", self.base],
+                 index=private / "index", objects=objects, alternates=self.shared)
             self._context = OperatorContext(self.admin, private, objects, self.shared)
         return self._context
 
