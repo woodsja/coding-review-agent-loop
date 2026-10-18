@@ -4,7 +4,8 @@
 ``sandboxed`` builds CLI-enforced grants per invocation from the provider and
 the invocation role:
 
-* only ``role == "coder"`` gets the coder grant; every other role, including
+* only ``role == "coder"`` gets the coder grant; the explicit Codex editor
+  split selection gets workspace-write without a Git metadata grant; other roles, including
   role-less planner turns and unknown roles, fails closed to read-only;
 * every response-directory grant targets a physically validated root that is
   outside every agent checkout and is re-verified before each spawn;
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
 AGENT_PERMISSION_MODES = ("default", "sandboxed", "dangerous")
 SANDBOXED_PROVIDERS = ("claude", "codex")
 PERMISSION_CLASS_CODER = "coder"
+PERMISSION_CLASS_EDITOR = "editor"
 PERMISSION_CLASS_READ_ONLY = "read-only"
 
 CLAUDE_READ_ONLY_TOOLS = "Read,Grep,Glob,Write,Edit,Bash"
@@ -116,8 +118,13 @@ def is_sandboxed(config: object) -> bool:
     return agent_permissions_mode(config) == "sandboxed"
 
 
-def permission_class_for_role(role: str | None) -> str:
-    """Only the exact ``coder`` role is a coder; everything else fails closed."""
+def permission_class_for_role(
+    role: str | None, *, config: AgentLoopConfig | None = None, provider: str | None = None,
+) -> str:
+    """Editor access requires the explicit split selection and Codex provider."""
+    if role == "editor" and provider == "codex" and getattr(config, "git_operator", None) == "claude":
+        validate_git_operator_selection(config)
+        return PERMISSION_CLASS_EDITOR
     return PERMISSION_CLASS_CODER if role == "coder" else PERMISSION_CLASS_READ_ONLY
 
 
@@ -147,6 +154,8 @@ class AgentSelection:
 
 def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection, ...]:
     """Every agent a sandboxed run could spawn, with the option that selects it."""
+    from .reviewer_seats import seat_backend
+
     selections = [
         AgentSelection("coder", config.coder, "--coder claude|codex"),
     ]
@@ -157,11 +166,12 @@ def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection
             )
         )
     for reviewer in config.reviewer:
-        selections.append(AgentSelection("reviewer", reviewer, "--reviewer claude|codex"))
+        selections.append(AgentSelection("reviewer", seat_backend(reviewer), "--reviewer claude|codex"))
     for seat in getattr(config, "reviewer_seats", ()):
+        seat_id = getattr(seat, "seat_id", str(seat))
         selections.append(AgentSelection(
-            f"reviewer seat {seat.seat_id!r}", seat.backend,
-            f"--reviewer-seat {seat.seat_id}=claude|codex",
+            f"reviewer seat {seat_id!r}", seat.backend,
+            f"--reviewer-seat {seat_id}=claude|codex",
         ))
     if config.primary_reviewer is not None:
         selections.append(
@@ -251,6 +261,125 @@ def validate_sandboxed_passthrough(args_by_option: Mapping[str, object]) -> None
             )
 
 
+def validate_git_operator_selection(config: AgentLoopConfig) -> None:
+    """Validate explicit split selection without probing CLIs or touching checkouts."""
+    if config.git_operator is None:
+        return
+    if config.git_operator != "claude":
+        raise AgentLoopError("--git-operator supports only claude.")
+    if sys.platform != "linux":
+        raise AgentLoopError("--git-operator claude requires Linux confinement.")
+    if not is_sandboxed(config):
+        raise AgentLoopError("--git-operator claude requires --agent-permissions sandboxed.")
+    if config.coder != "codex":
+        raise AgentLoopError("--git-operator claude requires --coder codex.")
+    from .reviewer_seats import seat_backend
+
+    if not any(seat_backend(reviewer) == "claude" for reviewer in config.reviewer):
+        raise AgentLoopError("--git-operator claude requires an independent Claude reviewer.")
+    if (config.effective_managed_ci
+            or getattr(config, "managed_ci_fresh_authorization", False)
+            or getattr(config, "managed_ci_issue_number", None) is not None
+            or config.materialize_split_issues or config.split_stage is not None
+            or config.implementation_coder is not None
+            or config.plan_execution_mode != "plan-only"):
+        raise AgentLoopError("--git-operator claude supports only ordinary issue/pr flows.")
+
+
+def validate_split_role_capabilities(config: AgentLoopConfig) -> None:
+    """Credential-free CLI flag and Linux read-only mount probes; no model calls.
+
+    Actual checkout mounts and authenticated model access remain the dedicated
+    launcher's responsibility. Never substitute an unrestricted CLI on failure.
+    """
+    env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"}
+    probes = (
+        (config.codex_cmd, ("exec", "--help"), ("--sandbox", "--config", "--output-last-message", "--ignore-user-config", "--ignore-rules")),
+        (config.claude_cmd, ("--help",), (
+            "--restricted", "--tools", "--strict-mcp-config", "--mcp-config",
+            "--permission-mode", "--permission-prompts", "--setting-sources",
+            "--settings", "--allowedTools", "--disallowedTools", "--no-session-persistence",
+        )),
+    )
+    try:
+        for command, args, flags in probes:
+            executable = shutil.which(command)
+            pin = None
+            try:
+                digest = getattr(config, "git_operator_cli_sha256", None)
+                if command == config.claude_cmd and digest is not None:
+                    from .claude_git_operator import _PinnedFile
+                    pin = _PinnedFile.open(Path(command), digest=digest)
+                    executable = f"/proc/self/fd/{pin.fd}"
+                elif not executable or executable_location_refusal(executable, config):
+                    raise ValueError("CLI unavailable")
+                result = subprocess.run(
+                    [executable, *args], capture_output=True, text=True, timeout=15,
+                    env=env, cwd="/", **({"pass_fds": (pin.fd,)} if pin else {}),
+                )
+                if pin:
+                    pin.verify()
+            finally:
+                if pin:
+                    pin.close()
+            if result.returncode or any(flag not in result.stdout for flag in flags):
+                raise ValueError("CLI flags unavailable")
+        # Match the launcher: fixed trusted Linux utilities, read-only host
+        # mounts and private runtime storage. This does not access credentials.
+        mounts = ["/usr/bin/bwrap", "--die-with-parent", "--new-session", "--unshare-pid",
+                  "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+                  "--ro-bind", "/usr", "/usr"]
+        for path in ("/bin", "/lib", "/lib64"):
+            if Path(path).exists():
+                mounts += ["--ro-bind", path, path]
+        mounts += ["--dev", "/dev", "--proc", "/proc", "--size", str(256 * 1024 * 1024),
+                   "--tmpfs", "/tmp", "--remount-ro", "/tmp", "--", "/usr/bin/true"]
+        result = subprocess.run(
+            mounts,
+            capture_output=True, text=True, timeout=15, env=env, cwd="/",
+        )
+        if result.returncode:
+            raise ValueError("mounts unavailable")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise AgentLoopError(
+            "--git-operator claude capability/mount checks failed; "
+            "required Codex/Claude CLI flags and Linux bwrap mounts must be available."
+        ) from None
+
+
+def require_split_role_workflow(
+    config: AgentLoopConfig, *, command: str, plan_first: bool = False
+) -> None:
+    """Fail-closed entry gate for ``--git-operator claude``; touches no checkout.
+
+    Runs before worktree claims (and again before agents start): flow shape,
+    a real (non-dry-run) transport, the owner-attested CLI digest and session
+    path, then the credential-free capability and mount probes. The session is
+    pinned by metadata only; its contents are never read. Success means the
+    claimed issue/pr workflow may proceed; the handoff adapter repeats the
+    checkout-relative checks under the claim.
+    """
+    validate_sandboxed_flow(config, command=command, plan_first=plan_first)
+    if config.dry_run:
+        raise AgentLoopError(
+            "--git-operator claude does not support --dry-run: publication needs a real trusted transport."
+        )
+    digest, session = config.git_operator_cli_sha256, config.git_operator_session_file
+    if digest is None or session is None:
+        raise AgentLoopError(
+            "--git-operator claude requires owner-attested --git-operator-cli-sha256 and "
+            "--git-operator-session-file."
+        )
+    from .claude_git_operator import _PinnedFile
+    from .git_handoff import HandoffError
+
+    try:
+        _PinnedFile.open(Path(session)).close()
+    except HandoffError as exc:
+        raise AgentLoopError(f"--git-operator claude: {exc}") from None
+    validate_split_role_capabilities(config)
+
+
 def committing_coder(config: AgentLoopConfig, *, command: str, plan_first: bool = False) -> str | None:
     """Return the agent that will commit in this flow, or None for plan-only runs."""
     if command in {"pr", "managed-pr", "task"}:
@@ -265,6 +394,11 @@ def committing_coder(config: AgentLoopConfig, *, command: str, plan_first: bool 
 
 
 def validate_sandboxed_flow(config: AgentLoopConfig, *, command: str, plan_first: bool = False) -> None:
+    validate_git_operator_selection(config)
+    if config.git_operator is not None:
+        if command not in {"issue", "pr"} or plan_first:
+            raise AgentLoopError("--git-operator claude supports only ordinary issue/pr flows.")
+        return
     if not is_sandboxed(config):
         return
     if committing_coder(config, command=command, plan_first=plan_first) == "codex":
@@ -942,6 +1076,8 @@ def establish_sandboxed_run(
     config: AgentLoopConfig, *, command: str, plan_first: bool = False
 ) -> None:
     """Fail-fast startup for sandboxed mode, before any agent is spawned."""
+    if config.git_operator is not None:
+        require_split_role_workflow(config, command=command, plan_first=plan_first)
     if not is_sandboxed(config):
         return
     validate_sandboxed_selections(config)
@@ -984,7 +1120,7 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
     """CLI permission args for one invocation; empty outside sandboxed mode."""
     if not is_sandboxed(config):
         return ()
-    permission_class = permission_class_for_role(role)
+    permission_class = permission_class_for_role(role, config=config, provider=provider)
     # Refuse before acquiring the response root: a refusal needs no scratch
     # tree, and must not be masked by its boundary check (#1253).
     if provider not in SANDBOXED_PROVIDERS:
@@ -997,7 +1133,16 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
             "--agent-permissions sandboxed cannot run Codex as a committing coder "
             "(its sandbox keeps .git read-only); use --coder claude."
         )
+    if role == "git-operator":
+        raise AgentLoopError("Git operator requires the dedicated private-Git Claude launcher.")
     root = sandboxed_response_root(config)
+    if permission_class == PERMISSION_CLASS_EDITOR:
+        # User/project exec policies must never add writable roots (notably
+        # ~/.local/state, which holds the host's trusted commit evidence).
+        return ("--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write",
+                "-c", "permissions={}", "-c", 'approval_policy="never"',
+                "-c", "sandbox_workspace_write.network_access=false",
+                "-c", "sandbox_workspace_write.writable_roots=[]")
     if provider == "claude":
         prefix = inspect_prefix(config)
         if permission_class == PERMISSION_CLASS_READ_ONLY:
@@ -1067,7 +1212,21 @@ def role_permission_env(config: AgentLoopConfig, provider: str, role: str | None
     """
     if not is_sandboxed(config):
         return {}
-    return dict(neutralized_git_env())
+    permission_class_for_role(role, config=config, provider=provider)
+    if provider == "codex" and role == "coder":
+        raise AgentLoopError("Sandboxed Codex cannot run as a committing coder.")
+    if role == "git-operator":
+        raise AgentLoopError("Git operator requires the dedicated private-Git Claude launcher.")
+    env = dict(neutralized_git_env())
+    if provider == "codex" and permission_class_for_role(role, config=config, provider=provider) == PERMISSION_CLASS_EDITOR:
+        # Codex edits local files; GitHub and Claude publication credentials
+        # belong only to the trusted host/Claude operator, not the editor.
+        for secret in ("GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN",
+                       "GITHUB_PERSONAL_ACCESS_TOKEN", "SSH_AUTH_SOCK",
+                       "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+                       "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+            env[secret] = ""
+    return env
 
 
 def prepare_sandboxed_spawn(config: AgentLoopConfig, provider: str, role: str | None) -> Path:

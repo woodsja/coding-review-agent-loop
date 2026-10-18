@@ -1242,6 +1242,7 @@ def _validate_coder_followup_response(
     *,
     unresolved_items: Sequence[UnresolvedReviewItem],
     human_requirements,
+    allow_editor_handoff: bool = False,
     required_architecture_impact_contract: int = 0,
     delivered_risk_test_matrix=None,
     delivered_risk_test_matrix_identity: str | None = None,
@@ -1256,6 +1257,7 @@ def _validate_coder_followup_response(
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
         text,
+        allow_editor_handoff=allow_editor_handoff,
         required_architecture_impact_contract=required_architecture_impact_contract,
         delivered_risk_test_matrix=delivered_risk_test_matrix,
         delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,

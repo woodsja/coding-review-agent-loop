@@ -76,11 +76,22 @@ IMPORTED_RAISERS: dict[str, frozenset[str]] = {
     "sanitize_historical_text": frozenset({"AgentLoopError"}),
     "normalize_fix_scope": frozenset({"AgentLoopError"}),
     "parse_managed_test_command": frozenset({"TestRuntimeConfigurationError"}),
+    "_path": frozenset({"HandoffError"}),
 }
 IMPORTED_NON_RAISERS: frozenset[str] = frozenset()
 
 
 SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
+    "_editor_declaration": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery", "kind-or-version-mismatch", "no-conservative-reading", "payload-bound"}),
+        (
+            "Fatal sites: no-conservative-reading: an invalid or incomplete editor publication "
+            "declaration cannot safely be approximated; kind-or-version-mismatch: a handoff "
+            "version outside v1 is unsupported; payload-bound: editor path lists are bounded; "
+            "authentication-or-forgery: candidate file paths cannot escape the worktree."
+        ),
+    ),
     "ExecutionDisposition.to_payload": ShapeCheckClassification(
         "fatal",
         frozenset({"authentication-or-forgery"}),

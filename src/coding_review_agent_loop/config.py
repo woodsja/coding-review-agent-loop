@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -552,6 +553,9 @@ class AgentLoopConfig:
     # static per-provider args; ``sandboxed`` builds role-scoped grants per
     # invocation (see agent_permissions.py).
     agent_permissions: str = "default"
+    git_operator: str | None = None
+    git_operator_cli_sha256: str | None = None
+    git_operator_session_file: str | None = None
 
     @property
     def architecture_membership_policy(self):
@@ -723,8 +727,22 @@ class AgentLoopConfig:
             AGENT_PERMISSION_MODES,
             validate_sandboxed_passthrough,
             validate_sandboxed_selections,
+            validate_git_operator_selection,
         )
 
+        validate_git_operator_selection(self)
+        for option, value in (("git-operator-cli-sha256", self.git_operator_cli_sha256),
+                              ("git-operator-session-file", self.git_operator_session_file)):
+            if value is not None:
+                valid = isinstance(value, str) and len(value) <= 4096 and not any(ord(c) < 32 for c in value)
+                if option.endswith("sha256"):
+                    valid = valid and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+                else:
+                    valid = valid and value.startswith("/") and ".." not in Path(value).parts and Path(value).name == ".credentials.json"
+                if not valid:
+                    raise AgentLoopError(f"--{option} requires an owner-supplied safe canonical value.")
+                if self.git_operator is None:
+                    raise AgentLoopError(f"--{option} requires --git-operator claude.")
         if self.agent_permissions not in AGENT_PERMISSION_MODES:
             raise AgentLoopError(
                 "--agent-permissions must be one of: " + ", ".join(AGENT_PERMISSION_MODES) + "."
@@ -2138,6 +2156,23 @@ def validate_sandboxed_args(
     named_seats: tuple[object, ...] = (),
 ) -> None:
     """Check every selected provider before command lookup or checkout setup."""
+    if getattr(args, "git_operator", None) is not None:
+        from types import SimpleNamespace
+        from .agent_permissions import validate_sandboxed_flow
+
+        validate_sandboxed_flow(SimpleNamespace(
+            git_operator=args.git_operator,
+            agent_permissions=resolve_agent_permissions_mode(args),
+            coder=args.coder,
+            reviewer=(*configured_reviewers, *(seat.backend for seat in named_seats)),
+            effective_managed_ci=bool(getattr(args, "managed_ci", False) or args.auto_merge),
+            managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
+            managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
+            materialize_split_issues=getattr(args, "materialize_split_issues", False),
+            split_stage=getattr(args, "split_stage", None),
+            implementation_coder=getattr(args, "implementation_coder", None),
+            plan_execution_mode=getattr(args, "plan_execution_mode", None) or "plan-only",
+        ), command=args.command, plan_first=getattr(args, "plan_first", False))
     if resolve_agent_permissions_mode(args) == "sandboxed":
         # Name the unsupported selection before command preflight would
         # report a missing default helper CLI such as agy.
@@ -2362,6 +2397,9 @@ def config_from_args(
         antigravity_cmd=args.antigravity_cmd,
         antigravity_args=static_args("antigravity", args.antigravity_arg),
         agent_permissions=permission_mode,
+        git_operator=getattr(args, "git_operator", None),
+        git_operator_cli_sha256=getattr(args, "git_operator_cli_sha256", None),
+        git_operator_session_file=getattr(args, "git_operator_session_file", None),
         antigravity_model=args.antigravity_model,
         antigravity_models=tuple(args.antigravity_models) if getattr(args, "antigravity_models", None) is not None else (),
         antigravity_print_timeout_seconds=getattr(

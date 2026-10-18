@@ -416,6 +416,9 @@ def test_default_fails_soft_when_xdist_is_not_active(tmp_path, files, args):
 def test_wrapper_resolved_plain_pytest_runs_with_budget_workers(tmp_path):
     """End to end: a plain pytest resolved by the wrapper in an xdist repo runs parallel."""
     project = _project(tmp_path, {"requirements-dev.txt": "pytest-xdist\n"})
+    # Bind repository detection to this project, not an unrelated ancestor
+    # marker such as /tmp/.git left by another test or service on the host.
+    (project / ".git").mkdir()
     report_dir = tmp_path / "wrapper-report"
     report_dir.mkdir()
     budget = WorkerBudget(3, "inherited", "clamp", "cpu", {}, True)

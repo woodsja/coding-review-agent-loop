@@ -4969,6 +4969,10 @@ def test_non_reviewer_prompts_do_not_carry_the_exhaustiveness_rule(tmp_path):
 )
 def test_coder_prompt_parallel_worker_guidance(tmp_path, fixture, supported, mode, sentence):
     config = make_config(tmp_path, test_workers=3, test_worker_enforcement=mode)
+    # The synthetic checkout must declare its own Git root. Otherwise an
+    # unrelated ancestor .git (for example under the host's /tmp) causes
+    # repository_root() to ignore these deliberately local fixture files.
+    (config.claude_dir / ".git").mkdir()
     for name, text in fixture.items():
         (config.claude_dir / name).write_text(text, encoding="utf-8")
     prompt = " ".join(build_issue_prompt(56, config).split())
@@ -4990,6 +4994,7 @@ def test_plain_pytest_lookup_prefers_parallel_cohort_then_serial(tmp_path):
     from coding_review_agent_loop.prompts import _expected_worker_cohorts
 
     config = make_config(tmp_path, test_workers=3, test_worker_enforcement="clamp")
+    (config.claude_dir / ".git").mkdir()  # Mark the fixture checkout, not a foreign parent.
     command = ["python3", "-m", "pytest", "tests/"]
     assert _expected_worker_cohorts(config, command) == ["serial"]
     (config.claude_dir / "pyproject.toml").write_text(

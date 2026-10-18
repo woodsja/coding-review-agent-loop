@@ -209,6 +209,9 @@ def run_issue_loop(
     requested_policy: str | None = None,
     usage_context: RunUsageContext | None = None,
 ) -> int:
+    if config.git_operator is not None:
+        from .agent_permissions import validate_sandboxed_flow
+        validate_sandboxed_flow(config, command="issue", plan_first=plan_first)
     owned_usage_context = usage_context is None
     usage_context = usage_context or _new_usage_context(config)
     reset_authenticated_github_actor(runner)
@@ -279,6 +282,8 @@ def run_issue_loop(
             issue_context=issue_context,
             parent_issue_context=parent_issue_context,
         )
+        if config.git_operator is not None and fresh_child is not None:
+            raise AgentLoopError("Split issue handoff supports only ordinary direct issues")
         if fresh_child is not None:
             route = fresh_child.route
             log(
@@ -523,6 +528,11 @@ def run_issue_loop(
                 )
             ),
         )
+        if resolved_pr is not None and config.git_operator is not None:
+            # Resume continues in the PR loop, whose corrections use SplitPrHandoff.
+            # A bound PR retires the issue journal that produced it.
+            from .handoff_journal import retire_published_issue_journal
+            retire_published_issue_journal(config, issue_number)
         if resolved_pr is not None:
             recovered_execution: ResolvedExecution | None = None
             recovered_topology = None
@@ -855,6 +865,11 @@ def run_issue_loop(
             config, coder_ci_dispatch_guard=managed_ci_creation_intent is not None
         )
         assigned_head_before = _read_assigned_workdir_head(runner, config)
+        split_handoff = None
+        if config.git_operator is not None:
+            from .split_issue_handoff import SplitIssueHandoff
+            split_handoff = SplitIssueHandoff.begin(
+                runner, config=config, issue_number=issue_number, expected_base=assigned_head_before)
         salvage_summary = latest_salvage_context(
             config.log_dir,
             issue_context.comments,
@@ -863,7 +878,15 @@ def run_issue_loop(
             scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE,
         )
         coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
-        coder_response = _run_validated_agent(
+        issue_validators = _architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
+                text,
+                human_requirements=implementation_requirements,
+                require_architecture_impact=True, architecture_status_mode=mode,
+                allow_editor_handoff=split_handoff is not None,
+            ))
+        coder_response = (split_handoff.recovered_response(issue_validators['validate'])
+                          if split_handoff is not None and split_handoff.recovered is not None
+                          else _run_validated_agent(
             runner,
             agent=config.coder,
             config=coder_config,
@@ -880,16 +903,12 @@ def run_issue_loop(
             marker_description="structured issue_implementation result, blocking, or clarification",
             require_architecture_impact_contract=True,
             architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-            **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
-                text,
-                human_requirements=implementation_requirements,
-                require_architecture_impact=True, architecture_status_mode=mode,
-            )),
+            **issue_validators,
             usage_context=usage_context,
             # Without the exact coder role a sandboxed run hands this committing
             # turn the fail-closed read-only grant (#1077).
-            role="coder",
-            use_repair=True,
+            role="editor" if split_handoff is not None else "coder",
+            use_repair=split_handoff is None,
             repair_expected_kind="issue_implementation",
             repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
             repair_requires_direct_discussion_ack=implementation_human_requirements_context.requires_direct_discussion_ack,
@@ -901,7 +920,7 @@ def run_issue_loop(
                 run_id=usage_context.run_id,
             ),
             operation_description="issue implementation",
-            completion_recovery=CompletionRecoveryPolicy(
+            completion_recovery=None if split_handoff is not None else CompletionRecoveryPolicy(
                 issue_number=issue_number,
                 issue_context=issue_context,
                 approved_plan_context=None,
@@ -912,7 +931,7 @@ def run_issue_loop(
                 managed_ci_creation_intent.protection_mode
                 if managed_ci_creation_intent is not None else None
             ),
-        )
+        ))
         coder_output = coder_response.text
         coder_session_id = coder_response.session_id
         implementation_result = coder_response.marker_value
@@ -935,6 +954,11 @@ def run_issue_loop(
                 "Coder implementation result was not accepted for handoff because a signed "
                 "human requirement is blocked."
             )
+        if split_handoff is not None:
+            pr_number = split_handoff.publish(
+                implementation_result, editor_text=coder_output, model_used=coder_response.model_used)
+            implementation_result = dataclasses_replace(implementation_result, pr_number=pr_number)
+            coder_session_id = None  # Reviewer never reuses the editor/operator session.
         if isinstance(implementation_result, StructuredIssueImplementation):
             if implementation_result.pr_number is None:
                 implementation_result = _degrade_out_of_checkout_tests(
@@ -970,14 +994,24 @@ def run_issue_loop(
                     + "."
                 )
             raise AgentLoopError("Issue implementation validator returned an unknown result type.")
-        validate_assigned_head_advanced(
-            before_head=assigned_head_before,
-            after_head=_read_assigned_workdir_head(runner, config),
-            assigned_workdir=active_workdir(config),
-        )
-        log(config, f"{agent_display_name(config.coder)} reported PR #{pr_number}; validating it is open")
+        if split_handoff is None:
+            validate_assigned_head_advanced(
+                before_head=assigned_head_before,
+                after_head=_read_assigned_workdir_head(runner, config),
+                assigned_workdir=active_workdir(config),
+            )
+        publication_actor = "Host publication bound" if split_handoff is not None else f"{agent_display_name(config.coder)} reported"
+        log(config, f"{publication_actor} PR #{pr_number}; validating it is open")
         validate_open_pr(runner, config=config, pr_number=pr_number)
         initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+        if split_handoff is not None:
+            split_handoff.synchronize(initial_pr_context.metadata)
+            validate_assigned_head_advanced(
+                before_head=assigned_head_before,
+                after_head=_read_assigned_workdir_head(runner, config),
+                assigned_workdir=active_workdir(config),
+            )
+            split_handoff.complete()
         # Once the managed draft is authenticated, a rejection of this turn
         # (for example a failed report validation or a checkout failure during
         # semantic correction) still publishes the dispatch audit (#1366).

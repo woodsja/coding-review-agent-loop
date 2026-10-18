@@ -553,7 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "Agent permission mode (default: default). 'sandboxed' builds CLI-enforced, "
                 "role-scoped grants per invocation for Claude and Codex: coders (Claude only) "
                 "may edit their checkout and run git, the prompt-named gh subcommands, and the "
-                "exact resolved test invocation; every other role is read-only, writes only "
+                "exact resolved test invocation; an explicitly selected Codex editor uses "
+                "workspace-write with --git-operator claude. Other roles are read-only, write only "
                 "its response file, and (Claude) inspects only through `agent-loop inspect`. "
                 "Sandboxed mode rejects every --<agent>-arg, Gemini/Antigravity on any "
                 "selection path (including the default repair and semantic-followup "
@@ -1419,6 +1420,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_common(issue)
+    issue.add_argument("--git-operator-cli-sha256", default=None,
+        help="Required with --git-operator: owner-supplied SHA256 of the native Claude CLI "
+             "selected by --claude-cmd; no automatic attestation.")
+    issue.add_argument("--git-operator-session-file", default=None,
+        help="Required with --git-operator: owner-supplied canonical Claude .credentials.json "
+             "path, mounted read-only; never discovered and its contents are never printed.")
+    issue.add_argument(
+        "--git-operator", choices=("claude",), default=None,
+        help=(
+            "Codex edits the checkout and a separate Claude Git operator commits it. Requires "
+            "Linux, bubblewrap, --coder codex, --agent-permissions sandboxed, a Claude reviewer, "
+            "--git-operator-cli-sha256 and --git-operator-session-file; direct issue or "
+            "ordinary pr only, without managed CI, plan-first, decomposition or --dry-run. "
+            "Invalid combinations are refused before any checkout is claimed. Default: disabled."
+        ),
+    )
     add_reviewer_floor(issue)
     issue.add_argument(
         "--managed-ci",
@@ -1486,6 +1503,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly widen a recovered expected-closing contract with a proper superset.",
     )
     add_common(pr)
+    pr.add_argument("--git-operator-cli-sha256", default=None,
+        help="Required with --git-operator: owner-supplied SHA256 of the native Claude CLI "
+             "selected by --claude-cmd; no automatic attestation.")
+    pr.add_argument("--git-operator-session-file", default=None,
+        help="Required with --git-operator: owner-supplied canonical Claude .credentials.json "
+             "path, mounted read-only; never discovered and its contents are never printed.")
+    pr.add_argument(
+        "--git-operator", choices=("claude",), default=None,
+        help=(
+            "Codex edits the checkout and a separate Claude Git operator commits it. Requires "
+            "Linux, bubblewrap, --coder codex, --agent-permissions sandboxed, a Claude reviewer, "
+            "--git-operator-cli-sha256 and --git-operator-session-file; direct issue or "
+            "ordinary pr only, without managed CI or --dry-run. Invalid combinations are "
+            "refused before any checkout is claimed. Default: disabled."
+        ),
+    )
     add_reviewer_floor(pr)
     pr.add_argument(
         "--managed-ci",
@@ -2668,6 +2701,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Preserve tokens (rather than a rendered command) so timeout guidance can
         # be safely shell-quoted locally. Programmatic callers have no sys.argv.
         invocation = tuple([sys.argv[0], *sys.argv[1:]]) if argv is None else tuple(["agent-loop", *argv])
+        if getattr(args, "git_operator", None) is not None:
+            validate_sandboxed_args(
+                args, tuple(args.reviewer or ()), named_seats=resolve_reviewer_seats(args)
+            )
         explicit_managed_ci = bool(getattr(args, "managed_ci", False))
         if explicit_managed_ci:
             if args.command not in {"issue", "pr", "managed-pr"}:
@@ -2707,6 +2744,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not named_seats and (args.primary_reviewer_seat is not None or args.primary_plan_reviewer_seat is not None):
             raise AgentLoopError("A named primary requires --reviewer-seat.")
         config = config_from_args(args, runner, invocation_argv=invocation)
+        if config.git_operator is not None:
+            from .agent_permissions import require_split_role_workflow
+
+            require_split_role_workflow(
+                config, command=args.command, plan_first=getattr(args, "plan_first", False)
+            )
         if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:
             # Before claims, sandbox setup and base-branch resolution (#1111).
             tool_provenance.capture_process_provenance(config)
