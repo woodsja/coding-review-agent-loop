@@ -552,6 +552,7 @@ class AgentLoopConfig:
     # static per-provider args; ``sandboxed`` builds role-scoped grants per
     # invocation (see agent_permissions.py).
     agent_permissions: str = "default"
+    git_operator: str | None = None
 
     @property
     def architecture_membership_policy(self):
@@ -723,8 +724,10 @@ class AgentLoopConfig:
             AGENT_PERMISSION_MODES,
             validate_sandboxed_passthrough,
             validate_sandboxed_selections,
+            validate_git_operator_selection,
         )
 
+        validate_git_operator_selection(self)
         if self.agent_permissions not in AGENT_PERMISSION_MODES:
             raise AgentLoopError(
                 "--agent-permissions must be one of: " + ", ".join(AGENT_PERMISSION_MODES) + "."
@@ -2138,6 +2141,23 @@ def validate_sandboxed_args(
     named_seats: tuple[object, ...] = (),
 ) -> None:
     """Check every selected provider before command lookup or checkout setup."""
+    if getattr(args, "git_operator", None) is not None:
+        from types import SimpleNamespace
+        from .agent_permissions import validate_sandboxed_flow
+
+        validate_sandboxed_flow(SimpleNamespace(
+            git_operator=args.git_operator,
+            agent_permissions=resolve_agent_permissions_mode(args),
+            coder=args.coder,
+            reviewer=(*configured_reviewers, *(seat.backend for seat in named_seats)),
+            effective_managed_ci=bool(getattr(args, "managed_ci", False) or args.auto_merge),
+            managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
+            managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
+            materialize_split_issues=getattr(args, "materialize_split_issues", False),
+            split_stage=getattr(args, "split_stage", None),
+            implementation_coder=getattr(args, "implementation_coder", None),
+            plan_execution_mode=getattr(args, "plan_execution_mode", None) or "plan-only",
+        ), command=args.command, plan_first=getattr(args, "plan_first", False))
     if resolve_agent_permissions_mode(args) == "sandboxed":
         # Name the unsupported selection before command preflight would
         # report a missing default helper CLI such as agy.
@@ -2362,6 +2382,7 @@ def config_from_args(
         antigravity_cmd=args.antigravity_cmd,
         antigravity_args=static_args("antigravity", args.antigravity_arg),
         agent_permissions=permission_mode,
+        git_operator=getattr(args, "git_operator", None),
         antigravity_model=args.antigravity_model,
         antigravity_models=tuple(args.antigravity_models) if getattr(args, "antigravity_models", None) is not None else (),
         antigravity_print_timeout_seconds=getattr(
