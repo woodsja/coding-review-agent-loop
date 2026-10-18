@@ -229,17 +229,13 @@ foreign or duplicate PRs. An uncertain POST is reconciled by listing again;
 retrying the same recorded identity does not blindly create another PR. PR
 binding currently supports `owner/repository` identities only.
 
-These modules are **not wired into issue_loop.py or pr_loop.py**. Checkpoint
-4C is partial: local executable/session attestation and its internal synthetic
-publication slice are implemented. Remaining work must add the explicit
-editor/operator option and role validation,
-retain claims across the seam, write EDITED/COMMITTED/PUSHED/PR_BOUND into existing
-round state, persist authenticated provenance/closing-contract records, and
-schedule a separate reviewer on the published head. The caller must preflight
-repository policy (including unsupported signed-commit requirements) and use
-trusted round-state values, never model-selected destinations or handoff IDs.
-Ordinary PR correction binding reuses the original handoff ID; existing legacy
-PRs need a trusted adoption path before using this identity contract.
+These modules are reached only through the opt-in `--git-operator claude` split
+flow described under "Split-role editor and Git operator" below.
+The caller uses trusted round-state values, never model-selected destinations or
+handoff IDs, and the handoff refuses a repository that requires signed commits
+before any editor runs. Ordinary PR correction binding reuses the original
+handoff ID; existing legacy PRs need a trusted adoption path before using this
+identity contract.
 
 LFS, submodules, ignore-rule changes, escaping links, oversized files (including
 binary files above 16 MiB), total candidate content above 128 MiB and packed-only
@@ -379,16 +375,23 @@ persisted across processes.
   never auto-merges. Host-session work is outside the external-agent process
   boundary. See [skill architecture](../skill_mode.md#architecture).
 
-## Decisions
+## Split-role editor and Git operator
 
-[Decision log](decisions/execution-and-concurrency.md)
+`split_issue_handoff.py` connects the ordinary direct issue path
+(`SplitIssueHandoff`) and ordinary PR corrections (`SplitPrHandoff`) to the
+verified Git primitives. `agent-loop issue N` and `agent-loop pr N` accept the
+opt-in `--git-operator claude`; the default and the committing-sandboxed-Codex
+refusal are unchanged.
 
-## Split-role checkpoint 4D (internal direct issue seam)
-
-`split_issue_handoff.py` connects the ordinary direct issue path to the existing
-verified Git primitives. The public CLI still raises `split-role workflow not
-yet wired` before claims or workflow execution. This checkpoint is testable
-through `run_issue_loop`; it is not a rollout of split-role execution.
+`require_split_role_workflow` is the entry gate. It runs before any worktree
+claim (and again before agents start) and refuses, without touching a checkout:
+anything but a direct `issue` or ordinary `pr` (plan-first, decomposition, task,
+discuss, managed PR and managed CI included), `--dry-run`, a missing
+`--git-operator-cli-sha256` or `--git-operator-session-file`, a CLI whose
+SHA256 does not match, an unsafe session file (metadata-only `O_PATH` pin; the
+contents are never read or printed), and missing Codex/Claude flags or
+bubblewrap mounts. The real full-model Claude invocation is a separate
+owner-run host smoke gate, not part of the unit suite.
 
 Under the issue loop's existing worktree claim, the host requires an explicit
 native Claude executable SHA256 and canonical read-only session-file path,
@@ -397,7 +400,7 @@ checks CLI/mount capabilities and trusted GitHub authentication, and calls
 host Python. No authentication is inferred from environment tokens or a home
 directory. The owner inputs are `--git-operator-cli-sha256` and
 `--git-operator-session-file`; `--claude-cmd` selects the attested native file.
-These options do not lift the CLI execution gate.
+Both are required with `--git-operator` and are never discovered.
 
 The editor uses `role="editor"` and a distinct prompt forbidding branch,
 commit, push and PR operations. Only the split parser accepts the version-1
@@ -418,14 +421,78 @@ checkout baseline, closing-contract and issue-to-PR handoff writers then feed
 the existing independent reviewer loop. Operator and reviewer sessions are
 never reused.
 
-`EDITED`, `COMMITTED`, `PUSHED` and `PR_BOUND` are sanitized progress messages,
-not durable recovery records. Temporary handoff evidence is retained on
-failure, but no crash recovery or cross-process idempotency is claimed. A new
-run has a new handoff/branch identity. Split-mode existing-PR resume is refused
-at the issue entry point. PR corrections, durable phase recording/recovery,
-and rollout integration remain future checkpoints; the CLI must stay blocked
-until those are complete. Existing reviewer/CI scheduling is reused unchanged;
-a correction requiring a committing Codex role still fails closed.
+### Trusted metadata placement
+
+The trusted Git administration directory, the operator's private index and
+objects, and the phase journal live under
+`$XDG_STATE_HOME/coding-review-agent-loop-handoff` (default
+`~/.local/state/...`), a mode-0700 directory owned by the user. It is refused
+if it lies inside `/tmp`, `/var/tmp`, `/dev/shm`, `$TMPDIR` or the checkout,
+because those are the roots a Codex workspace-write editor can modify, and it
+is refused beneath a group- or world-writable ancestor. Metadata is created
+before the editor runs, so the editor sandbox sees it only as a read-only
+filesystem. `tests/test_handoff_trusted_state.py` proves this with the real
+`codex sandbox` (the editor's exact workspace-write flags): writes to `/tmp`
+and the checkout succeed, while writes to the trusted config, HEAD, hooks,
+attributes, alternates, journal and operator area all fail with the operating
+system's read-only error. As defence in depth the host also seals the
+administration directory (config, HEAD, base index, every non-object entry)
+before the editor runs and refuses to capture, verify or publish if any entry
+differs, so planted configuration, hooks, filters or alternates cannot be
+executed even if a sandbox were misconfigured. The editor can still read files
+the sandbox can read, including the operator's session file; that file is
+mounted read-only for the operator and is never written or read by host
+Python, but its confidentiality from a workspace-write editor depends on the
+owner placing it outside paths the editor may read.
+
+### Durable phases and recovery
+
+Each handoff writes an atomic, fsynced, version-1 JSON record
+(`handoff_journal.py`, one per repository, kind and number) after every phase:
+
+- `EDITED`: the frozen candidate tree, declared new paths, commit identity and
+  the validated editor response text. Recorded after capture and before the
+  operator runs.
+- `COMMITTED`: the locally verified commit SHA.
+- `PUSHED`: the verified remote branch head equals that SHA.
+- `PR_BOUND`: the ordinary issue PR number (issue handoffs only; corrections
+  push to the existing PR and stop at `PUSHED`).
+
+A phase may not move backwards, and a journal that is corrupt, foreign,
+group/world accessible or names an unsafe branch is refused. On restart the
+next `begin` finds the journal and recovers without a second editor turn: it
+requires the new clean worktree to equal the journaled base, rebuilds the
+candidate from the previous handoff's hash-verified loose objects (no Git
+process reads the old metadata), re-captures it and demands the identical tree,
+re-runs the source-read-only operator, and demands the identical commit SHA
+(commit identity, timestamp and message are journaled, so the commit is
+deterministic). Push and PR binding are idempotent: an absent branch is
+created under a lease, a branch already at the SHA is accepted, any other head
+is refused, and an existing PR for the branch is validated and reused, so no
+duplicate commit, push or PR is created. The loops re-validate the journaled
+editor response with the same validators instead of invoking the editor, and
+call `complete()` after the checkout is synchronized, which retires the journal
+and its retained evidence. A correction whose PR head already equals the
+journaled commit retires the journal and continues with ordinary next-round
+logic; a journal recorded against a different base or head is refused with the
+file path to inspect. Host test receipts are ephemeral by design, so a
+recovered correction relies on the validation performed before `EDITED` was
+journaled. Resuming a bound PR through the issue entry point continues in the
+PR loop, retiring a journal that already reached `PUSHED`.
+
+### Known limits
+
+Tracked tool or configuration links, ignore-rule edits, Git LFS and filters
+that change content are refused or detected: the committed tree must equal the
+frozen candidate regardless of attributes, and the host hashes candidate bytes
+with `--no-filters`. Commits are unsigned (signing configuration is not read), so
+`begin` reads, before any editor turn, the repository rulesets for the base and
+head branches and the base branch's classic protection, and refuses when
+signatures are required or when that cannot be verified (for example an
+unreadable or ruleset-only protected branch). A change to the
+shared Git metadata by another process during a handoff is treated as tampering
+and fails closed rather than being tolerated. Managed CI, approved-plan and
+plan-first flows, merge-conflict corrections and non-Linux hosts are refused.
 
 `tests/test_split_issue_handoff.py` exercises the public issue loop with a
 linked disposable checkout, local bare origin, fake GitHub and fake provider
@@ -434,3 +501,7 @@ operator object creation, raw verification, lease publication, ordinary PR
 binding and the existing independent reviewer path. It does not prove live
 Claude authentication or OS confinement; dedicated operator tests and the
 owner's separate disposable live proof cover those boundaries.
+
+## Decisions
+
+[Decision log](decisions/execution-and-concurrency.md)

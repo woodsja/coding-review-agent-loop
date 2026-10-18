@@ -162,7 +162,8 @@ def receipt(adapter):
 
 def publish(adapter, parsed=None, *, head_change_expected=True, observations=None):
     return adapter.publish(parsed or ready(), head_change_expected=head_change_expected,
-                           test_observations=receipt(adapter) if observations is None else observations)
+                           test_observations=receipt(adapter) if observations is None else observations,
+                           editor_text=editor_text())
 
 
 def test_changed_source_head_refused_before_publication(correction, monkeypatch):

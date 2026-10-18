@@ -350,10 +350,34 @@ def validate_split_role_capabilities(config: AgentLoopConfig) -> None:
 def require_split_role_workflow(
     config: AgentLoopConfig, *, command: str, plan_first: bool = False
 ) -> None:
-    """Temporary run gate until issue and PR loops implement the handoff."""
+    """Fail-closed entry gate for ``--git-operator claude``; touches no checkout.
+
+    Runs before worktree claims (and again before agents start): flow shape,
+    a real (non-dry-run) transport, the owner-attested CLI digest and session
+    path, then the credential-free capability and mount probes. The session is
+    pinned by metadata only; its contents are never read. Success means the
+    claimed issue/pr workflow may proceed; the handoff adapter repeats the
+    checkout-relative checks under the claim.
+    """
     validate_sandboxed_flow(config, command=command, plan_first=plan_first)
+    if config.dry_run:
+        raise AgentLoopError(
+            "--git-operator claude does not support --dry-run: publication needs a real trusted transport."
+        )
+    digest, session = config.git_operator_cli_sha256, config.git_operator_session_file
+    if digest is None or session is None:
+        raise AgentLoopError(
+            "--git-operator claude requires owner-attested --git-operator-cli-sha256 and "
+            "--git-operator-session-file."
+        )
+    from .claude_git_operator import _PinnedFile
+    from .git_handoff import HandoffError
+
+    try:
+        _PinnedFile.open(Path(session)).close()
+    except HandoffError as exc:
+        raise AgentLoopError(f"--git-operator claude: {exc}") from None
     validate_split_role_capabilities(config)
-    raise AgentLoopError("split-role workflow not yet wired")
 
 
 def committing_coder(config: AgentLoopConfig, *, command: str, plan_first: bool = False) -> str | None:

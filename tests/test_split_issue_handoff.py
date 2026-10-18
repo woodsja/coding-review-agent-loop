@@ -54,7 +54,7 @@ def test_direct_issue_refuses_no_change_or_editor_git_mutation(direct, monkeypat
             foreign = git(root, 'commit-tree', h.base_tree, '-p', h.base, data=b'Foreign\n').decode()
             git(root, 'update-ref', 'HEAD', foreign)
         parsed = kw['validate'](editor_text())
-        return SimpleNamespace(text=editor_text(), session_id=None, marker_value=parsed)
+        return SimpleNamespace(text=editor_text(), session_id=None, marker_value=parsed, model_used=None)
     monkeypatch.setattr(loop, '_run_validated_agent', edit)
     with pytest.raises(AgentLoopError, match=diagnostic):
         loop.run_issue_loop(runner, issue_number=1, config=config)

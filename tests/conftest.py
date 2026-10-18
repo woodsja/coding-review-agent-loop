@@ -228,3 +228,40 @@ def _round_publication_needs_an_actor_surface(monkeypatch):
 
     monkeypatch.setattr(pr_loop, "round_publication", maybe)
     monkeypatch.setattr(plan_first_loop, "round_publication", maybe)
+
+
+@pytest.fixture(autouse=True)
+def _signed_commit_policy_is_proven_separately(monkeypatch):
+    """Handoff fakes model no branch-protection API; tests/test_split_publication_policy.py
+    exercises the real fail-closed check through the import-time reference."""
+    from coding_review_agent_loop import split_issue_handoff
+
+    monkeypatch.setattr(split_issue_handoff, "require_unsigned_publication_policy", lambda *a: None)
+
+
+@pytest.fixture(autouse=True)
+def _handoff_state_home():
+    """Trusted handoff metadata must live outside /tmp, so every test gets its own.
+
+    Placed under the user's cache directory (never an editor-writable root) and
+    removed after each test, so journals cannot leak between tests and the real
+    per-user state is never touched.
+    """
+    import os
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    cache = Path.home() / ".cache"
+    cache.mkdir(mode=0o700, exist_ok=True)
+    state = tempfile.mkdtemp(prefix="reviewloop-test-state-", dir=cache)
+    previous = os.environ.get("XDG_STATE_HOME")
+    os.environ["XDG_STATE_HOME"] = state
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = previous
+        shutil.rmtree(state, ignore_errors=True)

@@ -8889,16 +8889,7 @@ def run_pr_loop(
                     split_handoff = SplitPrHandoff.begin(
                         runner, config=config, pr_number=pr_number, metadata=pr_metadata,
                     )
-                coder_response = _run_validated_agent(
-                    runner,
-                    agent=config.coder,
-                    config=coder_config,
-                    prompt=followup_prompt,
-                    session_id=coder_session_id,
-                    marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                    require_architecture_impact_contract=True,
-                    architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
+                coder_validators = _architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         allow_editor_handoff=split_handoff is not None,
@@ -8929,7 +8920,19 @@ def run_pr_loop(
                             if approved_plan_context is not None and approved_plan_context.matrix_available
                             else None
                         ), architecture_status_mode=mode,
-                    )),
+                    ))
+                coder_response = (split_handoff.recovered_response(coder_validators['validate'])
+                                  if split_handoff is not None and split_handoff.recovered is not None
+                                  else _run_validated_agent(
+                    runner,
+                    agent=config.coder,
+                    config=coder_config,
+                    prompt=followup_prompt,
+                    session_id=coder_session_id,
+                    marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                    require_architecture_impact_contract=True,
+                    architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
+                    **coder_validators,
                     usage_context=usage_context,
                     role="editor" if split_handoff is not None else "coder",
                     use_repair=split_handoff is None,
@@ -8946,7 +8949,7 @@ def run_pr_loop(
                         run_id=usage_context.run_id,
                     ),
                     operation_description="PR feedback follow-up",
-                )
+                ))
                 coder_output = coder_response.text
                 coder_session_id = coder_response.session_id
                 latest_coder_output = coder_output
@@ -9016,10 +9019,12 @@ def run_pr_loop(
                             citation_row_ids=_evidence_stall_citation_rows(evidence_stall_snapshot),
                         ) if isinstance(coder_response.marker_value, StructuredCoderFollowup) else True,
                         test_observations=coder_response.acquisition_test_observations,
+                        editor_text=coder_output, model_used=coder_response.model_used,
                     )
                 updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
                 if split_handoff is not None:
                     split_handoff.synchronize(updated_pr_context.metadata)
+                    split_handoff.complete()
                 unresolved_items = _advance_machine_obligations_for_head(
                     unresolved_items,
                     current_head_sha=updated_pr_context.metadata.head_sha,

@@ -15,6 +15,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import zlib
 
 from .checkout_verification import registered_links, link_intact
@@ -25,6 +26,7 @@ from .secure_git import local_command, _trusted_executable
 MAX_FILE = 16 * 1024 * 1024
 MAX_TOTAL = 128 * 1024 * 1024
 MAX_PATHS = 10000
+MAX_METADATA_FILE = 64 * 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -53,6 +55,62 @@ class CommitIdentity:
             raise HandoffError("Invalid trusted commit message")
         value = f"{self.name} <{self.email}> {self.timestamp} +0000\n"
         return ("author " + value + "committer " + value).encode()
+
+
+def _branch_name(branch: str):
+    if (not isinstance(branch, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,199}", branch)
+            or any(x in branch for x in ("..", "//", "@{"))
+            or any(p.startswith(".") or p.endswith((".", ".lock")) for p in branch.split("/"))
+            or branch.endswith("/") or branch.startswith("refs/")):
+        raise HandoffError("Unsafe publication branch")
+
+
+def state_base() -> Path:
+    """The per-user directory for trusted handoff state and journals."""
+    state = os.environ.get("XDG_STATE_HOME")
+    if not state or not os.path.isabs(state):
+        state = os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(os.path.realpath(state)) / "coding-review-agent-loop-handoff"
+
+
+def ensure_state_base(checkout: Path) -> Path:
+    """Create/validate the private state root; it must be outside editor-writable roots."""
+    base = state_base()
+    writable = {Path(os.path.realpath(p)) for p in (
+        "/tmp", "/var/tmp", "/dev/shm", tempfile.gettempdir(), os.environ.get("TMPDIR") or "/tmp")}
+    writable.add(checkout.resolve(strict=True))
+    if any(base.is_relative_to(root) for root in writable):
+        raise HandoffError("Trusted handoff state must not be inside an editor-writable root")
+    try:
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for directory in (base, *base.parents):
+            info = directory.lstat()
+            if directory.is_symlink() or not stat.S_ISDIR(info.st_mode):
+                raise HandoffError("Unsafe trusted handoff state directory")
+            if directory == base and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+                raise HandoffError("Trusted handoff state must be private to the current user")
+            if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+                raise HandoffError("Trusted handoff state has a group- or world-writable ancestor")
+    except OSError as exc:
+        raise HandoffError("Trusted handoff state directory unavailable") from exc
+    return base
+
+
+def private_trusted_dir(checkout: Path, label: str) -> Path:
+    """Create host metadata outside every root a workspace-write editor can modify.
+
+    Codex workspace-write can write the checkout, /tmp and $TMPDIR, so the
+    trusted Git administration data lives in a 0700 per-user state directory
+    that is none of those. Creation happens before the editor runs; the editor
+    sandbox mounts it read-only (verified against the real Codex sandbox).
+    """
+    base = ensure_state_base(checkout)
+    try:
+        root = Path(tempfile.mkdtemp(prefix=label + "-", dir=base))
+    except OSError as exc:
+        raise HandoffError("Trusted handoff state directory unavailable") from exc
+    return root / "trusted"
 
 
 def _run(admin: Path | None, checkout: Path, args, *, data=None, objects=None, index=None, alternates=None):
@@ -188,6 +246,148 @@ class OperatorContext:
                 "GIT_NO_REPLACE_OBJECTS": "1"}
 
 
+_LOOSE_DIR = re.compile(r"[0-9a-f]{2}\Z")
+
+
+def _seal(admin: Path):
+    """Digest every trusted administration entry the host never rewrites.
+
+    Host-written loose objects and the scratch index are exempt; anything else
+    (config, hooks, attributes, alternates, packs, links, extra files) is part
+    of the seal, so editor-planted Git metadata cannot go unnoticed.
+    """
+    entries = []
+    for directory, dirs, files in os.walk(admin, followlinks=False):
+        rel = Path(directory).relative_to(admin)
+        dirs.sort()
+        if rel.parts[:1] == ("objects",) and len(rel.parts) >= 2 and _LOOSE_DIR.match(rel.parts[1]):
+            dirs[:] = []
+            continue
+        for name in sorted(dirs + files):
+            path = Path(directory) / name
+            relative = rel / name
+            if relative == Path("index") or (relative.parts[:1] == ("objects",)
+                                            and len(relative.parts) == 2 and _LOOSE_DIR.match(name)):
+                continue
+            info = path.lstat()
+            kind = stat.S_IFMT(info.st_mode)
+            if stat.S_ISREG(kind):
+                if info.st_size > MAX_METADATA_FILE:
+                    raise HandoffError("Trusted Git metadata exceeds inspection bound")
+                content = hashlib.sha256(path.read_bytes()).hexdigest()
+            elif stat.S_ISLNK(kind):
+                content = os.readlink(path)
+            elif stat.S_ISDIR(kind):
+                content = ""
+            else:
+                raise HandoffError("Unexpected trusted Git metadata entry")
+            entries.append((str(relative), stat.S_IMODE(info.st_mode), kind, content))
+            if len(entries) > 100000:
+                raise HandoffError("Trusted Git metadata exceeds inspection bound")
+    return tuple(entries)
+
+
+def _loose(objects: Path, oid: str):
+    """Read one loose object with no Git process, config or alternates."""
+    if not SHA.fullmatch(oid):
+        raise HandoffError("Invalid raw object identity")
+    value = _read(objects, oid[:2] + "/" + oid[2:])
+    if value is None or value[0] == "120000":
+        raise HandoffError("Journaled candidate object is missing")
+    try:
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(value[1], MAX_FILE + 4097)
+        if not decoder.eof or decoder.unused_data or len(raw) > MAX_FILE + 4096:
+            raise HandoffError("Unsupported raw object encoding")
+        if hashlib.sha1(raw).hexdigest() != oid:
+            raise HandoffError("Raw object hash mismatch")
+        header, content = raw.split(b"\0", 1)
+        kind, size = header.split(b" ")
+        if size != str(len(content)).encode():
+            raise HandoffError("Invalid raw object size")
+    except (ValueError, zlib.error) as exc:
+        raise HandoffError("Invalid journaled candidate object") from exc
+    return kind, content
+
+
+def _flatten(objects: Path, tree: str, prefix: str = "", out=None, depth: int = 0):
+    out = {} if out is None else out
+    kind, raw = _loose(objects, tree)
+    if kind != b"tree" or depth > 64:
+        raise HandoffError("Invalid journaled candidate tree")
+    while raw:
+        head, raw = raw.split(b"\0", 1)
+        oid, raw = raw[:20].hex(), raw[20:]
+        mode, name = head.decode().split(" ", 1)
+        path = prefix + name
+        if mode == "40000":
+            _flatten(objects, oid, path + "/", out, depth + 1)
+            continue
+        if mode not in {"100644", "100755", "120000"}:
+            raise HandoffError("Unsupported journaled candidate entry")
+        _path(path)
+        out[path] = (mode, oid)
+        if len(out) > MAX_PATHS:
+            raise HandoffError("Candidate exceeds path bound")
+    return out
+
+
+def _remove(root: Path, name: str):
+    _path(name)
+    opened = []
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        opened.append(fd)
+        parts = name.split("/")
+        for part in parts[:-1]:
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            opened.append(fd)
+        os.unlink(parts[-1], dir_fd=fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise HandoffError("Unsafe candidate restoration path") from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def _write(root: Path, name: str, mode: str, content: bytes):
+    _path(name)
+    opened = []
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        opened.append(fd)
+        parts = name.split("/")
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            opened.append(fd)
+        try:
+            os.unlink(parts[-1], dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        if mode == "120000":
+            target = os.fsdecode(content)
+            if not ((root / name).parent / target).resolve().is_relative_to(root):
+                raise HandoffError("Escaping symlink")
+            os.symlink(target, parts[-1], dir_fd=fd)
+            return
+        handle = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o755 if mode == "100755" else 0o644, dir_fd=fd)
+        with os.fdopen(handle, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o755 if mode == "100755" else 0o644)
+            stream.write(content)
+    except OSError as exc:
+        raise HandoffError("Unsafe candidate restoration path") from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
 class Handoff:
     @classmethod
     def begin(cls, checkout: Path, trusted: Path, identity: CommitIdentity, *, expected_base: str):
@@ -251,6 +451,7 @@ class Handoff:
             if value != (mode, self.git("cat-file", "blob", oid)):
                 raise HandoffError("Starting ignore rules differ from base")
         self.shared_stamp = _stamp(self.common)
+        self.seal = _seal(self.admin)
         self.tree = None
         self._context = None
         return self
@@ -262,6 +463,14 @@ class Handoff:
         return _run(self.admin, self.checkout, args, data=data, alternates=alternate)
 
     def _unchanged(self):
+        try:
+            sealed = _seal(self.admin) == self.seal
+            if self.tree is None:  # No host object write has happened yet.
+                sealed = sealed and sorted(os.listdir(self.objects)) == ["info"]
+        except OSError as exc:
+            raise HandoffError("Trusted Git metadata is unreadable") from exc
+        if not sealed:
+            raise HandoffError("Trusted Git metadata was modified after it was sealed")
         if (_identity(self.checkout.stat())[:2] != self.root_identity
                 or _pointer(self.checkout) != self.pointer
                 or _stamp(self.common) != self.shared_stamp):
@@ -307,6 +516,31 @@ class Handoff:
                 raise HandoffError("Git LFS is unsupported by the verified handoff")
             snapshot[name] = value
         return snapshot
+
+    def restore(self, previous_objects: Path, tree: str):
+        """Rebuild a journaled frozen candidate in this clean, base-pinned checkout.
+
+        Reads the previous handoff's loose objects directly (hash-verified, no Git
+        process), refuses unless the checkout currently equals the pinned base,
+        then writes only the paths that differ. The caller re-captures and must
+        require the identical tree before any commit is made.
+        """
+        if self.tree is not None:
+            raise HandoffError("Candidate already frozen")
+        for name, value in self._snapshot(frozenset()).items():
+            mode_oid = None if value is None else (value[0], hashlib.sha1(
+                b"blob " + str(len(value[1])).encode() + b"\0" + value[1]).hexdigest())
+            if mode_oid != self.base_entries.get(name):
+                raise HandoffError("Recovery requires a clean checkout at the pinned base")
+        candidate = _flatten(previous_objects, tree)
+        for name in sorted(set(self.base_entries) - set(candidate)):
+            _remove(self.checkout, name)
+        for name, (mode, oid) in sorted(candidate.items()):
+            if self.base_entries.get(name) != (mode, oid):
+                kind, content = _loose(previous_objects, oid)
+                if kind != b"blob":
+                    raise HandoffError("Invalid journaled candidate blob")
+                _write(self.checkout, name, mode, content)
 
     def capture(self, *, allowed_new: set[str], allow_no_change: bool = False):
         if self.tree is not None:

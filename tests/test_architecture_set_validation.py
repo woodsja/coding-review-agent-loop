@@ -358,7 +358,8 @@ def test_every_coder_invocation_wires_the_membership_hook():
     wired = 0
     for path in sorted(SRC.glob("*.py")):
         source = path.read_text(encoding="utf-8")
-        for node in ast.walk(ast.parse(source)):
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -366,6 +367,14 @@ def test_every_coder_invocation_wires_the_membership_hook():
             if name != "_run_validated_agent":
                 continue
             segment = ast.get_source_segment(source, node) or ""
+            # A call may splat validators built just before it (split-role
+            # recovery re-validates journaled text with the same callables).
+            for keyword in node.keywords:
+                if keyword.arg is None and isinstance(keyword.value, ast.Name):
+                    for assign in ast.walk(tree):
+                        if (isinstance(assign, ast.Assign) and any(
+                                isinstance(t, ast.Name) and t.id == keyword.value.id for t in assign.targets)):
+                            segment += ast.get_source_segment(source, assign) or ""
             if not any(validator in segment for validator in _CODER_VALIDATORS):
                 continue
             keywords = {keyword.arg for keyword in node.keywords}

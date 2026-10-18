@@ -1421,16 +1421,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common(issue)
     issue.add_argument("--git-operator-cli-sha256", default=None,
-        help="Owner-supplied SHA256 of the native Claude CLI; no automatic attestation.")
+        help="Required with --git-operator: owner-supplied SHA256 of the native Claude CLI "
+             "selected by --claude-cmd; no automatic attestation.")
     issue.add_argument("--git-operator-session-file", default=None,
-        help="Owner-supplied canonical Claude session path, mounted read-only; never discovered.")
+        help="Required with --git-operator: owner-supplied canonical Claude .credentials.json "
+             "path, mounted read-only; never discovered and its contents are never printed.")
     issue.add_argument(
         "--git-operator", choices=("claude",), default=None,
         help=(
-            "Select the Codex editor + Claude Git operator checkpoint. Requires Linux, "
-            "--coder codex, --agent-permissions sandboxed and a Claude reviewer; "
-            "direct issue or ordinary pr only, without managed CI. Workflow not yet wired; "
-            "execution stops before checkout claims. Default: disabled."
+            "Codex edits the checkout and a separate Claude Git operator commits it. Requires "
+            "Linux, bubblewrap, --coder codex, --agent-permissions sandboxed, a Claude reviewer, "
+            "--git-operator-cli-sha256 and --git-operator-session-file; direct issue or "
+            "ordinary pr only, without managed CI, plan-first, decomposition or --dry-run. "
+            "Invalid combinations are refused before any checkout is claimed. Default: disabled."
         ),
     )
     add_reviewer_floor(issue)
@@ -1501,16 +1504,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common(pr)
     pr.add_argument("--git-operator-cli-sha256", default=None,
-        help="Owner-supplied SHA256 of the native Claude CLI; no automatic attestation.")
+        help="Required with --git-operator: owner-supplied SHA256 of the native Claude CLI "
+             "selected by --claude-cmd; no automatic attestation.")
     pr.add_argument("--git-operator-session-file", default=None,
-        help="Owner-supplied canonical Claude session path, mounted read-only; never discovered.")
+        help="Required with --git-operator: owner-supplied canonical Claude .credentials.json "
+             "path, mounted read-only; never discovered and its contents are never printed.")
     pr.add_argument(
         "--git-operator", choices=("claude",), default=None,
         help=(
-            "Select the Codex editor + Claude Git operator checkpoint. Requires Linux, "
-            "--coder codex, --agent-permissions sandboxed and a Claude reviewer; "
-            "direct issue or ordinary pr only, without managed CI. Workflow not yet wired; "
-            "execution stops before checkout claims. Default: disabled."
+            "Codex edits the checkout and a separate Claude Git operator commits it. Requires "
+            "Linux, bubblewrap, --coder codex, --agent-permissions sandboxed, a Claude reviewer, "
+            "--git-operator-cli-sha256 and --git-operator-session-file; direct issue or "
+            "ordinary pr only, without managed CI or --dry-run. Invalid combinations are "
+            "refused before any checkout is claimed. Default: disabled."
         ),
     )
     add_reviewer_floor(pr)
