@@ -343,8 +343,8 @@ class ClaudeGitOperator:
         # Mask project settings, credential sources and registered environment
         # links; their targets are never mounted. Shared config/refs and the
         # checkout's .git pointer stay read-only.
-        masks = {'.aws', '.ssh', '.claude', '.claude.json', '.codex', '.agents',
-                 '.config', '.netrc', '.gitconfig', '.git-credentials'}
+        from .git_handoff import OPERATOR_MASKED_PATHS
+        masks = set(OPERATOR_MASKED_PATHS)
         masks.update(str(p) for p in handoff.links)
         for name in sorted(masks):
             path = handoff.checkout / name

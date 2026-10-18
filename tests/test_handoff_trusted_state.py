@@ -17,7 +17,7 @@ from coding_review_agent_loop.git_handoff import (CommitIdentity, Handoff, Hando
                                                   private_trusted_dir)
 from test_git_handoff import case as case, git  # noqa: F401  (fixture)
 
-EDITOR_FLAGS = ("-c", "permissions={}", "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=false")
+EDITOR_FLAGS = ("-c", "permissions={}", "-c", 'sandbox_mode="workspace-write"', "-c", "sandbox_workspace_write.network_access=false", "-c", "sandbox_workspace_write.writable_roots=[]")
 
 
 def sandboxed(cwd, script):

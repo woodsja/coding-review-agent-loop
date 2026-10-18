@@ -121,8 +121,10 @@ def test_editor_grant_is_narrow_and_reversible(split_config, monkeypatch, tmp_pa
     assert ap.permission_class_for_role("editor") == "read-only"
     assert ap.permission_class_for_role("editor", config=split_config, provider="codex") == "editor"
     grant = ap.role_permission_args(split_config, "codex", "editor")
-    assert grant == ("--sandbox", "workspace-write", "-c", 'approval_policy="never"',
-                     "-c", "sandbox_workspace_write.network_access=false")
+    assert grant == ("--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write",
+                     "-c", 'approval_policy="never"',
+                     "-c", "sandbox_workspace_write.network_access=false",
+                     "-c", "sandbox_workspace_write.writable_roots=[]")
     assert not any(".git" in arg or "gh" in arg or "add-dir" in arg for arg in grant)
     legacy = dataclasses.replace(split_config, git_operator=None)
     assert ap.role_permission_args(legacy, "codex", "editor")[:2] == ("--sandbox", "read-only")
@@ -137,8 +139,10 @@ def test_editor_grant_is_narrow_and_reversible(split_config, monkeypatch, tmp_pa
 
 def test_editor_env_cannot_promote_permissions(split_config):
     env = ap.role_permission_env(split_config, "codex", "editor")
-    assert env == ap.role_permission_env(split_config, "codex", None)
     assert env["GIT_CONFIG_COUNT"] == "0"
+    for secret in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY"):
+        assert env[secret] == ""
+    assert secret not in ap.role_permission_env(split_config, "codex", None)
     assert all(env[key] == "0" for key in ap.GIT_TRACE_VARIABLES)
 
 
@@ -257,7 +261,7 @@ def test_missing_or_unverifiable_inputs_fail_before_any_claim(
         monkeypatch.setattr(ap.shutil, "which", lambda cmd: "/usr/bin/" + cmd)
         monkeypatch.setattr(ap, "executable_location_refusal", lambda *a: None)
         monkeypatch.setattr(ap.subprocess, "run", lambda *a, **kw: SimpleNamespace(
-            returncode=0, stdout="--sandbox --config --output-last-message"))
+            returncode=0, stdout="--sandbox --config --output-last-message --ignore-user-config --ignore-rules"))
     if fault == "capability":
         def fail(c):
             raise AgentLoopError("--git-operator claude capability/mount checks failed; synthetic")
@@ -319,7 +323,8 @@ def test_capability_probe_is_closed_and_credential_free(split_config, monkeypatc
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
     monkeypatch.setattr(ap.shutil, "which", lambda cmd: None if failure == "missing" else "/usr/bin/" + cmd)
     monkeypatch.setattr(ap, "executable_location_refusal", lambda *a: None)
-    flags = ("--sandbox --config --output-last-message --restricted --tools --strict-mcp-config "
+    flags = ("--sandbox --config --output-last-message --ignore-user-config --ignore-rules "
+             "--restricted --tools --strict-mcp-config "
              "--mcp-config --permission-mode --permission-prompts --setting-sources --settings "
              "--allowedTools --disallowedTools --no-session-persistence")
     calls = []
@@ -434,7 +439,7 @@ def test_attested_capability_probe_uses_pinned_cli_without_credentials(split_con
     monkeypatch.setattr(_PinnedFile, 'open', pin)
     monkeypatch.setattr(ap.shutil, 'which', lambda cmd: '/usr/bin/codex')
     monkeypatch.setattr(ap, 'executable_location_refusal', lambda *a: None)
-    flags = ('--sandbox --config --output-last-message --restricted --tools --strict-mcp-config '
+    flags = ('--sandbox --config --output-last-message --ignore-user-config --ignore-rules --restricted --tools --strict-mcp-config '
              '--mcp-config --permission-mode --permission-prompts --setting-sources --settings '
              '--allowedTools --disallowedTools --no-session-persistence')
     def probe(command, **kwargs):

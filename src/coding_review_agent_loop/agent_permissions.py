@@ -294,7 +294,7 @@ def validate_split_role_capabilities(config: AgentLoopConfig) -> None:
     """
     env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"}
     probes = (
-        (config.codex_cmd, ("exec", "--help"), ("--sandbox", "--config", "--output-last-message")),
+        (config.codex_cmd, ("exec", "--help"), ("--sandbox", "--config", "--output-last-message", "--ignore-user-config", "--ignore-rules")),
         (config.claude_cmd, ("--help",), (
             "--restricted", "--tools", "--strict-mcp-config", "--mcp-config",
             "--permission-mode", "--permission-prompts", "--setting-sources",
@@ -1137,8 +1137,12 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
         raise AgentLoopError("Git operator requires the dedicated private-Git Claude launcher.")
     root = sandboxed_response_root(config)
     if permission_class == PERMISSION_CLASS_EDITOR:
-        return ("--sandbox", "workspace-write", "-c", 'approval_policy="never"',
-                "-c", "sandbox_workspace_write.network_access=false")
+        # User/project exec policies must never add writable roots (notably
+        # ~/.local/state, which holds the host's trusted commit evidence).
+        return ("--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write",
+                "-c", 'approval_policy="never"',
+                "-c", "sandbox_workspace_write.network_access=false",
+                "-c", "sandbox_workspace_write.writable_roots=[]")
     if provider == "claude":
         prefix = inspect_prefix(config)
         if permission_class == PERMISSION_CLASS_READ_ONLY:
@@ -1213,7 +1217,16 @@ def role_permission_env(config: AgentLoopConfig, provider: str, role: str | None
         raise AgentLoopError("Sandboxed Codex cannot run as a committing coder.")
     if role == "git-operator":
         raise AgentLoopError("Git operator requires the dedicated private-Git Claude launcher.")
-    return dict(neutralized_git_env())
+    env = dict(neutralized_git_env())
+    if provider == "codex" and permission_class_for_role(role, config=config, provider=provider) == PERMISSION_CLASS_EDITOR:
+        # Codex edits local files; GitHub and Claude publication credentials
+        # belong only to the trusted host/Claude operator, not the editor.
+        for secret in ("GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_TOKEN",
+                       "GITHUB_PERSONAL_ACCESS_TOKEN", "SSH_AUTH_SOCK",
+                       "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
+                       "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+            env[secret] = ""
+    return env
 
 
 def prepare_sandboxed_spawn(config: AgentLoopConfig, provider: str, role: str | None) -> Path:

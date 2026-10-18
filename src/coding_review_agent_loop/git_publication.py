@@ -10,11 +10,11 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 import re
-import tempfile
+from tempfile import TemporaryDirectory
 from urllib.parse import quote, urlsplit
 
 from . import git_transport as transport
-from .git_handoff import Handoff, HandoffError, SHA, _run
+from .git_handoff import Handoff, HandoffError, SHA, _run, ensure_state_base
 from .errors import AgentLoopError
 from .github import missing_expected_closing_issue_ids, unexpected_closing_issue_ids
 from .managed_pr import _api, _json_payload
@@ -72,7 +72,8 @@ def publish_verified(handoff: Handoff, sha: str, *, repo: str, origin: str,
     # operator packs/config/alternates are never consulted.
     base_pack = _run(handoff.admin, handoff.checkout, ['pack-objects', '--stdout', '--revs'],
                      data=(handoff.base + '\n').encode(), alternates=handoff.shared)
-    with tempfile.TemporaryDirectory(prefix='reviewloop-publish-') as raw:
+    with TemporaryDirectory(prefix='reviewloop-publish-',
+                            dir=ensure_state_base(handoff.checkout)) as raw:
         store = Path(raw)
         env = transport._transport_env(url, gh_cmd, ssh_identity=ssh_identity,
                                       forbidden_roots=(handoff.checkout, handoff.trusted,

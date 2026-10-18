@@ -206,3 +206,27 @@ def test_pr_missing_auth_fails_without_create():
         bind_ordinary_pr(repo='owner/repo', branch='issue-1', base='main', sha='a' * 40,
                          issue_ids=(1,), title='Fix', body='', handoff_id='run-1', api=api)
     assert calls == [('GET', 'user')]
+
+
+def test_token_bearing_push_store_cannot_lie_in_editor_writable_tmp(case, tmp_path, monkeypatch):
+    from coding_review_agent_loop import git_publication as publication
+    from coding_review_agent_loop.git_handoff import ensure_state_base
+    from tempfile import TemporaryDirectory
+    h, sha = candidate(case)
+    origin = tmp_path / 'origin'
+    origin.mkdir()
+    git(origin, 'init', '--bare', '-q')
+    seen = []
+
+    def observed_store(*args, **kwargs):
+        assert kwargs['dir'] == ensure_state_base(h.checkout)
+        assert not kwargs['dir'].is_relative_to('/tmp')
+        assert not kwargs['dir'].is_relative_to(h.checkout)
+        seen.append(kwargs['dir'])
+        return TemporaryDirectory(*args, **kwargs)
+
+    monkeypatch.setattr(publication, 'TemporaryDirectory', observed_store)
+    publication.publish_verified(h, sha, repo='owner/repo', origin=str(origin),
+                                 branch='verified', expected_head=None, local_origin=origin)
+    assert seen
+    assert git(origin, 'rev-parse', 'refs/heads/verified').decode() == sha

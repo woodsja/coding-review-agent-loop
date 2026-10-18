@@ -26,6 +26,13 @@ from .secure_git import local_command, _trusted_executable
 MAX_FILE = 16 * 1024 * 1024
 MAX_TOTAL = 128 * 1024 * 1024
 MAX_PATHS = 10000
+# The Claude Git-operator hides credential/project-setting paths inside its
+# namespace. Changed entries under one of these paths cannot be staged
+# faithfully and must be rejected *before* handing off to the model.
+OPERATOR_MASKED_PATHS = frozenset({
+    '.aws', '.ssh', '.claude', '.claude.json', '.codex', '.agents', '.config',
+    '.netrc', '.gitconfig', '.git-credentials',
+})
 MAX_METADATA_FILE = 64 * 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
@@ -563,6 +570,9 @@ class Handoff:
         self.changed_paths = tuple(p for p, value in self.snapshot.items() if (
             value is None or p not in self.base_entries or
             (value[0], hashlib.sha1(b"blob " + str(len(value[1])).encode() + b"\0" + value[1]).hexdigest()) != self.base_entries[p]))
+        if any(name.split("/", 1)[0] in OPERATOR_MASKED_PATHS for name in self.changed_paths):
+            self.tree = None
+            raise HandoffError("Changes to operator-masked credential or settings paths are unsupported")
         return self.tree
 
     def operator_context(self):

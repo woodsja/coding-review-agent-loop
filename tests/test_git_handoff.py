@@ -377,3 +377,14 @@ def test_operator_context_starts_with_base_git_index(case):
     p = subprocess.run(['git', 'status', '--short', '--untracked-files=no'], cwd=root,
                        env=env, capture_output=True, text=True, check=True)
     assert p.stdout.startswith(' M old'), p.stdout
+
+
+@pytest.mark.parametrize("path", [".claude/commands/instructions.md", ".config/settings.json", ".gitconfig"])
+def test_masked_settings_change_is_refused_before_credentialed_operator(case, path):
+    _, root, h = case
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("synthetic settings change\n")
+    with pytest.raises(HandoffError, match="operator-masked"):
+        h.capture(allowed_new={path})
+    assert h.tree is None

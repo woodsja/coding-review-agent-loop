@@ -2,7 +2,7 @@
 
 How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/git_handoff.py`, `src/coding_review_agent_loop/claude_git_operator.py`, `src/coding_review_agent_loop/git_publication.py`, `src/coding_review_agent_loop/split_issue_handoff.py`, `src/coding_review_agent_loop/handoff_journal.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`.
 
 ## Execution and Concurrency
 
@@ -122,14 +122,19 @@ publish a ready owner record only after administrative identity, HEAD, and
 clean status verify. Any setup failure removes only the recorded root and
 administrative inode identities; incomplete cleanup is reported as an error.
 
-**Local editor handoff primitive (fork #1, checkpoint 4A).**
-`git_handoff.py` is an internal local-only seam, not connected to the issue or
-PR loops. Its caller must retain the existing worktree ownership claim and
+**Local editor handoff primitive (fork #1).**
+`git_handoff.py` is an internal local-only seam used by the opt-in issue and PR
+correction loops through `split_issue_handoff.py`; legacy modes remain separate.
+Its caller must retain the existing worktree ownership claim and
 verify the assigned checkout. Call `Handoff.begin` before editing with a trusted
 expected base SHA and fixed commit identity/message, then `capture` after the
 editor exits with explicit approved new paths. The host reads candidate bytes
 through descriptors and builds the complete expected tree using native Git in
-separate trusted scratch metadata. Writes do not use alternates, since even
+private handoff state outside the editor workspace and `/tmp`. The host's
+credential-bearing temporary push store uses that same private state root, so
+an editor with workspace-write access cannot inject push-time Git config.
+The Codex editor ignores user configuration and rules and clears extra writable
+roots and inherited publication credentials before it is launched. Writes do not use alternates, since even
 writing an existing object can refresh timestamps in an alternate store.
 
 `run_local_commit` offers only fixed, candidate-allowlisted staging and native
@@ -142,6 +147,11 @@ reachable candidate tree/blob with host expectations. It never loads operator
 configuration, replacements, grafts or alternate paths. Source, pointer and
 shared-administration changes block verification.
 
+Changed source under an operator-masked credential/settings directory (for
+example `.claude/` or `.config/`) is explicitly rejected before staging, since
+those directories are intentionally hidden from the Git-operator. Unchanged
+tracked content in those directories remains in the pinned base tree.
+
 This slice rejects no-change candidates, ignore-rule additions/edits (including
 self-hiding ignore files), submodules, escaping links, oversized inputs, shared
 alternate stores and operator objects available only in packs. Ignored artifacts
@@ -150,10 +160,10 @@ Registered environment links are excluded only while intact. The Git-only
 namespace disables networking and must not be reused as a Claude runtime. Missing confinement fails closed; synthetic tests that cannot create
 namespaces skip the OS probes and provide no source-immutability claim.
 
-**Claude operator and host publication modules (fork #1, checkpoint 4B).**
+**Claude operator and host publication modules (fork #1).**
 `ClaudeGitOperator(executable).run(handoff, auth=...)` in
-`claude_git_operator.py` is the live model entry point, separate from both
-lifecycle loops. `prepare` exposes its launch for inspection and is a context
+`claude_git_operator.py` is the live model entry point invoked by the opt-in
+issue and PR correction handoff, not by a normal coder or reviewer session. `prepare` exposes its launch for inspection and is a context
 manager: callers must close it to release pinned descriptors. Linux bubblewrap
 and trusted system Git/Python remain mandatory. The default executable policy
 requires a root-owned executable under `/usr`. An explicit
@@ -184,8 +194,9 @@ parent directory or other login files are mounted. Token and session-file
 authentication cannot be combined. File replacement or modification blocks
 the run. A login that requires credential refresh/writes or other host files
 must fail closed; this implementation has no fallback or token extraction.
-Existing subscription login compatibility still requires the owner-run smoke
-test; the synthetic tests do not establish actual CLI authentication.
+Ralph validated the native Claude CLI with the owner's existing subscription
+in a disposable source-read-only, private-Git smoke test. The synthetic suite
+does not replace a full Codex-to-Claude issue/PR correction rollout test.
 
 Missing auth/confinement fails closed. A fresh
 mount root exposes system runtime files, the canonical read-only source, trusted
@@ -239,12 +250,12 @@ identity contract.
 
 LFS, submodules, ignore-rule changes, escaping links, oversized files (including
 binary files above 16 MiB), total candidate content above 128 MiB and packed-only
-operator output remain unsupported. No live Claude/GitHub invocation was used
-for checkpoint 4B. Synthetic tests cover wrapper/MCP dispatch, raw verification,
+operator output remain unsupported. Synthetic tests cover wrapper/MCP dispatch, raw verification,
 local-bare publication, exact leases/races, credential absence and PR retries.
-Namespace denial tests skip when bubblewrap is unavailable. The host must still
-run the separately authorized disposable **new MCP-role** Claude proof; the
-previous Bash proof does not establish this invocation's CLI/auth behavior.
+The required Ralph-host tests demonstrate real source/shared-Git write denial;
+other hosts that cannot create bubblewrap namespaces cannot claim that boundary.
+A production rollout still requires the full disposable issue-to-PR-correction
+cycle with authenticated Codex and Claude roles and exact-head review/CI.
 
 **Pre-turn checkout verification.** A claim protects against another
 agent-loop run, not against an operator, editor or stray script writing to the
