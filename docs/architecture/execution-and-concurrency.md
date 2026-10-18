@@ -146,12 +146,76 @@ This slice rejects no-change candidates, ignore-rule additions/edits (including
 self-hiding ignore files), submodules, escaping links, oversized inputs, shared
 alternate stores and operator objects available only in packs. Ignored artifacts
 are excluded; untracked enumeration is bounded even for ignored entries.
-Registered environment links are excluded only while intact. No Claude CLI,
-model permission allowlist, model-auth/credential masking, isolated Claude
-settings, object import, publication or durable recovery integration exists yet.
-The Git-only namespace disables networking and must not be reused as a Claude
-runtime. Missing confinement fails closed; synthetic tests that cannot create
+Registered environment links are excluded only while intact. The Git-only
+namespace disables networking and must not be reused as a Claude runtime. Missing confinement fails closed; synthetic tests that cannot create
 namespaces skip the OS probes and provide no source-immutability claim.
+
+**Claude operator and host publication modules (fork #1, checkpoint 4B).**
+`ClaudeGitOperator(executable).run(handoff, auth=...)` in
+`claude_git_operator.py` is the live model entry point, separate from both
+lifecycle loops. `prepare` exposes its launch for inspection. It requires a
+root-owned executable under `/usr`, Linux bubblewrap, and exactly one explicit
+in-memory `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`. It does not discover,
+copy or log credential files. Missing auth/confinement fails closed. A fresh
+mount root exposes system runtime files, the canonical read-only source, trusted
+read-only administration and shared **objects only**; shared config/refs and the
+host home are unavailable. Only private index/objects and ephemeral runtime
+scratch are writable. The model retains network access for Anthropic. Project
+credential/settings directories are masked; symlinked environment masks are
+currently refused. Persistent Claude settings, SSH sockets, GitHub credentials
+and provider pass-through environment variables are absent.
+
+Built-in Claude tools are disabled (`--tools ''`). A strict, explicit stdio MCP
+configuration exposes only `status`, `diff`, `stage` and `commit`, each accepting
+zero arguments. This small adapter dispatches the host-generated immutable Git
+wrapper, with fixed paths, Git environment, author/committer/message and no shell.
+It avoids Claude's implicit read-only Bash auto-approvals. Restricted mode,
+noninteractive permission denial, isolated settings, disabled hooks and
+`--no-session-persistence` apply independently. Native staging and `commit-tree`
+use the private index/loose objects and the pinned initial HEAD. A returned SHA
+is only usable after `Handoff.verify` succeeds. Runtime files have a per-file
+32 MiB limit, and ephemeral `/tmp` has a 256 MiB bound. The private object/index
+area retains the candidate's existing input bounds; it has no aggregate quota.
+
+`git_publication.publish_verified(handoff, sha, repo=..., origin=..., branch=...,
+expected_head=...)` is a host-only gate. It re-verifies raw objects and imports
+them, plus pinned trusted base history, into a disposable host-owned bare store.
+It reuses `git_transport` URL validation, sanitized transport environments,
+trusted authentication and fixed-error transport commands. No outbound command
+runs in operator metadata or the source checkout. The push names only the exact
+SHA/ref with an absent-head lease for a new issue, or the known parent SHA for a
+correction. A retry accepts the verified published SHA; any foreign head blocks.
+The helper checks the remote ref after push. Caller-held worktree/store claims
+must span capture, model execution, verification and publication.
+
+`bind_ordinary_pr(..., api=OrdinaryPrApi(runner, config))` creates or binds one
+ordinary PR using the existing managed-PR API transport and GitHub closing-issue
+parsers, without managed labels, draft policy or CI waivers. A fake API is an
+executable test seam. The host supplies a durable handoff ID, base, branch, SHA
+and exact closing-issue set. Binding validates the authenticated creator,
+same-repository head/base, SHA, open state and contract. It refuses closed,
+foreign or duplicate PRs. An uncertain POST is reconciled by listing again;
+retrying the same recorded identity does not blindly create another PR. PR
+binding currently supports `owner/repository` identities only.
+
+These modules are **not wired into issue_loop.py or pr_loop.py**. The next
+checkpoint must add the explicit editor/operator option and role validation,
+retain claims across the seam, write EDITED/COMMITTED/PUSHED/PR_BOUND into existing
+round state, persist authenticated provenance/closing-contract records, and
+schedule a separate reviewer on the published head. The caller must preflight
+repository policy (including unsupported signed-commit requirements) and use
+trusted round-state values, never model-selected destinations or handoff IDs.
+Ordinary PR correction binding reuses the original handoff ID; existing legacy
+PRs need a trusted adoption path before using this identity contract.
+
+LFS, submodules, ignore-rule changes, escaping links, oversized files (including
+binary files above 16 MiB), total candidate content above 128 MiB and packed-only
+operator output remain unsupported. No live Claude/GitHub invocation was used
+for checkpoint 4B. Synthetic tests cover wrapper/MCP dispatch, raw verification,
+local-bare publication, exact leases/races, credential absence and PR retries.
+Namespace denial tests skip when bubblewrap is unavailable. The host must still
+run the separately authorized disposable **new MCP-role** Claude proof; the
+previous Bash proof does not establish this invocation's CLI/auth behavior.
 
 **Pre-turn checkout verification.** A claim protects against another
 agent-loop run, not against an operator, editor or stray script writing to the

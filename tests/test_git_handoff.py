@@ -332,3 +332,26 @@ def test_new_ignore_cannot_hide_itself_and_other_new_files(case):
     (root / "nested" / "hidden").write_text("hidden by new rule")
     with pytest.raises(HandoffError, match="Ignore-rule"):
         h.capture(allowed_new=set())
+
+
+@pytest.mark.parametrize('name,content', [
+    ('.gitattributes', b'*.bin filter=lfs diff=lfs merge=lfs -text\n'),
+    ('pointer', b'version https://git-lfs.github.com/spec/v1\noid sha256:123\nsize 10\n'),
+])
+def test_lfs_is_explicitly_unsupported(case, name, content):
+    _, root, h = case
+    (root / name).write_bytes(content)
+    with pytest.raises(HandoffError, match='LFS'):
+        h.capture(allowed_new={name})
+
+
+def test_checkout_alias_is_canonicalized_for_private_git(case, tmp_path):
+    _, root, old = case
+    alias = tmp_path / 'checkout-alias'
+    alias.symlink_to(root, target_is_directory=True)
+    h = Handoff.begin(alias, tmp_path / 'alias-trusted', old.identity, expected_base=old.base)
+    assert h.checkout == root.resolve()
+    (root / 'old').write_text('after')
+    h.capture(allowed_new=set())
+    shutil.copytree(h.objects, h.operator_context().objects, dirs_exist_ok=True)
+    assert h.verify(operator_commit(h))

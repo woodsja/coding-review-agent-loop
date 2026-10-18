@@ -1,8 +1,8 @@
-"""Internal, local-only verified editor handoff (not yet a Claude role).
+"""Verified editor candidate and raw-object validation primitive.
 
 Call begin BEFORE editing, capture AFTER editor exit under the caller's worktree
 claim, then run_local_commit and verify. Only the disposable operator area may
-be mounted writable. No publication, recovery database, or agent CLI is here.
+be mounted writable. Claude invocation and host publication live in separate modules.
 Unsupported inputs fail closed. Trusted state must never be operator writable.
 """
 from __future__ import annotations
@@ -300,6 +300,11 @@ class Handoff:
             total += len(value[1]) if value else 0
             if total > MAX_TOTAL:
                 raise HandoffError("Candidate exceeds byte bound")
+            if value is not None and (
+                    value[1].startswith(b"version https://git-lfs.github.com/spec/v1\n")
+                    or (name.split("/")[-1] == ".gitattributes"
+                        and re.search(rb"filter\s*=\s*lfs(?:\s|$)", value[1]))):
+                raise HandoffError("Git LFS is unsupported by the verified handoff")
             snapshot[name] = value
         return snapshot
 
