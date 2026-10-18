@@ -50,6 +50,7 @@ def test_failed_confinement_has_no_fallback(case, monkeypatch):
     _, root, h = case
     (root / 'old').write_text('after')
     h.capture(allowed_new=set())
+    h.operator_context()  # Host preparation precedes the isolated launch/read probe.
     monkeypatch.setattr('coding_review_agent_loop.claude_git_operator._trusted_executable', str)
     calls = []
     def failed(*args, **kwargs):
@@ -245,6 +246,7 @@ def test_session_pin_never_reads_session_contents(case, tmp_path, monkeypatch):
     _, root, h = case
     (root / 'old').write_text('after')
     h.capture(allowed_new=set())
+    h.operator_context()  # Host preparation precedes the isolated launch/read probe.
     session = tmp_path / '.credentials.json'
     session.write_text('synthetic')
     session.chmod(0o600)
@@ -276,6 +278,7 @@ def test_run_checks_post_launch_pin_before_raw_commit_verification(case, tmp_pat
     _, root, h = case
     (root / 'old').write_text('after')
     h.capture(allowed_new=set())
+    h.operator_context()  # Host preparation precedes the isolated launch/read probe.
     binary, digest = local_claude(tmp_path)
     monkeypatch.setattr('coding_review_agent_loop.claude_git_operator._trusted_executable', str)
     seen_fds = []
@@ -298,6 +301,7 @@ def test_session_replacement_during_launch_is_refused(case, tmp_path, monkeypatc
     _, root, h = case
     (root / 'old').write_text('after')
     h.capture(allowed_new=set())
+    h.operator_context()  # Host preparation precedes the isolated launch/read probe.
     session = tmp_path / '.credentials.json'
     session.write_text('synthetic')
     session.chmod(0o600)

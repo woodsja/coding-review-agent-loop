@@ -249,3 +249,58 @@ def no_real_checkpoint_processes(monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail("checkpoint tests must stub every subprocess")
     monkeypatch.setattr(ap.subprocess, "run", forbidden)
+
+
+def test_owner_operator_strings_are_preserved_without_discovery(monkeypatch, tmp_path):
+    monkeypatch.setenv('XDG_CACHE_HOME', str(tmp_path / 'cache'))
+    monkeypatch.setattr(config_module, 'preflight_agent_commands', lambda *a, **k: None)
+    args = cli.build_parser().parse_args(argv('issue', '--git-operator', 'claude',
+        '--git-operator-cli-sha256', 'a' * 64,
+        '--git-operator-session-file', '/synthetic/.credentials.json'))
+    config = config_from_args(args, FakeRunner())
+    assert config.git_operator_cli_sha256 == 'a' * 64
+    assert config.git_operator_session_file == '/synthetic/.credentials.json'
+
+
+@pytest.mark.parametrize('changes', [
+    {'git_operator_cli_sha256': 'not-a-digest'},
+    {'git_operator_session_file': '/synthetic/../.credentials.json'},
+    {'git_operator_session_file': 'relative/.credentials.json'},
+    {'git_operator_session_file': '/synthetic/\n.credentials.json'},
+])
+def test_operator_owner_options_reject_unsafe_strings(split_config, changes):
+    with pytest.raises(AgentLoopError, match='owner-supplied safe'):
+        dataclasses.replace(split_config, **changes)
+
+
+def test_attested_capability_probe_uses_pinned_cli_without_credentials(split_config, monkeypatch):
+    from types import SimpleNamespace
+    from pathlib import Path
+    from coding_review_agent_loop.claude_git_operator import _PinnedFile
+    config = dataclasses.replace(split_config, claude_cmd='/synthetic/claude',
+        git_operator_cli_sha256='a' * 64,
+        git_operator_session_file='/synthetic/.credentials.json')
+    events = []
+    class Pin:
+        fd = 99
+        def verify(self): events.append('verify')
+        def close(self): events.append('close')
+    def pin(path, *, digest):
+        assert path == Path('/synthetic/claude') and digest == 'a' * 64
+        events.append('pin')
+        return Pin()
+    monkeypatch.setattr(_PinnedFile, 'open', pin)
+    monkeypatch.setattr(ap.shutil, 'which', lambda cmd: '/usr/bin/codex')
+    monkeypatch.setattr(ap, 'executable_location_refusal', lambda *a: None)
+    flags = ('--sandbox --config --output-last-message --restricted --tools --strict-mcp-config '
+             '--mcp-config --permission-mode --permission-prompts --setting-sources --settings '
+             '--allowedTools --disallowedTools --no-session-persistence')
+    def probe(command, **kwargs):
+        assert kwargs['env'] == {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent', 'LC_ALL': 'C'}
+        if command[0] == '/proc/self/fd/99':
+            assert kwargs['pass_fds'] == (99,)
+            events.append('help')
+        return SimpleNamespace(returncode=0, stdout=flags)
+    monkeypatch.setattr(ap.subprocess, 'run', probe)
+    ap.validate_split_role_capabilities(config)
+    assert events == ['pin', 'help', 'verify', 'close']

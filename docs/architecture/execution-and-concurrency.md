@@ -382,3 +382,55 @@ persisted across processes.
 ## Decisions
 
 [Decision log](decisions/execution-and-concurrency.md)
+
+## Split-role checkpoint 4D (internal direct issue seam)
+
+`split_issue_handoff.py` connects the ordinary direct issue path to the existing
+verified Git primitives. The public CLI still raises `split-role workflow not
+yet wired` before claims or workflow execution. This checkpoint is testable
+through `run_issue_loop`; it is not a rollout of split-role execution.
+
+Under the issue loop's existing worktree claim, the host requires an explicit
+native Claude executable SHA256 and canonical read-only session-file path,
+checks CLI/mount capabilities and trusted GitHub authentication, and calls
+`Handoff.begin` before the Codex editor turn. Session contents are never read by
+host Python. No authentication is inferred from environment tokens or a home
+directory. The owner inputs are `--git-operator-cli-sha256` and
+`--git-operator-session-file`; `--claude-cmd` selects the attested native file.
+These options do not lift the CLI execution gate.
+
+The editor uses `role="editor"` and a distinct prompt forbidding branch,
+commit, push and PR operations. Only the split parser accepts the version-1
+`editor_handoff` extension on `issue_implementation`: `pr_number` must be null,
+`outcome` is `ready` or `blocked`, and `new_paths` is an explicit unique list.
+A missing extension, blocked/clarification response, absent test/architecture
+evidence, undeclared file, no change, or changed assigned Git state refuses
+publication. Legacy marker and null-PR semantics are unchanged.
+
+After validation the host freezes tracked and declared new files, calls the
+dedicated source-read-only `ClaudeGitOperator`, independently verifies its raw
+SHA, and publishes under an absent-branch lease. Ordinary PR binding supplies
+the complete expected-closing issue set without managed-CI waiver semantics.
+The authenticated PR tuple must match that SHA, branch and base. Under the
+shared-store lock the host imports only verified raw objects and advances the
+owned checkout's HEAD/index without rewriting candidate files. The existing
+checkout baseline, closing-contract and issue-to-PR handoff writers then feed
+the existing independent reviewer loop. Operator and reviewer sessions are
+never reused.
+
+`EDITED`, `COMMITTED`, `PUSHED` and `PR_BOUND` are sanitized progress messages,
+not durable recovery records. Temporary handoff evidence is retained on
+failure, but no crash recovery or cross-process idempotency is claimed. A new
+run has a new handoff/branch identity. Split-mode existing-PR resume is refused
+at the issue entry point. PR corrections, durable phase recording/recovery,
+and rollout integration remain future checkpoints; the CLI must stay blocked
+until those are complete. Existing reviewer/CI scheduling is reused unchanged;
+a correction requiring a committing Codex role still fails closed.
+
+`tests/test_split_issue_handoff.py` exercises the public issue loop with a
+linked disposable checkout, local bare origin, fake GitHub and fake provider
+invocations. The success test uses real response validation, native synthetic
+operator object creation, raw verification, lease publication, ordinary PR
+binding and the existing independent reviewer path. It does not prove live
+Claude authentication or OS confinement; dedicated operator tests and the
+owner's separate disposable live proof cover those boundaries.

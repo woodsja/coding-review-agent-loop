@@ -152,6 +152,7 @@ def _validate_issue_implementation_response(
     delivered_risk_test_matrix_row_ids=None,
     execution_catalog=None,
     architecture_status_mode: str,
+    allow_editor_handoff: bool = False,
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
@@ -159,6 +160,7 @@ def _validate_issue_implementation_response(
     try:
         parsed = validate_structured_issue_implementation(
             text,
+            allow_editor_handoff=allow_editor_handoff,
             required_architecture_impact_contract=(1 if require_architecture_impact else 0),
             delivered_risk_test_matrix=delivered_risk_test_matrix,
             delivered_risk_test_matrix_identity=delivered_risk_test_matrix_identity,

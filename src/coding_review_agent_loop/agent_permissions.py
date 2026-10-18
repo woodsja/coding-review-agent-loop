@@ -304,12 +304,24 @@ def validate_split_role_capabilities(config: AgentLoopConfig) -> None:
     try:
         for command, args, flags in probes:
             executable = shutil.which(command)
-            if not executable or executable_location_refusal(executable, config):
-                raise ValueError("CLI unavailable")
-            result = subprocess.run(
-                [executable, *args], capture_output=True, text=True, timeout=15,
-                env=env, cwd="/",
-            )
+            pin = None
+            try:
+                digest = getattr(config, "git_operator_cli_sha256", None)
+                if command == config.claude_cmd and digest is not None:
+                    from .claude_git_operator import _PinnedFile
+                    pin = _PinnedFile.open(Path(command), digest=digest)
+                    executable = f"/proc/self/fd/{pin.fd}"
+                elif not executable or executable_location_refusal(executable, config):
+                    raise ValueError("CLI unavailable")
+                result = subprocess.run(
+                    [executable, *args], capture_output=True, text=True, timeout=15,
+                    env=env, cwd="/", **({"pass_fds": (pin.fd,)} if pin else {}),
+                )
+                if pin:
+                    pin.verify()
+            finally:
+                if pin:
+                    pin.close()
             if result.returncode or any(flag not in result.stdout for flag in flags):
                 raise ValueError("CLI flags unavailable")
         # Match the launcher: fixed trusted Linux utilities, read-only host

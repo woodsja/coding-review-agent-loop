@@ -986,13 +986,14 @@ def _review_command_policy(
 
 
 def _coder_workdir_guidance(
-    config: AgentLoopConfig, *, implementation: bool = True, agent: AgentName | None = None
+    config: AgentLoopConfig, *, implementation: bool = True, agent: AgentName | None = None,
+    editor: bool = False,
 ) -> str:
     active_agent = agent or config.coder
     from .reviewer_seats import seat_backend
     workdir = agent_workdir(config, active_agent).resolve()
     repo_name = config.repo.rsplit("/", 1)[-1]
-    scope = (
+    scope = "Code/test/documentation edits, inspection and tests" if editor else (
         "Implementation, inspection, tests, commits, and pushes"
         if implementation
         else "Inspection"
@@ -1020,10 +1021,10 @@ def _coder_workdir_guidance(
         f"{scope} must stay in that directory unless the user explicitly authorizes "
         "a different path. Do not `cd` into sibling, home, deployment, or duplicate "
         f"clones such as `~/{repo_name}` or `~/claude-code/{repo_name}`. Before "
-        "running tests or committing, run `pwd` and `git status --branch --short` "
+        f"running {'tests' if editor else 'tests or committing'}, run `pwd` and `git status --branch --short` "
         "and confirm the path is the assigned checkout."
         f"{dangerous_warning}\n"
-        f"{_sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
+        f"{('Editor sandbox: code/test/documentation edits and project tests use workspace-write; Git metadata stays protected and network access is disabled.' + chr(10)) if editor else _sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
     )
 
 
@@ -1784,6 +1785,7 @@ def _structured_issue_implementation_guidance(
     human_requirements_context: CoderHumanRequirementsPromptContext,
     coder_signature: str,
     include_coverage_map: bool = False,
+    editor: bool = False,
 ) -> str:
     """Return the one structured result contract shared by implementation turns."""
     if human_requirements_context.surfaced_requirement_ids:
@@ -1843,13 +1845,25 @@ def _structured_issue_implementation_guidance(
             "canonical_document_rationale": "",
         },
     }
+    if editor:
+        example["pr_number"] = None
+        example["summary"] = "Source and tests are ready for host publication."
+        example["editor_handoff"] = {"version": 1, "outcome": "ready", "new_paths": []}
+    editor_rules = (
+        "- Editor contract: pr_number MUST be null. editor_handoff version is 1; "
+        "outcome is ready only when edits and evidence are complete, otherwise blocked. "
+        "new_paths explicitly lists every intended new file, including an empty list "
+        "when none. Missing declarations never mean ready. Tests and architecture "
+        "evidence are required before publication.\n"
+        if editor else ""
+    )
     coverage_map_rules = (" " + _RISK_COVERAGE_MAP_RULES) if include_coverage_map else ""
     return f"""Use this mandatory structured `issue_implementation` result so the orchestrator can validate the implementation deterministically:
 
 {json.dumps(example, indent=2)}
 
 Rules:
-- `schema_version` is 1, `kind` is `issue_implementation`, and `state` is `blocking`.
+{editor_rules}- `schema_version` is 1, `kind` is `issue_implementation`, and `state` is `blocking`.
 - `summary` is non-blank and must explain the implementation outcome. `pr_number` is either a positive integer for the newly reported PR or `null` when no PR was accepted for handoff.
 - {requirement_rules}
 - A created-PR result may not contain a `blocked` signed-requirement disposition. If a signed requirement is discovered to be blocked after a PR was opened, set `pr_number` to `null`, keep the real PR number or URL in the summary or disposition evidence so the operator can locate it, and describe the conflict.
@@ -3157,6 +3171,23 @@ def build_issue_prompt(
         full_omission_fallback="Fetch the issue discussion directly before implementing.",
         config=config,
     )
+    if config.git_operator is not None:
+        return f"""Implement GitHub issue #{issue_number} in {config.repo}.
+You are the Codex editor. Make code/test/documentation edits and run relevant tests only.
+NEVER branch, commit, push, open a PR, or change Git metadata. The host owns publication.
+{_coder_workdir_guidance(config, editor=True)}
+{_scratch_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}
+{_coder_local_test_scope_guidance(config, structured=True)}
+{_coder_documentation_guidance()}
+{_architecture_context_block(config, architecture_context, protected_context=(human_requirements_context.block,))}
+{_architecture_impact_guidance(required=True, config=config)}
+{human_requirements_context.block}
+{_structured_issue_implementation_guidance(human_requirements_context=human_requirements_context, coder_signature=coder_signature, editor=True)}
+{_labeled_issue_context_block(issue_context, label="Target issue context")}
+{_memory_block(memory, config, include_runtime=True)}
+{_salvage_summary_block(salvage_summary)}
+Sign with {coder_signature}."""
     pr_reference_guidance = (
         _staged_issue_pr_reference_guidance(
             issue_number,

@@ -1420,6 +1420,10 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_common(issue)
+    issue.add_argument("--git-operator-cli-sha256", default=None,
+        help="Owner-supplied SHA256 of the native Claude CLI; no automatic attestation.")
+    issue.add_argument("--git-operator-session-file", default=None,
+        help="Owner-supplied canonical Claude session path, mounted read-only; never discovered.")
     issue.add_argument(
         "--git-operator", choices=("claude",), default=None,
         help=(
@@ -1496,6 +1500,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly widen a recovered expected-closing contract with a proper superset.",
     )
     add_common(pr)
+    pr.add_argument("--git-operator-cli-sha256", default=None,
+        help="Owner-supplied SHA256 of the native Claude CLI; no automatic attestation.")
+    pr.add_argument("--git-operator-session-file", default=None,
+        help="Owner-supplied canonical Claude session path, mounted read-only; never discovered.")
     pr.add_argument(
         "--git-operator", choices=("claude",), default=None,
         help=(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -553,6 +554,8 @@ class AgentLoopConfig:
     # invocation (see agent_permissions.py).
     agent_permissions: str = "default"
     git_operator: str | None = None
+    git_operator_cli_sha256: str | None = None
+    git_operator_session_file: str | None = None
 
     @property
     def architecture_membership_policy(self):
@@ -728,6 +731,18 @@ class AgentLoopConfig:
         )
 
         validate_git_operator_selection(self)
+        for option, value in (("git-operator-cli-sha256", self.git_operator_cli_sha256),
+                              ("git-operator-session-file", self.git_operator_session_file)):
+            if value is not None:
+                valid = isinstance(value, str) and len(value) <= 4096 and not any(ord(c) < 32 for c in value)
+                if option.endswith("sha256"):
+                    valid = valid and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+                else:
+                    valid = valid and value.startswith("/") and ".." not in Path(value).parts and Path(value).name == ".credentials.json"
+                if not valid:
+                    raise AgentLoopError(f"--{option} requires an owner-supplied safe canonical value.")
+                if self.git_operator is None:
+                    raise AgentLoopError(f"--{option} requires --git-operator claude.")
         if self.agent_permissions not in AGENT_PERMISSION_MODES:
             raise AgentLoopError(
                 "--agent-permissions must be one of: " + ", ".join(AGENT_PERMISSION_MODES) + "."
@@ -2383,6 +2398,8 @@ def config_from_args(
         antigravity_args=static_args("antigravity", args.antigravity_arg),
         agent_permissions=permission_mode,
         git_operator=getattr(args, "git_operator", None),
+        git_operator_cli_sha256=getattr(args, "git_operator_cli_sha256", None),
+        git_operator_session_file=getattr(args, "git_operator_session_file", None),
         antigravity_model=args.antigravity_model,
         antigravity_models=tuple(args.antigravity_models) if getattr(args, "antigravity_models", None) is not None else (),
         antigravity_print_timeout_seconds=getattr(
