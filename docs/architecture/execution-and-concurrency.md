@@ -122,6 +122,37 @@ publish a ready owner record only after administrative identity, HEAD, and
 clean status verify. Any setup failure removes only the recorded root and
 administrative inode identities; incomplete cleanup is reported as an error.
 
+**Local editor handoff primitive (fork #1, checkpoint 4A).**
+`git_handoff.py` is an internal local-only seam, not connected to the issue or
+PR loops. Its caller must retain the existing worktree ownership claim and
+verify the assigned checkout. Call `Handoff.begin` before editing with a trusted
+expected base SHA and fixed commit identity/message, then `capture` after the
+editor exits with explicit approved new paths. The host reads candidate bytes
+through descriptors and builds the complete expected tree using native Git in
+separate trusted scratch metadata. Writes do not use alternates, since even
+writing an existing object can refresh timestamps in an alternate store.
+
+`run_local_commit` offers only fixed, candidate-allowlisted staging and native
+`commit-tree` operations in a Linux bubblewrap namespace. The checkout, shared
+Git administration and host scratch metadata are read-only; a separate disposable
+index/object directory is writable. Its Git administration/configuration remains
+host-owned and read-only. `verify` reads operator loose objects directly,
+checks their hashes, exact parent/tree and fixed metadata, and compares every
+reachable candidate tree/blob with host expectations. It never loads operator
+configuration, replacements, grafts or alternate paths. Source, pointer and
+shared-administration changes block verification.
+
+This slice rejects no-change candidates, ignore-rule additions/edits (including
+self-hiding ignore files), submodules, escaping links, oversized inputs, shared
+alternate stores and operator objects available only in packs. Ignored artifacts
+are excluded; untracked enumeration is bounded even for ignored entries.
+Registered environment links are excluded only while intact. No Claude CLI,
+model permission allowlist, model-auth/credential masking, isolated Claude
+settings, object import, publication or durable recovery integration exists yet.
+The Git-only namespace disables networking and must not be reused as a Claude
+runtime. Missing confinement fails closed; synthetic tests that cannot create
+namespaces skip the OS probes and provide no source-immutability claim.
+
 **Pre-turn checkout verification.** A claim protects against another
 agent-loop run, not against an operator, editor or stray script writing to the
 same directory. `run_agent_result` therefore verifies the assigned checkout
