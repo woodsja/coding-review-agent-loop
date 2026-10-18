@@ -1255,6 +1255,8 @@ class StructuredCoderFollowup:
     # Orchestrator-derived, never parsed: addressed_items IDs that ledger
     # history proves were already resolved, dropped by validation (#1388).
     dropped_resolved_addressed_items: tuple[str, ...] = ()
+    editor_new_paths: tuple[str, ...] | None = None
+    editor_outcome: str | None = None
 
 
 @dataclass(frozen=True)
@@ -7680,6 +7682,31 @@ def parse_structured_plan_review(
     return parsed
 
 
+def _editor_declaration(payload):
+    """Strict opt-in declaration shared by issue and correction editors."""
+    editor_paths = None
+    editor_outcome = None
+    if "editor_handoff" in payload:
+        declaration = _expect_object(payload["editor_handoff"], context="editor_handoff")
+        _expect_exact_keys(declaration, context="editor_handoff",
+                           required={"version", "outcome", "new_paths"})
+        if type(declaration["version"]) is not int or declaration["version"] != 1:
+            raise AgentLoopError("Unsupported editor handoff version")
+        editor_outcome = declaration["outcome"]
+        if editor_outcome not in ("ready", "blocked"):
+            raise AgentLoopError("Editor handoff requires a ready/blocked outcome")
+        paths = declaration["new_paths"]
+        if (not isinstance(paths, list) or len(paths) > 10000
+                or any(not isinstance(p, str) or not p for p in paths)
+                or len(set(paths)) != len(paths)):
+            raise AgentLoopError("Editor new_paths must be an explicit unique path list")
+        from .git_handoff import _path
+        for path in paths:
+            _path(path)
+        editor_paths = tuple(paths)
+    return editor_paths, editor_outcome
+
+
 def validate_structured_coder_followup(
     text: str, *, required_architecture_impact_contract: int = 0,
     delivered_risk_test_matrix: RiskTestMatrix | Mapping[str, object] | None = None,
@@ -7689,6 +7716,7 @@ def validate_structured_coder_followup(
     delivered_risk_test_matrix_row_ids: Sequence[str] | None = None,
     execution_catalog: Sequence[object] | None = None,
     allow_historical_canonical_evidence: bool = False,
+    allow_editor_handoff: bool = False,
     architecture_status_mode: str = "strict",
     expected_sub_item_ids: Mapping[str, Sequence[str]] | None = None,
 ) -> StructuredCoderFollowup | None:
@@ -7711,6 +7739,8 @@ def validate_structured_coder_followup(
         "architecture_impact",
         "addressed_sub_items",
     }
+    if allow_editor_handoff:
+        optional_fields.add("editor_handoff")
     if allow_historical_canonical_evidence:
         optional_fields.add("risk_test_matrix_evidence")
     _expect_exact_keys(  # shape-check: fatal:unparseable-envelope
@@ -7845,7 +7875,10 @@ def validate_structured_coder_followup(
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
             "coder_followup.state must be `blocking` when a signed human requirement is blocked."
         )
+    editor_paths, editor_outcome = _editor_declaration(payload) if allow_editor_handoff else (None, None)
     return StructuredCoderFollowup(
+        editor_new_paths=editor_paths,
+        editor_outcome=editor_outcome,
         schema_version=1,
         kind="coder_followup",
         state=state,
@@ -8002,26 +8035,9 @@ def validate_structured_issue_implementation(
             raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
                 "issue_implementation.pr_number must be a positive integer or null."
             )
-    editor_paths = None
-    editor_outcome = None
-    if allow_editor_handoff and "editor_handoff" in payload:
-        declaration = _expect_object(payload["editor_handoff"], context="editor_handoff")
-        _expect_exact_keys(declaration, context="editor_handoff",
-                           required={"version", "outcome", "new_paths"})
-        if type(declaration["version"]) is not int or declaration["version"] != 1:
-            raise AgentLoopError("Unsupported editor handoff version")
-        editor_outcome = declaration["outcome"]
-        if editor_outcome not in ("ready", "blocked") or pr_number is not None:
-            raise AgentLoopError("Editor handoff requires a null PR and ready/blocked outcome")
-        paths = declaration["new_paths"]
-        if (not isinstance(paths, list) or len(paths) > 10000
-                or any(not isinstance(p, str) or not p for p in paths)
-                or len(set(paths)) != len(paths)):
-            raise AgentLoopError("Editor new_paths must be an explicit unique path list")
-        from .git_handoff import _path
-        for path in paths:
-            _path(path)
-        editor_paths = tuple(paths)
+    editor_paths, editor_outcome = _editor_declaration(payload) if allow_editor_handoff else (None, None)
+    if editor_outcome is not None and pr_number is not None:
+        raise AgentLoopError("Editor handoff requires a null PR")
     human_payload = _expect_object(  # shape-check: fatal:no-conservative-reading
         payload["human_requirements"], context="issue_implementation.human_requirements"
     )

@@ -868,6 +868,12 @@ def run_pr_loop(
             pr_number=pr_number,
             cwd=bootstrap_cwd,
         )
+        if config.git_operator is not None and (
+            approved_plan_context is not None or managed_pr_origin is not None
+            or managed_ci_handoff is not None or managed_ci_issue_number is not None
+            or config.effective_managed_ci
+        ):
+            raise AgentLoopError("Split corrections support ordinary PRs only")
         # Resolve the live PR base before any managed-CI authentication or
         # workdir setup.  An inherited repository default is provenance, not
         # permission to reinterpret a PR targeting another branch.
@@ -8874,7 +8880,15 @@ def run_pr_loop(
                 carried_reasons=dispatch_carried_reasons,
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
+            split_handoff = None
             try:
+                if config.git_operator is not None:
+                    if has_merge_conflict_item or approved_plan_context is not None or coder_ci_guarded:
+                        raise AgentLoopError("Split corrections support ordinary non-conflicted PRs only")
+                    from .split_issue_handoff import SplitPrHandoff
+                    split_handoff = SplitPrHandoff.begin(
+                        runner, config=config, pr_number=pr_number, metadata=pr_metadata,
+                    )
                 coder_response = _run_validated_agent(
                     runner,
                     agent=config.coder,
@@ -8887,6 +8901,7 @@ def run_pr_loop(
                     **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
                         text,
                         unresolved_items=items,
+                        allow_editor_handoff=split_handoff is not None,
                         optional_item_ids=optional_ids,
                         resolved_item_ids=resolved_ids,
                         human_requirements=human_requirements,
@@ -8916,8 +8931,8 @@ def run_pr_loop(
                         ), architecture_status_mode=mode,
                     )),
                     usage_context=usage_context,
-                    role="coder",
-                    use_repair=True,
+                    role="editor" if split_handoff is not None else "coder",
+                    use_repair=split_handoff is None,
                     repair_expected_kind="coder_followup",
                     repair_unresolved_item_ids=repair_unresolved_item_ids,
                     repair_optional_item_ids=coder_optional_item_ids,
@@ -8993,7 +9008,18 @@ def run_pr_loop(
                     human_requirements=human_requirements,
                     source_round=round_number,
                 )
+                if split_handoff is not None:
+                    split_handoff.publish(
+                        coder_response.marker_value,
+                        head_change_expected=_followup_reports_code_changes(
+                            coder_response.marker_value, prior_items=pre_turn_ledger,
+                            citation_row_ids=_evidence_stall_citation_rows(evidence_stall_snapshot),
+                        ) if isinstance(coder_response.marker_value, StructuredCoderFollowup) else True,
+                        test_observations=coder_response.acquisition_test_observations,
+                    )
                 updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                if split_handoff is not None:
+                    split_handoff.synchronize(updated_pr_context.metadata)
                 unresolved_items = _advance_machine_obligations_for_head(
                     unresolved_items,
                     current_head_sha=updated_pr_context.metadata.head_sha,

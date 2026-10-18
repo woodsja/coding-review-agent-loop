@@ -1021,7 +1021,8 @@ def _coder_workdir_guidance(
         f"{scope} must stay in that directory unless the user explicitly authorizes "
         "a different path. Do not `cd` into sibling, home, deployment, or duplicate "
         f"clones such as `~/{repo_name}` or `~/claude-code/{repo_name}`. Before "
-        f"running {'tests' if editor else 'tests or committing'}, run `pwd` and `git status --branch --short` "
+        f"running {'tests' if editor else 'tests or committing'}, run `pwd`"
+        f"{' ' if editor else ' and `git status --branch --short` '}"
         "and confirm the path is the assigned checkout."
         f"{dangerous_warning}\n"
         f"{('Editor sandbox: code/test/documentation edits and project tests use workspace-write; Git metadata stays protected and network access is disabled.' + chr(10)) if editor else _sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
@@ -5533,6 +5534,42 @@ or:
 """
 
 
+def _split_pr_editor_prompt(pr_number, round_number, review, config, *, memory,
+                            issue_context, parent_issue_context, human_requirements_context,
+                            approved_plan_context, step_back_context, classifiable_item_ids):
+    signature = agent_signature(config.coder, config, role="coder")
+    return f"""Correct the supplied review findings on existing PR #{pr_number} in {config.repo}.
+You are the Codex editor in workspace-write. Edit code, tests and documentation and run tests.
+NEVER run Git or gh commands, branch, stage, commit, push, open a PR, or change Git metadata.
+The host owns the pinned PR branch and publication. Do not sync or change HEAD.
+Return the existing coder_followup structured response with this additional required field:
+"editor_handoff": {{"version": 1, "outcome": "ready", "new_paths": []}}
+Declare EVERY intended new file with a relative path. Use outcome "blocked" if unable to deliver.
+Run relevant tests in this checkout; report only tests actually executed in this invocation.
+Missing, failed, unsafe or undelivered test evidence blocks publication.
+Citation-only follow-ups may leave code unchanged only when the host ledger permits it;
+no empty commits are created. Ordinary code findings require a changed candidate.
+{_coder_workdir_guidance(config, editor=True)}
+{_scratch_file_guidance()}
+{_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}
+{_coder_documentation_guidance()}
+{_architecture_impact_guidance(required=True, config=config)}
+{_architecture_context_block(config)}
+{_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
+{_issue_context_block(issue_context)}
+{human_requirements_context.block}
+{_coder_human_requirements_guidance(human_requirements_context, response_kind="coder_followup")}
+{_memory_block(memory, config, include_runtime=True)}
+{step_back_context}
+Review findings (round {round_number}):
+{review}
+{_structured_coder_followup_guidance(reviewer_name=format_agent_list(reviewers(config)),
+    human_requirements_context=human_requirements_context, coder_signature=signature,
+    include_coverage_map=False, classifiable_item_ids=classifiable_item_ids)}
+End with <!-- AGENT_STATE: blocking --> and then -- {signature}.
+"""
+
+
 def build_followup_prompt(
     pr_number: int,
     round_number: int,
@@ -5558,6 +5595,12 @@ def build_followup_prompt(
     human_requirements_context = _coder_requirements_context(
         config, human_requirements, human_requirements_context
     )
+    if config.git_operator is not None:
+        return _split_pr_editor_prompt(pr_number, round_number, review, config,
+            memory=memory, issue_context=issue_context, parent_issue_context=parent_issue_context,
+            human_requirements_context=human_requirements_context,
+            approved_plan_context=approved_plan_context, step_back_context=step_back_context,
+            classifiable_item_ids=classifiable_item_ids)
     return f"""{reviewer_name} reviewed pull request #{pr_number} in {config.repo} and found blocking issues.
 
 Address the review below in this local checkout. Pull/sync the PR branch if
@@ -5627,6 +5670,12 @@ def build_same_pr_followup_prompt(
         config, human_requirements, human_requirements_context
     )
     scope_framing = step_back_context or _SAME_PR_SMALL_CLEANUP_FRAMING
+    if config.git_operator is not None:
+        return _split_pr_editor_prompt(pr_number, round_number, review, config,
+            memory=memory, issue_context=issue_context, parent_issue_context=parent_issue_context,
+            human_requirements_context=human_requirements_context,
+            approved_plan_context=approved_plan_context, step_back_context=step_back_context,
+            classifiable_item_ids=classifiable_item_ids)
     return f"""{reviewer_name} requested same-PR follow-ups on pull request #{pr_number} in {config.repo}.
 
 Address the follow-up items below in this local checkout. Pull/sync the PR

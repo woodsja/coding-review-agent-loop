@@ -308,7 +308,7 @@ class Handoff:
             snapshot[name] = value
         return snapshot
 
-    def capture(self, *, allowed_new: set[str]):
+    def capture(self, *, allowed_new: set[str], allow_no_change: bool = False):
         if self.tree is not None:
             raise HandoffError("Candidate already frozen")
         self.allowed_new = frozenset(allowed_new)
@@ -323,7 +323,7 @@ class Handoff:
             entries.append(mode.encode() + b" " + oid + b"\t" + os.fsencode(name) + b"\0")
         self.git("update-index", "-z", "--index-info", data=b"".join(entries))
         self.tree = self.git("write-tree").decode().strip()
-        if self.tree == self.base_tree:
+        if self.tree == self.base_tree and not allow_no_change:
             self.tree = None
             raise HandoffError("No candidate changes")
         self.changed_paths = tuple(p for p, value in self.snapshot.items() if (
